@@ -1,0 +1,198 @@
+// What the system families answer with (docs/self-hosting.md §6.12): the
+// values a builtin that reaches outside the program makes -- `Ok`, `Err`,
+// `Some`, `None`, an `IoError` -- each box made as the Rust runtime's
+// `alloc` makes it (an integer's or a boolean's box its own, never an
+// interned one), and the text of what failed: the C library's `strerror`
+// for a system call's error number, as `grasm_sys::io::Error` shows it.
+import layout
+import sys
+import alloc
+import strread
+import numstr
+import bytes
+import display
+import structs
+import panic
+
+extern fn strerror(code: i32) -> addr
+extern fn strlen(p: addr) -> i64
+extern fn __error() -> addr
+
+pub let ENOENT = 2
+pub let EINTR = 4
+pub let EBADF = 9
+pub let EEXIST = 17
+pub let EAGAIN = 35
+pub let EILSEQ = 92
+
+/// The calling thread's error number.
+pub fn errno() -> i64 {
+    unsafe { __error().load_u32().as_i64() }
+}
+
+/// Whether `a` is the null address.
+pub fn null(a: addr) -> bool {
+    unsafe { a.as_i64() == 0 }
+}
+
+pub fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+/// A string argument's text and its length in `n`: the Rust runtime's
+/// `as_str`, which panics on anything else.
+pub fn text_arg(v: addr, inout n: i64) -> addr {
+    if not strread.is_str(v) {
+        unsafe { panic.say(mem_static("expected a string"), mem_static_len("expected a string")) }
+    }
+    strread.text_of(v, n)
+}
+
+/// Whether `v` is an `i64`'s box; its value goes to `out`.
+pub fn int_arg(v: addr, inout out: i64) -> bool {
+    if tag(v) != layout.TAG_I64 {
+        return false
+    }
+    out = unsafe { v.offset(layout.WORD_AT).load_i64() }
+    true
+}
+
+/// A copy of the `n` bytes at `p` ending in a NUL, for a C call; the caller
+/// frees it. A NUL inside ends the text where C reads it, as the Rust
+/// runtime's `c_path` leaves it.
+pub fn c_copy(p: addr, n: i64) -> addr {
+    let c = sys.alloc(n + 1)
+    sys.copy(c, p, n)
+    unsafe { c.offset(n).store_u8(0.as_u8()) }
+    c
+}
+
+// ----- values -----------------------------------------------------------------
+
+pub fn int(v: i64) -> addr {
+    let p = alloc.take()
+    unsafe {
+        p.offset(layout.TAG).store_u8(layout.TAG_I64.as_u8())
+        p.offset(layout.WORD_AT).store_i64(v)
+    }
+    p
+}
+
+pub fn boolean(v: bool) -> addr {
+    let p = alloc.take()
+    unsafe {
+        p.offset(layout.TAG).store_u8(layout.TAG_BOOL.as_u8())
+        p.offset(layout.BOOL_AT).store_u8(if v { 1.as_u8() } else { 0.as_u8() })
+    }
+    p
+}
+
+pub fn float(v: f64) -> addr {
+    let p = alloc.take()
+    unsafe {
+        p.offset(layout.TAG).store_u8(layout.TAG_F64.as_u8())
+        p.offset(layout.WORD_AT).store_f64(v)
+    }
+    p
+}
+
+pub fn unit() -> addr {
+    alloc.take()
+}
+
+/// A string of the `n` bytes at `p`, which are UTF-8.
+pub fn text(p: addr, n: i64) -> addr {
+    numstr.new_str(p, n)
+}
+
+/// A string of the text a `display` buffer holds, the buffer freed.
+pub fn text_of_buf(t: addr) -> addr {
+    let s = numstr.new_str(display.text_ptr(t), display.text_len(t))
+    display.text_free(t)
+    s
+}
+
+/// A string of the `n` bytes at `p`, each invalid UTF-8 sequence one U+FFFD
+/// (`String::from_utf8_lossy`).
+pub fn lossy_text(p: addr, n: i64) -> addr {
+    bytes.text_of_bytes(p, n)
+}
+
+pub fn ok(x: addr) -> addr {
+    unsafe { structs.variant1(mem_static("!"), 1, mem_static("Ok"), 2, x) }
+}
+
+pub fn err(x: addr) -> addr {
+    unsafe { structs.variant1(mem_static("!"), 1, mem_static("Err"), 3, x) }
+}
+
+pub fn some(x: addr) -> addr {
+    unsafe { structs.variant1(mem_static("Option"), 6, mem_static("Some"), 4, x) }
+}
+
+pub fn none() -> addr {
+    unsafe { structs.variant0(mem_static("Option"), 6, mem_static("None"), 4) }
+}
+
+/// `Err(IoError.<kind>(message))`, the message the `mn` bytes at `msg`.
+pub fn io_err(kind: addr, kn: i64, msg: addr, mn: i64) -> addr {
+    let s = text(msg, mn)
+    unsafe { err(structs.variant1(mem_static("IoError"), 7, kind, kn, s)) }
+}
+
+/// `Err(IoError.NotFound(path))`.
+pub fn not_found(p: addr, n: i64) -> addr {
+    unsafe { io_err(mem_static("NotFound"), 8, p, n) }
+}
+
+/// `Err(IoError.IoFailed(message))`, the message fixed text.
+pub fn failed(msg: addr, mn: i64) -> addr {
+    unsafe { io_err(mem_static("IoFailed"), 8, msg, mn) }
+}
+
+/// `Err(IoError.IoFailed(message))`, the message what a `display` buffer
+/// holds; the buffer freed.
+pub fn failed_buf(t: addr) -> addr {
+    let e = failed(display.text_ptr(t), display.text_len(t))
+    display.text_free(t)
+    e
+}
+
+/// `Err(IoError.IoFailed(<what error number code says>))`.
+pub fn failed_os(code: i64) -> addr {
+    let t = display.text_new()
+    put_os(t, code)
+    failed_buf(t)
+}
+
+/// A system call's failure, as the Rust runtime reports a file's: `NotFound`
+/// with the path when the error number is `ENOENT`, else `IoFailed` with
+/// what the number says.
+pub fn path_err(code: i64, p: addr, n: i64) -> addr {
+    if code == ENOENT {
+        return not_found(p, n)
+    }
+    failed_os(code)
+}
+
+/// What error number `code` says, as `grasm_sys::io::Error` shows it: the C
+/// library's `strerror` when that is UTF-8, else `os error <code>`.
+pub fn put_os(t: addr, code: i64) {
+    unsafe {
+        let s = strerror(code.as_i32())
+        if not null(s) {
+            let n = strlen(s)
+            if bytes.valid_utf8(s, n) {
+                display.put(t, s, n)
+                return
+            }
+        }
+        display.put(t, mem_static("os error "), mem_static_len("os error "))
+    }
+    display.put_int(t, code)
+}
+
+/// Fixed text into a `display` buffer.
+pub fn put_s(t: addr, p: addr, n: i64) {
+    display.put(t, p, n)
+}

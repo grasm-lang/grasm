@@ -1,0 +1,324 @@
+// The output buffers and the way out of a program (docs/self-hosting.md
+// §6.12): what the Rust runtime's `grasm_sys::io` streams, `rt_panic` and
+// `sys::exit` were, so that one buffer, this one, is the one every writer
+// shares and every way out flushes.
+//
+// Two streams, as the Rust runtime has them. Standard output is held in a
+// buffer of 8 KiB, one per process (`OUT_*`), written out when a newline
+// asks (`out_nl`), when a write would not fit -- a write of 8 KiB or more
+// then goes straight out -- and on the way out; standard error is the same
+// buffer machinery (`ERR_*`) flushed after every piece, so a message
+// written just before a crash is out before the crash. Each stream is
+// behind a lock built from a compare-and-swap, as the Rust runtime's are
+// behind a mutex. Which stream `print`'s pieces go to is per thread
+// (`TO_STDERR`): `eprint` brackets its pieces with `out_to_stderr`.
+//
+// The way out: a panic flushes standard output, writes `panic: <message>`
+// to standard error and exits 101 ([E-PANIC-EXIT]); `exit(code)` flushes and
+// exits with the code's low eight bits; both end in `leave`, which flushes
+// whichever stream is not held -- another thread mid-write keeps its lock
+// and its bytes, as the Rust runtime's `flush_all` keeps them (F101) -- and
+// calls the C library's `exit`. A write that fails drops what it was
+// writing, as the Rust runtime's does, and nothing reports it.
+import sys
+
+extern fn write(fd: i32, p: addr, n: i64) -> i64
+extern fn dlsym(handle: addr, name: addr) -> addr
+extern fn __error() -> addr
+extern fn sched_yield() -> i32
+
+/// The C library's `exit`, which runs what `atexit` registered (the `leaks`
+/// tool's check among them) where `_exit` would not. Its name is the
+/// built-in `exit`'s, so it is found by `dlsym`, not declared.
+type CExit = fn(i32)
+
+/// `RTLD_DEFAULT`: every image the process has loaded.
+let RTLD_DEFAULT = -2
+
+/// The size of each stream's buffer: what `std` gives a `BufWriter`.
+pub let BUF = 8192
+
+let EINTR = 4
+
+/// Standard output: its lock (0 free, 1 held), its buffer's address (0
+/// until first written), and how many bytes the buffer holds, every access
+/// to which is atomic.
+process_local OUT_LOCK: i64
+/// rtlint: guarded by OUT_LOCK
+process_local OUT_BUF: i64
+process_local OUT_LEN: i64
+/// Standard error, the same.
+process_local ERR_LOCK: i64
+/// rtlint: guarded by ERR_LOCK
+process_local ERR_BUF: i64
+process_local ERR_LEN: i64
+
+/// Whether this thread's `print` pieces go to standard error.
+thread_local TO_STDERR: i64
+
+pub fn errno() -> i64 {
+    unsafe { __error().load_u32().as_i64() }
+}
+
+/// `n` bytes at `p` to descriptor `fd`, retried past a signal; whether all
+/// of them went.
+pub fn write_fully(fd: i64, p: addr, n: i64) -> bool {
+    var done = 0
+    while done < n {
+        let w = unsafe { write(fd.as_i32(), p.offset(done), n - done) }
+        if w > 0 {
+            done += w
+        } else if w < 0 and errno() == EINTR {
+            // again
+        } else {
+            return false
+        }
+    }
+    true
+}
+
+// ----- the two locks ----------------------------------------------------------
+//
+// Each function that takes a lock does its own compare-and-swap on it, so
+// `scripts/rtlint.py` sees it taken; between failed tries it spins a while,
+// then yields.
+
+fn spin(tries: i64) -> i64 {
+    if tries > 64 {
+        unsafe {
+            let _ = sched_yield()
+        }
+        return 0
+    }
+    tries + 1
+}
+
+fn out_unlock() {
+    unsafe { mem_process(OUT_LOCK).atomic_store_i64(0, Release) }
+}
+
+fn err_unlock() {
+    unsafe { mem_process(ERR_LOCK).atomic_store_i64(0, Release) }
+}
+
+// ----- a stream's buffer, under its lock -----------------------------------------
+
+/// Appends `n` bytes at `p` to a stream whose buffer is `buf`, holding
+/// `len` bytes, writing to `fd` what does not fit: the buffer's bytes
+/// first, then these bytes straight out if they are a buffer's worth or
+/// more. Answers how many bytes the buffer holds after. A failed write
+/// leaves the buffer empty and these bytes unwritten, as the Rust runtime's
+/// `write_all` leaves them (its `mem::take` has already emptied the buffer).
+fn put_into(fd: i64, buf: addr, len: i64, p: addr, n: i64) -> i64 {
+    var held = len
+    if held + n > BUF {
+        held = 0
+        if len > 0 and not write_fully(fd, buf, len) {
+            return 0
+        }
+        if n >= BUF {
+            let _ = write_fully(fd, p, n)
+            return 0
+        }
+    }
+    sys.copy(unsafe { buf.offset(held) }, p, n)
+    held + n
+}
+
+/// rtlint: holds OUT_LOCK
+fn out_buf() -> addr {
+    unsafe {
+        var b = mem_process(OUT_BUF).load_i64()
+        if b == 0 {
+            b = sys.alloc(BUF).as_i64()
+            mem_process(OUT_BUF).store_i64(b)
+        }
+        mem_addr(b)
+    }
+}
+
+/// rtlint: holds ERR_LOCK
+fn err_buf() -> addr {
+    unsafe {
+        var b = mem_process(ERR_BUF).load_i64()
+        if b == 0 {
+            b = sys.alloc(BUF).as_i64()
+            mem_process(ERR_BUF).store_i64(b)
+        }
+        mem_addr(b)
+    }
+}
+
+/// rtlint: holds OUT_LOCK
+fn out_put(p: addr, n: i64) {
+    unsafe {
+        let len = mem_process(OUT_LEN).atomic_load_i64(Relaxed)
+        mem_process(OUT_LEN).atomic_store_i64(put_into(1, out_buf(), len, p, n), Release)
+    }
+}
+
+/// rtlint: holds OUT_LOCK
+fn out_flush_held() {
+    unsafe {
+        let len = mem_process(OUT_LEN).atomic_load_i64(Relaxed)
+        if len == 0 {
+            return
+        }
+        mem_process(OUT_LEN).atomic_store_i64(0, Release)
+        let _ = write_fully(1, out_buf(), len)
+    }
+}
+
+/// rtlint: holds ERR_LOCK
+fn err_put(p: addr, n: i64) {
+    unsafe {
+        let len = mem_process(ERR_LEN).atomic_load_i64(Relaxed)
+        mem_process(ERR_LEN).atomic_store_i64(put_into(2, err_buf(), len, p, n), Release)
+    }
+}
+
+/// rtlint: holds ERR_LOCK
+fn err_flush_held() {
+    unsafe {
+        let len = mem_process(ERR_LEN).atomic_load_i64(Relaxed)
+        if len == 0 {
+            return
+        }
+        mem_process(ERR_LEN).atomic_store_i64(0, Release)
+        let _ = write_fully(2, err_buf(), len)
+    }
+}
+
+// ----- what the families write through --------------------------------------------
+
+/// `n` bytes at `p` to standard output's buffer.
+pub fn out_bytes(p: addr, n: i64) {
+    var tries = 0
+    while unsafe { mem_process(OUT_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    out_put(p, n)
+    out_unlock()
+}
+
+/// A newline to standard output's buffer, and the buffer written out.
+fn out_line_end() {
+    var tries = 0
+    while unsafe { mem_process(OUT_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    unsafe { out_put(mem_static("\n"), 1) }
+    out_flush_held()
+    out_unlock()
+}
+
+/// Standard output's buffer, written out.
+pub fn flush_out() {
+    var tries = 0
+    while unsafe { mem_process(OUT_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    out_flush_held()
+    out_unlock()
+}
+
+/// Up to three pieces to standard error -- `an`, `bn` and `cn` bytes at
+/// `a`, `b` and `c` -- through its buffer and out at once: one write when
+/// they fit it, as the Rust runtime's `writeln!` to its locked stderr gives.
+pub fn err_pieces(a: addr, an: i64, b: addr, bn: i64, c: addr, cn: i64) {
+    var tries = 0
+    while unsafe { mem_process(ERR_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    err_put(a, an)
+    if bn > 0 {
+        err_put(b, bn)
+    }
+    if cn > 0 {
+        err_put(c, cn)
+    }
+    err_flush_held()
+    err_unlock()
+}
+
+/// `n` bytes at `p` to standard error, out at once.
+pub fn err_bytes(p: addr, n: i64) {
+    err_pieces(p, n, p, 0, p, 0)
+}
+
+/// A line of `n` bytes at `p` to standard error, as one write when it fits
+/// the buffer: what the leak check and the journal say. Standard output is
+/// not flushed first, as the Rust runtime's `eprint_line` does not flush it.
+pub fn err_line(p: addr, n: i64) {
+    unsafe { err_pieces(p, n, mem_static("\n"), 1, p, 0) }
+}
+
+/// `a` and `b` (`an` and `bn` bytes) and a newline to standard error, as one
+/// write when they fit the buffer: a line whose head is fixed text.
+pub fn err_line2(a: addr, an: i64, b: addr, bn: i64) {
+    unsafe { err_pieces(a, an, b, bn, mem_static("\n"), 1) }
+}
+
+/// Whichever stream is free written out, then the C library's `exit` with
+/// `code`. A stream another thread holds keeps its bytes: waiting on it
+/// from here could wait forever.
+pub fn leave(code: i64) {
+    unsafe {
+        if mem_process(OUT_LOCK).atomic_cas_i64(0, 1, Acquire) == 0 {
+            out_flush_held()
+            out_unlock()
+        }
+        if mem_process(ERR_LOCK).atomic_cas_i64(0, 1, Acquire) == 0 {
+            err_flush_held()
+            err_unlock()
+        }
+        let c_exit = dlsym(mem_addr(RTLD_DEFAULT), mem_static("exit"))
+        c_exit.call_c(CExit, code.as_i32())
+    }
+}
+
+/// A panic with the `n` bytes at `p` as its message, valid UTF-8: standard
+/// output flushed, `panic: <message>` to standard error, exit 101.
+pub fn panic_bytes(p: addr, n: i64) {
+    flush_out()
+    unsafe { err_pieces(mem_static("panic: "), mem_static_len("panic: "), p, n, mem_static("\n"), 1) }
+    leave(101)
+}
+
+/// Which stream this thread's `print` pieces go to.
+pub fn to_stderr() -> bool {
+    unsafe { mem_tls(TO_STDERR).load_i64() != 0 }
+}
+
+/// A piece of `print` or `eprint`: to this thread's stream.
+pub fn out_text(p: addr, n: i64) {
+    if to_stderr() {
+        err_bytes(p, n)
+    } else {
+        out_bytes(p, n)
+    }
+}
+
+export fn grt_out_text(p: addr, n: i64) {
+    out_text(p, n)
+}
+
+/// The newline ending a `print`: the stream flushed with it.
+export fn grt_out_nl() {
+    if to_stderr() {
+        unsafe { err_pieces(mem_static("\n"), 1, mem_addr(0), 0, mem_addr(0), 0) }
+        return
+    }
+    out_line_end()
+}
+
+export fn grt_out_to_stderr(on: i8) {
+    unsafe { mem_tls(TO_STDERR).store_i64(if on != 0 { 1 } else { 0 }) }
+}
+
+/// `exit(code)`: standard output flushed, and the code's low eight bits --
+/// what C's `exit` makes of it -- so `exit(-1)` fails rather than succeeds.
+export fn grt_exit(code: i64) {
+    flush_out()
+    leave(code.bit_and(255))
+}

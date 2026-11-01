@@ -1,0 +1,171 @@
+// Files at the level of the system calls (docs/self-hosting.md §6.12): what
+// `grasm_sys::fs::File` does -- `open` with flags and a mode, read to the
+// end, write all of it, seek, sync -- each retried past a signal, as the Rust
+// runtime retries them, and each answering the error number when it fails.
+//
+// `open` and `fcntl` are variadic in C, and on arm64 macOS a variadic
+// argument travels on the stack where a fixed one would be in a register:
+// declared with a fixed third parameter, `open`'s mode would be read from
+// whatever the stack held. So each is declared with eight register
+// parameters before it -- the six between are ignored by the callee -- and
+// the variadic one ninth, which the calling convention puts in the first
+// stack slot, where `va_arg` reads it.
+import sys
+import sysv
+
+extern fn open(path: addr, flags: i32, r2: i64, r3: i64, r4: i64, r5: i64, r6: i64, r7: i64, mode: i64) -> i32
+extern fn fcntl(fd: i32, cmd: i32, r2: i64, r3: i64, r4: i64, r5: i64, r6: i64, r7: i64, arg: i64) -> i32
+extern fn close(fd: i32) -> i32
+extern fn read(fd: i32, p: addr, n: i64) -> i64
+extern fn write(fd: i32, p: addr, n: i64) -> i64
+extern fn lseek(fd: i32, off: i64, whence: i32) -> i64
+extern fn fsync(fd: i32) -> i32
+
+pub let O_RDONLY = 0
+pub let O_WRONLY = 1
+pub let O_RDWR = 2
+pub let O_APPEND = 8
+pub let O_CREAT = 512
+pub let O_TRUNC = 1024
+pub let SEEK_SET = 0
+pub let SEEK_CUR = 1
+pub let SEEK_END = 2
+pub let F_GETFL = 3
+pub let F_SETFL = 4
+pub let F_SETFD = 2
+pub let FD_CLOEXEC = 1
+pub let O_NONBLOCK = 4
+
+/// `fcntl(fd, cmd, arg)`, the argument where C reads a variadic one.
+pub fn fcntl3(fd: i64, cmd: i64, arg: i64) -> i64 {
+    unsafe { fcntl(fd.as_i32(), cmd.as_i32(), 0, 0, 0, 0, 0, 0, arg).as_i64() }
+}
+
+/// Opens the path of the `n` bytes at `p` with `flags` and `mode`, retried
+/// past a signal: the descriptor, or the error number negated.
+pub fn open_path(p: addr, n: i64, flags: i64, mode: i64) -> i64 {
+    let c = sysv.c_copy(p, n)
+    while true {
+        let fd = unsafe { open(c, flags.as_i32(), 0, 0, 0, 0, 0, 0, mode) }.as_i64()
+        if fd >= 0 {
+            sys.dealloc(c)
+            return fd
+        }
+        let e = sysv.errno()
+        if e != sysv.EINTR {
+            sys.dealloc(c)
+            return 0 - e
+        }
+    }
+    0
+}
+
+pub fn close_fd(fd: i64) {
+    unsafe {
+        let _ = close(fd.as_i32())
+    }
+}
+
+/// One `read` of up to `n` bytes into `p`, retried past a signal: how many
+/// came, or the error number negated.
+pub fn read_once(fd: i64, p: addr, n: i64) -> i64 {
+    while true {
+        let got = unsafe { read(fd.as_i32(), p, n) }
+        if got >= 0 {
+            return got
+        }
+        let e = sysv.errno()
+        if e != sysv.EINTR {
+            return 0 - e
+        }
+    }
+    0
+}
+
+/// Everything left to read on `fd`, 8 KiB a `read` as `read_to_end` takes
+/// it, into a buffer grown as a `Vec` grows: its address, with how many
+/// bytes in `n` and its room in `cap` (the caller frees it when `cap` is not
+/// zero). A failed read answers the null address with the error number in
+/// `n`, the bytes so far freed.
+pub fn read_to_end(fd: i64, inout n: i64, inout cap: i64) -> addr {
+    var buf = unsafe { mem_addr(1) }
+    var len = 0
+    var room = 0
+    let chunk = sys.alloc(8192)
+    while true {
+        let got = read_once(fd, chunk, 8192)
+        if got < 0 {
+            sys.dealloc(chunk)
+            if room > 0 {
+                sys.dealloc(buf)
+            }
+            n = 0 - got
+            cap = 0
+            return unsafe { mem_addr(0) }
+        }
+        if got == 0 {
+            sys.dealloc(chunk)
+            n = len
+            cap = room
+            return buf
+        }
+        if len + got > room {
+            var want = 2 * room
+            if want < len + got {
+                want = len + got
+            }
+            if want < 8 {
+                want = 8
+            }
+            buf = if room == 0 { sys.alloc(want) } else { sys.grow(buf, want) }
+            room = want
+        }
+        sys.copy(unsafe { buf.offset(len) }, chunk, got)
+        len += got
+    }
+    unsafe { mem_addr(0) }
+}
+
+/// All `n` bytes at `p` to `fd`, retried past a signal: whether they all
+/// went, and when not, the error number at the write that failed in `e`.
+pub fn write_all(fd: i64, p: addr, n: i64, inout e: i64) -> bool {
+    var done = 0
+    while done < n {
+        let w = unsafe { write(fd.as_i32(), p.offset(done), n - done) }
+        if w > 0 {
+            done += w
+        } else {
+            let code = sysv.errno()
+            if w < 0 and code == sysv.EINTR {
+                // again
+            } else {
+                e = code
+                return false
+            }
+        }
+    }
+    true
+}
+
+/// `lseek`: the new offset, or the error number negated.
+pub fn seek(fd: i64, whence: i64, at: i64) -> i64 {
+    let r = unsafe { lseek(fd.as_i32(), at, whence.as_i32()) }
+    if r < 0 {
+        return 0 - sysv.errno()
+    }
+    r
+}
+
+/// `fsync`, retried past a signal: 0 or the error number.
+pub fn sync_fd(fd: i64) -> i64 {
+    while true {
+        if unsafe { fsync(fd.as_i32()) }.as_i64() == 0 {
+            return 0
+        }
+        let e = sysv.errno()
+        if e != sysv.EINTR {
+            return e
+        }
+    }
+    0
+}

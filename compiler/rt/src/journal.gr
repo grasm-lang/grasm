@@ -1,0 +1,823 @@
+// The record-and-replay journal (docs/replay.md; docs/self-hosting.md
+// §6.12): what `grasm_journal` and the Rust runtime's `journaled`,
+// `wire_of` and `val_of` were, byte for byte the same file.
+//
+// `GRASM_RECORD=path` writes a journal, `GRASM_REPLAY=path` reads one, both
+// set records. Per thread, as the Rust runtime's `MODE` is, and chosen the
+// first time the thread asks: a recording creates the file then, a replay
+// reads and checks all of it then. The file is `GRASMJRNL2` and then one
+// record per call that reached outside the program -- `u32` name length,
+// name, `u32` value length, value -- each value in the one encoding every
+// engine reads (`Wire`): a tag byte, then 0 unit, 1 an `i64`, 2 an `f64`'s
+// bits, 3 a byte, 4 text and 5 bytes each a `u32` length and the bytes, 6 a
+// list and 7 a tuple each a `u32` count and the items, 8 a variant's type
+// and name as text and its fields as a list. Little-endian throughout.
+//
+// On replay each call takes the next record, which must name it: one that
+// names another call, or none left, stops the run with exit 7 and says so,
+// as a C call does (`refuse_foreign`) -- a recording holds nothing a C
+// function did.
+import layout
+import sys
+import alloc
+import strread
+import numstr
+import bytes
+import display
+import structs
+import lists
+import io
+import sysv
+import fsys
+
+extern fn getenv(name: addr) -> addr
+extern fn strlen(p: addr) -> i64
+
+/// 0 until this thread asks; then 1 off, 2 recording, 3 replaying.
+thread_local J_STATE: i64
+/// Recording: the journal's descriptor.
+thread_local J_FD: i64
+/// Replaying: the journal's bytes, its records (four words each: the name's
+/// address and length, the value's address and length), how many, and how
+/// many this run has taken.
+thread_local J_RAW: i64
+thread_local J_RECS: i64
+thread_local J_N: i64
+thread_local J_AT: i64
+
+/// Variant names a replay made: each one copy for the whole process, as the
+/// Rust runtime's `interned` keeps them, so a variant may hold its name for
+/// as long as it lives. Pairs of address and length, behind a lock.
+process_local NAMES_LOCK: i64
+/// rtlint: guarded by NAMES_LOCK
+process_local NAMES: i64
+/// rtlint: guarded by NAMES_LOCK
+process_local NNAMES: i64
+/// rtlint: guarded by NAMES_LOCK
+process_local NAMECAP: i64
+
+let MAGIC_LEN = 10
+
+// ----- the mode ------------------------------------------------------------------
+
+/// The value of environment variable `name` (static, NUL-terminated) when it
+/// is set and UTF-8, its length in `n`; else the null address -- what
+/// `grasm_sys::sys::env_var` gives.
+pub fn env_text(name: addr, inout n: i64) -> addr {
+    unsafe {
+        let v = getenv(name)
+        if sysv.null(v) {
+            return v
+        }
+        let len = strlen(v)
+        if not bytes.valid_utf8(v, len) {
+            return mem_addr(0)
+        }
+        n = len
+        v
+    }
+}
+
+fn state() -> i64 {
+    let s = unsafe { mem_tls(J_STATE).load_i64() }
+    if s != 0 {
+        return s
+    }
+    open()
+    unsafe { mem_tls(J_STATE).load_i64() }
+}
+
+/// Stops the run: `<lead><path>: <why>` to standard error, exit 7.
+fn cannot(lead: addr, ln: i64, path: addr, pn: i64, why: addr) {
+    let t = display.text_new()
+    display.put(t, lead, ln)
+    display.put(t, path, pn)
+    unsafe { display.put(t, mem_static(": "), 2) }
+    display.put(t, display.text_ptr(why), display.text_len(why))
+    io.err_line(display.text_ptr(t), display.text_len(t))
+    io.leave(7)
+}
+
+fn open() {
+    var n = 0
+    let rec = unsafe { env_text(mem_static("GRASM_RECORD"), n) }
+    if not sysv.null(rec) {
+        let fd = fsys.open_path(rec, n, fsys.O_WRONLY + fsys.O_CREAT + fsys.O_TRUNC, 438)
+        if fd < 0 {
+            let why = display.text_new()
+            sysv.put_os(why, 0 - fd)
+            unsafe { cannot(mem_static("grasm: cannot record to "), mem_static_len("grasm: cannot record to "), rec, n, why) }
+        }
+        var e = 0
+        let _ = unsafe { fsys.write_all(fd, mem_static("GRASMJRNL2"), MAGIC_LEN, e) }
+        unsafe {
+            mem_tls(J_FD).store_i64(fd)
+            mem_tls(J_STATE).store_i64(2)
+        }
+        return
+    }
+    let rep = unsafe { env_text(mem_static("GRASM_REPLAY"), n) }
+    if not sysv.null(rep) {
+        let why = display.text_new()
+        if not read_journal(rep, n, why) {
+            unsafe { cannot(mem_static("grasm: cannot replay "), mem_static_len("grasm: cannot replay "), rep, n, why) }
+        }
+        display.text_free(why)
+        unsafe { mem_tls(J_STATE).store_i64(3) }
+        return
+    }
+    unsafe { mem_tls(J_STATE).store_i64(1) }
+}
+
+pub fn active() -> bool {
+    state() != 1
+}
+
+pub fn replaying() -> bool {
+    state() == 3
+}
+
+pub fn recording() -> bool {
+    state() == 2
+}
+
+// ----- reading a journal -----------------------------------------------------------
+
+fn u32_at(p: addr, at: i64) -> i64 {
+    unsafe { p.offset(at).load_u32().as_i64() }
+}
+
+/// Reads and checks the journal at the path of the `n` bytes at `p` into
+/// this thread's records; when it cannot, what went wrong into `why`.
+fn read_journal(p: addr, n: i64, why: addr) -> bool {
+    let fd = fsys.open_path(p, n, fsys.O_RDONLY, 0)
+    if fd < 0 {
+        sysv.put_os(why, 0 - fd)
+        return false
+    }
+    var len = 0
+    var cap = 0
+    let raw = fsys.read_to_end(fd, len, cap)
+    fsys.close_fd(fd)
+    if sysv.null(raw) {
+        sysv.put_os(why, len)
+        return false
+    }
+    if len < MAGIC_LEN or unsafe { not same(raw, mem_static("GRASMJRNL2"), MAGIC_LEN) } {
+        unsafe { display.put(why, mem_static("not a Grasm journal"), mem_static_len("not a Grasm journal")) }
+        return false
+    }
+    var recs = sys.alloc(32 * 8)
+    var rcap = 8
+    var nrec = 0
+    var at = MAGIC_LEN
+    while at < len {
+        if at + 4 > len {
+            return mid_record(why)
+        }
+        let nl = u32_at(raw, at)
+        at += 4
+        if at + nl > len {
+            return mid_record(why)
+        }
+        let np = at
+        at += nl
+        if at + 4 > len {
+            return mid_record(why)
+        }
+        let vl = u32_at(raw, at)
+        at += 4
+        if at + vl > len {
+            return mid_record(why)
+        }
+        let vp = at
+        at += vl
+        if not check(unsafe { raw.offset(vp) }, vl, why) {
+            return false
+        }
+        if nrec == rcap {
+            rcap = 2 * rcap
+            recs = sys.grow(recs, 32 * rcap)
+        }
+        unsafe {
+            let r = recs.offset(32 * nrec)
+            r.store_addr(raw.offset(np))
+            r.offset(8).store_i64(nl)
+            r.offset(16).store_addr(raw.offset(vp))
+            r.offset(24).store_i64(vl)
+        }
+        nrec += 1
+    }
+    unsafe {
+        mem_tls(J_RAW).store_addr(raw)
+        mem_tls(J_RECS).store_addr(recs)
+        mem_tls(J_N).store_i64(nrec)
+        mem_tls(J_AT).store_i64(0)
+    }
+    true
+}
+
+fn mid_record(why: addr) -> bool {
+    unsafe { display.put(why, mem_static("journal ends mid-record"), mem_static_len("journal ends mid-record")) }
+    false
+}
+
+fn same(a: addr, b: addr, n: i64) -> bool {
+    var i = 0
+    while i < n {
+        if unsafe { a.offset(i).load_u8() != b.offset(i).load_u8() } {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn ends_early(why: addr) -> bool {
+    unsafe { display.put(why, mem_static("a recorded value ends early"), mem_static_len("a recorded value ends early")) }
+    false
+}
+
+/// Whether the `n` bytes at `p` are one whole value, read in the order
+/// `Wire::decode` reads it, so a broken one fails with its first error.
+fn check(p: addr, n: i64, why: addr) -> bool {
+    var at = 0
+    var need = 1
+    while need > 0 {
+        need -= 1
+        if at + 1 > n {
+            return ends_early(why)
+        }
+        let t = unsafe { p.offset(at).load_u8() }.as_i64()
+        at += 1
+        if t == 0 {
+            // unit
+        } else if t == 1 or t == 2 {
+            if at + 8 > n {
+                return ends_early(why)
+            }
+            at += 8
+        } else if t == 3 {
+            if at + 1 > n {
+                return ends_early(why)
+            }
+            at += 1
+        } else if t == 4 or t == 5 {
+            if at + 4 > n {
+                return ends_early(why)
+            }
+            let k = u32_at(p, at)
+            at += 4
+            if at + k > n {
+                return ends_early(why)
+            }
+            at += k
+        } else if t == 6 or t == 7 {
+            if at + 4 > n {
+                return ends_early(why)
+            }
+            need += u32_at(p, at)
+            at += 4
+        } else if t == 8 {
+            var i = 0
+            while i < 2 {
+                if at + 4 > n {
+                    return ends_early(why)
+                }
+                let k = u32_at(p, at)
+                at += 4
+                if at + k > n {
+                    return ends_early(why)
+                }
+                at += k
+                i += 1
+            }
+            if at + 4 > n {
+                return ends_early(why)
+            }
+            need += u32_at(p, at)
+            at += 4
+        } else {
+            unsafe { display.put(why, mem_static("unknown value tag "), mem_static_len("unknown value tag ")) }
+            display.put_int(why, t)
+            unsafe { display.put(why, mem_static(" in the journal"), mem_static_len(" in the journal")) }
+            return false
+        }
+    }
+    if at != n {
+        unsafe { display.put(why, mem_static("trailing bytes after a recorded value"), mem_static_len("trailing bytes after a recorded value")) }
+        return false
+    }
+    true
+}
+
+// ----- replaying ---------------------------------------------------------------------
+
+/// The next record when replaying, which must name `name` (`nn` bytes):
+/// its index; -1 when not replaying. A record naming another call, or none
+/// left, stops the run.
+pub fn gate(name: addr, nn: i64) -> i64 {
+    if not replaying() {
+        return -1
+    }
+    unsafe {
+        let at = mem_tls(J_AT).load_i64()
+        if at >= mem_tls(J_N).load_i64() {
+            let t = display.text_new()
+            display.put(t, mem_static("grasm: the journal ran out at call "), mem_static_len("grasm: the journal ran out at call "))
+            display.put_int(t, at + 1)
+            display.put(t, mem_static(" (`"), 3)
+            display.put(t, name, nn)
+            display.put(t, mem_static("`) — the program reached outside itself more often than the recording holds, so it has diverged from the run being replayed"), mem_static_len("`) — the program reached outside itself more often than the recording holds, so it has diverged from the run being replayed"))
+            io.err_line(display.text_ptr(t), display.text_len(t))
+            io.leave(7)
+        }
+        let r = mem_tls(J_RECS).load_addr().offset(32 * at)
+        let rp = r.load_addr()
+        let rn = r.offset(8).load_i64()
+        if rn != nn or not same(rp, name, nn) {
+            let t = display.text_new()
+            display.put(t, mem_static("grasm: at call "), mem_static_len("grasm: at call "))
+            display.put_int(t, at + 1)
+            display.put(t, mem_static(" the recording says `"), mem_static_len(" the recording says `"))
+            let l = bytes.lossy(rp, rn)
+            display.put(t, display.text_ptr(l), display.text_len(l))
+            display.text_free(l)
+            display.put(t, mem_static("` and this run asked for `"), mem_static_len("` and this run asked for `"))
+            display.put(t, name, nn)
+            display.put(t, mem_static("` — the program has taken a different path from the one recorded, so this is not a replay of it"), mem_static_len("` — the program has taken a different path from the one recorded, so this is not a replay of it"))
+            io.err_line(display.text_ptr(t), display.text_len(t))
+            io.leave(7)
+        }
+        mem_tls(J_AT).store_i64(at + 1)
+        at
+    }
+}
+
+/// Record `i`'s value: its bytes, their count in `n`.
+pub fn value_bytes(i: i64, inout n: i64) -> addr {
+    unsafe {
+        let r = mem_tls(J_RECS).load_addr().offset(32 * i)
+        n = r.offset(24).load_i64()
+        r.offset(16).load_addr()
+    }
+}
+
+/// Whether record `i` holds an `i64` (`Wire::Int`); its value in `out`.
+pub fn value_int(i: i64, inout out: i64) -> bool {
+    var n = 0
+    let p = value_bytes(i, n)
+    if unsafe { p.load_u8() }.as_i64() != 1 {
+        return false
+    }
+    out = unsafe { p.offset(1).load_i64() }
+    true
+}
+
+/// Whether record `i` holds a boolean (`Wire::Bool`); its value in `out`.
+pub fn value_bool(i: i64, inout out: bool) -> bool {
+    var n = 0
+    let p = value_bytes(i, n)
+    if unsafe { p.load_u8() }.as_i64() != 3 {
+        return false
+    }
+    out = unsafe { p.offset(1).load_u8() }.as_i64() != 0
+    true
+}
+
+/// One copy, for the process, of a name read lossily from the `n` bytes at
+/// `p` (`interned`).
+fn intern(p: addr, n: i64, inout len: i64) -> addr {
+    let l = bytes.lossy(p, n)
+    let lp = display.text_ptr(l)
+    let ln = display.text_len(l)
+    var tries = 0
+    while unsafe { mem_process(NAMES_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries += 1
+    }
+    let found = interned(lp, ln)
+    display.text_free(l)
+    unsafe { mem_process(NAMES_LOCK).atomic_store_i64(0, Release) }
+    len = ln
+    found
+}
+
+/// rtlint: holds NAMES_LOCK
+fn interned(p: addr, n: i64) -> addr {
+    unsafe {
+        let names = mem_addr(mem_process(NAMES).load_i64())
+        let count = mem_process(NNAMES).load_i64()
+        var i = 0
+        while i < count {
+            let e = names.offset(16 * i)
+            if e.offset(8).load_i64() == n and same(e.load_addr(), p, n) {
+                return e.load_addr()
+            }
+            i += 1
+        }
+        let cap = mem_process(NAMECAP).load_i64()
+        if count == cap {
+            let want = if cap == 0 { 8 } else { 2 * cap }
+            let grown = if cap == 0 { sys.alloc(16 * want) } else { sys.grow(names, 16 * want) }
+            mem_process(NAMES).store_i64(grown.as_i64())
+            mem_process(NAMECAP).store_i64(want)
+        }
+        let copy = sys.alloc(if n > 0 { n } else { 1 })
+        sys.copy(copy, p, n)
+        let e = mem_addr(mem_process(NAMES).load_i64()).offset(16 * count)
+        e.store_addr(copy)
+        e.offset(8).store_i64(n)
+        mem_process(NNAMES).store_i64(count + 1)
+        copy
+    }
+}
+
+/// A frame of a value being built: the box, where its children go, how
+/// many, how many have come; and whether it is a variant.
+let FR = 40
+
+/// The value the `n` bytes at `p` encode, built as the Rust runtime's
+/// `val_of` builds it: every box its own, lists and tuples in a `Vec`
+/// exactly as long, a variant's names interned.
+pub fn value_of(p: addr, n: i64) -> addr {
+    var frames = sys.alloc(FR * 8)
+    var fcap = 8
+    var depth = 0
+    var at = 0
+    var out = unsafe { mem_addr(0) }
+    while true {
+        let t = unsafe { p.offset(at).load_u8() }.as_i64()
+        at += 1
+        var v = unsafe { mem_addr(0) }
+        var opened = false
+        if t == 0 {
+            v = sysv.unit()
+        } else if t == 1 {
+            v = sysv.int(unsafe { p.offset(at).load_i64() })
+            at += 8
+        } else if t == 2 {
+            v = sysv.float(unsafe { p.offset(at).load_f64() })
+            at += 8
+        } else if t == 3 {
+            v = sysv.boolean(unsafe { p.offset(at).load_u8() }.as_i64() != 0)
+            at += 1
+        } else if t == 4 {
+            let k = u32_at(p, at)
+            at += 4
+            v = bytes.text_of_bytes(unsafe { p.offset(at) }, k)
+            at += k
+        } else if t == 5 {
+            let k = u32_at(p, at)
+            at += 4
+            v = bytes.bytes_copy(unsafe { p.offset(at) }, k)
+            at += k
+        } else if t == 6 or t == 7 {
+            let k = u32_at(p, at)
+            at += 4
+            var slots = unsafe { mem_addr(0) }
+            v = lists.heap_list(if t == 6 { layout.TAG_LIST } else { layout.TAG_TUPLE }, k, slots)
+            if k > 0 {
+                if depth == fcap {
+                    fcap = 2 * fcap
+                    frames = sys.grow(frames, FR * fcap)
+                }
+                unsafe {
+                    let f = frames.offset(FR * depth)
+                    f.store_addr(v)
+                    f.offset(8).store_addr(slots)
+                    f.offset(16).store_i64(k)
+                    f.offset(24).store_i64(0)
+                    f.offset(32).store_i64(0)
+                }
+                depth += 1
+                opened = true
+            }
+        } else {
+            let tl = u32_at(p, at)
+            var tn = 0
+            let tp = intern(unsafe { p.offset(at + 4) }, tl, tn)
+            at += 4 + tl
+            let nl = u32_at(p, at)
+            var nn = 0
+            let np = intern(unsafe { p.offset(at + 4) }, nl, nn)
+            at += 4 + nl
+            let k = u32_at(p, at)
+            at += 4
+            v = structs.variant0(tp, tn, np, nn)
+            if k > 0 {
+                if depth == fcap {
+                    fcap = 2 * fcap
+                    frames = sys.grow(frames, FR * fcap)
+                }
+                unsafe {
+                    let f = frames.offset(FR * depth)
+                    f.store_addr(v)
+                    f.offset(8).store_addr(sys.alloc(8 * k))
+                    f.offset(16).store_i64(k)
+                    f.offset(24).store_i64(0)
+                    f.offset(32).store_i64(1)
+                }
+                depth += 1
+                opened = true
+            }
+        }
+        if not opened {
+            // `v` is whole: into the frame above, and each frame it fills
+            // up whole in turn.
+            var done = v
+            var placing = true
+            while placing {
+                if depth == 0 {
+                    out = done
+                    placing = false
+                } else {
+                    unsafe {
+                        let f = frames.offset(FR * (depth - 1))
+                        let i = f.offset(24).load_i64()
+                        f.offset(8).load_addr().offset(8 * i).store_addr(done)
+                        f.offset(24).store_i64(i + 1)
+                        if i + 1 < f.offset(16).load_i64() {
+                            placing = false
+                        } else {
+                            done = f.load_addr()
+                            if f.offset(32).load_i64() == 1 {
+                                let k = f.offset(16).load_i64()
+                                let slots = f.offset(8).load_addr()
+                                if k == 1 {
+                                    done.offset(layout.VARIANT_FIELDS).store_addr(slots.load_addr())
+                                    sys.dealloc(slots)
+                                } else {
+                                    done.offset(layout.VARIANT_FIELDS).store_addr(slots)
+                                }
+                                done.offset(layout.VARIANT_NFIELDS).store_i64(k)
+                            }
+                            depth -= 1
+                        }
+                    }
+                }
+            }
+            if depth == 0 {
+                sys.dealloc(frames)
+                return out
+            }
+        }
+    }
+    out
+}
+
+/// Record `i`'s value, built.
+pub fn value(i: i64) -> addr {
+    var n = 0
+    let p = value_bytes(i, n)
+    value_of(p, n)
+}
+
+/// When replaying, the next record's value, which must be `name`'s (`nn`
+/// bytes); else the null address. The first half of the Rust runtime's
+/// `journaled`.
+pub fn replayed(name: addr, nn: i64) -> addr {
+    let i = gate(name, nn)
+    if i < 0 {
+        return unsafe { mem_addr(0) }
+    }
+    value(i)
+}
+
+// ----- recording ---------------------------------------------------------------------
+
+fn put_u32(t: addr, v: i64) {
+    display.put_byte(t, v.bit_and(255))
+    display.put_byte(t, v.shr(8).bit_and(255))
+    display.put_byte(t, v.shr(16).bit_and(255))
+    display.put_byte(t, v.shr(24).bit_and(255))
+}
+
+fn put_u64(t: addr, v: i64) {
+    var i = 0
+    while i < 8 {
+        display.put_byte(t, v.shr(8 * i).bit_and(255))
+        i += 1
+    }
+}
+
+fn put_text(t: addr, p: addr, n: i64) {
+    put_u32(t, n)
+    display.put(t, p, n)
+}
+
+/// Stops the run: the journal cannot carry a `what`.
+fn unsupported(what: addr, wn: i64) {
+    let t = display.text_new()
+    unsafe {
+        display.put(t, mem_static("grasm: cannot record a "), mem_static_len("grasm: cannot record a "))
+        display.put(t, what, wn)
+        display.put(t, mem_static(" — the journal has no encoding for it, and recording something else in its place would make the replay a lie about what happened"), mem_static_len(" — the journal has no encoding for it, and recording something else in its place would make the replay a lie about what happened"))
+    }
+    io.err_line(display.text_ptr(t), display.text_len(t))
+    io.leave(7)
+}
+
+/// Value `v` encoded onto `t` (`wire_of`, then `Wire::encode`): first all
+/// of it is in the encoding or the run stops, then children in order. A
+/// null address is the unit value.
+fn encode(t: addr, v: addr) {
+    var stack = sys.alloc(64)
+    var cap = 8
+    var n = 1
+    unsafe { stack.store_addr(v) }
+    while n > 0 {
+        n -= 1
+        let x = unsafe { stack.offset(8 * n).load_addr() }
+        if sysv.null(x) {
+            display.put_byte(t, 0)
+        } else {
+            let tag = sysv.tag(x)
+            var kids = unsafe { mem_addr(0) }
+            var nk = 0
+            if tag == layout.TAG_UNIT {
+                display.put_byte(t, 0)
+            } else if tag == layout.TAG_I64 {
+                display.put_byte(t, 1)
+                put_u64(t, unsafe { x.offset(layout.WORD_AT).load_i64() })
+            } else if tag == layout.TAG_F64 {
+                display.put_byte(t, 2)
+                put_u64(t, unsafe { x.offset(layout.WORD_AT).load_i64() })
+            } else if tag == layout.TAG_BOOL {
+                display.put_byte(t, 3)
+                display.put_byte(t, unsafe { x.offset(layout.BOOL_AT).load_u8() }.as_i64())
+            } else if tag == layout.TAG_STR {
+                var len = 0
+                let p = strread.text_of(x, len)
+                display.put_byte(t, 4)
+                put_text(t, p, len)
+            } else if tag == layout.TAG_BYTES {
+                let p = unsafe { x.offset(layout.BYTES_PTR).load_addr() }
+                let len = unsafe { x.offset(layout.BYTES_LEN).load_i64() }
+                display.put_byte(t, 5)
+                put_text(t, p, len)
+            } else if tag == layout.TAG_LIST or tag == layout.TAG_TUPLE {
+                kids = lists.items(x, nk)
+                display.put_byte(t, if tag == layout.TAG_LIST { 6 } else { 7 })
+                put_u32(t, nk)
+            } else if tag == layout.TAG_LIST_SCALAR {
+                let sk = lists.skind(x)
+                let len = lists.slen(x)
+                if sk == layout.SK_REF and len > 0 {
+                    unsafe { unsupported(mem_static("reference"), 9) }
+                }
+                if sk == layout.SK_U64 and len > 0 {
+                    unsafe { unsupported(mem_static("u64"), 3) }
+                }
+                display.put_byte(t, 6)
+                put_u32(t, len)
+                var i = 0
+                while i < len {
+                    let bits = lists.sget(x, i)
+                    if sk == layout.SK_F64 {
+                        display.put_byte(t, 2)
+                        put_u64(t, bits)
+                    } else if sk == layout.SK_BOOL {
+                        display.put_byte(t, 3)
+                        display.put_byte(t, if bits != 0 { 1 } else { 0 })
+                    } else {
+                        display.put_byte(t, 1)
+                        put_u64(t, bits)
+                    }
+                    i += 1
+                }
+            } else if tag == layout.TAG_VARIANT {
+                unsafe {
+                    display.put_byte(t, 8)
+                    put_text(t, x.offset(layout.VARIANT_TYPE + layout.STRREF_PTR).load_addr(), x.offset(layout.VARIANT_TYPE + layout.STRREF_LEN).load_i64())
+                    put_text(t, x.offset(layout.VARIANT_NAME + layout.STRREF_PTR).load_addr(), x.offset(layout.VARIANT_NAME + layout.STRREF_LEN).load_i64())
+                    nk = x.offset(layout.VARIANT_NFIELDS).load_i64()
+                    kids = if nk == 1 { x.offset(layout.VARIANT_FIELDS) } else { x.offset(layout.VARIANT_FIELDS).load_addr() }
+                }
+                put_u32(t, nk)
+            } else {
+                unsafe {
+                    if tag == layout.TAG_RANGE {
+                        unsupported(mem_static("range"), 5)
+                    } else if tag == layout.TAG_HANDLER {
+                        unsupported(mem_static("handler"), 7)
+                    } else if tag == layout.TAG_ENV {
+                        unsupported(mem_static("environment"), 11)
+                    } else if tag == layout.TAG_REF {
+                        unsupported(mem_static("reference"), 9)
+                    } else if tag == layout.TAG_U64 {
+                        unsupported(mem_static("u64"), 3)
+                    } else if tag == layout.TAG_STRBUF {
+                        unsupported(mem_static("string builder"), 14)
+                    } else if tag == layout.TAG_BYTEBUF {
+                        unsupported(mem_static("byte builder"), 12)
+                    } else if tag == layout.TAG_MAP {
+                        unsupported(mem_static("map"), 3)
+                    } else if tag == layout.TAG_STRUCT {
+                        unsupported(mem_static("struct"), 6)
+                    } else if tag == layout.TAG_FN {
+                        unsupported(mem_static("function"), 8)
+                    } else {
+                        unsupported(mem_static("value list"), 10)
+                    }
+                }
+            }
+            // The children, last first, so the first comes off next.
+            if n + nk > cap {
+                while n + nk > cap {
+                    cap = 2 * cap
+                }
+                stack = sys.grow(stack, 8 * cap)
+            }
+            var k = nk - 1
+            while k >= 0 {
+                unsafe { stack.offset(8 * n).store_addr(kids.offset(8 * k).load_addr()) }
+                n += 1
+                k -= 1
+            }
+        }
+    }
+    sys.dealloc(stack)
+}
+
+/// Writes `name`'s record of value `v` when recording: one write of the
+/// whole record, its failure ignored, as `grasm_journal::put` ignores it.
+pub fn record(name: addr, nn: i64, v: addr) {
+    if not recording() {
+        return
+    }
+    let payload = display.text_new()
+    encode(payload, v)
+    write_record(name, nn, payload)
+}
+
+/// `name`'s record of a boolean, when recording, made with no box.
+pub fn record_bool(name: addr, nn: i64, b: bool) {
+    if not recording() {
+        return
+    }
+    let payload = display.text_new()
+    display.put_byte(payload, 3)
+    display.put_byte(payload, if b { 1 } else { 0 })
+    write_record(name, nn, payload)
+}
+
+/// `name`'s record of an `i64`, when recording, made with no box.
+pub fn record_int(name: addr, nn: i64, v: i64) {
+    if not recording() {
+        return
+    }
+    let payload = display.text_new()
+    display.put_byte(payload, 1)
+    put_u64(payload, v)
+    write_record(name, nn, payload)
+}
+
+/// `name`'s record of the unit value, when recording.
+pub fn record_unit(name: addr, nn: i64) {
+    if not recording() {
+        return
+    }
+    let payload = display.text_new()
+    display.put_byte(payload, 0)
+    write_record(name, nn, payload)
+}
+
+/// The record of `name` and the encoded value `payload` (freed) to the
+/// journal.
+fn write_record(name: addr, nn: i64, payload: addr) {
+    let t = display.text_new()
+    put_u32(t, nn)
+    display.put(t, name, nn)
+    put_u32(t, display.text_len(payload))
+    display.put(t, display.text_ptr(payload), display.text_len(payload))
+    display.text_free(payload)
+    var e = 0
+    let _ = fsys.write_all(unsafe { mem_tls(J_FD).load_i64() }, display.text_ptr(t), display.text_len(t), e)
+    display.text_free(t)
+}
+
+/// A C call under replay stops the run: whatever the C function read or
+/// changed was never written down. The name is the `n` bytes at `p`.
+pub fn refuse_foreign(p: addr, n: i64) {
+    if not replaying() {
+        return
+    }
+    let t = display.text_new()
+    unsafe {
+        display.put(t, mem_static("grasm: this run calls the C function `"), mem_static_len("grasm: this run calls the C function `"))
+        if bytes.valid_utf8(p, n) {
+            display.put(t, p, n)
+        } else {
+            display.put(t, mem_static("?"), 1)
+        }
+        display.put(t, mem_static("`, and a recording holds nothing a C function did — replaying would call it for real, so the replay stops here"), mem_static_len("`, and a recording holds nothing a C function did — replaying would call it for real, so the replay stops here"))
+    }
+    io.err_line(display.text_ptr(t), display.text_len(t))
+    io.leave(7)
+}
+
+/// Called by compiled code before every call of an `extern fn`, with the C
+/// function's name.
+export fn grt_foreign_call(name: addr, len: i64) {
+    refuse_foreign(name, len)
+}

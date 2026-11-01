@@ -5,27 +5,20 @@
 // (MASTERPLAN §8.3) -- but the runtime half is the runtime's, and moves with
 // the allocator (docs/self-hosting.md §6.11).
 //
-// A box this runtime makes while a region is open counts `ARENA` and is
-// recorded in the innermost region (`alloc.take`). The Rust code still
-// linked records its own in its own regions, so each push and pop is also
-// the Rust runtime's, and the sweep is in three steps: first what every one
-// of this side's boxes holds from outside the region is found, while every
-// box of the region on either side still counts `ARENA`; then the Rust
-// runtime sweeps its own boxes, finding this side's still `ARENA` and
-// leaving them; then what was found outside is released and this side's
-// boxes are freed, without walking into their children, each of which the
-// region owns and frees by its own record. Finding first is not the Rust
-// sweep's order, which frees each box before looking at the next one's
-// children and so takes a box it has just freed for one from outside
-// (docs/known-issues.md); the Rust side's sweep keeps that.
+// A box made while a region is open counts `ARENA` and is recorded in the
+// innermost region (`alloc.take`). The sweep is in two steps: first what
+// every one of the region's boxes holds from outside the region is found,
+// while every box of the region still counts `ARENA`; then what was found
+// outside is released and the region's boxes are freed, without walking
+// into their children, each of which the region owns and frees by its own
+// record. Finding first is not the Rust runtime's sweep's order, which frees
+// each box before looking at the next one's children and so takes a box it
+// has just freed for one from outside (docs/known-issues.md).
 import layout
 import sys
 import alloc
 import release
 import val
-
-extern fn grasm_region_push()
-extern fn grasm_region_pop()
 
 export fn grt_region_push() {
     unsafe {
@@ -43,7 +36,6 @@ export fn grt_region_push() {
         r.offset(8).store_i64(0)
         r.offset(16).store_i64(0)
         l.offset(alloc.L_DEPTH).store_i64(depth + 1)
-        grasm_region_push()
     }
 }
 
@@ -52,7 +44,6 @@ export fn grt_region_pop() {
         let l = alloc.local()
         let depth = l.offset(alloc.L_DEPTH).load_i64()
         if depth == 0 {
-            grasm_region_pop()
             return
         }
         let r = l.offset(alloc.L_REGIONS).load_addr().offset((depth - 1) * alloc.REC_SIZE)
@@ -71,7 +62,6 @@ export fn grt_region_pop() {
             release.outside_children(boxes.offset(8 * i).load_addr(), out, ocap, on)
             i += 1
         }
-        grasm_region_pop()
         var j = 0
         while j < on {
             val.dec(out.offset(8 * j).load_addr())

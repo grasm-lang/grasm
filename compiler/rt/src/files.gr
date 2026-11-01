@@ -1,0 +1,651 @@
+// Files and directories ([L-LIB-FS]; docs/self-hosting.md §6.12): what the
+// Rust runtime's `grasm_read_file` ... `grasm_list_dir` were, each reading or
+// writing the world through the same system calls in the same order and
+// failing with the same `IoError` -- `NotFound(path)` where the Rust runtime
+// tells a missing file apart, `IoFailed(<what the error number says>)`
+// otherwise -- and each journaled: under `GRASM_REPLAY` the recorded answer,
+// and nothing touched; under `GRASM_RECORD` the answer written down.
+import layout
+import sys
+import strread
+import bytes
+import display
+import lists
+import panic
+import sysv
+import fsys
+import journal
+
+extern fn rename(from: addr, to: addr) -> i32
+extern fn unlink(path: addr) -> i32
+extern fn mkdir(path: addr, mode: i32) -> i32
+extern fn access(path: addr, mode: i32) -> i32
+extern fn opendir(path: addr) -> addr
+extern fn readdir(dir: addr) -> addr
+extern fn closedir(dir: addr) -> i32
+extern fn strlen(p: addr) -> i64
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+
+/// Where a `struct dirent`'s name starts on arm64 macOS: after the inode,
+/// the seek offset, the record and name lengths and the type.
+let DIRENT_NAME = 21
+
+/// The bytes a `bytes` value holds, their count in `n`; none for anything
+/// else (the Rust runtime's `as_bytes`).
+fn bytes_arg(v: addr, inout n: i64) -> addr {
+    unsafe {
+        if sysv.tag(v) != layout.TAG_BYTES {
+            n = 0
+            return mem_addr(1)
+        }
+        n = v.offset(layout.BYTES_LEN).load_i64()
+        v.offset(layout.BYTES_PTR).load_addr()
+    }
+}
+
+/// Reads all of the file at the path of the `n` bytes at `p`: the bytes in
+/// a buffer the caller frees (when `cap` is not zero), their count in `len`;
+/// or the null address with the error number in `len`.
+fn read_all(p: addr, n: i64, inout len: i64, inout cap: i64) -> addr {
+    let fd = fsys.open_path(p, n, fsys.O_RDONLY, 0)
+    if fd < 0 {
+        len = 0 - fd
+        cap = 0
+        return unsafe { mem_addr(0) }
+    }
+    let buf = fsys.read_to_end(fd, len, cap)
+    fsys.close_fd(fd)
+    buf
+}
+
+/// Creates (or empties) the file at the path of `n` bytes at `p` and writes
+/// the `dn` bytes at `d` into it: 0, or the error number.
+fn write_whole(p: addr, n: i64, d: addr, dn: i64) -> i64 {
+    let fd = fsys.open_path(p, n, fsys.O_WRONLY + fsys.O_CREAT + fsys.O_TRUNC, 438)
+    if fd < 0 {
+        return 0 - fd
+    }
+    var e = 0
+    let ok = fsys.write_all(fd, d, dn, e)
+    fsys.close_fd(fd)
+    if ok { 0 } else { e }
+}
+
+fn ok_unit() -> addr {
+    sysv.ok(sysv.unit())
+}
+
+// ----- reading and writing whole files ---------------------------------------------
+
+fn read_file_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    var len = 0
+    var cap = 0
+    let buf = read_all(p, n, len, cap)
+    if sysv.null(buf) {
+        return sysv.path_err(len, p, n)
+    }
+    if not bytes.valid_utf8(buf, len) {
+        if cap > 0 {
+            sys.dealloc(buf)
+        }
+        return sysv.failed_os(sysv.EILSEQ)
+    }
+    let s = sysv.text(buf, len)
+    if cap > 0 {
+        sys.dealloc(buf)
+    }
+    sysv.ok(s)
+}
+
+export fn grt_read_file(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("read_file"), 9) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = read_file_now(path)
+    unsafe { journal.record(mem_static("read_file"), 9, out) }
+    out
+}
+
+fn write_file_now(path: addr, content: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    var cn = 0
+    let c = sysv.text_arg(content, cn)
+    let e = write_whole(p, n, c, cn)
+    if e != 0 {
+        return sysv.failed_os(e)
+    }
+    ok_unit()
+}
+
+export fn grt_write_file(path: addr, content: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("write_file"), 10) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = write_file_now(path, content)
+    unsafe { journal.record(mem_static("write_file"), 10, out) }
+    out
+}
+
+fn read_bytes_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    var len = 0
+    var cap = 0
+    let buf = read_all(p, n, len, cap)
+    if sysv.null(buf) {
+        return sysv.path_err(len, p, n)
+    }
+    let b = bytes.bytes_copy(buf, len)
+    if cap > 0 {
+        sys.dealloc(buf)
+    }
+    sysv.ok(b)
+}
+
+export fn grt_read_bytes(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("read_bytes"), 10) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = read_bytes_now(path)
+    unsafe { journal.record(mem_static("read_bytes"), 10, out) }
+    out
+}
+
+fn write_bytes_now(path: addr, data: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    var dn = 0
+    let d = bytes_arg(data, dn)
+    let e = write_whole(p, n, d, dn)
+    if e != 0 {
+        return sysv.failed_os(e)
+    }
+    ok_unit()
+}
+
+export fn grt_write_bytes(path: addr, data: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("write_bytes"), 11) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = write_bytes_now(path, data)
+    unsafe { journal.record(mem_static("write_bytes"), 11, out) }
+    out
+}
+
+/// Add to the end of a file, creating it if it is not there.
+fn append_bytes_now(path: addr, data: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let fd = fsys.open_path(p, n, fsys.O_WRONLY + fsys.O_APPEND + fsys.O_CREAT, 438)
+    if fd < 0 {
+        return sysv.failed_os(0 - fd)
+    }
+    var dn = 0
+    let d = bytes_arg(data, dn)
+    var e = 0
+    let ok = fsys.write_all(fd, d, dn, e)
+    fsys.close_fd(fd)
+    if not ok {
+        return sysv.failed_os(e)
+    }
+    ok_unit()
+}
+
+export fn grt_append_bytes(path: addr, data: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("append_bytes"), 12) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = append_bytes_now(path, data)
+    unsafe { journal.record(mem_static("append_bytes"), 12, out) }
+    out
+}
+
+/// A range of a file: from `offset`, at most `count` bytes, short at the
+/// end, empty past it.
+fn read_bytes_at_now(path: addr, offset: addr, count: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    var off = 0
+    var want = 0
+    if not sysv.int_arg(offset, off) or not sysv.int_arg(count, want) {
+        return unsafe { sysv.failed(mem_static("read_bytes_at takes an integer offset and count"), mem_static_len("read_bytes_at takes an integer offset and count")) }
+    }
+    if off < 0 or want < 0 {
+        let t = display.text_new()
+        unsafe { sysv.put_s(t, mem_static("read_bytes_at: offset "), mem_static_len("read_bytes_at: offset ")) }
+        display.put_int(t, off)
+        unsafe { sysv.put_s(t, mem_static(" and count "), mem_static_len(" and count ")) }
+        display.put_int(t, want)
+        unsafe { sysv.put_s(t, mem_static(" must not be negative"), mem_static_len(" must not be negative")) }
+        return sysv.failed_buf(t)
+    }
+    let fd = fsys.open_path(p, n, fsys.O_RDONLY, 0)
+    if fd < 0 {
+        return sysv.path_err(0 - fd, p, n)
+    }
+    let s = fsys.seek(fd, fsys.SEEK_SET, off)
+    if s < 0 {
+        fsys.close_fd(fd)
+        return sysv.failed_os(0 - s)
+    }
+    let buf = if want > 0 { sys.alloc_zeroed(want) } else { unsafe { mem_addr(1) } }
+    if sysv.null(buf) {
+        fsys.close_fd(fd)
+        // What `vec![0; n]` does when the system has no room: the Rust
+        // runtime's allocation failure, a panic whose message it cannot
+        // print.
+        unsafe { panic.say(mem_static("(message needs formatting)"), mem_static_len("(message needs formatting)")) }
+    }
+    var filled = 0
+    while filled < want {
+        let got = fsys.read_once(fd, unsafe { buf.offset(filled) }, want - filled)
+        if got < 0 {
+            fsys.close_fd(fd)
+            if want > 0 {
+                sys.dealloc(buf)
+            }
+            return sysv.failed_os(0 - got)
+        }
+        if got == 0 {
+            break
+        }
+        filled += got
+    }
+    fsys.close_fd(fd)
+    let b = bytes.bytes_copy(buf, filled)
+    if want > 0 {
+        sys.dealloc(buf)
+    }
+    sysv.ok(b)
+}
+
+export fn grt_read_bytes_at(path: addr, offset: addr, count: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("read_bytes_at"), 13) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = read_bytes_at_now(path, offset, count)
+    unsafe { journal.record(mem_static("read_bytes_at"), 13, out) }
+    out
+}
+
+/// How many bytes a file holds, by opening it and seeking to its end and
+/// back, as `grasm_sys::fs::metadata` does.
+fn file_size_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let fd = fsys.open_path(p, n, fsys.O_RDONLY, 0)
+    if fd < 0 {
+        return sysv.path_err(0 - fd, p, n)
+    }
+    let here = fsys.seek(fd, fsys.SEEK_CUR, 0)
+    if here < 0 {
+        fsys.close_fd(fd)
+        return sysv.path_err(0 - here, p, n)
+    }
+    let end = fsys.seek(fd, fsys.SEEK_END, 0)
+    if end < 0 {
+        fsys.close_fd(fd)
+        return sysv.path_err(0 - end, p, n)
+    }
+    let back = fsys.seek(fd, fsys.SEEK_SET, here)
+    fsys.close_fd(fd)
+    if back < 0 {
+        return sysv.path_err(0 - back, p, n)
+    }
+    sysv.ok(sysv.int(end))
+}
+
+export fn grt_file_size(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("file_size"), 9) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = file_size_now(path)
+    unsafe { journal.record(mem_static("file_size"), 9, out) }
+    out
+}
+
+/// The file on the disk before the answer: opened to append, not created.
+fn sync_file_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let fd = fsys.open_path(p, n, fsys.O_WRONLY + fsys.O_APPEND, 438)
+    if fd < 0 {
+        return sysv.path_err(0 - fd, p, n)
+    }
+    let e = fsys.sync_fd(fd)
+    fsys.close_fd(fd)
+    if e != 0 {
+        return sysv.path_err(e, p, n)
+    }
+    ok_unit()
+}
+
+export fn grt_sync_file(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("sync_file"), 9) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = sync_file_now(path)
+    unsafe { journal.record(mem_static("sync_file"), 9, out) }
+    out
+}
+
+fn rename_file_now(from: addr, to: addr) -> addr {
+    var an = 0
+    let a = sysv.text_arg(from, an)
+    var bn = 0
+    let b = sysv.text_arg(to, bn)
+    let ac = sysv.c_copy(a, an)
+    let bc = sysv.c_copy(b, bn)
+    let r = unsafe { rename(ac, bc) }.as_i64()
+    let e = sysv.errno()
+    sys.dealloc(ac)
+    sys.dealloc(bc)
+    if r < 0 {
+        return sysv.path_err(e, a, an)
+    }
+    ok_unit()
+}
+
+export fn grt_rename_file(from: addr, to: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("rename_file"), 11) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = rename_file_now(from, to)
+    unsafe { journal.record(mem_static("rename_file"), 11, out) }
+    out
+}
+
+fn remove_file_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let c = sysv.c_copy(p, n)
+    let r = unsafe { unlink(c) }.as_i64()
+    let e = sysv.errno()
+    sys.dealloc(c)
+    if r < 0 {
+        return sysv.path_err(e, p, n)
+    }
+    ok_unit()
+}
+
+export fn grt_remove_file(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("remove_file"), 11) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = remove_file_now(path)
+    unsafe { journal.record(mem_static("remove_file"), 11, out) }
+    out
+}
+
+// ----- directories ---------------------------------------------------------------------
+
+/// `mkdir -p`: each component in turn, one already there no failure.
+fn make_dir_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let so_far = sys.alloc(n + 2)
+    var len = 0
+    unsafe {
+        if n > 0 and p.load_u8().as_i64() == 47 {
+            so_far.store_u8(47.as_u8())
+            len = 1
+        }
+    }
+    var i = 0
+    while i < n {
+        // The next component: from `i` to the next `/` or the end.
+        var j = i
+        while j < n and unsafe { p.offset(j).load_u8() }.as_i64() != 47 {
+            j += 1
+        }
+        if j > i {
+            unsafe {
+                if len > 0 and so_far.offset(len - 1).load_u8().as_i64() != 47 {
+                    so_far.offset(len).store_u8(47.as_u8())
+                    len += 1
+                }
+            }
+            sys.copy(unsafe { so_far.offset(len) }, unsafe { p.offset(i) }, j - i)
+            len += j - i
+            let c = sysv.c_copy(so_far, len)
+            let r = unsafe { mkdir(c, 511.as_i32()) }.as_i64()
+            let e = sysv.errno()
+            sys.dealloc(c)
+            if r < 0 and e != sysv.EEXIST {
+                sys.dealloc(so_far)
+                return sysv.failed_os(e)
+            }
+        }
+        i = j + 1
+    }
+    sys.dealloc(so_far)
+    ok_unit()
+}
+
+export fn grt_make_dir(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("make_dir"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = make_dir_now(path)
+    unsafe { journal.record(mem_static("make_dir"), 8, out) }
+    out
+}
+
+/// One directory, failing if the name is taken; for its maker alone (0700).
+fn make_dir_new_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let c = sysv.c_copy(p, n)
+    let r = unsafe { mkdir(c, 448.as_i32()) }.as_i64()
+    let e = sysv.errno()
+    sys.dealloc(c)
+    if r < 0 {
+        return sysv.failed_os(e)
+    }
+    ok_unit()
+}
+
+export fn grt_make_dir_new(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("make_dir_new"), 12) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = make_dir_new_now(path)
+    unsafe { journal.record(mem_static("make_dir_new"), 12, out) }
+    out
+}
+
+/// The order of two texts, (address, length) at `a` and `b`: their bytes',
+/// then the shorter first, as Rust orders `String`s.
+fn text_cmp(a: addr, b: addr) -> i64 {
+    unsafe {
+        let la = a.offset(8).load_i64()
+        let lb = b.offset(8).load_i64()
+        let m = if la < lb { la } else { lb }
+        if m > 0 {
+            let c = memcmp(a.load_addr(), b.load_addr(), m).as_i64()
+            if c != 0 {
+                return c
+            }
+        }
+        la - lb
+    }
+}
+
+/// Sorts `n` texts, (address, length) pairs at `xs`, by `text_cmp`, stably:
+/// a merge sort, bottom up.
+fn sort_texts(xs: addr, n: i64) {
+    if n < 2 {
+        return
+    }
+    let tmp = sys.alloc(16 * n)
+    var width = 1
+    var src = xs
+    var dst = tmp
+    while width < n {
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n { lo + width } else { n }
+            let hi = if lo + 2 * width < n { lo + 2 * width } else { n }
+            var i = lo
+            var j = mid
+            var k = lo
+            while k < hi {
+                var take_left = false
+                if i < mid and j < hi {
+                    take_left = unsafe { text_cmp(src.offset(16 * i), src.offset(16 * j)) } <= 0
+                } else {
+                    take_left = i < mid
+                }
+                unsafe {
+                    if take_left {
+                        dst.offset(16 * k).store_i64(src.offset(16 * i).load_i64())
+                        dst.offset(16 * k + 8).store_i64(src.offset(16 * i + 8).load_i64())
+                        i += 1
+                    } else {
+                        dst.offset(16 * k).store_i64(src.offset(16 * j).load_i64())
+                        dst.offset(16 * k + 8).store_i64(src.offset(16 * j + 8).load_i64())
+                        j += 1
+                    }
+                }
+                k += 1
+            }
+            lo = hi
+        }
+        let t = src
+        src = dst
+        dst = t
+        width = 2 * width
+    }
+    if unsafe { src.as_i64() != xs.as_i64() } {
+        sys.copy(xs, src, 16 * n)
+    }
+    sys.dealloc(tmp)
+}
+
+/// A directory's entries by name, sorted, `.` and `..` left out; each name
+/// read lossily, as `String::from_utf8_lossy` reads it.
+fn list_dir_now(path: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let c = sysv.c_copy(p, n)
+    let dir = unsafe { opendir(c) }
+    let e = sysv.errno()
+    sys.dealloc(c)
+    if sysv.null(dir) {
+        return sysv.path_err(e, p, n)
+    }
+    var names = sys.alloc(16 * 16)
+    var cap = 16
+    var count = 0
+    while true {
+        let ent = unsafe { readdir(dir) }
+        if sysv.null(ent) {
+            break
+        }
+        let at = unsafe { ent.offset(DIRENT_NAME) }
+        let len = unsafe { strlen(at) }
+        let dot = unsafe { len == 1 and at.load_u8().as_i64() == 46 }
+        let dotdot = unsafe { len == 2 and at.load_u8().as_i64() == 46 and at.offset(1).load_u8().as_i64() == 46 }
+        if not dot and not dotdot {
+            let t = bytes.lossy(at, len)
+            if count == cap {
+                cap = 2 * cap
+                names = sys.grow(names, 16 * cap)
+            }
+            unsafe {
+                // The text's buffer is the name's now; its block is freed.
+                names.offset(16 * count).store_addr(display.text_ptr(t))
+                names.offset(16 * count + 8).store_i64(display.text_len(t))
+                sys.dealloc(t)
+            }
+            count += 1
+        }
+    }
+    unsafe {
+        let _ = closedir(dir)
+    }
+    sort_texts(names, count)
+    var slots = unsafe { mem_addr(0) }
+    let l = lists.heap_list(layout.TAG_LIST, count, slots)
+    var i = 0
+    while i < count {
+        unsafe {
+            let np = names.offset(16 * i).load_addr()
+            slots.offset(8 * i).store_addr(sysv.text(np, names.offset(16 * i + 8).load_i64()))
+            sys.dealloc(np)
+        }
+        i += 1
+    }
+    sys.dealloc(names)
+    sysv.ok(l)
+}
+
+export fn grt_list_dir(path: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("list_dir"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = list_dir_now(path)
+    unsafe { journal.record(mem_static("list_dir"), 8, out) }
+    out
+}
+
+/// Whether anything is at the path: one `access` call. Journaled as a
+/// boolean of its own: a replay's answer when it holds one, else the world's.
+export fn grt_file_exists(path: addr) -> i8 {
+    let i = unsafe { journal.gate(mem_static("file_exists"), 11) }
+    if i >= 0 {
+        var b = false
+        if journal.value_bool(i, b) {
+            return if b { 1.as_i8() } else { 0.as_i8() }
+        }
+    }
+    var n = 0
+    let p = sysv.text_arg(path, n)
+    let c = sysv.c_copy(p, n)
+    let there = unsafe { access(c, 0.as_i32()) }.as_i64() == 0
+    sys.dealloc(c)
+    unsafe { journal.record_bool(mem_static("file_exists"), 11, there) }
+    if there { 1.as_i8() } else { 0.as_i8() }
+}

@@ -1,18 +1,16 @@
 // Panics: the message, and the way out ([E-PANIC-EXIT]).
 //
 // A panic flushes what the program has written to stdout, writes `panic:
-// <message>` to stderr and exits 101. The buffers it flushes are the Rust
-// runtime's, and every Rust function still linked writes and panics through
-// them, so the way out stays the Rust runtime's `grasm_panic_msg` until the
-// output buffers move (docs/self-hosting.md §6.7, "state"; §6.11); what moves
-// here is which panics there are and what each says. Each message is static
-// bytes (`mem_static`), read-only and NUL-terminated, so saying it allocates
-// nothing -- a runtime out of memory can still say so.
-extern fn grasm_panic_msg(p: addr, n: i64)
+// <message>` to stderr and exits 101 -- through this runtime's own buffers
+// and way out (`io.gr`, docs/self-hosting.md §6.12). Each message here is
+// static bytes (`mem_static`), read-only and NUL-terminated, so saying it
+// allocates nothing -- a runtime out of memory can still say so.
+import io
 
-/// Panics with the `n` bytes of text at `p`, static bytes (`mem_static`).
+/// Panics with the `n` bytes of text at `p`, valid UTF-8: static bytes
+/// (`mem_static`), or text a family made.
 pub fn say(p: addr, n: i64) {
-    unsafe { grasm_panic_msg(p, n) }
+    io.panic_bytes(p, n)
 }
 
 pub fn div_zero() {

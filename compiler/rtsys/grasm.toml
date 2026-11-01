@@ -1,0 +1,14 @@
+[package]
+name = "rtsys"
+version = "0.1.0"
+entry = "sysfuzz.gr"
+
+# The programs that hold the Grasm runtime's system families -- files,
+# arguments, the environment, input, other programs, the network and the
+# record-and-replay journal -- to the Rust runtime's
+# (`scripts/fuzz_rtsys.sh`, docs/self-hosting.md §6.12). A package of its own
+# beside `compiler/rt`, as `compiler/rttasks` is: it reaches the network and
+# runs programs, and a package inside `compiler/rt`'s directory is held to
+# `compiler/rt`'s capabilities when the runtime is built from the
+# repository's root.
+capabilities = ["io", "net", "proc", "unsafe", "mem", "async"]

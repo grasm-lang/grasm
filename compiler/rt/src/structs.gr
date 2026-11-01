@@ -29,7 +29,6 @@ import panic
 import fmt
 
 extern fn memcmp(a: addr, b: addr, n: i64) -> i32
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 fn tag(v: addr) -> i64 {
     unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
@@ -63,11 +62,19 @@ fn buffer(n: i64, size: i64, align: i64) -> addr {
 /// `desc_ty`. Two threads reaching an unbuilt descriptor at once both build
 /// one and one wins the exchange; the loser frees its own, which nothing saw.
 pub fn type_of(d: addr) -> addr {
+    // The common case, made once and read every time, in a function of its
+    // own: the backend saves every register the making uses on entry.
     unsafe {
         let cached = d.offset(layout.DESC_CACHE).atomic_load_i64(Acquire)
         if cached != 0 {
             return mem_addr(cached)
         }
+    }
+    make_type(d)
+}
+
+fn make_type(d: addr) -> addr {
+    unsafe {
         let n = d.offset(layout.DESC_NFIELDS).load_i64()
         let triples = d.offset(layout.DESC_FIELDS)
         let names = buffer(n, 16, 8)
@@ -456,6 +463,21 @@ fn new_variant(tp: addr, tl: i64, np: addr, nl: i64) -> addr {
         v.offset(layout.VARIANT_NFIELDS).store_i64(0)
     }
     v
+}
+
+/// A variant of type and name the texts at `tp` and `np`, no fields yet.
+pub fn variant0(tp: addr, tl: i64, np: addr, nl: i64) -> addr {
+    new_variant(tp, tl, np, nl)
+}
+
+/// The same with one field, whose count moves in.
+pub fn variant1(tp: addr, tl: i64, np: addr, nl: i64, a: addr) -> addr {
+    grt_variant_new1(tp, tl, np, nl, a)
+}
+
+/// A tuple of three, whose counts move in.
+pub fn triple(a: addr, b: addr, c: addr) -> addr {
+    grt_tuple3(a, b, c)
 }
 
 export fn grt_variant_new(tp: addr, tl: i64, np: addr, nl: i64) -> addr {
@@ -939,7 +961,7 @@ pub fn panic_index(i: i64, n: i64) {
         at += mem_static_len(" out of bounds (len ")
         at += fmt.i64_text(n, msg.offset(at))
         msg.offset(at).store_u8(41)
-        grasm_panic_msg(msg, at + 1)
+        panic.say(msg, at + 1)
     }
 }
 

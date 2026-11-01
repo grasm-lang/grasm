@@ -73,10 +73,9 @@ fn bounds(what: addr, wn: i64, i: i64, n: i64) {
     unsafe { display.put(t, mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len ")) }
     display.put_int(t, n)
     display.put_byte(t, 41)
-    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+    unsafe { panic.say(display.text_ptr(t), display.text_len(t)) }
 }
 
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 fn index_bounds(i: i64, n: i64) {
     structs.panic_index(i, n)
@@ -170,7 +169,7 @@ fn is_inline(l: addr) -> bool {
 }
 
 /// A list's (or tuple's) elements, their count in `n`.
-fn items(l: addr, inout n: i64) -> addr {
+pub fn items(l: addr, inout n: i64) -> addr {
     unsafe {
         if is_inline(l) {
             n = l.offset(layout.LIST_LEN).load_u8().as_i64()
@@ -210,7 +209,7 @@ fn fresh(t: i64) -> addr {
 
 /// A list of boxes (or tuple) of `n` in a `Vec` exactly that long -- what a
 /// collected `Vec` makes -- its elements to be written at `out`.
-fn heap_list(t: i64, n: i64, inout out: addr) -> addr {
+pub fn heap_list(t: i64, n: i64, inout out: addr) -> addr {
     let l = alloc.take()
     unsafe {
         l.offset(layout.TAG).store_u8(t.as_u8())
@@ -302,7 +301,7 @@ fn code_of(sk: i64) -> i64 {
     2
 }
 
-fn skind(l: addr) -> i64 {
+pub fn skind(l: addr) -> i64 {
     unsafe { l.offset(layout.SCALAR_KIND_AT).load_u8() }.as_i64()
 }
 
@@ -318,11 +317,11 @@ fn width(l: addr) -> i64 {
     if is_bytes(l) { 1 } else { 8 }
 }
 
-fn slen(l: addr) -> i64 {
+pub fn slen(l: addr) -> i64 {
     vec_len(sdata(l))
 }
 
-fn sget(l: addr, i: i64) -> i64 {
+pub fn sget(l: addr, i: i64) -> i64 {
     unsafe {
         if is_bytes(l) {
             return vec_ptr(sdata(l)).offset(i).load_u8().as_i64()
@@ -341,7 +340,7 @@ fn sset(l: addr, i: i64, bits: i64) {
     }
 }
 
-fn spush(l: addr, bits: i64) {
+pub fn spush(l: addr, bits: i64) {
     if is_bytes(l) {
         vec_push(sdata(l), if bits != 0 { 1 } else { 0 }, 1)
     } else {
@@ -350,7 +349,7 @@ fn spush(l: addr, bits: i64) {
 }
 
 /// A new scalar list of kind `sk`, empty: bytes for bools, words otherwise.
-fn new_scalar(sk: i64) -> addr {
+pub fn new_scalar(sk: i64) -> addr {
     let l = alloc.take()
     scalar_into(l, sk)
     l
@@ -510,6 +509,18 @@ fn to_scalar(l: addr, sk: i64) {
 
 // ----- making lists -------------------------------------------------------------
 
+pub fn list_new() -> addr {
+    empty(0)
+}
+
+pub fn list_push(l: addr, e: addr) -> addr {
+    grt_list_push(l, e)
+}
+
+pub fn from_words(kind: i64, words: addr, n: i64) -> addr {
+    grt_list_from_words(kind, words, n)
+}
+
 export fn grt_list_new() -> addr {
     empty(0)
 }
@@ -560,7 +571,7 @@ export fn grt_list_fill_scalar(kind: i64, n: i64, bits: i64) -> addr {
         display.put_int(t, n)
         unsafe {
             display.put(t, mem_static(" elements would need more memory than one can hold"), mem_static_len(" elements would need more memory than one can hold"))
-            grasm_panic_msg(display.text_ptr(t), display.text_len(t))
+            panic.say(display.text_ptr(t), display.text_len(t))
         }
     }
     let l = new_scalar(sk)
@@ -1414,6 +1425,79 @@ fn msort(xs: addr, n: i64, mode: i64, sk: i64, keys: addr) {
     sys.dealloc(tmp)
 }
 
+/// Sorts the `n` words at `xs` in signed order, stably: `msort` with the
+/// comparison written in place, for words whose order is their signed
+/// order (`ordered_keys`).
+fn msort_words(xs: addr, n: i64) {
+    if n < 2 {
+        return
+    }
+    let tmp = sys.alloc(8 * n)
+    var src = xs
+    var dst = tmp
+    var w = 1
+    unsafe {
+        while w < n {
+            var lo = 0
+            while lo < n {
+                let mid = if lo + w < n { lo + w } else { n }
+                let hi = if lo + 2 * w < n { lo + 2 * w } else { n }
+                var i = lo
+                var j = mid
+                var k = lo
+                while i < mid and j < hi {
+                    let x = src.offset(8 * i).load_i64()
+                    let y = src.offset(8 * j).load_i64()
+                    if y < x {
+                        dst.offset(8 * k).store_i64(y)
+                        j += 1
+                    } else {
+                        dst.offset(8 * k).store_i64(x)
+                        i += 1
+                    }
+                    k += 1
+                }
+                if i < mid {
+                    sys.copy(dst.offset(8 * k), src.offset(8 * i), 8 * (mid - i))
+                    k += mid - i
+                }
+                if j < hi {
+                    sys.copy(dst.offset(8 * k), src.offset(8 * j), 8 * (hi - j))
+                }
+                lo = hi
+            }
+            let s = src
+            src = dst
+            dst = s
+            w = 2 * w
+        }
+    }
+    if src != xs {
+        sys.copy(xs, src, 8 * n)
+    }
+    sys.dealloc(tmp)
+}
+
+/// The `n` scalar words at `xs`, of kind `sk`, made words whose signed
+/// order is `scalar_cmp`'s order of them -- or made back, since each
+/// transformation is its own inverse: an `i64` or a reference as it is, a
+/// `u64` with its top bit flipped, a float's bits as `total` makes them.
+/// Two words are equal after it exactly when they were before, so a sort of
+/// them need not be stable to be the same sort.
+fn ordered_keys(xs: addr, n: i64, sk: i64) {
+    if sk == layout.SK_I64 or sk == layout.SK_REF {
+        return
+    }
+    var i = 0
+    unsafe {
+        while i < n {
+            let x = xs.offset(8 * i).load_i64()
+            xs.offset(8 * i).store_i64(if sk == layout.SK_U64 { x.bit_xor(-9223372036854775807 - 1) } else { total(x) })
+            i += 1
+        }
+    }
+}
+
 /// Sorted in place, honouring copy-on-write. Bools have no order and stay
 /// as they are.
 export fn grt_list_sort(l: addr) -> addr {
@@ -1425,7 +1509,12 @@ export fn grt_list_sort(l: addr) -> addr {
         msort(p, n, 0, 0, unsafe { mem_addr(0) })
     } else if t == layout.TAG_LIST_SCALAR {
         if not is_bytes(target) {
-            msort(vec_ptr(sdata(target)), slen(target), 1, skind(target), unsafe { mem_addr(0) })
+            let sk = skind(target)
+            let p = vec_ptr(sdata(target))
+            let n = slen(target)
+            ordered_keys(p, n, sk)
+            msort_words(p, n)
+            ordered_keys(p, n, sk)
         }
     } else {
         unreachable()
@@ -1739,7 +1828,7 @@ fn range_of(r: addr, what: addr, wn: i64) {
         display.put(t, what, wn)
         unsafe {
             display.put(t, mem_static(": not a range"), mem_static_len(": not a range"))
-            grasm_panic_msg(display.text_ptr(t), display.text_len(t))
+            panic.say(display.text_ptr(t), display.text_len(t))
         }
     }
 }

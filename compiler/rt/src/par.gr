@@ -1,0 +1,494 @@
+// The parallel workers ([T-PAR-MAP-PURE], [L-LIB-NET-WORKERS];
+// docs/self-hosting.md §6.12): `par_map` and `par_filter` over data, a
+// `parallel` block's tasks, and `net_workers` -- what the Rust runtime's
+// were, on threads this runtime starts.
+//
+// A lifted body is a C-convention function of the captured words and one
+// element, answering a word: an element's result, or for a filter whether
+// it stays. Every worker writes its own slots of a buffer made before any
+// starts, so the answer is the one any schedule gives -- each worker's
+// elements are its own and the body is pure.
+//
+// Data (`par_words`): the first element is computed on the calling thread
+// and timed, and the rest spread only when they are many (256) or that one
+// element times their number is worth a thread's start (500 µs); then over
+// as many workers as the machine has cores, each with an 8 MiB stack (the
+// recursion floor sits 6 MiB below where a thread first asks, so it must
+// fit), taking chunks of the rest -- a sixteenth of each worker's share --
+// from the last chunk to the first, and the calling thread taking them too,
+// so a worker that cannot start costs time and never an element. A
+// `parallel` block's tasks (`par_tasks_next`) each get a thread at once,
+// with the system's stack.
+//
+// As the Rust runtime does, a thread that has run a parallel region's work
+// stays marked as inside one (`IN_PARALLEL`) -- the calling thread too, once
+// it has taken chunks -- and a `par_map` reached from a thread so marked runs
+// its elements one after another (docs/known-issues.md). What each thread
+// allocated is its allocator's business (`alloc.gr`), handed to the process
+// when the thread ends, before `pthread_join` returns.
+import layout
+import sys
+import alloc
+import display
+import lists
+import val
+import panic
+import sysv
+import journal
+import net
+
+extern fn pthread_attr_init(attr: addr) -> i32
+extern fn pthread_attr_setstacksize(attr: addr, size: i64) -> i32
+extern fn pthread_attr_destroy(attr: addr) -> i32
+extern fn pthread_create(out: addr, attr: addr, entry: addr, arg: addr) -> i32
+extern fn pthread_join(t: addr, out: addr) -> i32
+extern fn pthread_setname_np(name: addr) -> i32
+extern fn sysconf(name: i32) -> i64
+extern fn clock_gettime(clock: i32, ts: addr) -> i32
+
+/// A lifted body: the captured words, an element; its answer.
+type Lifted = fn(addr, i64) -> i64
+
+thread_local IN_PARALLEL: i64
+thread_local TASKS_NEXT: i64
+
+let WORKER_STACK = 8388608
+let PAR_MIN_ELEMS = 256
+let PAR_MIN_WORK_NS = 500000
+let SC_NPROCESSORS_ONLN = 58
+let NET_WORKERS_MAX = 256
+
+// A data job, shared by its threads: the body, the captured words, the
+// elements (past the first), how many, the answers (words, or bytes for a
+// filter), the chunk size, how many chunks are left to take, whether a
+// filter.
+let J_CODE = 0
+let J_ENV = 8
+let J_IN = 16
+let J_NIN = 24
+let J_OUT = 32
+let J_CHUNK = 40
+let J_LEFT = 48
+let J_FILTER = 56
+let J_SIZE = 64
+
+// A task or a network worker, one thread each: the body, the captured
+// words, its element, where its answer goes, and its thread's name (or 0).
+let T_CODE = 0
+let T_ENV = 8
+let T_X = 16
+let T_OUT = 24
+let T_NAME = 32
+let T_NET = 40
+let T_SIZE = 48
+
+fn mono_ns() -> i64 {
+    let ts = sys.alloc_zeroed(16)
+    unsafe {
+        let _ = clock_gettime(6.as_i32(), ts)
+        let n = ts.load_i64() * 1000000000 + ts.offset(8).load_i64()
+        sys.dealloc(ts)
+        n
+    }
+}
+
+fn in_parallel() -> bool {
+    unsafe { mem_tls(IN_PARALLEL).load_i64() != 0 }
+}
+
+/// How many workers for `n` elements, one of which took `one` nanoseconds.
+fn workers_for(n: i64, one: i64) -> i64 {
+    if in_parallel() or n < 2 {
+        return 1
+    }
+    // `Duration::saturating_mul`, against 500 µs.
+    let much = if one > 0 and n > 9223372036854775807 / one { true } else { one * n >= PAR_MIN_WORK_NS }
+    if not (n >= PAR_MIN_ELEMS or much) {
+        return 1
+    }
+    let cores = unsafe { sysconf(SC_NPROCESSORS_ONLN.as_i32()) }
+    let p = if cores > 0 { cores } else { 1 }
+    if p < n { p } else { n }
+}
+
+/// Starts a thread running `entry(arg)`, with a stack of `stack` bytes or
+/// the system's when 0: its handle into `out`; whether it started.
+fn spawn(entry: addr, arg: addr, stack: i64, out: addr) -> bool {
+    unsafe {
+        if stack == 0 {
+            return pthread_create(out, mem_addr(0), entry, arg).as_i64() == 0
+        }
+        let attr = sys.alloc_zeroed(128)
+        let _ = pthread_attr_init(attr)
+        let _ = pthread_attr_setstacksize(attr, stack)
+        let r = pthread_create(out, attr, entry, arg).as_i64()
+        let _ = pthread_attr_destroy(attr)
+        sys.dealloc(attr)
+        r == 0
+    }
+}
+
+fn join_all(handles: addr, n: i64) {
+    var i = 0
+    while i < n {
+        unsafe {
+            let _ = pthread_join(handles.offset(8 * i).load_addr(), mem_addr(0))
+        }
+        i += 1
+    }
+}
+
+/// Takes chunks of `job` until none is left, writing each element's answer.
+fn drain(job: addr) {
+    unsafe {
+        mem_tls(IN_PARALLEL).store_i64(1)
+        let code = job.offset(J_CODE).load_addr()
+        let env = job.offset(J_ENV).load_addr()
+        let input = job.offset(J_IN).load_addr()
+        let nin = job.offset(J_NIN).load_i64()
+        let out = job.offset(J_OUT).load_addr()
+        let chunk = job.offset(J_CHUNK).load_i64()
+        let filter = job.offset(J_FILTER).load_i64() != 0
+        while true {
+            let left = job.offset(J_LEFT).atomic_add_i64(-1, AcqRel)
+            if left <= 0 {
+                break
+            }
+            let start = (left - 1) * chunk
+            let end = if start + chunk < nin { start + chunk } else { nin }
+            var i = start
+            while i < end {
+                let w = code.call_c(Lifted, env, input.offset(8 * i).load_i64())
+                if filter {
+                    out.offset(i).store_u8(if w != 0 { 1.as_u8() } else { 0.as_u8() })
+                } else {
+                    out.offset(8 * i).store_i64(w)
+                }
+                i += 1
+            }
+        }
+    }
+}
+
+fn drain_entry(job: addr) -> addr {
+    drain(job)
+    unsafe { mem_addr(0) }
+}
+
+/// The rest of the elements (`nin` at `input`, answers into `out`) over
+/// `workers` threads and this one.
+fn spread(code: addr, env: addr, input: addr, nin: i64, out: addr, filter: bool, workers: i64) {
+    var chunk = (nin + workers * 16 - 1) / (workers * 16)
+    if chunk < 1 {
+        chunk = 1
+    }
+    let job = sys.alloc(J_SIZE)
+    unsafe {
+        job.offset(J_CODE).store_addr(code)
+        job.offset(J_ENV).store_addr(env)
+        job.offset(J_IN).store_addr(input)
+        job.offset(J_NIN).store_i64(nin)
+        job.offset(J_OUT).store_addr(out)
+        job.offset(J_CHUNK).store_i64(chunk)
+        job.offset(J_LEFT).atomic_store_i64((nin + chunk - 1) / chunk, Release)
+        job.offset(J_FILTER).store_i64(if filter { 1 } else { 0 })
+    }
+    let handles = sys.alloc(8 * workers)
+    var started = 0
+    var w = 0
+    while w < workers {
+        if spawn(unsafe { mem_fn_addr(drain_entry) }, job, WORKER_STACK, unsafe { handles.offset(8 * started) }) {
+            started += 1
+        }
+        w += 1
+    }
+    drain(job)
+    join_all(handles, started)
+    sys.dealloc(handles)
+    sys.dealloc(job)
+}
+
+fn task_entry(t: addr) -> addr {
+    unsafe {
+        mem_tls(IN_PARALLEL).store_i64(1)
+        let w = t.offset(T_CODE).load_addr().call_c(Lifted, t.offset(T_ENV).load_addr(), t.offset(T_X).load_i64())
+        t.offset(T_OUT).load_addr().store_i64(w)
+        mem_addr(0)
+    }
+}
+
+/// `code` over the `n` words at `words`, the captured words at `env`: the
+/// answers, a buffer of `n` words the caller frees.
+fn par_words(words: addr, n: i64, code: addr, env: addr) -> addr {
+    let out = sys.alloc_zeroed(8 * n + 8)
+    if n == 0 {
+        return out
+    }
+    let next = unsafe { mem_tls(TASKS_NEXT).load_i64() } != 0
+    unsafe { mem_tls(TASKS_NEXT).store_i64(0) }
+    if next and n >= 2 and not in_parallel() {
+        // A `parallel` block's tasks: a thread each, with the system's stack.
+        let recs = sys.alloc(T_SIZE * n)
+        let handles = sys.alloc(8 * n)
+        var started = 0
+        var i = 0
+        while i < n {
+            unsafe {
+                let t = recs.offset(T_SIZE * i)
+                t.offset(T_CODE).store_addr(code)
+                t.offset(T_ENV).store_addr(env)
+                t.offset(T_X).store_i64(words.offset(8 * i).load_i64())
+                t.offset(T_OUT).store_addr(out.offset(8 * i))
+                if spawn(mem_fn_addr(task_entry), t, 0, handles.offset(8 * started)) {
+                    started += 1
+                }
+            }
+            i += 1
+        }
+        join_all(handles, started)
+        sys.dealloc(handles)
+        sys.dealloc(recs)
+        return out
+    }
+    let began = mono_ns()
+    unsafe { out.store_i64(code.call_c(Lifted, env, words.load_i64())) }
+    let took = mono_ns() - began
+    let workers = workers_for(n, if took > 0 { took } else { 0 })
+    if workers <= 1 {
+        var i = 1
+        while i < n {
+            unsafe { out.offset(8 * i).store_i64(code.call_c(Lifted, env, words.offset(8 * i).load_i64())) }
+            i += 1
+        }
+        return out
+    }
+    spread(code, env, unsafe { words.offset(8) }, n - 1, unsafe { out.offset(8) }, false, workers)
+    out
+}
+
+/// The captured words, copied (`env_owned`).
+fn env_copy(env: addr, n: i64) -> addr {
+    let c = sys.alloc(8 * n + 8)
+    if n > 0 {
+        sys.copy(c, env, 8 * n)
+    }
+    c
+}
+
+/// A list of the `n` answers at `out`: boxes when `out_kind` is negative, a
+/// scalar list of that kind otherwise.
+fn answers(out: addr, n: i64, out_kind: i64) -> addr {
+    if out_kind < 0 {
+        var l = lists.list_new()
+        var i = 0
+        while i < n {
+            l = lists.list_push(l, unsafe { mem_addr(out.offset(8 * i).load_i64()) })
+            i += 1
+        }
+        return l
+    }
+    lists.from_words(out_kind, out, n)
+}
+
+export fn grt_par_tasks_next() {
+    unsafe { mem_tls(TASKS_NEXT).store_i64(1) }
+}
+
+export fn grt_par_map_scalar(l: addr, code: addr, env: addr, env_len: i64, out_kind: i64) -> addr {
+    var n = 0
+    let words = unsafe { net.scalar_words(l, mem_static("par_map"), 7, n) }
+    let envc = env_copy(env, env_len)
+    let out = par_words(words, n, code, envc)
+    let r = lists.from_words(out_kind, out, n)
+    sys.dealloc(out)
+    sys.dealloc(envc)
+    sys.dealloc(words)
+    r
+}
+
+export fn grt_par_map_mixed(l: addr, code: addr, env: addr, env_len: i64, in_boxed: i64, out_kind: i64) -> addr {
+    var n = 0
+    var words = unsafe { mem_addr(0) }
+    if in_boxed != 0 {
+        if sysv.tag(l) != layout.TAG_LIST {
+            unsafe { panic.say(mem_static("par_map on a non-list"), mem_static_len("par_map on a non-list")) }
+        }
+        let items = lists.items(l, n)
+        words = sys.alloc(8 * n + 8)
+        sys.copy(words, items, 8 * n)
+    } else {
+        words = unsafe { net.scalar_words(l, mem_static("par_map"), 7, n) }
+    }
+    let envc = env_copy(env, env_len)
+    let out = par_words(words, n, code, envc)
+    let r = answers(out, n, out_kind)
+    sys.dealloc(out)
+    sys.dealloc(envc)
+    sys.dealloc(words)
+    r
+}
+
+export fn grt_par_filter_scalar(l: addr, code: addr, env: addr, env_len: i64) -> addr {
+    let t = sysv.tag(l)
+    var sk = layout.SK_I64
+    if t == layout.TAG_LIST_SCALAR {
+        sk = lists.skind(l)
+    } else if t == layout.TAG_LIST {
+        var k = 0
+        let items = lists.items(l, k)
+        if k > 0 {
+            let ft = sysv.tag(unsafe { items.load_addr() })
+            sk = if ft == layout.TAG_F64 { layout.SK_F64 } else if ft == layout.TAG_BOOL { layout.SK_BOOL } else if ft == layout.TAG_REF { layout.SK_REF } else if ft == layout.TAG_U64 { layout.SK_U64 } else { layout.SK_I64 }
+        }
+    } else {
+        unsafe { panic.say(mem_static("par_filter on a non-list"), mem_static_len("par_filter on a non-list")) }
+    }
+    var n = 0
+    let words = unsafe { net.scalar_words(l, mem_static("par_filter"), 10, n) }
+    let envc = env_copy(env, env_len)
+    let keep = sys.alloc_zeroed(n + 1)
+    var workers = 1
+    if n > 0 {
+        let began = mono_ns()
+        unsafe { keep.store_u8(if code.call_c(Lifted, envc, words.load_i64()) != 0 { 1.as_u8() } else { 0.as_u8() }) }
+        let took = mono_ns() - began
+        workers = workers_for(n, if took > 0 { took } else { 0 })
+    }
+    if workers <= 1 {
+        var i = 1
+        while i < n {
+            unsafe { keep.offset(i).store_u8(if code.call_c(Lifted, envc, words.offset(8 * i).load_i64()) != 0 { 1.as_u8() } else { 0.as_u8() }) }
+            i += 1
+        }
+    } else {
+        spread(code, envc, unsafe { words.offset(8) }, n - 1, unsafe { keep.offset(1) }, true, workers)
+    }
+    // In input order, so the answer does not depend on how many ran it.
+    let out = lists.new_scalar(sk)
+    var i = 0
+    while i < n {
+        if unsafe { keep.offset(i).load_u8() }.as_i64() != 0 {
+            lists.spush(out, unsafe { words.offset(8 * i).load_i64() })
+        }
+        i += 1
+    }
+    sys.dealloc(keep)
+    sys.dealloc(envc)
+    sys.dealloc(words)
+    out
+}
+
+export fn grt_par_filter_boxed(l: addr, code: addr, env: addr, env_len: i64) -> addr {
+    if sysv.tag(l) != layout.TAG_LIST {
+        unsafe { panic.say(mem_static("par_filter on a non-list"), mem_static_len("par_filter on a non-list")) }
+    }
+    var n = 0
+    let items = lists.items(l, n)
+    let words = sys.alloc(8 * n + 8)
+    sys.copy(words, items, 8 * n)
+    let envc = env_copy(env, env_len)
+    let verdicts = par_words(words, n, code, envc)
+    var out = lists.list_new()
+    var i = 0
+    while i < n {
+        unsafe {
+            if verdicts.offset(8 * i).load_i64() != 0 {
+                let p = mem_addr(words.offset(8 * i).load_i64())
+                val.inc(p)
+                out = lists.list_push(out, p)
+            }
+        }
+        i += 1
+    }
+    sys.dealloc(verdicts)
+    sys.dealloc(envc)
+    sys.dealloc(words)
+    out
+}
+
+/// `[0, 1, ..., n - 1]`, the worker indices of `net_workers(n, f)`: empty
+/// for `n <= 0`, a panic past 256.
+export fn grt_net_workers_indices(n: i64) -> addr {
+    if n > NET_WORKERS_MAX {
+        let t = display.text_new()
+        unsafe { display.put(t, mem_static("net_workers: at most 256 workers, asked for "), mem_static_len("net_workers: at most 256 workers, asked for ")) }
+        display.put_int(t, n)
+        panic.say(display.text_ptr(t), display.text_len(t))
+    }
+    let l = lists.new_scalar(layout.SK_I64)
+    var i = 0
+    while i < n {
+        lists.spush(l, i)
+        i += 1
+    }
+    l
+}
+
+fn net_entry(t: addr) -> addr {
+    unsafe {
+        let name = t.offset(T_NAME).load_addr()
+        let _ = pthread_setname_np(name)
+        let w = t.offset(T_CODE).load_addr().call_c(Lifted, t.offset(T_ENV).load_addr(), t.offset(T_X).load_i64())
+        t.offset(T_OUT).load_addr().store_i64(w)
+        mem_addr(0)
+    }
+}
+
+/// `code` once per worker index, each on a thread of its own, the answers
+/// in index order; under a recording or a replay, and for fewer than two,
+/// one after another on this thread -- the journal is one sequence.
+export fn grt_net_workers(l: addr, code: addr, env: addr, env_len: i64, out_kind: i64) -> addr {
+    var n = 0
+    let words = unsafe { net.scalar_words(l, mem_static("net_workers"), 11, n) }
+    let envc = env_copy(env, env_len)
+    let out = sys.alloc_zeroed(8 * n + 8)
+    if journal.active() or n < 2 {
+        var i = 0
+        while i < n {
+            unsafe { out.offset(8 * i).store_i64(code.call_c(Lifted, envc, words.offset(8 * i).load_i64())) }
+            i += 1
+        }
+    } else {
+        let recs = sys.alloc(T_SIZE * n)
+        let handles = sys.alloc(8 * n)
+        var i = 0
+        while i < n {
+            let x = unsafe { words.offset(8 * i).load_i64() }
+            let nm = display.text_new()
+            unsafe { display.put(nm, mem_static("net-worker-"), mem_static_len("net-worker-")) }
+            display.put_int(nm, x)
+            display.put_byte(nm, 0)
+            unsafe {
+                let t = recs.offset(T_SIZE * i)
+                t.offset(T_CODE).store_addr(code)
+                t.offset(T_ENV).store_addr(envc)
+                t.offset(T_X).store_i64(x)
+                t.offset(T_OUT).store_addr(out.offset(8 * i))
+                t.offset(T_NAME).store_addr(display.text_ptr(nm))
+                t.offset(T_NET).store_addr(nm)
+                if not spawn(mem_fn_addr(net_entry), t, WORKER_STACK, handles.offset(8 * i)) {
+                    // Nothing to fall back to: the workers already started
+                    // may never return.
+                    let m = display.text_new()
+                    display.put(m, mem_static("net_workers: cannot start worker "), mem_static_len("net_workers: cannot start worker "))
+                    display.put_int(m, x)
+                    panic.say(display.text_ptr(m), display.text_len(m))
+                }
+            }
+            i += 1
+        }
+        join_all(handles, n)
+        i = 0
+        while i < n {
+            display.text_free(unsafe { recs.offset(T_SIZE * i + T_NET).load_addr() })
+            i += 1
+        }
+        sys.dealloc(handles)
+        sys.dealloc(recs)
+    }
+    let r = answers(out, n, out_kind)
+    sys.dealloc(out)
+    sys.dealloc(envc)
+    sys.dealloc(words)
+    r
+}

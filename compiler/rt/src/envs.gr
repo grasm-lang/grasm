@@ -1,0 +1,215 @@
+// What a program is started with and can ask for ([L-LIB-ENV]; docs/self-
+// hosting.md §6.12): its arguments, its environment, a line of standard
+// input, and bytes of entropy -- each journaled, as every other way a
+// program reads the world.
+//
+// The arguments are the calling thread's, as the Rust runtime's
+// `PROGRAM_ARGS` is a thread-local: `main`'s thread is given them, every
+// other thread has none.
+import layout
+import sys
+import alloc
+import bytes
+import display
+import lists
+import panic
+import sysv
+import fsys
+import journal
+
+extern fn strlen(p: addr) -> i64
+extern fn getenv(name: addr) -> addr
+
+/// This thread's arguments: (address, length) pairs, copies; and how many.
+thread_local ARGS: i64
+thread_local NARGS: i64
+
+/// `main`'s arguments, `argv[0]` past: each must be UTF-8, as the Rust
+/// runtime's `take_str` requires of what the compiler hands it.
+export fn grt_set_args(argc: i64, argv: addr) {
+    let n = if argc > 0 { argc } else { 0 }
+    let pairs = sys.alloc(16 * n + 16)
+    var i = 0
+    while i < n {
+        unsafe {
+            let p = argv.offset(8 * i).load_addr()
+            let len = strlen(p)
+            if not bytes.valid_utf8(p, len) {
+                panic.say(mem_static("compiler emitted a non-UTF-8 name"), mem_static_len("compiler emitted a non-UTF-8 name"))
+            }
+            let copy = sys.alloc(len + 1)
+            sys.copy(copy, p, len)
+            pairs.offset(16 * i).store_addr(copy)
+            pairs.offset(16 * i + 8).store_i64(len)
+        }
+        i += 1
+    }
+    unsafe {
+        mem_tls(ARGS).store_addr(pairs)
+        mem_tls(NARGS).store_i64(n)
+    }
+}
+
+fn args_now() -> addr {
+    let n = unsafe { mem_tls(NARGS).load_i64() }
+    let pairs = unsafe { mem_tls(ARGS).load_addr() }
+    var slots = unsafe { mem_addr(0) }
+    let l = lists.heap_list(layout.TAG_LIST, n, slots)
+    var i = 0
+    while i < n {
+        unsafe { slots.offset(8 * i).store_addr(sysv.text(pairs.offset(16 * i).load_addr(), pairs.offset(16 * i + 8).load_i64())) }
+        i += 1
+    }
+    l
+}
+
+export fn grt_args() -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("args"), 4) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = args_now()
+    unsafe { journal.record(mem_static("args"), 4, out) }
+    out
+}
+
+/// `Some(value)` of environment variable `name` when it is set and UTF-8.
+fn env_now(name: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(name, n)
+    let c = sysv.c_copy(p, n)
+    let v = unsafe { getenv(c) }
+    sys.dealloc(c)
+    if sysv.null(v) {
+        return sysv.none()
+    }
+    let len = unsafe { strlen(v) }
+    if not bytes.valid_utf8(v, len) {
+        return sysv.none()
+    }
+    sysv.some(sysv.text(v, len))
+}
+
+export fn grt_env(name: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("env"), 3) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = env_now(name)
+    unsafe { journal.record(mem_static("env"), 3, out) }
+    out
+}
+
+/// One line of standard input, a byte at a time so nothing past the line
+/// is taken; its newline and any carriage returns before it dropped. Text
+/// that is not UTF-8, or a read that fails, gives the empty line, as the
+/// Rust runtime's `read_line` leaves its string.
+fn input_now() -> addr {
+    let t = display.text_new()
+    let one = sys.alloc(8)
+    var ok = true
+    while true {
+        let got = fsys.read_once(0, one, 1)
+        if got == 0 {
+            break
+        }
+        if got < 0 {
+            ok = false
+            break
+        }
+        let b = unsafe { one.load_u8() }.as_i64()
+        display.put_byte(t, b)
+        if b == 10 {
+            break
+        }
+    }
+    sys.dealloc(one)
+    var len = display.text_len(t)
+    let p = display.text_ptr(t)
+    if not ok or not bytes.valid_utf8(p, len) {
+        len = 0
+    }
+    while len > 0 and (unsafe { p.offset(len - 1).load_u8() }.as_i64() == 10 or unsafe { p.offset(len - 1).load_u8() }.as_i64() == 13) {
+        len -= 1
+    }
+    let s = sysv.text(p, len)
+    display.text_free(t)
+    s
+}
+
+export fn grt_input() -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("input"), 5) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = input_now()
+    unsafe { journal.record(mem_static("input"), 5, out) }
+    out
+}
+
+/// `n` bytes from `/dev/urandom`: a count past 1 MiB is a refusal, and a
+/// short read a failure, never a short answer.
+fn random_bytes_now(count: addr) -> addr {
+    var n = 0
+    if not sysv.int_arg(count, n) {
+        return unsafe { sysv.failed(mem_static("count must be an integer"), mem_static_len("count must be an integer")) }
+    }
+    if n < 0 {
+        let t = display.text_new()
+        unsafe { sysv.put_s(t, mem_static("random_bytes needs a count of 0 or more, got "), mem_static_len("random_bytes needs a count of 0 or more, got ")) }
+        display.put_int(t, n)
+        return sysv.failed_buf(t)
+    }
+    if n > 1048576 {
+        let t = display.text_new()
+        unsafe { sysv.put_s(t, mem_static("random_bytes is capped at 1048576 bytes, asked for "), mem_static_len("random_bytes is capped at 1048576 bytes, asked for ")) }
+        display.put_int(t, n)
+        return sysv.failed_buf(t)
+    }
+    if n == 0 {
+        return sysv.ok(bytes.bytes_copy(unsafe { mem_addr(1) }, 0))
+    }
+    let fd = unsafe { fsys.open_path(mem_static("/dev/urandom"), 12, fsys.O_RDONLY, 0) }
+    if fd < 0 {
+        let t = display.text_new()
+        unsafe { sysv.put_s(t, mem_static("cannot open /dev/urandom: "), mem_static_len("cannot open /dev/urandom: ")) }
+        sysv.put_os(t, 0 - fd)
+        return sysv.failed_buf(t)
+    }
+    let buf = sys.alloc_zeroed(n)
+    var done = 0
+    while done < n {
+        let got = fsys.read_once(fd, unsafe { buf.offset(done) }, n - done)
+        if got <= 0 {
+            fsys.close_fd(fd)
+            sys.dealloc(buf)
+            let t = display.text_new()
+            unsafe { sysv.put_s(t, mem_static("short read: "), mem_static_len("short read: ")) }
+            sysv.put_os(t, if got == 0 { 0 } else { 0 - got })
+            return sysv.failed_buf(t)
+        }
+        done += got
+    }
+    fsys.close_fd(fd)
+    let b = bytes.bytes_copy(buf, n)
+    sys.dealloc(buf)
+    sysv.ok(b)
+}
+
+export fn grt_random_bytes(count: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("random_bytes"), 12) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = random_bytes_now(count)
+    unsafe { journal.record(mem_static("random_bytes"), 12, out) }
+    out
+}

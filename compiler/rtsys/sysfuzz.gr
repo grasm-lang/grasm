@@ -1,0 +1,300 @@
+// Files, directories, arguments, the environment, standard input and other
+// programs on the Grasm runtime against the Rust runtime's
+// (docs/self-hosting.md §6.12), for `scripts/fuzz_rtsys.sh`, which builds
+// this twice -- on the Rust runtime and with the Grasm runtime alone --
+// runs both in the same empty scratch directory, and requires the same
+// bytes out and the same way out; then records each with `GRASM_RECORD`,
+// requires the two journals to be the same bytes, and replays each on the
+// other build.
+//
+//     sysfuzz <dir> <seed> <rounds> [<panic>]
+//
+// Each round is one operation on a name drawn from a small set -- some
+// files, some directories, some nested, some absent, one with a NUL in it --
+// with what it answered printed: every `IoError` with its text, so a
+// failure's words are compared as well as its kind. Between rounds the
+// arguments, environment variables (set and not, UTF-8 and not) and lines of
+// standard input are read too, and other programs run -- found and not, with
+// arguments, exit codes and standard error, alone and as a pipeline fed
+// input. With a panic number, the run ends in one of the family's panics.
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+fn name(inout s: i64, dir: str) -> str {
+    let k = pick(s, 14)
+    if k == 0 {
+        return dir + "/a"
+    }
+    if k == 1 {
+        return dir + "/b.txt"
+    }
+    if k == 2 {
+        return dir + "/sub"
+    }
+    if k == 3 {
+        return dir + "/sub/c"
+    }
+    if k == 4 {
+        return dir + "/sub/deep/er"
+    }
+    if k == 5 {
+        return dir + "/missing/x"
+    }
+    if k == 6 {
+        return dir + "/é ü"
+    }
+    if k == 7 {
+        return dir + "/sub//d/"
+    }
+    if k == 8 {
+        return dir
+    }
+    if k == 9 {
+        return ""
+    }
+    if k == 10 {
+        return dir + "/a\u{0}hidden"
+    }
+    if k == 11 {
+        return dir + "/sub/c/under-a-file"
+    }
+    if k == 12 {
+        return "/dev/null"
+    }
+    dir + "/z" + pick(s, 3).to_str()
+}
+
+fn content(inout s: i64) -> [i64] {
+    var out: [i64] = []
+    let n = pick(s, 12)
+    for i in 0..n {
+        let k = pick(s, 6)
+        if k == 0 {
+            out.push(0xff)
+        } else if k == 1 {
+            out.push(0xc3)
+            out.push(0xa9)
+        } else if k == 2 {
+            out.push(10)
+        } else if k == 3 {
+            out.push(0)
+        } else {
+            out.push(97 + pick(s, 26))
+        }
+    }
+    out
+}
+
+fn text(inout s: i64) -> str {
+    let n = pick(s, 10)
+    var out = ""
+    for i in 0..n {
+        let k = pick(s, 5)
+        if k == 0 {
+            out = out + "é"
+        } else if k == 1 {
+            out = out + "\n"
+        } else {
+            out = out + (97 + pick(s, 26)).to_char()
+        }
+    }
+    out
+}
+
+fn show_unit(r: () ! IoError) -> str {
+    match r {
+        Ok(_) -> "ok"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn file_op(inout s: i64, dir: str) -> str / {io} {
+    let k = pick(s, 15)
+    let p = name(s, dir)
+    if k == 0 {
+        return "write {p}: " + show_unit(write_file(p, text(s)))
+    }
+    if k == 1 {
+        match read_file(p) {
+            Ok(t) -> return "read {p}: {t.len()} {t}"
+            Err(e) -> return "read {p}: err {e}"
+        }
+    }
+    if k == 2 {
+        return "append {p}: " + show_unit(append_bytes(p, bytes_of(content(s))))
+    }
+    if k == 3 {
+        match read_bytes(p) {
+            Ok(b) -> return "bytes {p}: {b.len()} {b}"
+            Err(e) -> return "bytes {p}: err {e}"
+        }
+    }
+    if k == 4 {
+        let off = pick(s, 12) - 2
+        let n = pick(s, 12) - 2
+        match read_bytes_at(p, off, n) {
+            Ok(b) -> return "at {p} {off} {n}: {b}"
+            Err(e) -> return "at {p} {off} {n}: err {e}"
+        }
+    }
+    if k == 5 {
+        match file_size(p) {
+            Ok(n) -> return "size {p}: {n}"
+            Err(e) -> return "size {p}: err {e}"
+        }
+    }
+    if k == 6 {
+        return "exists {p}: {file_exists(p)}"
+    }
+    if k == 7 {
+        return "remove {p}: " + show_unit(remove_file(p))
+    }
+    if k == 8 {
+        let q = name(s, dir)
+        return "rename {p} {q}: " + show_unit(rename_file(p, q))
+    }
+    if k == 9 {
+        return "mkdir {p}: " + show_unit(make_dir(p))
+    }
+    if k == 10 {
+        return "mkdir_new {p}: " + show_unit(make_dir_new(p))
+    }
+    if k == 11 {
+        match list_dir(p) {
+            Ok(ns) -> return "list {p}: {ns}"
+            Err(e) -> return "list {p}: err {e}"
+        }
+    }
+    if k == 12 {
+        return "sync {p}: " + show_unit(sync_file(p))
+    }
+    if k == 13 {
+        let b = bytes_of(content(s))
+        return "write_bytes {p}: " + show_unit(write_bytes(p, b.slice(0, b.len() / 2)))
+    }
+    match list_dir(dir) {
+        Ok(ns) -> return "listing: {ns}"
+        Err(e) -> return "listing: err {e}"
+    }
+}
+
+fn proc_op(inout s: i64) -> str / {io, proc} {
+    let k = pick(s, 7)
+    if k == 0 {
+        match proc_run("echo", ["one", text(s), "é"]) {
+            Ok(r) -> return "echo: {r}"
+            Err(e) -> return "echo: err {e}"
+        }
+    }
+    if k == 1 {
+        let code = pick(s, 4)
+        match proc_run("sh", ["-c", "printf 'out\\377'; printf 'err %s' x >&2; exit {code}"]) {
+            Ok(r) -> return "sh: {r}"
+            Err(e) -> return "sh: err {e}"
+        }
+    }
+    if k == 2 {
+        match proc_run("grasm-no-such-program", ["x"]) {
+            Ok(r) -> return "missing: {r}"
+            Err(e) -> return "missing: err {e}"
+        }
+    }
+    if k == 3 {
+        match proc_pipeline([("tr", ["a-z", "A-Z"]), ("sort", []), ("uniq", ["-c"])], text(s) + "\nb\na\nb\n") {
+            Ok(r) -> return "pipeline: {r}"
+            Err(e) -> return "pipeline: err {e}"
+        }
+    }
+    if k == 4 {
+        match proc_pipeline([("cat", [])], "") {
+            Ok(r) -> return "empty pipeline: {r}"
+            Err(e) -> return "empty pipeline: err {e}"
+        }
+    }
+    if k == 5 {
+        match proc_pipeline([("sh", ["-c", "cat; echo first >&2"]), ("grasm-no-such-program", [])], "in") {
+            Ok(r) -> return "broken pipeline: {r}"
+            Err(e) -> return "broken pipeline: err {e}"
+        }
+    }
+    match proc_pipeline([("sh", ["-c", "echo mid >&2; cat"]), ("wc", ["-c"])], text(s)) {
+        Ok(r) -> return "stderr pipeline: {r}"
+        Err(e) -> return "stderr pipeline: err {e}"
+    }
+}
+
+fn env_op(inout s: i64) -> str / {io} {
+    let k = pick(s, 5)
+    if k == 0 {
+        return "args: {args()}"
+    }
+    if k == 1 {
+        return "input: [{input()}]"
+    }
+    let names = ["SYSFUZZ_SET", "SYSFUZZ_EMPTY", "SYSFUZZ_UNSET", "SYSFUZZ_BAD", "SYSFUZZ_UTF8"]
+    let n = names[pick(s, names.len())]
+    match env(n) {
+        Some(v) -> return "env {n}: [{v}]"
+        None -> return "env {n}: none"
+    }
+}
+
+fn panic_case(p: i64, dir: str) / {io, unsafe, mem} {
+    if p == 0 {
+        let s = "a\u{0}b"
+        // A NUL in a string handed to C is a panic.
+        let _n = unsafe { strlen(s) }
+    }
+    if p == 1 {
+        let _ = unsafe { mem_alloc(-1, 8) }
+    }
+    if p == 2 {
+        let _ = unsafe { mem_alloc(8, 3) }
+    }
+    if p == 3 {
+        let _ = unsafe { mem_alloc(1099511627777, 8) }
+    }
+    if p == 4 {
+        print("exits")
+        exit(-2)
+    }
+    print("partial line then exit {exit_now()}")
+}
+
+fn exit_now() -> i64 / {io} {
+    exit(300)
+    0
+}
+
+extern fn strlen(s: str) -> i64
+
+fn main() / {io, proc, unsafe, mem} {
+    let a = args()
+    let dir = a[0]
+    var s = a[1].parse_int() ?? 1
+    let rounds = a[2].parse_int() ?? 10
+    if a.len() > 3 {
+        print("panic case")
+        panic_case(a[3].parse_int() ?? 0, dir)
+        return
+    }
+    // Something to find: a directory two deep, a file in it and one beside.
+    print("setup: {show_unit(make_dir(dir + "/sub/deep"))} {show_unit(write_file(dir + "/a", "alpha\n"))} {show_unit(write_file(dir + "/sub/c", "c"))}")
+    for r in 0..rounds {
+        let k = pick(s, 10)
+        if k < 7 {
+            print("{r} {file_op(s, dir)}")
+        } else if k < 8 {
+            print("{r} {proc_op(s)}")
+        } else {
+            print("{r} {env_op(s)}")
+        }
+    }
+}

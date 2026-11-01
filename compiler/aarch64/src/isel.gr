@@ -538,13 +538,12 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
     // eight bytes each: the caller stores them at the bottom of its frame,
     // where `sp` points at the call, and the callee reads them above its
     // saved frame pointer. The outgoing area is as big as the largest call
-    // needs.
+    // needs. A C call has them only in the runtime, which declares its C
+    // functions' arguments past the eighth eight bytes wide
+    // (`compiler/mir`'s `extern_ok_for`).
     for i in 0..f.op.len() {
         if f.op[i] == ir.M_CALL or f.op[i] == ir.M_CALLRT or f.op[i] == ir.M_CALLIND {
             let ap = plan_args(call_fp(f, i))
-            if f.op[i] == ir.M_CALLRT and ap.nstack > 0 {
-                fail("a runtime call with {f.can[i]} arguments; only eight of each class travel in registers")
-            }
             if ap.nstack > vc.nout {
                 vc.nout = ap.nstack
             }

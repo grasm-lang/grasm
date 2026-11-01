@@ -1,0 +1,122 @@
+// The record-and-replay journal on the Grasm runtime against the Rust
+// runtime's (docs/self-hosting.md §6.12), for `scripts/fuzz_rtsys.sh`, which
+// writes journals by hand (`scripts/rtjournal.py`) and replays each on both
+// builds: the same bytes out and the same way out -- every value the journal
+// can hold built back the same, the clocks answering what the journal says,
+// and every way a replay stops (a journal run out, a call the recording does
+// not name, a journal that is not one, a C call) stopping both the same.
+//
+// What the program does comes from the journal too: its arguments are its
+// first record, a script of one letter per call.
+
+extern fn getpid() -> i64
+
+fn show_unit(r: () ! IoError) -> str {
+    match r {
+        Ok(_) -> "ok"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn step(c: str) -> str / {io, net, proc, unsafe} {
+    if c == "n" {
+        return "now {now_millis()}"
+    }
+    if c == "m" {
+        return "mono {monotonic_millis()}"
+    }
+    if c == "N" {
+        return "nanos {monotonic_nanos()}"
+    }
+    if c == "s" {
+        sleep_millis(1)
+        return "slept"
+    }
+    if c == "e" {
+        return "exists {file_exists("/grasm-jfuzz-nothing-here")}"
+    }
+    if c == "r" {
+        match read_file("/grasm-jfuzz-nothing-here") {
+            Ok(t) -> return "read {t.len()} [{t}]"
+            Err(e) -> return "read err {e}"
+        }
+    }
+    if c == "b" {
+        match read_bytes("/grasm-jfuzz-nothing-here") {
+            Ok(b) -> return "bytes {b.len()} {b}"
+            Err(e) -> return "bytes err {e}"
+        }
+    }
+    if c == "l" {
+        match list_dir("/grasm-jfuzz-nothing-here") {
+            Ok(ns) -> return "list {ns.len()} {ns}"
+            Err(e) -> return "list err {e}"
+        }
+    }
+    if c == "E" {
+        match env("GRASM_JFUZZ") {
+            Some(v) -> return "env [{v}]"
+            None -> return "env none"
+        }
+    }
+    if c == "i" {
+        return "input [{input()}]"
+    }
+    if c == "R" {
+        match random_bytes(4) {
+            Ok(b) -> return "random {b}"
+            Err(e) -> return "random err {e}"
+        }
+    }
+    if c == "c" {
+        net_close(3)
+        return "closed"
+    }
+    if c == "w" {
+        match net_wait([1, 2], 0) {
+            Ok(r) -> return "wait {r}"
+            Err(e) -> return "wait err {e}"
+        }
+    }
+    if c == "p" {
+        match proc_run("grasm-jfuzz-program", ["x"]) {
+            Ok(r) -> return "run {r}"
+            Err(e) -> return "run err {e}"
+        }
+    }
+    if c == "a" {
+        return "args {args()}"
+    }
+    if c == "z" {
+        match file_size("/grasm-jfuzz-nothing-here") {
+            Ok(n) -> return "size {n}"
+            Err(e) -> return "size err {e}"
+        }
+    }
+    if c == "t" {
+        match tcp_read(1) {
+            Ok(t) -> return "tcp [{t}]"
+            Err(e) -> return "tcp err {e}"
+        }
+    }
+    if c == "W" {
+        return "write " + show_unit(write_file("/grasm-jfuzz-nothing-here/x", "y"))
+    }
+    if c == "C" {
+        let p = unsafe { getpid() }
+        return "pid {p > 0}"
+    }
+    "unknown step {c}"
+}
+
+fn main() / {io, net, proc, unsafe} {
+    let a = args()
+    if a.len() == 0 {
+        print("no script")
+        return
+    }
+    let script = a[0]
+    for i in 0..script.len() {
+        print(step(script.substr(i, 1)))
+    }
+}

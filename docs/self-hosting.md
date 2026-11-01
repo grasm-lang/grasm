@@ -2201,6 +2201,196 @@ common case reads its constants from a block made once: 7.0 s against 3.8 s
 against 0.8 s). Every other read of a layout
 constant in the runtime is still a call; nothing else has been timed.
 
+### 6.12 S5 part four: the rest of the runtime, and S5's exit
+
+Written 2026-10-28. All 345 of the runtime's entry points come from Grasm,
+and a program is linked with the Grasm runtime alone: no
+`libgrasm_rt_abi.a` on the link line, and nothing of the Rust runtime in the
+binary (`compiler/link -interpose rt.o` with no archive after it binds every
+`_grasm_<name>` the program names to `_grt_<name>`). The runtime calls none
+of the Rust runtime's entry points; `scripts/lib/rtswap.sh` fails on one.
+
+| family | entry points | from Grasm | moved in this part |
+|---|---:|---:|---|
+| values and counting | 22 | 22 | |
+| number formatting and parsing | 19 | 19 | |
+| output | 9 | 9 | `out_text`, `out_nl`, `out_to_stderr` (`io.gr`) |
+| panics, exit, stack floor | 13 | 13 | `panic_msg`, `exit`, `report_main_err` (`io.gr`, `way.gr`) |
+| math | 38 | 38 | |
+| strings | 51 | 51 | `str_c_new`, `str_c_free` (`cmem.gr`) |
+| bytes | 21 | 21 | `append_bytes` (`files.gr`) |
+| lists and ranges | 52 | 52 | `list_dir` (`files.gr`) |
+| maps and hashing | 15 | 15 | |
+| structs, variants, tuples, results | 29 | 29 | |
+| function values, effect handlers | 15 | 15 | `env` (`envs.gr`) |
+| generational references | 6 | 6 | |
+| args, files, clock, net, proc, C, raw memory | 42 | 42 | all (`files.gr`, `clock.gr`, `envs.gr`, `cmem.gr`, `net.gr`, `proc.gr`, `journal.gr`) |
+| tasks, channels, fibers, parallelism | 13 | 13 | `par_*`, `net_workers*` (`par.gr`) |
+| **all** | **345** | **345** | 60 |
+
+`compiler/rt` is 18,983 lines of Grasm in 44 modules (13,238 in 31 before
+this part); `families.txt` lists 345 names and no `state`, `backend` or
+`uses` line.
+
+**Step one: the output buffer and the ways out** (`io.gr`, `way.gr`).
+Standard output is one buffer of 8 KiB for the process, behind a lock
+built from a compare-and-swap, written out at each `print`'s newline, when
+a write would not fit (a write of 8 KiB or more then goes straight out), and
+on every way out; standard error is the same machinery written out after
+every piece -- the Rust runtime's `grasm_sys::io` streams, chunk for chunk.
+Which stream `print`'s pieces go to is a runtime thread-local cell. A panic
+writes standard output out, writes `panic: <message>` to standard error in
+one write and exits 101; `exit(code)` writes it out and exits with the
+code's low eight bits; the error `main` returns is shown after `error:
+unhandled error from main: ` and exits 1; and every way out ends in
+`io.leave`, which writes out each stream no other thread holds -- as the
+Rust runtime's `flush_all` skips a held one (F101) -- and calls the C
+library's `exit`, found by `dlsym` because its name is the built-in
+`exit`'s, so `atexit` work (the `leaks` tool's among it) still runs. A
+message the program made is read as `String::from_utf8_lossy` reads it.
+Panic texts stay static bytes. While steps two and three were done, each
+Rust entry point still linked was entered through a wrapper that wrote this
+side's standard output out first, since the Rust code flushed only its own
+buffer before its panics and exits; by the end of step three none was left,
+and neither is the wrapper.
+
+**Step two: the system families and the journal.** Arguments, the
+environment, a line of input and entropy (`envs.gr`); files and directories
+(`files.gr`, over `fsys.gr`'s system calls); the clocks and sleeping
+(`clock.gr`); C strings, `mem_alloc`, `mem_free` and the program's
+thread-local block (`cmem.gr`); TCP and UDP with the handle table, its
+lowest-free-first handles, sockets counted strong and weak as the Rust
+runtime's `Arc`s, and `net_wait` on a `kqueue` per thread or `poll`
+(`net.gr`); `proc_run` and `proc_pipeline`, nothing allocated between
+`fork` and `exec` and both pipes drained by one `poll` loop (`proc.gr`).
+Each answers with the same values and fails with the same `IoError` text --
+`strerror`'s words for an error number, `NotFound(path)` where the Rust
+runtime tells a missing file apart. `journal.gr` is `grasm_journal`: the
+same `GRASMJRNL2` file, per thread and chosen on the thread's first ask, a
+replay checked whole when it is opened, each journaled builtin either
+answering its record or writing one, the clocks and `file_exists` and
+`net_close` journaled as the Rust runtime journals them (a record of another
+shape taken and the world read anyway), a C call refused under a replay,
+and every way a replay stops worded the same. `open`'s mode and `fcntl`'s
+argument are variadic in C, and arm64 macOS passes a variadic argument on
+the stack: the runtime declares each with eight register parameters and
+the variadic one ninth, which the backend now passes in the first stack
+slot (below). What Rust behaviour this part found wrong and kept, and the
+one it did not keep, is in docs/known-issues.md ("Found on 2026-10-28").
+
+**Step three: the parallel workers** (`par.gr`): `par_map` and
+`par_filter` timed on their first element and spread over the cores when
+worth it, each worker on an 8 MiB stack taking chunks from the last to the
+first and the calling thread taking them too; a `parallel` block's tasks a
+thread each; `net_workers` a named thread each, or one after another under
+a journal. What each worker allocates is its allocator's business, handed
+to the process when the thread ends (`alloc.gr`'s thread-end call, which
+also frees the read buffer, the `kqueue` and the program's thread-local
+block a thread kept).
+
+**Step four: S5's exit.** The leak check is this runtime's alone
+(`leak.gr`); the allocator keeps one ledger; regions sweep only this
+runtime's boxes; the poisoned build is this package with `build.gr` saying
+so, built beside the ordinary one by every gate that links the poisoned
+Rust runtime. Three changes outside `compiler/rt`, each in `compiler/mir`
+or `compiler/aarch64` and none in Rust:
+
+- `s3 --runtime` names the runtime's own calls of an entry point it defines
+  by its `grt_` name -- the checks `/` and `%` make on their divisor -- so
+  the runtime links with nothing behind it;
+- a runtime's C function may take more than eight integer arguments, each
+  past the eighth eight bytes wide, passed on the stack; a program's still
+  takes eight of each class, so no program's object changes for it;
+- a module-level constant whose value is a literal -- an integer or a
+  float, negated or not, or a boolean -- is that literal where it is read,
+  not a call of a function answering it ([T-CONST] re-evaluates a constant
+  on every read, and a literal's evaluation gives the same value and does
+  nothing else). That is the cost §6.11 named: in the runtime it removed
+  2,225 of 7,470 calls and 26 KB of the object. It applies to programs too.
+
+**The gates, on the final tree** (2026-10-28 to 2026-10-31, the machine at a
+load average of 8 to 20 throughout, which none of these times):
+
+- `rtswap`, the programs linked with the Grasm runtime alone: "programs
+  with a main: 651   external set aside: 3"; "Cranelift objects:
+  identical: 648   failed: 0   timed out: 0"; "runtime names the programs
+  reference: 323 distinct, 323 taken from Grasm and 0 from Rust; per
+  program, 36345 references bound to Grasm and 0 to Rust"; "programs that
+  took nothing from Grasm (compared nothing): 0"; "poisoned runtime:
+  agreeing with no use after free: 648"; "Grasm backend objects: in the
+  subset: 648   identical: 648   timed out: 0".
+- Through `rtwith.sh`, which first shows "the Grasm runtime: 345 names
+  moved (...); it calls none of the Rust runtime's" and "examples/hello.gr
+  took 15 runtime names from Grasm and none from Rust, linked with no Rust
+  runtime archive": `leakcheck` "leak-free: 623   leaking: 0   not
+  compiled: 0   external: 3   timed out: 0   crashed: 0   ended before the
+  check: 25"; `usecheck` with the poisoned build "clean: 648
+  use-after-free: 0   out of memory: 0   external: 3   declined: 0   timed
+  out: 0"; `replaytest` "journaled: 44   unhooked: 0   no test program: 0"
+  and "a native recording replayed elsewhere: identical on every engine"
+  (the browser engine not checked); and the 22 generators that build
+  natively, each with nothing disagreeing, leaking or failing (`fuzz_s3`
+  "programs: 60   compared: 60   identical: 60", `fuzz_differential` and
+  `fuzz_generics` and `fuzz_handlers` 500 each, `fuzz_operators` 176
+  cells, `fuzz_panics` 104, `fuzz_exits` 85, `fuzz_modules` 72 with no
+  holes, and the rest).
+- The three new family gates: `fuzz_rtout` "runs identical, apart and
+  together: 180 of 180 (20 seeds of 60 rounds, each ending all 9 ways;
+  8094668 bytes together)"; `fuzz_rtsys` "files, input, environment,
+  programs: seeds identical: 12 of 12 (720 rounds)", "journals recorded
+  byte-identical: 12   replayed on the other runtime as recorded: 24",
+  "network: seeds identical: 6 of 6 (360 rounds)", "hand-written journals
+  identical: 200 of 200 (81 replayed whole, 119 refused)   names of the
+  family taken from Grasm: 44"; `fuzz_rtpar` "seeds identical: 12 of 12
+  (480 rounds, each leak-free; in the last seed 4 long enough to spread)
+  panics identical: 4 of 4". `fuzz_rtrelease` with workers: "leaks runs: 8
+  leaking: 0 (with workers: 0 blocks against the Rust build's 16, of sizes
+  16 128, 8 workers)". Part three's eleven family gates, `rtlayout` (149
+  constants measured and equal, 52 also stated by the Rust source),
+  `rtlint` and `rtdialect` pass as before.
+- `rtcontrols` "checks of planted faults: 78   caught: 78   missed:
+  0"; `rtdialectcontrols` "controls: 5   caught: 5
+  missed: 0"; `s3controls` "controls: 29   caught: 29   missed: 0".
+- The backend's, for its three changes: `s3subset` "identical: 648
+  mismatched: 0   timed out: 0   no TIR: 0"; `difftest` "identical: 648
+  mismatched: 0   unsupported: 0   external: 3   timed out: 0"; `objtest`
+  "objects: 648   reproducible: 648   literal loads on their lines: 108370
+  with problems: 0" and "runtime objects: 2   reproducible: 2"; `ra_check`
+  "programs: 648   stressed runs: 3240   identical: 3240   failed: 0", its
+  control 43489 of 43489; `s3rc` 623 leak-checked, none leaking, 648 clean
+  under poison; `inctest` 5 scenarios; `reprotest` "built twice: 160
+  differ: 0"; `encodetest` 6416 of 6416; `tirtest`, `tirdiff`, `loaddiff`,
+  `tokentest`, `asttest`, `fmttest`, `linttest` and `gatecheck` as before.
+
+**The benchmarks.** `scripts/rtbench.py` runs `bench.sh`'s eight programs,
+each linked twice from the same objects -- with the Rust runtime archive and
+with the Grasm runtime alone -- checks each prints what `grasm run` prints,
+and times them in alternation, refusing, as `bench.sh` does, above a load
+average of 0.35 of the cores. Measured once, 2026-10-31, 21 rounds, the
+median of each, on this 8-core machine (6 performance cores) at the load
+shown, the serial rows at 2.4 to 2.6 and the parallel rows above the
+threshold, so those two are not to be quoted:
+
+| program | Rust runtime | Grasm runtime | ratio | load |
+|---|---:|---:|---:|---|
+| fib | 5.21 ms | 5.22 ms | 1.003 | 2.59 |
+| sieve | 6.75 ms | 7.32 ms | 1.084 | 2.62 |
+| matmul | 5.34 ms | 5.39 ms | 1.008 | 2.57 |
+| wordfreq | 16.18 ms | 54.73 ms | 3.383 | 2.52 |
+| tree | 19.78 ms | 36.88 ms | 1.864 | 2.52 to 2.40 |
+| sort | 10.96 ms | 42.98 ms | 3.922 | 2.40 |
+| parmap | 64.30 ms | 67.13 ms | 1.044 | 4.03 to 5.79 |
+| parwords | 11.36 ms | 13.35 ms | 1.176 | 5.32 |
+
+The geometric mean is 1.550: every program passes on the Grasm runtime, and
+three are much slower on it. Programs that spend their time in compiled
+code (`fib`, `matmul`) do not move. A profile under load put `sort`'s and
+`tree`'s extra time in the runtime's list sort and struct type lookup,
+which this part gave fast paths (`lists.gr`'s `msort_words`, `structs.gr`'s
+`type_of`); at a load of 8 to 10 (numbers not to quote) they took `sort`
+from about 5.9x to 4.0x and `tree` from 2.2x to 1.9x. `wordfreq`, which
+leans on maps and strings, is not profiled here.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -2465,10 +2655,27 @@ Measured, not estimated; each line is a gate's result on master.
   it (latent: no compiled program sweeps a region). Measured once: one
   corpus program built by the Grasm backend took 7.0 s on this runtime
   against 3.8 s on the Rust one.
+- **S5 part four** (§6.12): all 345 entry points come from Grasm -- the
+  output buffer and every way out, arguments, files, clocks, the network,
+  processes, C strings, raw memory and the journal they go through, and the
+  parallel workers -- and programs link with the Grasm runtime alone, no
+  `libgrasm_rt_abi.a` on the line. `rtswap`: all 648 corpus programs that
+  link no system library identical on both runtimes from both backends'
+  objects, 323 of 323 runtime names taken from Grasm, and with no use after
+  free under the poisoned build; through `rtwith.sh`, `leakcheck` 623
+  leak-free and none leaking (25 end before the check), `usecheck` 648
+  clean, `replaytest` 44 journaled builtins hooked, and the 22 generators
+  that build natively with nothing disagreeing; three new gates
+  (`fuzz_rtout`, `fuzz_rtsys`, `fuzz_rtpar`) identical on every seed,
+  `fuzz_rtrelease` leak-free with workers; `rtcontrols` 78 of 78 planted
+  faults caught. Five Rust runtime defects found and recorded in
+  docs/known-issues.md, the Grasm runtime keeping four for now so the two
+  stay comparable, and the backend gained three changes (§6.12). The
+  benchmarks, measured once at a load of 2.4 to 2.6 on 8 cores: every
+  program passes, `fib`, `sieve` and `matmul` within 9% of the Rust
+  runtime, `tree` 1.86x, `wordfreq` 3.38x and `sort` 3.92x slower.
 - **Not started:** S2 part three (the diagnostics' words and spans), S6
-  (self-compilation), S7-S9; S5's last families -- output and the way out of
-  a panic, arguments, files, clocks, the network, processes, C strings, raw
-  memory and the parallel workers -- and its exit.
+  (self-compilation), S7-S9.
 
 With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
 and the runtime in Grasm; they come next, one stage at a time.

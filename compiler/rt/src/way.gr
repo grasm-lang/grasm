@@ -1,0 +1,40 @@
+// The ways out of a program that need values (docs/self-hosting.md §6.12):
+// a panic with a message the program made, and the error a fallible `main`
+// returned. The buffers and the exit are `io.gr`'s.
+import layout
+import io
+import bytes
+import display
+import panic
+
+/// A panic whose message is the `n` bytes at `p`, made by the program: as
+/// they are when they are UTF-8, else with each invalid sequence one
+/// U+FFFD, as the Rust runtime's `String::from_utf8_lossy` gives them.
+export fn grt_panic_msg(p: addr, n: i64) {
+    if bytes.valid_utf8(p, n) {
+        io.panic_bytes(p, n)
+        return
+    }
+    let t = bytes.lossy(p, n)
+    io.panic_bytes(display.text_ptr(t), display.text_len(t))
+}
+
+/// `main` returned `Err(e)`: standard output flushed, `error: unhandled
+/// error from main: <e>` to standard error, exit 1 ([E-MAIN-ERR]).
+export fn grt_report_main_err(v: addr) {
+    unsafe {
+        if v.offset(layout.TAG).load_u8().as_i64() != layout.TAG_VARIANT {
+            panic.say(mem_static("bad main error value"), mem_static_len("bad main error value"))
+        }
+        // The first field: in the variant's word when it has one, else the
+        // first of the slice the word points at.
+        var f = v.offset(layout.VARIANT_FIELDS).load_addr()
+        if v.offset(layout.VARIANT_NFIELDS).load_i64() != 1 {
+            f = f.load_addr()
+        }
+        io.flush_out()
+        let b = display.shown(f)
+        io.err_line2(mem_static("error: unhandled error from main: "), mem_static_len("error: unhandled error from main: "), display.text_ptr(b), display.text_len(b))
+        io.leave(1)
+    }
+}

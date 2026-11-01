@@ -1,4 +1,4 @@
-// The box allocator (docs/self-hosting.md §6.7 "state", §6.11): where a
+// The box allocator (docs/self-hosting.md §6.7 "state", §6.11, §6.12): where a
 // value's 64-byte box comes from and goes back to, how many are live, the
 // regions a box is made inside, and the interned boxes.
 //
@@ -15,24 +15,18 @@
 //
 // Process-wide, in process cells, every access atomic (`scripts/rtlint.py`):
 // that key, the escaped balances, the interned boxes (`false`, `true`, and
-// -128 to 1024, immortal, made once), and whether the Rust runtime linked
-// behind this one is the poisoned build, asked once.
-//
-// Two allocators, one ledger. The Rust code still linked makes and frees
-// boxes through its own pool and count, which no link can redirect (§6.7),
-// and a box either side made may be freed by the other: then one side's
-// count goes up for a box the other's goes down for. Each count alone is
-// wrong and their sum is right, so `live` here is this side's half; `leak.gr`
-// adds the two.
+// -128 to 1024, immortal, made once), and whether this is the poisoned
+// build (`build.gr`). Every box is this runtime's: no other allocator is
+// linked (docs/self-hosting.md §6.12).
 import layout
 import sys
 import panic
+import build
 
 extern fn pthread_key_create(key: addr, dtor: addr) -> i32
 extern fn pthread_key_delete(key: i64) -> i32
 extern fn pthread_setspecific(key: i64, v: addr) -> i32
 extern fn munmap(a: addr, len: i64) -> i32
-extern fn grasm_val_dec(v: addr)
 
 /// A freed box past this many in a thread's pool goes back to `free`.
 let POOL_CAP = 65536
@@ -60,7 +54,11 @@ pub let L_NBUILD = 64
 /// (base, length) pairs, up to `STACKS_MAX`, and how many it holds.
 pub let L_STACKS = 72
 pub let L_NSTACKS = 80
-let L_SIZE = 88
+/// What other modules keep per thread and free when it ends
+/// (`at_thread_end`): an array of (function, argument) pairs, how many.
+let L_ENDS = 88
+let L_NENDS = 96
+let L_SIZE = 104
 pub let BUILDERS_MAX = 8
 pub let STACKS_MAX = 64
 pub let REC_SIZE = 24
@@ -73,7 +71,7 @@ process_local KEY: i64
 /// What threads that have ended left live, and made, on this side.
 process_local ESCAPED: i64
 process_local ESCAPED_MADE: i64
-/// 0 until asked; then 1 for the ordinary Rust runtime, 2 for the poisoned.
+/// 0 until asked; then 1 for the ordinary build, 2 for the poisoned.
 process_local POISONED: i64
 /// The interned boxes' block, 0 until made.
 process_local INTERNED: i64
@@ -126,6 +124,17 @@ pub fn local() -> addr {
 /// using this one freed.
 fn thread_end(b: addr) {
     unsafe {
+        // What other modules asked to be done at the end, last asked first,
+        // while this thread's cells still hold what they freed.
+        let ends = b.offset(L_ENDS).load_addr()
+        var e = b.offset(L_NENDS).load_i64() - 1
+        while e >= 0 {
+            ends.offset(16 * e).load_addr().call_c(EndFn, ends.offset(16 * e + 8).load_addr())
+            e -= 1
+        }
+        if ends.as_i64() != 0 {
+            sys.dealloc(ends)
+        }
         mem_tls(LOCAL).store_i64(0)
         mem_process(ESCAPED).atomic_add_i64(b.offset(L_LIVE).load_i64(), AcqRel)
         mem_process(ESCAPED_MADE).atomic_add_i64(b.offset(L_MADE).load_i64(), AcqRel)
@@ -176,6 +185,24 @@ fn thread_end(b: addr) {
     }
 }
 
+/// A function called with one argument when a thread ends.
+type EndFn = fn(addr)
+
+/// Asks that `f(arg)` -- the address of a function taking one `addr` --
+/// be called when this thread ends, before its block is freed: for what a
+/// module keeps per thread in cells of its own.
+pub fn at_thread_end(f: addr, arg: addr) {
+    let l = local()
+    unsafe {
+        let n = l.offset(L_NENDS).load_i64()
+        let ends = if n == 0 { sys.alloc(16 * 8) } else if n % 8 == 0 { sys.grow(l.offset(L_ENDS).load_addr(), 16 * (n + 8)) } else { l.offset(L_ENDS).load_addr() }
+        ends.offset(16 * n).store_addr(f)
+        ends.offset(16 * n + 8).store_addr(arg)
+        l.offset(L_ENDS).store_addr(ends)
+        l.offset(L_NENDS).store_i64(n + 1)
+    }
+}
+
 /// What ended threads left live and made on this side; `take` empties them.
 pub fn escaped(take: bool) -> i64 {
     unsafe {
@@ -203,24 +230,16 @@ pub fn escaped_made(take: bool) -> i64 {
     }
 }
 
-/// Whether the Rust runtime behind this one is the poisoned build
-/// (`grasm_rt/poison`), whose freed boxes stay out of circulation counting
-/// `POISON`: asked once, by handing it a box of nothing and looking at it.
-/// Its live count loses one for that box, so this side's gains one, and the
-/// two counts still add up.
+/// Whether this is the poisoned build (`build.POISON`), whose freed boxes
+/// stay out of circulation counting `POISON`, so a later touch of one is
+/// caught: read once into a process cell.
 pub fn poisoned() -> bool {
     unsafe {
         let known = mem_process(POISONED).atomic_load_i64(Acquire)
         if known != 0 {
             return known == 2
         }
-        let b = sys.alloc(layout.BOX_SIZE)
-        b.offset(layout.TAG).store_u8(layout.TAG_UNIT.as_u8())
-        b.atomic_store_i64(1, Relaxed)
-        grasm_val_dec(b)
-        let l = local()
-        l.offset(L_LIVE).store_i64(l.offset(L_LIVE).load_i64() + 1)
-        let answer = if b.atomic_load_i64(Relaxed) == layout.POISON { 2 } else { 1 }
+        let answer = if build.POISON { 2 } else { 1 }
         mem_process(POISONED).atomic_store_i64(answer, Release)
         answer == 2
     }

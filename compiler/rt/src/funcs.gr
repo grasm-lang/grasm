@@ -23,7 +23,6 @@ import val
 import panic
 
 extern fn memcmp(a: addr, b: addr, n: i64) -> i32
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 fn tag(v: addr) -> i64 {
     unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
@@ -334,7 +333,7 @@ export fn grt_handler_lookup(ep: addr, el: i64, op: addr, ol: i64) -> addr {
         msg.offset(lead + el).store_u8(46)
         sys.copy(msg.offset(lead + el + 1), op, ol)
         sys.copy(msg.offset(lead + el + 1 + ol), mem_static("` — no handler installed"), tail)
-        grasm_panic_msg(msg, n)
+        panic.say(msg, n)
         mem_addr(0)
     }
 }

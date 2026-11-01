@@ -27,7 +27,6 @@ import equal
 import fmt
 import panic
 
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 /// The digits of 5^s for s from 0 to 64, for a decimal shifted left by s
 /// bits: offsets (66 words) and then the digits, made once.
@@ -126,7 +125,7 @@ fn base_panic(head: addr, hn: i64, base: i64) {
     let t = display.text_new()
     display.put(t, head, hn)
     display.put_int(t, base)
-    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+    unsafe { panic.say(display.text_ptr(t), display.text_len(t)) }
 }
 
 fn none() -> addr {
@@ -809,7 +808,7 @@ export fn grt_f64_to_fixed(x: f64, places: i64) -> addr {
         display.put_int(t, places)
         unsafe {
             display.put(t, mem_static("): places must be 0 to 17"), mem_static_len("): places must be 0 to 17"))
-            grasm_panic_msg(display.text_ptr(t), display.text_len(t))
+            panic.say(display.text_ptr(t), display.text_len(t))
         }
     }
     let t = display.text_new()
@@ -1038,5 +1037,5 @@ export fn grt_assert_eq(a: addr, b: addr) {
     let sb = display.shown(b)
     display.put(t, display.text_ptr(sb), display.text_len(sb))
     display.put_byte(t, 96)
-    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+    unsafe { panic.say(display.text_ptr(t), display.text_len(t)) }
 }

@@ -1,0 +1,246 @@
+// The network on the Grasm runtime against the Rust runtime's
+// (docs/self-hosting.md §6.12), for `scripts/fuzz_rtsys.sh`, which builds
+// this twice -- on the Rust runtime and with the Grasm runtime alone --
+// and requires the same bytes out and the same way out.
+//
+//     netfuzz <seed> <rounds>
+//
+// Everything is on the loopback address and printed only where it does not
+// depend on timing or on which port the system chose: connections dialled
+// and accepted on a listener the program opened, text and bytes (whole
+// buffers and windows of them) sent one message at a time and read after
+// `net_wait` says the reader is ready, waits that must find nothing ready,
+// handles closed (twice, too) and used after, operations on the wrong kind
+// of socket, ports out of range, a port nothing listens on, datagrams to
+// itself; with each failure's text.
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+fn text(inout s: i64) -> str {
+    let n = 1 + pick(s, 30)
+    var out = ""
+    for i in 0..n {
+        let k = pick(s, 6)
+        if k == 0 {
+            out = out + "é"
+        } else if k == 1 {
+            out = out + " "
+        } else {
+            out = out + (97 + pick(s, 26)).to_char()
+        }
+    }
+    out
+}
+
+fn payload(inout s: i64) -> [i64] {
+    var out: [i64] = []
+    let n = 1 + pick(s, 20)
+    for i in 0..n {
+        out.push(if pick(s, 4) == 0 { 0xff } else { 97 + pick(s, 26) })
+    }
+    out
+}
+
+fn handles_of(r: [i64] ! IoError) -> str {
+    match r {
+        Ok(hs) -> "{hs}"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn show_unit(r: () ! IoError) -> str {
+    match r {
+        Ok(_) -> "ok"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn show_i(r: i64 ! IoError) -> str {
+    match r {
+        Ok(n) -> "ok {n}"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn show_s(r: str ! IoError) -> str {
+    match r {
+        Ok(t) -> "ok [{t}]"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn show_peer(r: (str, i64) ! IoError) -> str {
+    match r {
+        Ok(p) -> "ok {p.0}"
+        Err(e) -> "err {e}"
+    }
+}
+
+fn int_of(r: i64 ! IoError) -> i64 {
+    match r {
+        Ok(n) -> n
+        Err(e) -> -1
+    }
+}
+
+/// Waits until `h` is ready to read, at most two seconds; whether it was.
+fn ready(h: i64) -> bool / {net} {
+    match net_wait([h], 2000) {
+        Ok(r) -> r.len() == 1
+        Err(e) -> false
+    }
+}
+
+fn main() / {io, net} {
+    let a = args()
+    var s = a[0].parse_int() ?? 1
+    let rounds = a[1].parse_int() ?? 10
+    let lis = int_of(tcp_listen(0))
+    let port = int_of(net_port(lis))
+    print("listening: {lis >= 0} port chosen: {port > 0}")
+    // Pairs of connected sockets: client, server.
+    var clients: [i64] = []
+    var servers: [i64] = []
+    var closed: [i64] = []
+    let udp = int_of(udp_bind(0))
+    let uport = int_of(net_port(udp))
+    print("udp bound: {udp >= 0} {uport > 0}")
+    for r in 0..rounds {
+        let k = pick(s, 12)
+        if k == 0 or clients.len() == 0 {
+            let c = int_of(tcp_connect("127.0.0.1", port))
+            print("{r} wait for the dial: {handles_of(net_wait([lis], 2000))}")
+            let sv = int_of(tcp_accept(lis))
+            clients.push(c)
+            servers.push(sv)
+            print("{r} connected: {c} accepted: {sv}")
+            match tcp_peer(sv) {
+                Ok(p) -> print("{r} peer host: {p.0}")
+                Err(e) -> print("{r} peer: err {e}")
+            }
+        } else if k <= 3 {
+            let i = pick(s, clients.len())
+            let to_server = pick(s, 2) == 0
+            let from = if to_server { clients[i] } else { servers[i] }
+            let into = if to_server { servers[i] } else { clients[i] }
+            let t = text(s)
+            print("{r} write {from}->{into}: {show_unit(tcp_write(from, t))}")
+            if ready(into) {
+                match tcp_read(into) {
+                    Ok(got) -> print("{r} read [{got}] same: {got == t}")
+                    Err(e) -> print("{r} read: err {e}")
+                }
+            } else {
+                print("{r} nothing arrived")
+            }
+        } else if k <= 5 {
+            let i = pick(s, clients.len())
+            let b = bytes_of(payload(s))
+            // A window of the buffer, sometimes: what goes out is what the
+            // runtime sends for one.
+            let sent = if pick(s, 2) == 0 { b } else { b.slice(0, b.len() / 2) }
+            print("{r} bytes {clients[i]}->{servers[i]}: {show_unit(tcp_write_bytes(clients[i], sent))} ({sent.len()} in the value)")
+            if ready(servers[i]) {
+                match tcp_read_bytes(servers[i]) {
+                    Ok(got) -> print("{r} read {got.len()}: {got}")
+                    Err(e) -> print("{r} read: err {e}")
+                }
+            }
+        } else if k == 6 {
+            // Nothing pending on any connection: a zero wait finds none.
+            var all: [i64] = []
+            for c in clients {
+                all.push(c)
+            }
+            for c in servers {
+                all.push(c)
+            }
+            print("{r} idle wait: {handles_of(net_wait(all, 0))}")
+        } else if k == 7 {
+            let i = pick(s, clients.len())
+            let h = if pick(s, 2) == 0 { clients[i] } else { servers[i] }
+            net_close(h)
+            net_close(h)
+            closed.push(h)
+            print("{r} closed {h}")
+            print("{r} write after close: {show_unit(tcp_write(h, "x"))}")
+            print("{r} wait after close: {handles_of(net_wait([h], 0))}")
+            // The other end sees the end.
+            let other = if h == clients[i] { servers[i] } else { clients[i] }
+            if ready(other) {
+                match tcp_read(other) {
+                    Ok(got) -> print("{r} other end read: [{got}]")
+                    Err(e) -> print("{r} other end: err {e}")
+                }
+            }
+            net_close(other)
+            closed.push(other)
+            var nc: [i64] = []
+            var ns: [i64] = []
+            for j in 0..clients.len() {
+                if j != i {
+                    nc.push(clients[j])
+                    ns.push(servers[j])
+                }
+            }
+            clients = nc
+            servers = ns
+        } else if k == 8 {
+            let w = pick(s, 6)
+            if w == 0 {
+                print("{r} accept on a connection: {show_i(tcp_accept(clients[0]))}")
+            } else if w == 1 {
+                print("{r} read on the listener: {show_s(tcp_read(lis))}")
+            } else if w == 2 {
+                print("{r} tcp read on udp: {show_s(tcp_read(udp))}")
+            } else if w == 3 {
+                print("{r} udp send on tcp: {show_i(udp_send(clients[0], "127.0.0.1", 9, bytes_of([1])))}")
+            } else if w == 4 {
+                print("{r} peer of the listener: {show_peer(tcp_peer(lis))}")
+            } else {
+                print("{r} handle 99: {show_s(tcp_read(99))} {show_peer(tcp_peer(99))} {show_i(net_port(99))}")
+            }
+        } else if k == 9 {
+            let w = pick(s, 4)
+            if w == 0 {
+                print("{r} listen on 70000: {show_i(tcp_listen(70000))}")
+            } else if w == 1 {
+                print("{r} connect to port 0: {show_i(tcp_connect("127.0.0.1", 0))}")
+            } else if w == 2 {
+                print("{r} udp bind -1: {show_i(udp_bind(-1))}")
+            } else {
+                // A port nothing listens on: one this program just let go.
+                let tmp = int_of(tcp_listen(0))
+                let tp = int_of(net_port(tmp))
+                net_close(tmp)
+                print("{r} connect to a closed port: {show_i(tcp_connect("127.0.0.1", tp))}")
+            }
+        } else if k == 10 {
+            let b = bytes_of(payload(s))
+            print("{r} udp to self: {show_i(udp_send(udp, "127.0.0.1", uport, b))}")
+            if ready(udp) {
+                match udp_recv_from(udp) {
+                    Ok(m) -> print("{r} datagram {m.0} from {m.1}")
+                    Err(e) -> print("{r} datagram: err {e}")
+                }
+            }
+        } else {
+            let b = bytes_of(payload(s))
+            print("{r} udp window to self: {show_i(udp_send(udp, "localhost", uport, b.slice(1, b.len())))}")
+            if ready(udp) {
+                match udp_recv(udp) {
+                    Ok(m) -> print("{r} datagram {m}")
+                    Err(e) -> print("{r} datagram: err {e}")
+                }
+            }
+        }
+    }
+    print("closed in all: {closed.len()}")
+}

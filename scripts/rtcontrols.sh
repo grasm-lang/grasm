@@ -36,10 +36,9 @@
 #   alloc-live      a box given back without one fewer counted live
 #   alloc-escaped   a thread's live count not handed to the process when the
 #                   thread ends, which only the leak check at exit adds up
-#   alloc-poison    the allocator taking the poisoned build for the ordinary
-#                   one, and so handing a freed box out again
-#   alloc-handover  the leak check not handing this side's balance to the
-#                   Rust runtime's ledger before its check counts
+#   alloc-poison    a `dec` taking two, which the Grasm runtime's poisoned
+#                   build must report as a use after free
+#   leak-escaped    the leak check not counting what ended threads left live
 #   map-hash        the hash's last multiplier one off
 #   map-seed        the maps' seed not drawn from `getentropy`
 #   map-tombstone   a deleted entry's bucket always made EMPTY, never DELETED
@@ -88,6 +87,19 @@
 #   task-floor      a task's recursion checked against its thread's floor
 #   task-wake       a scheduler taking wakes meant for another block
 #   task-select     `chan_select` answering the last ready channel
+#   out-nl-held     a `print`'s newline not writing standard output out
+#   err-held        an `eprint` piece kept in standard error's buffer
+#   main-err-exit   the error `main` returns exiting 2 rather than 1
+#   journal-endian  a journal's integers written big-endian
+#   journal-clock   a replayed clock answering one more than its record
+#   foreign-quiet   a C call under a replay let through
+#   listdir-unsorted a directory's names in the order `readdir` gives them
+#   net-handle-high a closed socket's handle never taken again
+#   proc-swap       a program's standard output and error swapped
+#   cstr-nul        a string holding a NUL handed to C without the panic
+#   par-skip        a spread map's first chunk never taken
+#   par-order       a parallel filter's survivors kept last first
+#   net-order       network workers' answers in reverse order
 #
 # `RT_CONTROLS=<regex>` runs only the controls it matches. `RT_POISON=` as
 # for `scripts/rtswap.sh`.
@@ -101,6 +113,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 . "$(dirname "$0")/lib/s3.sh"
 . "$(dirname "$0")/lib/link.sh"
+. "$(dirname "$0")/lib/rtswap.sh"
 s3_driver
 link_driver
 export S3 LINK GRASM
@@ -111,7 +124,8 @@ ran=0
 declare -a MISSED=()
 
 # Copies compiler/rt to $WORK/$1 and replaces the text $3 with $4 in its
-# file $2 (exactly once), then builds the copy's object, $WORK/$1.o.
+# file $2 (exactly once), then builds the copy's object, $WORK/$1.o, and its
+# poisoned build, $WORK/$1.poison.o.
 plant() {
     local name=$1 file=$2
     rm -rf "${WORK:?}/$name"
@@ -127,8 +141,9 @@ open(path, "w").write(text.replace(old, new))
 EOF
         return 1
     fi
-    "$GRASM" tir "$WORK/$name/src/main.gr" >"$WORK/$name.tir" 2>"$WORK/$name.log" &&
-        "$S3" "$WORK/$name.tir" -o "$WORK/$name.o" --runtime >>"$WORK/$name.log" 2>&1
+    # And its poisoned build beside it, which the gates link where the Rust
+    # runtime's poisoned one is linked.
+    rtswap_build "$WORK/$name" "$WORK/$name.o" && rtswap_build "$WORK/$name" "$WORK/$name.poison.o" poison
 }
 
 # Runs `$3...` (a gate, with the planted object in RT_OBJ) and requires it to
@@ -290,22 +305,18 @@ if control alloc-escaped; then
 fi
 
 if control alloc-poison; then
-    plant alloc-poison src/alloc.gr '        if known != 0 {
-            return known == 2
-        }' '        if known != 0 or known == 0 {
-            return false
-        }' || { echo "error: alloc-poison does not build"; exit 1; }
-    expect alloc-poison 'differ under the poisoned runtime' env RTREL_SEEDS=1 RTREL_ROUNDS=20 RTREL_LEAKS=0 RTREL_POISONED=2 bash scripts/fuzz_rtrelease.sh
+    # The poisoned build is the one that catches a use after free: a `dec`
+    # taking two frees a box something still holds, and only that build
+    # says so (its `POISON`, read in `alloc.poisoned`).
+    plant alloc-poison src/val.gr 'v.atomic_add_i64(-1, Release) - 1 > 0' 'v.atomic_add_i64(-2, Release) - 2 > 0' ||
+        { echo "error: alloc-poison does not build"; exit 1; }
+    expect alloc-poison 'a use after free under the poisoned runtime' env RTREL_SEEDS=0 RTREL_ROUNDS=20 RTREL_LEAKS=0 RTREL_POISONED=2 bash scripts/fuzz_rtrelease.sh
 fi
 
-if control alloc-handover; then
-    plant alloc-handover src/leak.gr '            if stats {
-                hand_over(made)
-                hand_over(live - made)
-            } else {
-                hand_over(live)
-            }' '' || { echo "error: alloc-handover does not build"; exit 1; }
-    expect alloc-handover 'the two runtimes differ' env RTREL_SEEDS=2 RTREL_ROUNDS=20 RTREL_LEAKS=0 RTREL_POISONED=0 bash scripts/fuzz_rtrelease.sh
+if control leak-escaped; then
+    plant leak-escaped src/leak.gr '    let live = unsafe { alloc.local().offset(alloc.L_LIVE).load_i64() } + alloc.escaped(false)' '    let live = unsafe { alloc.local().offset(alloc.L_LIVE).load_i64() }' ||
+        { echo "error: leak-escaped does not build"; exit 1; }
+    expect leak-escaped 'the two runtimes differ' env RTPAR_SEEDS=4 RTPAR_ROUNDS=40 bash scripts/fuzz_rtpar.sh
 fi
 
 if control map-hash; then
@@ -435,7 +446,7 @@ if control ref-generation; then
 fi
 
 if control ref-drain; then
-    plant ref-drain src/leak.gr '            refs.drain()
+    plant ref-drain src/leak.gr '    refs.drain()
 ' '' || { echo "error: ref-drain does not build"; exit 1; }
     expect ref-drain 'the two runtimes differ' env RTREFS_SEEDS=2 RTREFS_ROUNDS=200 bash scripts/fuzz_rtrefs.sh
 fi
@@ -634,6 +645,108 @@ if control task-select; then
     expect task-select 'differs?' env RTTASKS_SEEDS=3 RTTASKS_ROUNDS=10 bash scripts/fuzz_rttasks.sh
 fi
 
+# Output and the ways out (docs/self-hosting.md §6.12): faults only the order
+# of the two streams together shows, and an exit status.
+if control out-nl-held; then
+    plant out-nl-held src/io.gr '    unsafe { out_put(mem_static("\n"), 1) }
+    out_flush_held()
+    out_unlock()' '    unsafe { out_put(mem_static("\n"), 1) }
+    out_unlock()' || { echo "error: out-nl-held does not build"; exit 1; }
+    expect out-nl-held 'the two runtimes differ' env RTOUT_SEEDS=2 RTOUT_ROUNDS=30 bash scripts/fuzz_rtout.sh
+fi
+
+if control err-held; then
+    plant err-held src/io.gr '        err_put(c, cn)
+    }
+    err_flush_held()
+    err_unlock()' '        err_put(c, cn)
+    }
+    err_unlock()' || { echo "error: err-held does not build"; exit 1; }
+    expect err-held 'the two runtimes differ' env RTOUT_SEEDS=2 RTOUT_ROUNDS=30 bash scripts/fuzz_rtout.sh
+fi
+
+if control main-err-exit; then
+    plant main-err-exit src/way.gr '        io.leave(1)' '        io.leave(2)' || { echo "error: main-err-exit does not build"; exit 1; }
+    expect main-err-exit 'ending 8: the two runtimes differ \(exit 1 and 2\)' env RTOUT_SEEDS=1 RTOUT_ROUNDS=5 bash scripts/fuzz_rtout.sh
+fi
+
+# The system families and the journal (§6.12).
+if control journal-endian; then
+    plant journal-endian src/journal.gr '        display.put_byte(t, v.shr(8 * i).bit_and(255))' '        display.put_byte(t, v.shr(56 - 8 * i).bit_and(255))' ||
+        { echo "error: journal-endian does not build"; exit 1; }
+    expect journal-endian 'wrote different journals|the two runtimes differ' env RTSYS_SEEDS=3 RTSYS_ROUNDS=40 RTSYS_NET=0 RTSYS_JOURNALS=0 bash scripts/fuzz_rtsys.sh
+fi
+
+if control journal-clock; then
+    plant journal-clock src/clock.gr 'export fn grt_now_millis() -> i64 {
+    let i = unsafe { journal.gate(mem_static("now_millis"), 10) }
+    if i >= 0 {
+        var v = 0
+        if journal.value_int(i, v) {
+            return v
+        }' 'export fn grt_now_millis() -> i64 {
+    let i = unsafe { journal.gate(mem_static("now_millis"), 10) }
+    if i >= 0 {
+        var v = 0
+        if journal.value_int(i, v) {
+            return v + 1
+        }' || { echo "error: journal-clock does not build"; exit 1; }
+    expect journal-clock 'journal [0-9]+ \([a-z]+\): the two runtimes differ' env RTSYS_SEEDS=1 RTSYS_ROUNDS=10 RTSYS_NET=0 RTSYS_JOURNALS=40 bash scripts/fuzz_rtsys.sh
+fi
+
+if control foreign-quiet; then
+    plant foreign-quiet src/journal.gr 'pub fn refuse_foreign(p: addr, n: i64) {
+    if not replaying() {' 'pub fn refuse_foreign(p: addr, n: i64) {
+    if true {' || { echo "error: foreign-quiet does not build"; exit 1; }
+    expect foreign-quiet 'journal [0-9]+ \(ccall\): the two runtimes differ' env RTSYS_SEEDS=1 RTSYS_ROUNDS=10 RTSYS_NET=0 RTSYS_JOURNALS=60 bash scripts/fuzz_rtsys.sh
+fi
+
+if control listdir-unsorted; then
+    plant listdir-unsorted src/files.gr '    sort_texts(names, count)' '    let _unsorted = count' ||
+        { echo "error: listdir-unsorted does not build"; exit 1; }
+    expect listdir-unsorted 'sysfuzz seed [0-9]+: the two runtimes differ' env RTSYS_SEEDS=6 RTSYS_ROUNDS=60 RTSYS_NET=0 RTSYS_JOURNALS=0 bash scripts/fuzz_rtsys.sh
+fi
+
+if control net-handle-high; then
+    plant net-handle-high src/net.gr '        if mem_process(NFREE).load_i64() > 0 {' '        if mem_process(NFREE).load_i64() > 1000000 {' ||
+        { echo "error: net-handle-high does not build"; exit 1; }
+    expect net-handle-high 'netfuzz seed [0-9]+: the two runtimes differ' env RTSYS_SEEDS=1 RTSYS_ROUNDS=60 RTSYS_NET=3 RTSYS_JOURNALS=0 bash scripts/fuzz_rtsys.sh
+fi
+
+if control proc-swap; then
+    plant proc-swap src/proc.gr 'display.put(if fd == out { to } else { te }, chunk, got)' 'display.put(if fd == out { te } else { to }, chunk, got)' ||
+        { echo "error: proc-swap does not build"; exit 1; }
+    expect proc-swap 'sysfuzz seed [0-9]+: the two runtimes differ' env RTSYS_SEEDS=4 RTSYS_ROUNDS=60 RTSYS_NET=0 RTSYS_JOURNALS=0 bash scripts/fuzz_rtsys.sh
+fi
+
+if control cstr-nul; then
+    plant cstr-nul src/cmem.gr 'if unsafe { p.offset(i).load_u8() }.as_i64() == 0 {' 'if unsafe { p.offset(i).load_u8() }.as_i64() == 256 {' ||
+        { echo "error: cstr-nul does not build"; exit 1; }
+    expect cstr-nul 'panic case 0: the two runtimes differ' env RTSYS_SEEDS=1 RTSYS_ROUNDS=10 RTSYS_NET=0 RTSYS_JOURNALS=0 bash scripts/fuzz_rtsys.sh
+fi
+
+# The parallel workers (§6.12).
+if control par-skip; then
+    plant par-skip src/par.gr 'job.offset(J_LEFT).atomic_store_i64((nin + chunk - 1) / chunk, Release)' 'job.offset(J_LEFT).atomic_store_i64((nin + chunk - 1) / chunk - 1, Release)' ||
+        { echo "error: par-skip does not build"; exit 1; }
+    expect par-skip 'parfuzz [0-9]+ [0-9]+: the two runtimes differ' env RTPAR_SEEDS=4 RTPAR_ROUNDS=40 bash scripts/fuzz_rtpar.sh
+fi
+
+if control par-order; then
+    plant par-order src/par.gr 'lists.spush(out, unsafe { words.offset(8 * i).load_i64() })' 'lists.spush(out, unsafe { words.offset(8 * (n - 1 - i)).load_i64() })' ||
+        { echo "error: par-order does not build"; exit 1; }
+    expect par-order 'parfuzz [0-9]+ [0-9]+: the two runtimes differ' env RTPAR_SEEDS=4 RTPAR_ROUNDS=40 bash scripts/fuzz_rtpar.sh
+fi
+
+if control net-order; then
+    plant net-order src/par.gr '                t.offset(T_X).store_i64(x)
+                t.offset(T_OUT).store_addr(out.offset(8 * i))
+                t.offset(T_NAME)' '                t.offset(T_X).store_i64(x)
+                t.offset(T_OUT).store_addr(out.offset(8 * (n - 1 - i)))
+                t.offset(T_NAME)' || { echo "error: net-order does not build"; exit 1; }
+    expect net-order 'parfuzz [0-9]+ [0-9]+: the two runtimes differ' env RTPAR_SEEDS=4 RTPAR_ROUNDS=40 bash scripts/fuzz_rtpar.sh
+fi
+
 if control fallback-gone; then
     plant fallback-gone src/math.gr 'export fn grt_f64_sqrt(' 'fn grt_f64_sqrt(' ||
         { echo "error: fallback-gone does not build"; exit 1; }
@@ -648,7 +761,7 @@ if control fallback-call; then
 export fn grt_f64_floor(v: f64) -> f64 {
     unsafe { grasm_f64_floor(v) }
 }' || { echo "error: fallback-call does not build"; exit 1; }
-    expect fallback-call "calls the Rust runtime's _grasm_f64_floor" env RT_S3=0 RT_POISON= RT_PROGRAMS='^examples/hello' bash scripts/rtswap.sh
+    expect fallback-call 'the Grasm runtime calls _grasm_f64_floor, which nothing linked with it defines' env RT_S3=0 RT_POISON= RT_PROGRAMS='^examples/hello' bash scripts/rtswap.sh
 fi
 
 echo

@@ -1,0 +1,1911 @@
+// The network ([L-LIB-NET], [L-LIB-UDP]; docs/self-hosting.md §6.12): what
+// the Rust runtime's sockets were -- the handle table, TCP listeners and
+// connections, UDP sockets, `net_wait` on a `kqueue` per thread -- each
+// operation journaled, each failure the same `IoFailed` text.
+//
+// A handle is an index into one table for the whole process, so every
+// worker means the same socket by it ([L-LIB-NET-WORKERS]); a new socket
+// takes the lowest free index (a min-heap of them), as handle numbers are
+// visible to programs. The table is behind a lock (`SOCK_LOCK`) held only to
+// find or change an entry, never across a call that can block: an operation
+// takes the socket out counted (`strong`, as the Rust runtime's `Arc`) and
+// lets go, and the descriptor is closed when the last count goes -- so a
+// `net_close` on one thread while another waits in `accept` or `kevent`
+// leaves the waiter on the socket it started with. A `kqueue` keeps its
+// sockets by identity, counted weakly (`weak`), as the Rust runtime's
+// `Weak`: the record outlives its descriptor while a waiter remembers it.
+//
+// Per thread, as the Rust runtime's thread-locals: a 64 KiB read buffer;
+// the listeners the last `net_wait` found ready, so a `tcp_accept` on one
+// does not wait; and the `kqueue`, with the set registered on it.
+import layout
+import sys
+import alloc
+import strread
+import bytes
+import display
+import lists
+import structs
+import panic
+import sysv
+import fsys
+import journal
+
+extern fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+extern fn bind(fd: i32, a: addr, len: i32) -> i32
+extern fn listen(fd: i32, backlog: i32) -> i32
+extern fn accept(fd: i32, a: addr, len: addr) -> i32
+extern fn connect(fd: i32, a: addr, len: i32) -> i32
+extern fn send(fd: i32, p: addr, n: i64, flags: i32) -> i64
+extern fn recv(fd: i32, p: addr, n: i64, flags: i32) -> i64
+extern fn sendto(fd: i32, p: addr, n: i64, flags: i32, a: addr, alen: i32) -> i64
+extern fn recvfrom(fd: i32, p: addr, n: i64, flags: i32, a: addr, alen: addr) -> i64
+extern fn setsockopt(fd: i32, level: i32, name: i32, value: addr, len: i32) -> i32
+extern fn close(fd: i32) -> i32
+extern fn getaddrinfo(host: addr, service: addr, hint: addr, out: addr) -> i32
+extern fn freeaddrinfo(a: addr)
+extern fn getsockname(fd: i32, a: addr, len: addr) -> i32
+extern fn getpeername(fd: i32, a: addr, len: addr) -> i32
+extern fn inet_ntop(family: i32, a: addr, out: addr, len: i32) -> addr
+extern fn poll(fds: addr, n: i32, timeout: i32) -> i32
+extern fn kqueue() -> i32
+extern fn kevent(kq: i32, changes: addr, nchanges: i32, events: addr, nevents: i32, timeout: addr) -> i32
+extern fn strlen(p: addr) -> i64
+
+let SOCK_STREAM = 1
+let SOCK_DGRAM = 2
+let SOL_SOCKET = 65535
+let SO_REUSEADDR = 4
+let IPPROTO_TCP = 6
+let TCP_NODELAY = 1
+let AF_INET6 = 30
+
+let POLLIN = 1
+let POLLHUP = 16
+let POLLNVAL = 32
+
+let EVFILT_READ = -1
+let EV_ADD = 1
+let EV_DELETE = 2
+let EV_RECEIPT = 64
+let EV_ERROR = 16384
+/// A `struct kevent`: ident at 0, filter (i16) at 8, flags (u16) at 10,
+/// fflags at 12, data at 16, udata at 24.
+let KEV = 32
+
+/// The kinds of socket.
+let LISTENER = 0
+let STREAM = 1
+let DATAGRAM = 2
+
+// A socket: its strong count, its weak count (one for all the strong ones
+// together, as an `Arc`'s), its kind and its descriptor.
+let S_STRONG = 0
+let S_WEAK = 8
+let S_KIND = 16
+let S_FD = 24
+let S_SIZE = 32
+
+/// The table's lock.
+process_local SOCK_LOCK: i64
+/// rtlint: guarded by SOCK_LOCK
+process_local SLOTS: i64
+/// rtlint: guarded by SOCK_LOCK
+process_local NSLOTS: i64
+/// rtlint: guarded by SOCK_LOCK
+process_local SLOTCAP: i64
+/// rtlint: guarded by SOCK_LOCK
+process_local FREEH: i64
+/// rtlint: guarded by SOCK_LOCK
+process_local NFREE: i64
+/// rtlint: guarded by SOCK_LOCK
+process_local FREECAP: i64
+
+/// This thread's read buffer, 64 KiB once made.
+thread_local RBUF: i64
+/// The listeners this thread's last `net_wait` found ready: an array, its
+/// length and its room.
+thread_local READY: i64
+thread_local NREADY: i64
+thread_local READYCAP: i64
+/// This thread's `kqueue` and what is registered with it: the descriptor
+/// plus one (0 for none made yet); the handles as the program passed them
+/// (array, count); the registered sockets, by descriptor and socket record,
+/// each counted weakly (pairs, count); each descriptor's place in the set
+/// (array of `u32`, count); which are listeners (bytes); the events'
+/// room (array, count). And whether the thread-end call is armed.
+thread_local KQ: i64
+thread_local KQ_H: i64
+thread_local KQ_NH: i64
+thread_local KQ_REG: i64
+thread_local KQ_NREG: i64
+thread_local KQ_POS: i64
+thread_local KQ_NPOS: i64
+thread_local KQ_LIS: i64
+thread_local KQ_EV: i64
+thread_local KQ_NEV: i64
+thread_local ARMED: i64
+
+// ----- sockets, counted -------------------------------------------------------------
+
+fn sock_new(kind: i64, fd: i64) -> addr {
+    let s = sys.alloc(S_SIZE)
+    unsafe {
+        s.offset(S_STRONG).atomic_store_i64(1, Relaxed)
+        s.offset(S_WEAK).atomic_store_i64(1, Relaxed)
+        s.offset(S_KIND).store_i64(kind)
+        s.offset(S_FD).store_i64(fd)
+    }
+    s
+}
+
+fn kind_of(s: addr) -> i64 {
+    unsafe { s.offset(S_KIND).load_i64() }
+}
+
+fn fd_of(s: addr) -> i64 {
+    unsafe { s.offset(S_FD).load_i64() }
+}
+
+fn weak_drop(s: addr) {
+    if unsafe { s.offset(S_WEAK).atomic_add_i64(-1, AcqRel) } == 1 {
+        sys.dealloc(s)
+    }
+}
+
+/// One strong count given back: the last closes the descriptor.
+fn sock_drop(s: addr) {
+    if unsafe { s.offset(S_STRONG).atomic_add_i64(-1, AcqRel) } == 1 {
+        unsafe {
+            let _ = close(fd_of(s).as_i32())
+        }
+        weak_drop(s)
+    }
+}
+
+/// A weak count on `s`.
+fn downgrade(s: addr) {
+    unsafe {
+        let _ = s.offset(S_WEAK).atomic_add_i64(1, AcqRel)
+    }
+}
+
+/// Whether `s` is still open; a strong count taken when it is.
+fn upgrade(s: addr) -> bool {
+    var n = unsafe { s.offset(S_STRONG).atomic_load_i64(Acquire) }
+    while n != 0 {
+        let was = unsafe { s.offset(S_STRONG).atomic_cas_i64(n, n + 1, AcqRel) }
+        if was == n {
+            return true
+        }
+        n = was
+    }
+    false
+}
+
+/// A socket of `kind` on descriptor `fd` that failed before it was put in
+/// the table: its descriptor closed, as dropping the Rust runtime's
+/// `Socket` closes it.
+fn shut(fd: i64) {
+    unsafe {
+        let _ = close(fd.as_i32())
+    }
+}
+
+// ----- the table --------------------------------------------------------------------
+
+fn spin(tries: i64) -> i64 {
+    if tries > 64 {
+        unsafe {
+            let _ = sched_yield()
+        }
+        return 0
+    }
+    tries + 1
+}
+
+extern fn sched_yield() -> i32
+
+fn unlock() {
+    unsafe { mem_process(SOCK_LOCK).atomic_store_i64(0, Release) }
+}
+
+/// rtlint: holds SOCK_LOCK
+fn heap_push(i: i64) {
+    unsafe {
+        var n = mem_process(NFREE).load_i64()
+        let cap = mem_process(FREECAP).load_i64()
+        if n == cap {
+            let want = if cap == 0 { 16 } else { 2 * cap }
+            let a = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_process(FREEH).load_i64()), 8 * want) }
+            mem_process(FREEH).store_i64(a.as_i64())
+            mem_process(FREECAP).store_i64(want)
+        }
+        let h = mem_addr(mem_process(FREEH).load_i64())
+        // Sift up.
+        var at = n
+        while at > 0 {
+            let up = (at - 1) / 2
+            if h.offset(8 * up).load_i64() <= i {
+                break
+            }
+            h.offset(8 * at).store_i64(h.offset(8 * up).load_i64())
+            at = up
+        }
+        h.offset(8 * at).store_i64(i)
+        mem_process(NFREE).store_i64(n + 1)
+    }
+}
+
+/// rtlint: holds SOCK_LOCK
+fn heap_pop() -> i64 {
+    unsafe {
+        let n = mem_process(NFREE).load_i64()
+        let h = mem_addr(mem_process(FREEH).load_i64())
+        let top = h.load_i64()
+        let last = h.offset(8 * (n - 1)).load_i64()
+        let m = n - 1
+        mem_process(NFREE).store_i64(m)
+        // Sift the last one down from the root.
+        var at = 0
+        while true {
+            let l = 2 * at + 1
+            if l >= m {
+                break
+            }
+            var c = l
+            if l + 1 < m and h.offset(8 * (l + 1)).load_i64() < h.offset(8 * l).load_i64() {
+                c = l + 1
+            }
+            if h.offset(8 * c).load_i64() >= last {
+                break
+            }
+            h.offset(8 * at).store_i64(h.offset(8 * c).load_i64())
+            at = c
+        }
+        if m > 0 {
+            h.offset(8 * at).store_i64(last)
+        }
+        top
+    }
+}
+
+/// rtlint: holds SOCK_LOCK
+fn slot(i: i64) -> addr {
+    unsafe { mem_addr(mem_process(SLOTS).load_i64()).offset(8 * i) }
+}
+
+/// rtlint: holds SOCK_LOCK
+fn nslots() -> i64 {
+    unsafe { mem_process(NSLOTS).load_i64() }
+}
+
+/// rtlint: holds SOCK_LOCK
+fn put_held(s: addr) -> i64 {
+    unsafe {
+        if mem_process(NFREE).load_i64() > 0 {
+            let i = heap_pop()
+            slot(i).store_addr(s)
+            return i
+        }
+        let n = mem_process(NSLOTS).load_i64()
+        let cap = mem_process(SLOTCAP).load_i64()
+        if n == cap {
+            let want = if cap == 0 { 4 } else { 2 * cap }
+            let a = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_process(SLOTS).load_i64()), 8 * want) }
+            mem_process(SLOTS).store_i64(a.as_i64())
+            mem_process(SLOTCAP).store_i64(want)
+        }
+        mem_process(NSLOTS).store_i64(n + 1)
+        slot(n).store_addr(s)
+        n
+    }
+}
+
+/// A new socket in the table: its handle, the lowest free.
+fn socket_put(kind: i64, fd: i64) -> i64 {
+    let s = sock_new(kind, fd)
+    var tries = 0
+    while unsafe { mem_process(SOCK_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    let h = put_held(s)
+    unlock()
+    h
+}
+
+/// rtlint: holds SOCK_LOCK
+fn get_held(h: i64) -> addr {
+    unsafe {
+        if h < 0 or h >= nslots() {
+            return mem_addr(0)
+        }
+        let s = slot(h).load_addr()
+        if not sysv.null(s) {
+            let _ = s.offset(S_STRONG).atomic_add_i64(1, AcqRel)
+        }
+        s
+    }
+}
+
+/// The socket handle `h` names, counted, so it stays open however long the
+/// caller holds it; the null address when it names none.
+fn socket_get(h: i64) -> addr {
+    var tries = 0
+    while unsafe { mem_process(SOCK_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    let s = get_held(h)
+    unlock()
+    s
+}
+
+/// rtlint: holds SOCK_LOCK
+fn take_held(h: i64) -> addr {
+    unsafe {
+        if h < 0 or h >= nslots() {
+            return mem_addr(0)
+        }
+        let s = slot(h).load_addr()
+        if not sysv.null(s) {
+            slot(h).store_i64(0)
+            heap_push(h)
+        }
+        s
+    }
+}
+
+/// rtlint: holds SOCK_LOCK
+fn names_held(h: i64, s: addr) -> bool {
+    unsafe { h >= 0 and h < nslots() and slot(h).load_addr().as_i64() == s.as_i64() }
+}
+
+/// `socket {h} is not open`.
+fn not_open(h: i64) -> addr {
+    let t = display.text_new()
+    unsafe { sysv.put_s(t, mem_static("socket "), 7) }
+    display.put_int(t, h)
+    unsafe { sysv.put_s(t, mem_static(" is not open"), 12) }
+    sysv.failed_buf(t)
+}
+
+/// `socket {h}` and the rest, as an `IoFailed`.
+fn socket_says(h: i64, rest: addr, rn: i64) -> addr {
+    let t = display.text_new()
+    unsafe { sysv.put_s(t, mem_static("socket "), 7) }
+    display.put_int(t, h)
+    sysv.put_s(t, rest, rn)
+    sysv.failed_buf(t)
+}
+
+/// The handle an operation was given: whether it is an `i64`, in `h`.
+fn handle_arg(v: addr, inout h: i64) -> bool {
+    sysv.int_arg(v, h)
+}
+
+fn handle_not_int() -> addr {
+    unsafe { sysv.failed(mem_static("handle must be an integer"), mem_static_len("handle must be an integer")) }
+}
+
+fn port_not_int() -> addr {
+    unsafe { sysv.failed(mem_static("port must be an integer"), mem_static_len("port must be an integer")) }
+}
+
+fn port_out_of_range(port: i64) -> addr {
+    let t = display.text_new()
+    unsafe { sysv.put_s(t, mem_static("port "), 5) }
+    display.put_int(t, port)
+    unsafe { sysv.put_s(t, mem_static(" is out of range"), 16) }
+    sysv.failed_buf(t)
+}
+
+// ----- per thread ---------------------------------------------------------------------
+
+fn thread_done(unused: addr) {
+    unsafe {
+        let b = mem_tls(RBUF).load_i64()
+        if b != 0 {
+            sys.dealloc(mem_addr(b))
+            mem_tls(RBUF).store_i64(0)
+        }
+        let r = mem_tls(READY).load_i64()
+        if r != 0 {
+            sys.dealloc(mem_addr(r))
+            mem_tls(READY).store_i64(0)
+        }
+        let kq = mem_tls(KQ).load_i64()
+        if kq != 0 {
+            let _ = close((kq - 1).as_i32())
+            mem_tls(KQ).store_i64(0)
+            kq_forget()
+        }
+        mem_tls(ARMED).store_i64(0)
+    }
+}
+
+/// This thread's state is freed when it ends: armed on first use.
+fn arm() {
+    unsafe {
+        if mem_tls(ARMED).load_i64() == 0 {
+            mem_tls(ARMED).store_i64(1)
+            alloc.at_thread_end(mem_fn_addr(thread_done), mem_addr(0))
+        }
+    }
+}
+
+fn rbuf() -> addr {
+    unsafe {
+        var b = mem_tls(RBUF).load_i64()
+        if b == 0 {
+            arm()
+            b = sys.alloc_zeroed(65536).as_i64()
+            mem_tls(RBUF).store_i64(b)
+        }
+        mem_addr(b)
+    }
+}
+
+fn ready_clear() {
+    unsafe { mem_tls(NREADY).store_i64(0) }
+}
+
+fn ready_push(h: i64) {
+    unsafe {
+        let n = mem_tls(NREADY).load_i64()
+        let cap = mem_tls(READYCAP).load_i64()
+        if n == cap {
+            arm()
+            let want = if cap == 0 { 4 } else { 2 * cap }
+            let a = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_tls(READY).load_i64()), 8 * want) }
+            mem_tls(READY).store_i64(a.as_i64())
+            mem_tls(READYCAP).store_i64(want)
+        }
+        mem_addr(mem_tls(READY).load_i64()).offset(8 * n).store_i64(h)
+        mem_tls(NREADY).store_i64(n + 1)
+    }
+}
+
+/// Whether `h` was among the ready listeners; taken out if so, the last put
+/// in its place (`swap_remove`).
+fn ready_take(h: i64) -> bool {
+    unsafe {
+        let n = mem_tls(NREADY).load_i64()
+        let a = mem_addr(mem_tls(READY).load_i64())
+        var i = 0
+        while i < n {
+            if a.offset(8 * i).load_i64() == h {
+                a.offset(8 * i).store_i64(a.offset(8 * (n - 1)).load_i64())
+                mem_tls(NREADY).store_i64(n - 1)
+                return true
+            }
+            i += 1
+        }
+        false
+    }
+}
+
+// ----- addresses ----------------------------------------------------------------------
+
+// An address: its length, its family, then its bytes (up to 128).
+let A_LEN = 0
+let A_FAMILY = 8
+let A_BYTES = 16
+let A_SIZE = 144
+
+fn addr_new() -> addr {
+    sys.alloc_zeroed(A_SIZE)
+}
+
+/// The `getaddrinfo` hint the Rust runtime gives: any family, a stream.
+fn hint() -> addr {
+    let h = sys.alloc_zeroed(48)
+    unsafe { h.offset(8).store_u32(SOCK_STREAM.as_u32()) }
+    h
+}
+
+/// `host` (`hn` bytes) and `port` resolved: the first address, or with
+/// `all`, every one with bytes, into `out` (address records, up to `room`),
+/// their count answered; -1 when nothing resolves (`ENOENT`, as the Rust
+/// runtime reports it: `getaddrinfo` reports through its own return value).
+fn resolve(host: addr, hn: i64, port: i64, all: bool, out: addr, room: i64) -> i64 {
+    let hc = sysv.c_copy(host, hn)
+    let pt = display.text_new()
+    display.put_int(pt, port)
+    let pc = sysv.c_copy(display.text_ptr(pt), display.text_len(pt))
+    display.text_free(pt)
+    let hi = hint()
+    let found = sys.alloc_zeroed(8)
+    let r = unsafe { getaddrinfo(hc, pc, hi, found) }.as_i64()
+    sys.dealloc(hc)
+    sys.dealloc(pc)
+    sys.dealloc(hi)
+    let first = unsafe { found.load_addr() }
+    sys.dealloc(found)
+    if r != 0 or sysv.null(first) {
+        return -1
+    }
+    var count = 0
+    var node = first
+    unsafe {
+        while not sysv.null(node) and count < room {
+            let len = node.offset(16).load_u32().as_i64()
+            let a = node.offset(32).load_addr()
+            if not all or (not sysv.null(a) and len > 0) {
+                let rec = out.offset(8 * count).load_addr()
+                let keep = if len > 128 { 128 } else { len }
+                rec.offset(A_LEN).store_i64(keep)
+                rec.offset(A_FAMILY).store_i64(node.offset(4).load_u32().as_i64())
+                sys.copy(rec.offset(A_BYTES), a, keep)
+                count += 1
+                if not all {
+                    break
+                }
+            }
+            node = node.offset(40).load_addr()
+        }
+        freeaddrinfo(first)
+    }
+    if count == 0 {
+        return -1
+    }
+    count
+}
+
+/// An address's text and port (`Addr::parts`): the port from bytes 2 and 3,
+/// big-endian; the family from byte 1; the text by `inet_ntop`, empty when
+/// the address is too short or cannot be shown.
+fn parts(a: addr, t: addr) -> i64 {
+    unsafe {
+        let len = a.offset(A_LEN).load_i64()
+        let b = a.offset(A_BYTES)
+        if len < 4 {
+            return 0
+        }
+        let port = b.offset(2).load_u8().as_i64() * 256 + b.offset(3).load_u8().as_i64()
+        let family = b.offset(1).load_u8().as_i64()
+        let at = if family == AF_INET6 { 8 } else { 4 }
+        let want = if family == AF_INET6 { 46 } else { 16 }
+        if len < at {
+            return port
+        }
+        let text = sys.alloc_zeroed(46)
+        let shown = inet_ntop(family.as_i32(), b.offset(at), text, want.as_i32())
+        if not sysv.null(shown) {
+            display.put(t, text, strlen(text))
+        }
+        sys.dealloc(text)
+        port
+    }
+}
+
+/// `getsockname` or `getpeername` of `fd` into `a`: 0, or the error number.
+fn name_of(fd: i64, peer: bool, a: addr) -> i64 {
+    let lenp = sys.alloc(8)
+    unsafe {
+        lenp.store_u32(128.as_u32())
+        let r = if peer { getpeername(fd.as_i32(), a.offset(A_BYTES), lenp) } else { getsockname(fd.as_i32(), a.offset(A_BYTES), lenp) }
+        if r.as_i64() < 0 {
+            let e = sysv.errno()
+            sys.dealloc(lenp)
+            return e
+        }
+        let got = lenp.load_u32().as_i64()
+        a.offset(A_LEN).store_i64(if got > 128 { 128 } else { got })
+    }
+    sys.dealloc(lenp)
+    0
+}
+
+fn set_opt(fd: i64, level: i64, name: i64, on: bool) -> i64 {
+    let v = sys.alloc(8)
+    unsafe {
+        v.store_u32(if on { 1.as_u32() } else { 0.as_u32() })
+        let r = setsockopt(fd.as_i32(), level.as_i32(), name.as_i32(), v, 4.as_i32()).as_i64()
+        let e = sysv.errno()
+        sys.dealloc(v)
+        if r < 0 { e } else { 0 }
+    }
+}
+
+/// `fd` blocking or not: 0, or the error number.
+fn set_nonblocking(fd: i64, on: bool) -> i64 {
+    let flags = fsys.fcntl3(fd, fsys.F_GETFL, 0)
+    if flags < 0 {
+        return sysv.errno()
+    }
+    let want = if on { flags.bit_or(fsys.O_NONBLOCK) } else { flags.bit_and(fsys.O_NONBLOCK.bit_not()) }
+    if fsys.fcntl3(fd, fsys.F_SETFL, want) < 0 {
+        return sysv.errno()
+    }
+    0
+}
+
+/// Nagle's algorithm off, its failure ignored.
+fn without_nagle(fd: i64) {
+    let _ = set_opt(fd, IPPROTO_TCP, TCP_NODELAY, true)
+}
+
+/// A socket of `kind` for address `a`'s family: the descriptor, or the
+/// error number negated.
+fn open_socket(kind: i64, a: addr) -> i64 {
+    let fd = unsafe { socket(a.offset(A_FAMILY).load_i64().as_i32(), kind.as_i32(), 0.as_i32()) }.as_i64()
+    if fd < 0 {
+        return 0 - sysv.errno()
+    }
+    fd
+}
+
+/// A listener on `host:port`, `SO_REUSEADDR` set first, a backlog of 1024:
+/// the descriptor, or the error number negated.
+fn listen_on(host: addr, hn: i64, port: i64) -> i64 {
+    let recs = sys.alloc(8)
+    let a = addr_new()
+    unsafe { recs.store_addr(a) }
+    let n = resolve(host, hn, port, false, recs, 1)
+    sys.dealloc(recs)
+    if n < 0 {
+        sys.dealloc(a)
+        return 0 - sysv.ENOENT
+    }
+    let fd = open_socket(SOCK_STREAM, a)
+    if fd < 0 {
+        sys.dealloc(a)
+        return fd
+    }
+    var e = set_opt(fd, SOL_SOCKET, SO_REUSEADDR, true)
+    if e == 0 {
+        if unsafe { bind(fd.as_i32(), a.offset(A_BYTES), a.offset(A_LEN).load_i64().as_i32()) }.as_i64() < 0 {
+            e = sysv.errno()
+        } else if unsafe { listen(fd.as_i32(), 1024.as_i32()) }.as_i64() < 0 {
+            e = sysv.errno()
+        }
+    }
+    sys.dealloc(a)
+    if e != 0 {
+        shut(fd)
+        return 0 - e
+    }
+    fd
+}
+
+/// A UDP socket bound to `host:port`: the descriptor, or the error number
+/// negated.
+fn udp_on(host: addr, hn: i64, port: i64) -> i64 {
+    let recs = sys.alloc(8)
+    let a = addr_new()
+    unsafe { recs.store_addr(a) }
+    let n = resolve(host, hn, port, false, recs, 1)
+    sys.dealloc(recs)
+    if n < 0 {
+        sys.dealloc(a)
+        return 0 - sysv.ENOENT
+    }
+    let fd = open_socket(SOCK_DGRAM, a)
+    if fd < 0 {
+        sys.dealloc(a)
+        return fd
+    }
+    if unsafe { bind(fd.as_i32(), a.offset(A_BYTES), a.offset(A_LEN).load_i64().as_i32()) }.as_i64() < 0 {
+        let e = sysv.errno()
+        sys.dealloc(a)
+        shut(fd)
+        return 0 - e
+    }
+    sys.dealloc(a)
+    fd
+}
+
+/// Every address of `host` tried in turn: the first that connects, or the
+/// last error number negated (`ENOENT` when none resolves).
+fn connect_to(host: addr, hn: i64, port: i64) -> i64 {
+    let room = 64
+    let recs = sys.alloc(8 * room)
+    var i = 0
+    while i < room {
+        unsafe { recs.offset(8 * i).store_addr(addr_new()) }
+        i += 1
+    }
+    let n = resolve(host, hn, port, true, recs, room)
+    var last = sysv.ENOENT
+    var got = -1
+    var k = 0
+    while k < n and got < 0 {
+        let a = unsafe { recs.offset(8 * k).load_addr() }
+        let fd = open_socket(SOCK_STREAM, a)
+        if fd < 0 {
+            last = 0 - fd
+        } else {
+            var trying = true
+            while trying {
+                if unsafe { connect(fd.as_i32(), a.offset(A_BYTES), a.offset(A_LEN).load_i64().as_i32()) }.as_i64() >= 0 {
+                    got = fd
+                    trying = false
+                } else {
+                    let e = sysv.errno()
+                    if e != sysv.EINTR {
+                        last = e
+                        shut(fd)
+                        trying = false
+                    }
+                }
+            }
+        }
+        k += 1
+    }
+    i = 0
+    while i < room {
+        sys.dealloc(unsafe { recs.offset(8 * i).load_addr() })
+        i += 1
+    }
+    sys.dealloc(recs)
+    if got >= 0 { got } else { 0 - last }
+}
+
+// ----- waiting ------------------------------------------------------------------------
+
+/// `poll` for reading on `n` descriptors at `fds`, retried past a signal:
+/// which are ready -- a peer gone or a descriptor not open counts -- as a
+/// byte each into `ready`; 0, or the error number.
+fn wait_readable(fds: addr, n: i64, timeout: i64, ready: addr) -> i64 {
+    let set = sys.alloc_zeroed(8 * n + 8)
+    var i = 0
+    while i < n {
+        unsafe {
+            set.offset(8 * i).store_u32(fds.offset(8 * i).load_i64().as_u32())
+            set.offset(8 * i + 4).store_u16(POLLIN.as_u16())
+            set.offset(8 * i + 6).store_u16(0.as_u16())
+        }
+        i += 1
+    }
+    while true {
+        let r = unsafe { poll(set, n.as_i32(), timeout.as_i32()) }.as_i64()
+        if r >= 0 {
+            i = 0
+            while i < n {
+                let rev = unsafe { set.offset(8 * i + 6).load_u16() }.as_i64()
+                unsafe { ready.offset(i).store_u8(if rev.bit_and(POLLIN + POLLHUP + POLLNVAL) != 0 { 1.as_u8() } else { 0.as_u8() }) }
+                i += 1
+            }
+            sys.dealloc(set)
+            return 0
+        }
+        let e = sysv.errno()
+        if e != sysv.EINTR {
+            sys.dealloc(set)
+            return e
+        }
+    }
+    0
+}
+
+/// One connection from listener `fd`; when `ready`, without waiting for
+/// one. The descriptor, or into `why` what went wrong and -1.
+fn accept_from(fd: i64, ready: bool, why: addr) -> i64 {
+    while true {
+        let c = unsafe { accept(fd.as_i32(), mem_addr(0), mem_addr(0)) }.as_i64()
+        if c >= 0 {
+            // Accepted from a non-blocking listener, a stream inherits the
+            // mode on macOS; every read and write here expects to block.
+            let e = set_nonblocking(c, false)
+            if e != 0 {
+                shut(c)
+                sysv.put_os(why, e)
+                return -1
+            }
+            without_nagle(c)
+            return c
+        }
+        let e = sysv.errno()
+        if e == sysv.EAGAIN {
+            if ready {
+                unsafe { sysv.put_s(why, mem_static("no connection is waiting"), mem_static_len("no connection is waiting")) }
+                return -1
+            }
+            let fds = sys.alloc(8)
+            let r = sys.alloc(8)
+            unsafe { fds.store_i64(fd) }
+            let w = wait_readable(fds, 1, -1, r)
+            sys.dealloc(fds)
+            sys.dealloc(r)
+            if w != 0 {
+                sysv.put_os(why, w)
+                return -1
+            }
+        } else if e != sysv.EINTR {
+            sysv.put_os(why, e)
+            return -1
+        }
+    }
+    -1
+}
+
+/// The sockets `n` handles at `hs` name, each counted, into `held`, under
+/// one lock; when one names none, every one taken given back and the
+/// handle answered (else -1).
+fn socket_set(hs: addr, n: i64, held: addr) -> i64 {
+    var tries = 0
+    while unsafe { mem_process(SOCK_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    var i = 0
+    var missing = -1
+    while i < n and missing < 0 {
+        let h = unsafe { hs.offset(8 * i).load_i64() }
+        let s = get_held(h)
+        if sysv.null(s) {
+            missing = h
+        } else {
+            unsafe { held.offset(8 * i).store_addr(s) }
+            i += 1
+        }
+    }
+    unlock()
+    if missing >= 0 {
+        var k = 0
+        while k < i {
+            sock_drop(unsafe { held.offset(8 * k).load_addr() })
+            k += 1
+        }
+        return missing
+    }
+    -1
+}
+
+/// The waiter's registrations forgotten: each weak count given back.
+fn kq_forget() {
+    unsafe {
+        let reg = mem_addr(mem_tls(KQ_REG).load_i64())
+        var i = 0
+        while i < mem_tls(KQ_NREG).load_i64() {
+            weak_drop(reg.offset(16 * i + 8).load_addr())
+            i += 1
+        }
+        mem_tls(KQ_NREG).store_i64(0)
+        mem_tls(KQ_NH).store_i64(0)
+    }
+    free_cell_h()
+    free_cell_reg()
+    free_cell_pos()
+    free_cell_lis()
+    free_cell_ev()
+}
+
+fn free_cell_h() {
+    unsafe {
+        let p = mem_tls(KQ_H).load_i64()
+        if p != 0 {
+            sys.dealloc(mem_addr(p))
+            mem_tls(KQ_H).store_i64(0)
+        }
+    }
+}
+
+fn free_cell_reg() {
+    unsafe {
+        let p = mem_tls(KQ_REG).load_i64()
+        if p != 0 {
+            sys.dealloc(mem_addr(p))
+            mem_tls(KQ_REG).store_i64(0)
+        }
+    }
+}
+
+fn free_cell_pos() {
+    unsafe {
+        let p = mem_tls(KQ_POS).load_i64()
+        if p != 0 {
+            sys.dealloc(mem_addr(p))
+            mem_tls(KQ_POS).store_i64(0)
+        }
+        mem_tls(KQ_NPOS).store_i64(0)
+    }
+}
+
+fn free_cell_lis() {
+    unsafe {
+        let p = mem_tls(KQ_LIS).load_i64()
+        if p != 0 {
+            sys.dealloc(mem_addr(p))
+            mem_tls(KQ_LIS).store_i64(0)
+        }
+    }
+}
+
+fn free_cell_ev() {
+    unsafe {
+        let p = mem_tls(KQ_EV).load_i64()
+        if p != 0 {
+            sys.dealloc(mem_addr(p))
+            mem_tls(KQ_EV).store_i64(0)
+        }
+        mem_tls(KQ_NEV).store_i64(0)
+    }
+}
+
+fn kev_set(k: addr, fd: i64, flags: i64) {
+    unsafe {
+        k.store_i64(fd)
+        k.offset(8).store_u16(EVFILT_READ.as_u16())
+        k.offset(10).store_u16(flags.as_u16())
+        k.offset(12).store_u32(0.as_u32())
+        k.offset(16).store_i64(0)
+        k.offset(24).store_i64(0)
+    }
+}
+
+/// Whether this thread's waiter's handles are `wanted` (`n` at `hs`), each
+/// still naming the socket registered for it.
+fn kq_same(hs: addr, n: i64) -> bool {
+    unsafe {
+        if mem_tls(KQ_NH).load_i64() != n or mem_tls(KQ_H).load_i64() == 0 {
+            return false
+        }
+        let have = mem_addr(mem_tls(KQ_H).load_i64())
+        var i = 0
+        while i < n {
+            if have.offset(8 * i).load_i64() != hs.offset(8 * i).load_i64() {
+                return false
+            }
+            i += 1
+        }
+        let reg = mem_addr(mem_tls(KQ_REG).load_i64())
+        var tries = 0
+        while mem_process(SOCK_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {
+            tries = spin(tries)
+        }
+        var all = true
+        i = 0
+        while i < n and all {
+            all = names_held(hs.offset(8 * i).load_i64(), reg.offset(16 * i + 8).load_addr())
+            i += 1
+        }
+        unlock()
+        all
+    }
+}
+
+/// `net_wait` through this thread's `kqueue`: 1 waited, with which of the
+/// `n` handles are ready and which are listeners as bytes into `ready` and
+/// `lis`; 2 failed, with why into `why`; 0 when `poll` must answer instead
+/// (no `kqueue`, or a handle twice in the set).
+fn kq_wait(hs: addr, n: i64, timeout: i64, ready: addr, lis: addr, why: addr) -> i64 {
+    unsafe {
+        if mem_tls(KQ).load_i64() == 0 {
+            let kq = kqueue().as_i64()
+            if kq < 0 {
+                return 0
+            }
+            arm()
+            mem_tls(KQ).store_i64(kq + 1)
+        }
+        let kq = mem_tls(KQ).load_i64() - 1
+        if not kq_same(hs, n) {
+            let held = sys.alloc(8 * n + 8)
+            let missing = socket_set(hs, n, held)
+            if missing >= 0 {
+                sys.dealloc(held)
+                let t = display.text_new()
+                sysv.put_s(t, mem_static("socket "), 7)
+                display.put_int(t, missing)
+                sysv.put_s(t, mem_static(" is not open"), 12)
+                display.put(why, display.text_ptr(t), display.text_len(t))
+                display.text_free(t)
+                return 2
+            }
+            // Where each descriptor sits in the set, by number.
+            var top = 0
+            var i = 0
+            while i < n {
+                let fd = fd_of(held.offset(8 * i).load_addr())
+                if fd > top {
+                    top = fd
+                }
+                i += 1
+            }
+            let npos = top + 1
+            let pos = sys.alloc(4 * npos + 4)
+            i = 0
+            while i < npos {
+                pos.offset(4 * i).store_u32(4294967295.as_u32())
+                i += 1
+            }
+            i = 0
+            while i < n {
+                let fd = fd_of(held.offset(8 * i).load_addr())
+                if fd < 0 or pos.offset(4 * fd).load_u32().as_i64() != 4294967295 {
+                    sys.dealloc(pos)
+                    drop_held(held, n)
+                    return 0
+                }
+                pos.offset(4 * fd).store_u32(i.as_u32())
+                i += 1
+            }
+            let reg = mem_addr(mem_tls(KQ_REG).load_i64())
+            let nreg = mem_tls(KQ_NREG).load_i64()
+            let changes = sys.alloc(KEV * (nreg + n) + KEV)
+            var nch = 0
+            i = 0
+            while i < nreg {
+                let rs = reg.offset(16 * i + 8).load_addr()
+                var kept = false
+                var j = 0
+                while j < n and not kept {
+                    kept = held.offset(8 * j).load_addr().as_i64() == rs.as_i64()
+                    j += 1
+                }
+                if not kept and upgrade(rs) {
+                    kev_set(changes.offset(KEV * nch), reg.offset(16 * i).load_i64(), EV_DELETE + EV_RECEIPT)
+                    nch += 1
+                    sock_drop(rs)
+                }
+                i += 1
+            }
+            i = 0
+            while i < n {
+                let s = held.offset(8 * i).load_addr()
+                let fd = fd_of(s)
+                var known = false
+                var j = 0
+                while j < nreg and not known {
+                    known = reg.offset(16 * j).load_i64() == fd and reg.offset(16 * j + 8).load_addr().as_i64() == s.as_i64()
+                    j += 1
+                }
+                if not known {
+                    kev_set(changes.offset(KEV * nch), fd, EV_ADD + EV_RECEIPT)
+                    nch += 1
+                }
+                i += 1
+            }
+            if nch > 0 {
+                let receipts = sys.alloc(KEV * nch)
+                sys.copy(receipts, changes, KEV * nch)
+                let got = kevent(kq.as_i32(), changes, nch.as_i32(), receipts, nch.as_i32(), mem_addr(0)).as_i64()
+                if got < 0 {
+                    let e = sysv.errno()
+                    sys.dealloc(receipts)
+                    sys.dealloc(changes)
+                    sys.dealloc(pos)
+                    drop_held(held, n)
+                    sysv.put_os(why, e)
+                    return 2
+                }
+                var r = 0
+                while r < got {
+                    let rc = receipts.offset(KEV * r)
+                    var added = false
+                    var c = 0
+                    while c < nch and not added {
+                        let ch = changes.offset(KEV * c)
+                        added = ch.load_i64() == rc.load_i64() and ch.offset(10).load_u16().as_i64().bit_and(EV_ADD) != 0
+                        c += 1
+                    }
+                    let data = rc.offset(16).load_i64()
+                    if rc.offset(10).load_u16().as_i64().bit_and(EV_ERROR) != 0 and data != 0 and added {
+                        // What is registered is no longer known: start over.
+                        let _ = close(kq.as_i32())
+                        mem_tls(KQ).store_i64(kqueue().as_i64() + 1)
+                        kq_forget()
+                        sys.dealloc(receipts)
+                        sys.dealloc(changes)
+                        sys.dealloc(pos)
+                        drop_held(held, n)
+                        sysv.put_os(why, data)
+                        return 2
+                    }
+                    r += 1
+                }
+                sys.dealloc(receipts)
+            }
+            sys.dealloc(changes)
+            // The new set: registrations, weakly; listeners; handles.
+            let old = mem_addr(mem_tls(KQ_REG).load_i64())
+            i = 0
+            while i < nreg {
+                weak_drop(old.offset(16 * i + 8).load_addr())
+                i += 1
+            }
+            free_cell_reg()
+            free_cell_lis()
+            free_cell_h()
+            free_cell_pos()
+            let nr = sys.alloc(16 * n + 16)
+            let nl = sys.alloc(n + 1)
+            let nh = sys.alloc(8 * n + 8)
+            i = 0
+            while i < n {
+                let s = held.offset(8 * i).load_addr()
+                nr.offset(16 * i).store_i64(fd_of(s))
+                downgrade(s)
+                nr.offset(16 * i + 8).store_addr(s)
+                nl.offset(i).store_u8(if kind_of(s) == LISTENER { 1.as_u8() } else { 0.as_u8() })
+                nh.offset(8 * i).store_i64(hs.offset(8 * i).load_i64())
+                i += 1
+            }
+            mem_tls(KQ_REG).store_addr(nr)
+            mem_tls(KQ_NREG).store_i64(n)
+            mem_tls(KQ_LIS).store_addr(nl)
+            mem_tls(KQ_H).store_addr(nh)
+            mem_tls(KQ_NH).store_i64(n)
+            mem_tls(KQ_POS).store_addr(pos)
+            mem_tls(KQ_NPOS).store_i64(npos)
+            drop_held(held, n)
+        }
+        let cap = if n > 1 { n } else { 1 }
+        if mem_tls(KQ_NEV).load_i64() < cap {
+            free_cell_ev()
+            mem_tls(KQ_EV).store_addr(sys.alloc(KEV * cap))
+            mem_tls(KQ_NEV).store_i64(cap)
+        }
+        let ev = mem_addr(mem_tls(KQ_EV).load_i64())
+        var i = 0
+        while i < cap {
+            kev_set(ev.offset(KEV * i), -1, 0)
+            i += 1
+        }
+        let ts = sys.alloc(16)
+        var tp = mem_addr(0)
+        if timeout >= 0 {
+            ts.store_i64(timeout / 1000)
+            ts.offset(8).store_i64(timeout % 1000 * 1000000)
+            tp = ts
+        }
+        while true {
+            let got = kevent(kq.as_i32(), mem_addr(0), 0.as_i32(), ev, cap.as_i32(), tp).as_i64()
+            if got >= 0 {
+                i = 0
+                while i < n {
+                    ready.offset(i).store_u8(0.as_u8())
+                    lis.offset(i).store_u8(mem_addr(mem_tls(KQ_LIS).load_i64()).offset(i).load_u8())
+                    i += 1
+                }
+                let pos = mem_addr(mem_tls(KQ_POS).load_i64())
+                let npos = mem_tls(KQ_NPOS).load_i64()
+                var e = 0
+                while e < got {
+                    let id = ev.offset(KEV * e).load_i64()
+                    if id >= 0 and id < npos {
+                        let at = pos.offset(4 * id).load_u32().as_i64()
+                        if at != 4294967295 {
+                            ready.offset(at).store_u8(1.as_u8())
+                        }
+                    }
+                    e += 1
+                }
+                sys.dealloc(ts)
+                return 1
+            }
+            let e = sysv.errno()
+            if e != sysv.EINTR {
+                sys.dealloc(ts)
+                sysv.put_os(why, e)
+                return 2
+            }
+        }
+        0
+    }
+}
+
+fn drop_held(held: addr, n: i64) {
+    var i = 0
+    while i < n {
+        sock_drop(unsafe { held.offset(8 * i).load_addr() })
+        i += 1
+    }
+    sys.dealloc(held)
+}
+
+/// `net_wait` through `poll`: 1 or 2 as `kq_wait` answers.
+fn poll_wait(hs: addr, n: i64, timeout: i64, ready: addr, lis: addr, why: addr) -> i64 {
+    let held = sys.alloc(8 * n + 8)
+    let missing = socket_set(hs, n, held)
+    if missing >= 0 {
+        sys.dealloc(held)
+        unsafe { sysv.put_s(why, mem_static("socket "), 7) }
+        display.put_int(why, missing)
+        unsafe { sysv.put_s(why, mem_static(" is not open"), 12) }
+        return 2
+    }
+    let fds = sys.alloc(8 * n + 8)
+    var i = 0
+    while i < n {
+        let s = unsafe { held.offset(8 * i).load_addr() }
+        unsafe {
+            fds.offset(8 * i).store_i64(fd_of(s))
+            lis.offset(i).store_u8(if kind_of(s) == LISTENER { 1.as_u8() } else { 0.as_u8() })
+        }
+        i += 1
+    }
+    let e = wait_readable(fds, n, timeout, ready)
+    sys.dealloc(fds)
+    drop_held(held, n)
+    if e != 0 {
+        sysv.put_os(why, e)
+        return 2
+    }
+    1
+}
+
+/// A list's elements as words, whichever representation holds it (the Rust
+/// runtime's `scalar_words`); their count in `n`. The caller frees them.
+pub fn scalar_words(l: addr, what: addr, wn: i64, inout n: i64) -> addr {
+    let t = sysv.tag(l)
+    if t == layout.TAG_LIST_SCALAR {
+        n = lists.slen(l)
+        let w = sys.alloc(8 * n + 8)
+        var i = 0
+        while i < n {
+            unsafe { w.offset(8 * i).store_i64(lists.sget(l, i)) }
+            i += 1
+        }
+        return w
+    }
+    if t == layout.TAG_LIST {
+        var k = 0
+        let items = lists.items(l, k)
+        let w = sys.alloc(8 * k + 8)
+        var i = 0
+        while i < k {
+            let x = unsafe { items.offset(8 * i).load_addr() }
+            let xt = sysv.tag(x)
+            unsafe {
+                if xt == layout.TAG_I64 or xt == layout.TAG_U64 or xt == layout.TAG_F64 {
+                    w.offset(8 * i).store_i64(x.offset(layout.WORD_AT).load_i64())
+                } else if xt == layout.TAG_BOOL {
+                    w.offset(8 * i).store_i64(x.offset(layout.BOOL_AT).load_u8().as_i64())
+                } else {
+                    let m = display.text_new()
+                    display.put(m, what, wn)
+                    sysv.put_s(m, mem_static(" on a list of non-scalars"), mem_static_len(" on a list of non-scalars"))
+                    panic.say(display.text_ptr(m), display.text_len(m))
+                }
+            }
+            i += 1
+        }
+        n = k
+        return w
+    }
+    let m = display.text_new()
+    display.put(m, what, wn)
+    unsafe { sysv.put_s(m, mem_static(" on a non-list"), mem_static_len(" on a non-list")) }
+    panic.say(display.text_ptr(m), display.text_len(m))
+    unsafe { mem_addr(0) }
+}
+
+fn net_wait_now(handles: addr, timeout: addr) -> addr {
+    var tm = 0
+    if not sysv.int_arg(timeout, tm) {
+        return unsafe { sysv.failed(mem_static("timeout must be an integer"), mem_static_len("timeout must be an integer")) }
+    }
+    let ms = if tm < 0 { -1 } else if tm > 2147483647 { 2147483647 } else { tm }
+    var n = 0
+    let hs = unsafe { scalar_words(handles, mem_static("net_wait"), 8, n) }
+    if n == 0 {
+        sys.dealloc(hs)
+        return sysv.ok(lists.new_scalar(layout.SK_I64))
+    }
+    let ready = sys.alloc(n + 1)
+    let lis = sys.alloc(n + 1)
+    let why = display.text_new()
+    var r = kq_wait(hs, n, ms, ready, lis, why)
+    if r == 0 {
+        r = poll_wait(hs, n, ms, ready, lis, why)
+    }
+    if r == 2 {
+        sys.dealloc(hs)
+        sys.dealloc(ready)
+        sys.dealloc(lis)
+        return sysv.failed_buf(why)
+    }
+    display.text_free(why)
+    ready_clear()
+    var i = 0
+    while i < n {
+        unsafe {
+            if ready.offset(i).load_u8().as_i64() != 0 and lis.offset(i).load_u8().as_i64() != 0 {
+                ready_push(hs.offset(8 * i).load_i64())
+            }
+        }
+        i += 1
+    }
+    let out = lists.new_scalar(layout.SK_I64)
+    i = 0
+    while i < n {
+        unsafe {
+            if ready.offset(i).load_u8().as_i64() != 0 {
+                lists.spush(out, hs.offset(8 * i).load_i64())
+            }
+        }
+        i += 1
+    }
+    sys.dealloc(hs)
+    sys.dealloc(ready)
+    sys.dealloc(lis)
+    sysv.ok(out)
+}
+
+export fn grt_net_wait(handles: addr, timeout: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("net_wait"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = net_wait_now(handles, timeout)
+    unsafe { journal.record(mem_static("net_wait"), 8, out) }
+    out
+}
+
+// ----- the operations -----------------------------------------------------------------
+
+fn net_port_now(handle: addr) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    let a = addr_new()
+    let e = name_of(fd_of(s), false, a)
+    sock_drop(s)
+    if e != 0 {
+        sys.dealloc(a)
+        return sysv.failed_os(e)
+    }
+    let t = display.text_new()
+    let port = parts(a, t)
+    display.text_free(t)
+    sys.dealloc(a)
+    sysv.ok(sysv.int(port))
+}
+
+export fn grt_net_port(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("net_port"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = net_port_now(handle)
+    unsafe { journal.record(mem_static("net_port"), 8, out) }
+    out
+}
+
+/// A listener on `host`, or the loopback address when `host` is null.
+fn listen_now(host: addr, port: addr, on: bool) -> addr {
+    var hp = unsafe { mem_static("127.0.0.1") }
+    var hn = 9
+    if on {
+        if not strread.is_str(host) {
+            return unsafe { sysv.failed(mem_static("host must be text"), mem_static_len("host must be text")) }
+        }
+        hp = strread.text_of(host, hn)
+    }
+    var p = 0
+    if not sysv.int_arg(port, p) {
+        return port_not_int()
+    }
+    if p < 0 or p > 65535 {
+        return port_out_of_range(p)
+    }
+    let fd = listen_on(hp, hn, p)
+    if fd < 0 {
+        return sysv.failed_os(0 - fd)
+    }
+    let e = set_nonblocking(fd, true)
+    if e != 0 {
+        shut(fd)
+        return sysv.failed_os(e)
+    }
+    sysv.ok(sysv.int(socket_put(LISTENER, fd)))
+}
+
+export fn grt_tcp_listen(port: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_listen"), 10) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = listen_now(unsafe { mem_addr(0) }, port, false)
+    unsafe { journal.record(mem_static("tcp_listen"), 10, out) }
+    out
+}
+
+export fn grt_tcp_listen_on(host: addr, port: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_listen_on"), 13) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = listen_now(host, port, true)
+    unsafe { journal.record(mem_static("tcp_listen_on"), 13, out) }
+    out
+}
+
+fn tcp_connect_now(host: addr, port: addr) -> addr {
+    if not strread.is_str(host) {
+        return unsafe { sysv.failed(mem_static("host must be text"), mem_static_len("host must be text")) }
+    }
+    var hn = 0
+    let hp = strread.text_of(host, hn)
+    var p = 0
+    if not sysv.int_arg(port, p) {
+        return port_not_int()
+    }
+    if p < 1 or p > 65535 {
+        return port_out_of_range(p)
+    }
+    let fd = connect_to(hp, hn, p)
+    if fd < 0 {
+        return sysv.failed_os(0 - fd)
+    }
+    without_nagle(fd)
+    sysv.ok(sysv.int(socket_put(STREAM, fd)))
+}
+
+export fn grt_tcp_connect(host: addr, port: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_connect"), 11) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_connect_now(host, port)
+    unsafe { journal.record(mem_static("tcp_connect"), 11, out) }
+    out
+}
+
+fn tcp_accept_now(handle: addr) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    let ready = ready_take(h)
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    let k = kind_of(s)
+    if k == STREAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a connection, not a listener"), mem_static_len(" is a connection, not a listener")) }
+    }
+    if k == DATAGRAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a datagram socket, not a listener"), mem_static_len(" is a datagram socket, not a listener")) }
+    }
+    let why = display.text_new()
+    let c = accept_from(fd_of(s), ready, why)
+    sock_drop(s)
+    if c < 0 {
+        return sysv.failed_buf(why)
+    }
+    display.text_free(why)
+    sysv.ok(sysv.int(socket_put(STREAM, c)))
+}
+
+export fn grt_tcp_accept(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_accept"), 10) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_accept_now(handle)
+    unsafe { journal.record(mem_static("tcp_accept"), 10, out) }
+    out
+}
+
+/// One `recv` on a stream into this thread's buffer: how many bytes, or the
+/// error number negated.
+fn recv_once(fd: i64) -> i64 {
+    let b = rbuf()
+    while true {
+        let n = unsafe { recv(fd.as_i32(), b, 65536, 0.as_i32()) }
+        if n >= 0 {
+            return n
+        }
+        let e = sysv.errno()
+        if e != sysv.EINTR {
+            return 0 - e
+        }
+    }
+    0
+}
+
+/// A read on stream `h`: as text (lossy) or as bytes.
+fn tcp_read_any(handle: addr, as_bytes: bool) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    let k = kind_of(s)
+    if k == LISTENER {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a listener, not a connection"), mem_static_len(" is a listener, not a connection")) }
+    }
+    if k == DATAGRAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a datagram socket — use udp_recv, which keeps message boundaries"), mem_static_len(" is a datagram socket — use udp_recv, which keeps message boundaries")) }
+    }
+    let n = recv_once(fd_of(s))
+    sock_drop(s)
+    if n < 0 {
+        return sysv.failed_os(0 - n)
+    }
+    if as_bytes {
+        return sysv.ok(bytes.bytes_copy(rbuf(), n))
+    }
+    sysv.ok(sysv.lossy_text(rbuf(), n))
+}
+
+export fn grt_tcp_read(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_read"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_read_any(handle, false)
+    unsafe { journal.record(mem_static("tcp_read"), 8, out) }
+    out
+}
+
+export fn grt_tcp_read_bytes(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_read_bytes"), 14) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_read_any(handle, true)
+    unsafe { journal.record(mem_static("tcp_read_bytes"), 14, out) }
+    out
+}
+
+/// All `n` bytes at `p` sent on `fd`, retried past a signal: 0, or the
+/// error number.
+fn send_all(fd: i64, p: addr, n: i64) -> i64 {
+    var done = 0
+    while done < n {
+        let w = unsafe { send(fd.as_i32(), p.offset(done), n - done, 0.as_i32()) }
+        if w > 0 {
+            done += w
+        } else {
+            let e = sysv.errno()
+            if not (w < 0 and e == sysv.EINTR) {
+                return if e == 0 { -1 } else { e }
+            }
+        }
+    }
+    0
+}
+
+/// The whole buffer a `bytes` value shares, not only its window: what the
+/// Rust runtime sends (`b.owner.clone()`), and so what this sends
+/// (docs/known-issues.md).
+fn owner_bytes(v: addr, inout n: i64) -> addr {
+    unsafe {
+        let arc = v.offset(layout.BYTES_OWNER).load_addr()
+        let vec = arc.offset(layout.ARC_DATA)
+        n = vec.offset(layout.VEC_LEN).load_i64()
+        vec.offset(layout.VEC_PTR).load_addr()
+    }
+}
+
+/// A write on stream `h`: `p` and `n` the bytes.
+fn tcp_write_on(h: i64, p: addr, n: i64) -> addr {
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    let k = kind_of(s)
+    if k == LISTENER {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a listener, not a connection"), mem_static_len(" is a listener, not a connection")) }
+    }
+    if k == DATAGRAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a datagram socket — use udp_send, which needs a destination"), mem_static_len(" is a datagram socket — use udp_send, which needs a destination")) }
+    }
+    let e = send_all(fd_of(s), p, n)
+    sock_drop(s)
+    if e != 0 {
+        return sysv.failed_os(if e < 0 { 0 } else { e })
+    }
+    sysv.ok(sysv.unit())
+}
+
+fn tcp_write_bytes_now(handle: addr, data: addr) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    if sysv.tag(data) != layout.TAG_BYTES {
+        return unsafe { sysv.failed(mem_static("tcp_write_bytes needs bytes"), mem_static_len("tcp_write_bytes needs bytes")) }
+    }
+    var n = 0
+    let p = owner_bytes(data, n)
+    tcp_write_on(h, p, n)
+}
+
+export fn grt_tcp_write_bytes(handle: addr, data: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_write_bytes"), 15) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_write_bytes_now(handle, data)
+    unsafe { journal.record(mem_static("tcp_write_bytes"), 15, out) }
+    out
+}
+
+fn tcp_write_now(handle: addr, data: addr) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    var n = 0
+    let p = sysv.text_arg(data, n)
+    tcp_write_on(h, p, n)
+}
+
+export fn grt_tcp_write(handle: addr, data: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_write"), 9) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_write_now(handle, data)
+    unsafe { journal.record(mem_static("tcp_write"), 9, out) }
+    out
+}
+
+fn tcp_peer_now(handle: addr) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    let k = kind_of(s)
+    if k == LISTENER {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a listener, not a connection"), mem_static_len(" is a listener, not a connection")) }
+    }
+    if k == DATAGRAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is a datagram socket — use udp_recv_from, which names each sender"), mem_static_len(" is a datagram socket — use udp_recv_from, which names each sender")) }
+    }
+    let a = addr_new()
+    let e = name_of(fd_of(s), true, a)
+    sock_drop(s)
+    if e != 0 {
+        sys.dealloc(a)
+        return sysv.failed_os(e)
+    }
+    let t = display.text_new()
+    let port = parts(a, t)
+    sys.dealloc(a)
+    let host = sysv.text_of_buf(t)
+    sysv.ok(structs.pair(host, sysv.int(port)))
+}
+
+export fn grt_tcp_peer(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("tcp_peer"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = tcp_peer_now(handle)
+    unsafe { journal.record(mem_static("tcp_peer"), 8, out) }
+    out
+}
+
+/// Closes a listener or a connection; closing one twice is no error. Its
+/// record is written before the socket is touched, and a replay never
+/// reaches the table.
+export fn grt_net_close(handle: addr) {
+    if unsafe { journal.gate(mem_static("net_close"), 9) } >= 0 {
+        return
+    }
+    unsafe { journal.record_unit(mem_static("net_close"), 9) }
+    var h = 0
+    if not handle_arg(handle, h) {
+        return
+    }
+    var tries = 0
+    while unsafe { mem_process(SOCK_LOCK).atomic_cas_i64(0, 1, Acquire) } != 0 {
+        tries = spin(tries)
+    }
+    let s = take_held(h)
+    unlock()
+    if not sysv.null(s) {
+        sock_drop(s)
+    }
+}
+
+fn udp_bind_now(port: addr) -> addr {
+    var p = 0
+    if not sysv.int_arg(port, p) {
+        return port_not_int()
+    }
+    if p < 0 or p > 65535 {
+        return port_out_of_range(p)
+    }
+    let fd = unsafe { udp_on(mem_static("0.0.0.0"), 7, p) }
+    if fd < 0 {
+        return sysv.failed_os(0 - fd)
+    }
+    sysv.ok(sysv.int(socket_put(DATAGRAM, fd)))
+}
+
+export fn grt_udp_bind(port: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("udp_bind"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = udp_bind_now(port)
+    unsafe { journal.record(mem_static("udp_bind"), 8, out) }
+    out
+}
+
+fn udp_send_now(handle: addr, host: addr, port: addr, data: addr) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    var p = 0
+    if not sysv.int_arg(port, p) {
+        return port_not_int()
+    }
+    if p < 1 or p > 65535 {
+        return port_out_of_range(p)
+    }
+    var hn = 0
+    let hp = sysv.text_arg(host, hn)
+    if sysv.tag(data) != layout.TAG_BYTES {
+        return unsafe { sysv.failed(mem_static("udp_send takes bytes"), mem_static_len("udp_send takes bytes")) }
+    }
+    var dn = 0
+    let dp = owner_bytes(data, dn)
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    if kind_of(s) != DATAGRAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is not a datagram socket"), mem_static_len(" is not a datagram socket")) }
+    }
+    let recs = sys.alloc(8)
+    let a = addr_new()
+    unsafe { recs.store_addr(a) }
+    let found = resolve(hp, hn, p, false, recs, 1)
+    sys.dealloc(recs)
+    if found < 0 {
+        sys.dealloc(a)
+        sock_drop(s)
+        return sysv.failed_os(sysv.ENOENT)
+    }
+    var sent = -1
+    var e = 0
+    while sent == -1 {
+        let w = unsafe { sendto(fd_of(s).as_i32(), dp, dn, 0.as_i32(), a.offset(A_BYTES), a.offset(A_LEN).load_i64().as_i32()) }
+        if w >= 0 {
+            sent = w
+        } else {
+            e = sysv.errno()
+            if e != sysv.EINTR {
+                sent = -2
+            }
+        }
+    }
+    sys.dealloc(a)
+    sock_drop(s)
+    if sent == -2 {
+        return sysv.failed_os(e)
+    }
+    sysv.ok(sysv.int(sent))
+}
+
+export fn grt_udp_send(handle: addr, host: addr, port: addr, data: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("udp_send"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = udp_send_now(handle, host, port, data)
+    unsafe { journal.record(mem_static("udp_send"), 8, out) }
+    out
+}
+
+/// One datagram on `h`, whole; with `from`, the sender's address and port
+/// too.
+fn udp_recv_any(handle: addr, from: bool) -> addr {
+    var h = 0
+    if not handle_arg(handle, h) {
+        return handle_not_int()
+    }
+    let s = socket_get(h)
+    if sysv.null(s) {
+        return not_open(h)
+    }
+    if kind_of(s) != DATAGRAM {
+        sock_drop(s)
+        return unsafe { socket_says(h, mem_static(" is not a datagram socket"), mem_static_len(" is not a datagram socket")) }
+    }
+    let b = rbuf()
+    let a = addr_new()
+    let flen = sys.alloc(8)
+    unsafe { flen.store_u32(128.as_u32()) }
+    var got = -1
+    var e = 0
+    while got == -1 {
+        let n = unsafe { recvfrom(fd_of(s).as_i32(), b, 65536, 0.as_i32(), a.offset(A_BYTES), flen) }
+        if n >= 0 {
+            got = n
+        } else {
+            e = sysv.errno()
+            if e != sysv.EINTR {
+                got = -2
+            }
+        }
+    }
+    sock_drop(s)
+    let fl = unsafe { flen.load_u32() }.as_i64()
+    sys.dealloc(flen)
+    if got == -2 {
+        sys.dealloc(a)
+        return sysv.failed_os(e)
+    }
+    unsafe { a.offset(A_LEN).store_i64(if fl > 128 { 128 } else { fl }) }
+    let data = bytes.bytes_copy(b, got)
+    if not from {
+        sys.dealloc(a)
+        return sysv.ok(data)
+    }
+    let t = display.text_new()
+    let port = parts(a, t)
+    sys.dealloc(a)
+    let host = sysv.text_of_buf(t)
+    sysv.ok(structs.triple(data, host, sysv.int(port)))
+}
+
+export fn grt_udp_recv(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("udp_recv"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = udp_recv_any(handle, false)
+    unsafe { journal.record(mem_static("udp_recv"), 8, out) }
+    out
+}
+
+export fn grt_udp_recv_from(handle: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("udp_recv_from"), 13) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = udp_recv_any(handle, true)
+    unsafe { journal.record(mem_static("udp_recv_from"), 13, out) }
+    out
+}

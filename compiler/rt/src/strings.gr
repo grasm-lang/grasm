@@ -31,7 +31,6 @@ import fmt
 import panic
 
 extern fn memcmp(a: addr, b: addr, n: i64) -> i32
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 let MAX_ALLOC = 8589934592
 let LEN_CACHE_MIN = 256
@@ -50,7 +49,7 @@ fn say(p: addr, n: i64) {
 
 /// Panics with the text in buffer `t`.
 fn say_text(t: addr) {
-    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+    unsafe { panic.say(display.text_ptr(t), display.text_len(t)) }
 }
 
 /// `v`'s text, its length in `n` (`as_str`): anything else is a panic.

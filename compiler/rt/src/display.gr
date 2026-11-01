@@ -20,9 +20,9 @@ import strread
 import keys
 import release
 import numstr
+import io
+import panic
 
-extern fn grasm_out_text(p: addr, n: i64)
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 // ----- text being made: a block of three words, its bytes, length, room
 
@@ -558,14 +558,14 @@ pub fn shown(v: addr) -> addr {
 
 export fn grt_out_val(v: addr) {
     let b = shown(v)
-    unsafe { grasm_out_text(text_ptr(b), text_len(b)) }
+    unsafe { io.out_text(text_ptr(b), text_len(b)) }
     text_free(b)
 }
 
 export fn grt_out_ref(r: i64) {
     let b = text_new()
     put_ref(b, r)
-    unsafe { grasm_out_text(text_ptr(b), text_len(b)) }
+    unsafe { io.out_text(text_ptr(b), text_len(b)) }
     text_free(b)
 }
 
@@ -582,9 +582,9 @@ export fn grt_panic_value(v: addr) {
     if unsafe { v.offset(layout.TAG).load_u8() }.as_i64() == layout.TAG_STR {
         var len = 0
         let p = strread.text_of(v, len)
-        unsafe { grasm_panic_msg(p, len) }
+        unsafe { panic.say(p, len) }
         return
     }
     let b = shown(v)
-    unsafe { grasm_panic_msg(text_ptr(b), text_len(b)) }
+    unsafe { panic.say(text_ptr(b), text_len(b)) }
 }

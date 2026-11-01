@@ -145,6 +145,9 @@ run_gate fuzz_rtstrings scripts/fuzz_rtstrings.sh
 run_gate fuzz_rtcase   scripts/fuzz_rtcase.sh
 run_gate fuzz_rtparse  scripts/fuzz_rtparse.sh
 run_gate fuzz_rttasks  scripts/fuzz_rttasks.sh
+run_gate fuzz_rtout    scripts/fuzz_rtout.sh
+run_gate fuzz_rtsys    scripts/fuzz_rtsys.sh
+run_gate fuzz_rtpar    scripts/fuzz_rtpar.sh
 run_gate rtcontrols    scripts/rtcontrols.sh
 run_gate rtdialect     scripts/rtdialect.sh
 run_gate rtdialectcontrols scripts/rtdialectcontrols.sh

@@ -1,0 +1,132 @@
+// The clocks and waiting (docs/self-hosting.md §6.12): `now_millis`, the
+// wall clock; `monotonic_millis` and `monotonic_nanos`, time since a moment
+// this process cannot name, the first time either is asked; `sleep_millis`.
+// Each is journaled as the Rust runtime journals it: on replay the recorded
+// number when the record holds one (a record holding anything else is taken
+// and the clock read anyway, as `if let Some(Wire::Int(v))` falls through),
+// and a replayed sleep does not wait.
+import layout
+import sys
+import sysv
+import journal
+
+extern fn clock_gettime(clock: i32, ts: addr) -> i32
+extern fn nanosleep(want: addr, left: addr) -> i32
+
+let CLOCK_REALTIME = 0
+/// macOS's `CLOCK_MONOTONIC`.
+let CLOCK_MONOTONIC = 6
+
+/// When the monotonic clocks started counting, in nanoseconds on
+/// `CLOCK_MONOTONIC`; 0 until first asked (the clock is never 0).
+process_local MONO_START: i64
+
+/// The clock's reading as seconds and nanoseconds, zero when it cannot be
+/// read, as `grasm_sys::sys::now` leaves its `TimeSpec`.
+fn reading(clock: i64, inout secs: i64, inout nanos: i64) {
+    let ts = sys.alloc_zeroed(16)
+    unsafe {
+        let _ = clock_gettime(clock.as_i32(), ts)
+        secs = ts.load_i64()
+        nanos = ts.offset(8).load_i64()
+    }
+    sys.dealloc(ts)
+}
+
+/// The monotonic clock in nanoseconds.
+fn mono_now() -> i64 {
+    var s = 0
+    var ns = 0
+    reading(CLOCK_MONOTONIC, s, ns)
+    s * 1000000000 + ns
+}
+
+/// Nanoseconds since the monotonic clocks started counting, never less
+/// than nothing.
+fn mono_elapsed() -> i64 {
+    var start = unsafe { mem_process(MONO_START).atomic_load_i64(Acquire) }
+    if start == 0 {
+        let now = mono_now()
+        let was = unsafe { mem_process(MONO_START).atomic_cas_i64(0, now, AcqRel) }
+        start = if was == 0 { now } else { was }
+    }
+    let d = mono_now() - start
+    if d < 0 { 0 } else { d }
+}
+
+export fn grt_now_millis() -> i64 {
+    let i = unsafe { journal.gate(mem_static("now_millis"), 10) }
+    if i >= 0 {
+        var v = 0
+        if journal.value_int(i, v) {
+            return v
+        }
+    }
+    var s = 0
+    var ns = 0
+    reading(CLOCK_REALTIME, s, ns)
+    let now = s * 1000 + ns / 1000000
+    unsafe { journal.record_int(mem_static("now_millis"), 10, now) }
+    now
+}
+
+export fn grt_monotonic_millis() -> i64 {
+    let i = unsafe { journal.gate(mem_static("monotonic_millis"), 16) }
+    if i >= 0 {
+        var v = 0
+        if journal.value_int(i, v) {
+            return v
+        }
+    }
+    let now = mono_elapsed() / 1000000
+    unsafe { journal.record_int(mem_static("monotonic_millis"), 16, now) }
+    now
+}
+
+export fn grt_monotonic_nanos() -> i64 {
+    let i = unsafe { journal.gate(mem_static("monotonic_nanos"), 15) }
+    if i >= 0 {
+        var v = 0
+        if journal.value_int(i, v) {
+            return v
+        }
+    }
+    let now = mono_elapsed()
+    unsafe { journal.record_int(mem_static("monotonic_nanos"), 15, now) }
+    now
+}
+
+/// Waits `n` milliseconds, finishing the wait a signal cut short.
+pub fn sleep_for(n: i64) {
+    let want = sys.alloc(16)
+    let left = sys.alloc_zeroed(16)
+    unsafe {
+        want.store_i64(n / 1000)
+        want.offset(8).store_i64(n % 1000 * 1000000)
+        var at = want
+        while nanosleep(at, left).as_i64() != 0 {
+            if sysv.errno() != sysv.EINTR {
+                break
+            }
+            at = left
+        }
+    }
+    sys.dealloc(want)
+    sys.dealloc(left)
+}
+
+/// Wait. A replay does not.
+export fn grt_sleep_millis(ms: addr) -> addr {
+    var n = 0
+    if not sysv.int_arg(ms, n) {
+        n = 0
+    }
+    if unsafe { journal.gate(mem_static("sleep_millis"), 12) } >= 0 {
+        return sysv.unit()
+    }
+    if n > 0 {
+        sleep_for(n)
+    }
+    unsafe { journal.record_unit(mem_static("sleep_millis"), 12) }
+    sysv.unit()
+}

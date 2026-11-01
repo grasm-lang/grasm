@@ -1995,7 +1995,7 @@ fn lower_callextern(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     let t = info.t
     let name = sexp.word(t, e, 3)
     let decl = extern_decl(t, name)
-    if decl < 0 or not extern_ok(t, decl) {
+    if decl < 0 or not extern_ok_for(t, decl, info.runtime) {
         bad(v, "outside the subset: a call of C function `{name}` {span_of(t, e)}")
         return -1
     }
@@ -2009,6 +2009,18 @@ fn lower_callextern(info: TirInfo, inout v: Vir, e: i64) -> i64 {
 /// Whether every parameter and the answer of `extern` declaration `decl`
 /// cross as this backend passes them.
 pub fn extern_ok(t: TirTree, decl: i64) -> bool {
+    extern_ok_for(t, decl, false)
+}
+
+/// `extern_ok`, for a program or for the runtime (`s3 --runtime`). A
+/// runtime's C function may take more than eight integers: past the eighth
+/// each travels on the stack, eight bytes at a time in argument order, so
+/// each must be eight bytes wide -- Apple's arm64 convention packs a
+/// narrower one -- and that is where the convention puts a variadic
+/// argument of any width. The runtime passes `open`'s mode and `fcntl`'s
+/// argument that way (`compiler/rt/src/fsys.gr`). A program's C function
+/// takes eight of each class, as before.
+pub fn extern_ok_for(t: TirTree, decl: i64, runtime: bool) -> bool {
     let ps = sexp.at(t, decl, 2)
     if t.kind[ps] != 2 {
         return false
@@ -2024,10 +2036,13 @@ pub fn extern_ok(t: TirTree, decl: i64) -> bool {
             nfp += 1
         } else {
             nint += 1
+            if nint > 8 and not (runtime and (is_ty(t, p, "i64") or is_ty(t, p, "u64") or is_ty(t, p, "addr"))) {
+                return false
+            }
         }
     }
-    // Eight of each class travel in registers; a runtime call takes no more.
-    nint <= 8 and nfp <= 8 and c_ret_ok(t, sexp.at(t, decl, 3))
+    // Eight of each class travel in registers.
+    nfp <= 8 and c_ret_ok(t, sexp.at(t, decl, 3))
 }
 
 /// The function a C function is called through as a value: the closure
@@ -3242,6 +3257,26 @@ fn call_parts(info: TirInfo, inout v: Vir, e: i64) -> (i64, i64, i64) {
     (r, -1, c)
 }
 
+/// Whether TIR expression `x` is a literal a constant's read may be: an
+/// integer, a float or a boolean, or an integer or a float negated.
+fn literal_const(t: TirTree, x: i64) -> bool {
+    if t.kind[x] != 2 {
+        return false
+    }
+    let kw = sexp.kw(t, x)
+    if kw == "int" or kw == "float" or kw == "bool" {
+        return true
+    }
+    if kw == "unary" and sexp.word(t, x, 3) == "neg" {
+        let ks = sexp.kids(t, x)
+        if ks.len() == 1 and t.kind[ks[0]] == 2 {
+            let inner = sexp.kw(t, ks[0])
+            return inner == "int" or inner == "float"
+        }
+    }
+    false
+}
+
 fn lower_const_read(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     let t = info.t
     let name = sexp.word(t, e, 3)
@@ -3254,6 +3289,15 @@ fn lower_const_read(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     if not held(k) {
         bad(v, "outside the subset: a constant of type {ty_text(t, e, 1)} {span_of(t, e)}")
         return -1
+    }
+    // A constant whose value is a literal -- an integer or a float, negated
+    // or not, or a boolean -- is that literal wherever it is read:
+    // evaluating it again ([T-CONST]) can only give the same value and does
+    // nothing else, so the read is the literal itself and not a call of a
+    // function answering it (docs/self-hosting.md §6.12).
+    let body = sexp.kids(t, info.c_elem[c])[0]
+    if literal_const(t, body) {
+        return value_of(info, v, body)
     }
     var args: [i64] = []
     if info.recursive[c] {

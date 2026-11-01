@@ -1,0 +1,115 @@
+// Output and the ways out on the Grasm runtime against the Rust runtime's
+// (docs/self-hosting.md §6.12), for `scripts/fuzz_rtout.sh`, which builds
+// this twice -- on the Rust runtime and with the Grasm runtime alone --
+// and requires the same bytes on standard output, on standard error and on
+// the two together (`2>&1`), whose order is when each stream was flushed,
+// and the same exit status.
+//
+//     outfuzz <seed> <rounds> [<end>]
+//
+// Each round prints or eprints: text of every length either side of the
+// buffers' 8 KiB, values of every kind interpolated, a line an `eprint`
+// interrupts while its pieces are made, empty lines. The run ends as `end`
+// says: 0 returning, 1 a panic with fixed text, 2 `exit` with a code past
+// 255, 3 `exit(-1)`, 4 a failed assertion, 5 a division by zero, 6 an index
+// out of bounds, 7 a panic with made text, 8 the error `main` returns.
+
+type Oops = | Bad(why: str, n: i64)
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+fn text(inout s: i64) -> str {
+    let k = pick(s, 8)
+    let n = if k == 0 { 8191 + pick(s, 3) } else if k == 1 { 4000 + pick(s, 300) } else if k == 2 { 0 } else { pick(s, 90) }
+    var b = str_builder()
+    for i in 0..n {
+        let c = pick(s, 30)
+        if c == 0 {
+            b.push_str("é")
+        } else if c == 1 {
+            b.push_str("\{")
+        } else {
+            b.push_str((97 + c).to_char())
+        }
+    }
+    b.to_str()
+}
+
+fn noisy(s: i64) -> i64 / {io} {
+    eprint("noise {s % 7}")
+    s % 1000
+}
+
+fn round(inout s: i64, r: i64) / {io} {
+    let k = pick(s, 9)
+    if k == 0 {
+        print(text(s))
+    } else if k == 1 {
+        eprint(text(s))
+    } else if k == 2 {
+        print("{r} a {noisy(next(s))} b {noisy(next(s))} c")
+    } else if k == 3 {
+        eprint("{r} e {noisy(next(s))} f")
+    } else if k == 4 {
+        let xs = [pick(s, 100), pick(s, 100)]
+        let m = {"k": 1.5, "j": -0.0}
+        print("{r} values {xs} {m} {r % 2 == 0} {3.25 * r.as_f64()} {(r, "t")}")
+    } else if k == 5 {
+        print("")
+        eprint("")
+    } else if k == 6 {
+        let t = text(s)
+        print("{r} {t.len()} {t}")
+    } else if k == 7 {
+        eprint("{r} {text(s)} {pick(s, 10)}")
+    } else {
+        print("{r} plain")
+    }
+}
+
+fn end_with(e: i64, s: i64) ! Oops / {io} {
+    if e == 1 {
+        panic("a planned panic é")
+    }
+    if e == 2 {
+        exit(300 + s.ushr(1) % 10)
+    }
+    if e == 3 {
+        exit(-1)
+    }
+    if e == 4 {
+        assert(s == s + 1)
+    }
+    if e == 5 {
+        let z = s - s
+        print("never {s / z}")
+    }
+    if e == 6 {
+        let xs = [1, 2, 3]
+        print("never {xs[3 + s.ushr(1) % 5]}")
+    }
+    if e == 7 {
+        panic("value {[s, s + 1]} {s.to_base(16)}")
+    }
+    if e == 8 {
+        fail(Bad("from main", s))
+    }
+}
+
+fn main() ! Oops / {io} {
+    let a = args()
+    var s = a[0].parse_int() ?? 1
+    let rounds = a[1].parse_int() ?? 10
+    let e = if a.len() > 2 { a[2].parse_int() ?? 0 } else { 0 }
+    for r in 0..rounds {
+        round(s, r)
+    }
+    try end_with(e, s)
+}

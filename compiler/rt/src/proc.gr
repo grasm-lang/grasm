@@ -1,0 +1,529 @@
+// Other programs ([L-LIB-PROC]; docs/self-hosting.md §6.12): `proc_run`,
+// a program run to its end with its standard output and error captured, and
+// `proc_pipeline`, a chain of them each one's output the next one's input --
+// what `grasm_sys::process` and the Rust runtime's two builtins were, each
+// journaled.
+//
+// Two rules decide the shape, as they decide the Rust runtime's. Nothing is
+// allocated between `fork` and `exec`: another thread may hold `malloc`'s
+// lock at the fork, and the child has only the thread that forked, so every
+// C string and the argument vector exist before it, and the child calls only
+// `close`, `dup2`, `execvp`, `write` and `_exit`. And both pipes are drained
+// together by one `poll` loop, or a child writing more to one than its pipe
+// holds while the parent reads the other would wait forever. A pipe's ends
+// are close-on-exec, so no child holds open a pipe it does not use; whether
+// `execvp` ran is said by a pipe of its own, which a failed one writes its
+// error number to and a successful one closes.
+import layout
+import sys
+import strread
+import bytes
+import display
+import lists
+import structs
+import sysv
+import fsys
+import journal
+
+extern fn pipe(ends: addr) -> i32
+extern fn fork() -> i32
+extern fn dup2(from: i32, to: i32) -> i32
+extern fn close(fd: i32) -> i32
+extern fn execvp(file: addr, argv: addr) -> i32
+extern fn _exit(code: i32)
+extern fn waitpid(pid: i32, status: addr, flags: i32) -> i32
+extern fn read(fd: i32, p: addr, n: i64) -> i64
+extern fn write(fd: i32, p: addr, n: i64) -> i64
+extern fn poll(fds: addr, n: i32, timeout: i32) -> i32
+extern fn kill(pid: i32, signal: i32) -> i32
+extern fn pthread_create(out: addr, attr: addr, entry: addr, arg: addr) -> i32
+extern fn pthread_detach(t: addr) -> i32
+
+let SIGKILL = 9
+let POLLIN = 1
+
+fn shut(fd: i64) {
+    if fd >= 0 {
+        unsafe {
+            let _ = close(fd.as_i32())
+        }
+    }
+}
+
+/// A pipe, both ends close-on-exec: its reader and writer into `r` and `w`;
+/// 0, or the error number.
+fn new_pipe(inout r: i64, inout w: i64) -> i64 {
+    let ends = sys.alloc(8)
+    if unsafe { pipe(ends) }.as_i64() < 0 {
+        let e = sysv.errno()
+        sys.dealloc(ends)
+        return e
+    }
+    r = unsafe { ends.load_u32() }.as_i64()
+    w = unsafe { ends.offset(4).load_u32() }.as_i64()
+    sys.dealloc(ends)
+    let _ = fsys.fcntl3(r, fsys.F_SETFD, fsys.FD_CLOEXEC)
+    let _ = fsys.fcntl3(w, fsys.F_SETFD, fsys.FD_CLOEXEC)
+    0
+}
+
+/// The argument vector of `program` and the `n` strings at `args` (text
+/// pairs): NUL-terminated copies and a null-terminated array of them, made
+/// before any fork. Freed by `argv_free`.
+fn argv_of(prog: addr, pn: i64, args: addr, n: i64) -> addr {
+    let v = sys.alloc(8 * (n + 2))
+    unsafe {
+        v.store_addr(sysv.c_copy(prog, pn))
+        var i = 0
+        while i < n {
+            v.offset(8 * (i + 1)).store_addr(sysv.c_copy(args.offset(16 * i).load_addr(), args.offset(16 * i + 8).load_i64()))
+            i += 1
+        }
+        v.offset(8 * (n + 1)).store_i64(0)
+    }
+    v
+}
+
+fn argv_free(v: addr, n: i64) {
+    var i = 0
+    while i <= n {
+        sys.dealloc(unsafe { v.offset(8 * i).load_addr() })
+        i += 1
+    }
+    sys.dealloc(v)
+}
+
+/// `pid`'s end: its exit code, or -1 for a signal; the error number negated
+/// minus 1000 when `waitpid` fails.
+fn wait_for(pid: i64) -> i64 {
+    let status = sys.alloc_zeroed(8)
+    while true {
+        let r = unsafe { waitpid(pid.as_i32(), status, 0.as_i32()) }.as_i64()
+        if r >= 0 {
+            break
+        }
+        let e = sysv.errno()
+        if e != sysv.EINTR {
+            sys.dealloc(status)
+            return -1000 - e
+        }
+    }
+    let st = unsafe { status.load_u32() }.as_i64()
+    sys.dealloc(status)
+    if st.bit_and(127) == 0 {
+        return st.shr(8).bit_and(255)
+    }
+    -1
+}
+
+/// Forks and execs `program` with `args` (its argument vector made first),
+/// giving it `stdin`, `stdout` and `stderr` (-1 to leave its own): the
+/// child's pid, or the error number negated.
+fn start(prog: addr, pn: i64, args: addr, n: i64, stdin: i64, stdout: i64, stderr: i64) -> i64 {
+    let argv = argv_of(prog, pn, args, n)
+    var tr = 0
+    var tw = 0
+    let e = new_pipe(tr, tw)
+    if e != 0 {
+        argv_free(argv, n)
+        return 0 - e
+    }
+    let why = sys.alloc_zeroed(8)
+    let pid = unsafe { fork() }.as_i64()
+    if pid < 0 {
+        let fe = sysv.errno()
+        shut(tr)
+        shut(tw)
+        sys.dealloc(why)
+        argv_free(argv, n)
+        return 0 - fe
+    }
+    if pid == 0 {
+        unsafe {
+            let _ = close(tr.as_i32())
+            if stdin >= 0 {
+                let _ = dup2(stdin.as_i32(), 0.as_i32())
+            }
+            if stdout >= 0 {
+                let _ = dup2(stdout.as_i32(), 1.as_i32())
+            }
+            if stderr >= 0 {
+                let _ = dup2(stderr.as_i32(), 2.as_i32())
+            }
+            let _ = execvp(argv.load_addr(), argv)
+            why.store_u32(__error().load_u32())
+            let _ = write(tw.as_i32(), why, 4)
+            _exit(127.as_i32())
+        }
+    }
+    shut(tw)
+    let got = unsafe { read(tr.as_i32(), why, 4) }
+    shut(tr)
+    argv_free(argv, n)
+    if got == 4 {
+        let code = unsafe { why.load_u32() }.as_i64()
+        sys.dealloc(why)
+        let _ = wait_for(pid)
+        return 0 - code
+    }
+    sys.dealloc(why)
+    pid
+}
+
+extern fn __error() -> addr
+
+/// Reads `out` and `err` to their ends together, by one `poll` loop, each
+/// closed as it ends: their bytes into the `display` buffers `to` and `te`.
+fn drain_both(out0: i64, err0: i64, to: addr, te: addr) {
+    var out = out0
+    var err = err0
+    let chunk = sys.alloc(8192)
+    let set = sys.alloc(16)
+    while out >= 0 or err >= 0 {
+        var n = 0
+        unsafe {
+            if out >= 0 {
+                set.offset(8 * n).store_u32(out.as_u32())
+                set.offset(8 * n + 4).store_u16(POLLIN.as_u16())
+                set.offset(8 * n + 6).store_u16(0.as_u16())
+                n += 1
+            }
+            if err >= 0 {
+                set.offset(8 * n).store_u32(err.as_u32())
+                set.offset(8 * n + 4).store_u16(POLLIN.as_u16())
+                set.offset(8 * n + 6).store_u16(0.as_u16())
+                n += 1
+            }
+        }
+        let r = unsafe { poll(set, n.as_i32(), -1.as_i32()) }.as_i64()
+        if r < 0 {
+            if sysv.errno() == sysv.EINTR {
+                continue
+            }
+            break
+        }
+        var i = 0
+        while i < n {
+            let fd = unsafe { set.offset(8 * i).load_u32() }.as_i64()
+            let rev = unsafe { set.offset(8 * i + 6).load_u16() }.as_i64()
+            if rev != 0 {
+                let got = unsafe { read(fd.as_i32(), chunk, 8192) }
+                if got > 0 {
+                    display.put(if fd == out { to } else { te }, chunk, got)
+                } else if got == 0 or sysv.errno() != sysv.EINTR {
+                    shut(fd)
+                    if fd == out {
+                        out = -1
+                    } else {
+                        err = -1
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+    sys.dealloc(chunk)
+    sys.dealloc(set)
+}
+
+/// The text pairs of a list of strings (each must be one); their count in
+/// `n`. Freed by the caller; the texts are the strings' own.
+fn texts_of(l: addr, inout n: i64) -> addr {
+    var k = 0
+    let items = lists.items(l, k)
+    let pairs = sys.alloc(16 * k + 16)
+    var i = 0
+    while i < k {
+        var len = 0
+        let p = sysv.text_arg(unsafe { items.offset(8 * i).load_addr() }, len)
+        unsafe {
+            pairs.offset(16 * i).store_addr(p)
+            pairs.offset(16 * i + 8).store_i64(len)
+        }
+        i += 1
+    }
+    n = k
+    pairs
+}
+
+/// `Err(IoFailed("<program>: <what error number e says>"))`.
+fn failed_prog(prog: addr, pn: i64, e: i64) -> addr {
+    let t = display.text_new()
+    display.put(t, prog, pn)
+    unsafe { sysv.put_s(t, mem_static(": "), 2) }
+    sysv.put_os(t, e)
+    sysv.failed_buf(t)
+}
+
+/// `Ok((code, stdout, stderr))`, the outputs read lossily.
+fn result3(code: i64, to: addr, te: addr) -> addr {
+    let a = sysv.int(code)
+    let b = sysv.lossy_text(display.text_ptr(to), display.text_len(to))
+    let c = sysv.lossy_text(display.text_ptr(te), display.text_len(te))
+    display.text_free(to)
+    display.text_free(te)
+    sysv.ok(structs.triple(a, b, c))
+}
+
+fn proc_run_now(cmd: addr, args: addr) -> addr {
+    var pn = 0
+    let prog = sysv.text_arg(cmd, pn)
+    if sysv.tag(args) != layout.TAG_LIST {
+        return unsafe { sysv.failed(mem_static("run takes a list of arguments"), mem_static_len("run takes a list of arguments")) }
+    }
+    var n = 0
+    let texts = texts_of(args, n)
+    var outr = 0
+    var outw = 0
+    var e = new_pipe(outr, outw)
+    if e != 0 {
+        sys.dealloc(texts)
+        return failed_prog(prog, pn, e)
+    }
+    var errr = 0
+    var errw = 0
+    e = new_pipe(errr, errw)
+    if e != 0 {
+        shut(outr)
+        shut(outw)
+        sys.dealloc(texts)
+        return failed_prog(prog, pn, e)
+    }
+    let pid = start(prog, pn, texts, n, -1, outw, errw)
+    sys.dealloc(texts)
+    shut(outw)
+    shut(errw)
+    if pid < 0 {
+        shut(outr)
+        shut(errr)
+        return failed_prog(prog, pn, 0 - pid)
+    }
+    let to = display.text_new()
+    let te = display.text_new()
+    drain_both(outr, errr, to, te)
+    let code = wait_for(pid)
+    if code <= -1000 {
+        display.text_free(to)
+        display.text_free(te)
+        return failed_prog(prog, pn, -1000 - code)
+    }
+    result3(code, to, te)
+}
+
+export fn grt_proc_run(cmd: addr, args: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("proc_run"), 8) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = proc_run_now(cmd, args)
+    unsafe { journal.record(mem_static("proc_run"), 8, out) }
+    out
+}
+
+/// What the thread feeding a pipeline's first stage is given: the
+/// descriptor, the text's copy and its length.
+fn feed(arg: addr) -> addr {
+    unsafe {
+        let fd = arg.load_i64()
+        let p = arg.offset(8).load_addr()
+        let n = arg.offset(16).load_i64()
+        var done = 0
+        while done < n {
+            let w = write(fd.as_i32(), p.offset(done), n - done)
+            if w > 0 {
+                done += w
+            } else if w < 0 and __error().load_u32().as_i64() == sysv.EINTR {
+                // again
+            } else {
+                break
+            }
+        }
+        let _ = close(fd.as_i32())
+        sys.dealloc(p)
+        sys.dealloc(arg)
+        mem_addr(0)
+    }
+}
+
+/// Every stage started so far stopped and reaped, the descriptors given
+/// closed, and the failure answered.
+fn give_up(prog: addr, pn: i64, e: i64, pids: addr, npids: i64, a: i64, b: i64, c: i64, d: i64) -> addr {
+    var i = 0
+    while i < npids {
+        let pid = unsafe { pids.offset(8 * i).load_i64() }
+        unsafe {
+            let _ = kill(pid.as_i32(), SIGKILL.as_i32())
+        }
+        let _ = wait_for(pid)
+        i += 1
+    }
+    shut(a)
+    shut(b)
+    shut(c)
+    shut(d)
+    failed_prog(prog, pn, e)
+}
+
+fn proc_pipeline_now(stages: addr, input: addr) -> addr {
+    if sysv.tag(stages) != layout.TAG_LIST {
+        return unsafe { sysv.failed(mem_static("proc_pipeline takes a list of stages"), mem_static_len("proc_pipeline takes a list of stages")) }
+    }
+    var ns = 0
+    let items = lists.items(stages, ns)
+    if ns == 0 {
+        return unsafe { sysv.failed(mem_static("a pipeline needs at least one stage"), mem_static_len("a pipeline needs at least one stage")) }
+    }
+    // The plan: each stage's program (text pair) and arguments (pairs, count).
+    let plan = sys.alloc(32 * ns)
+    var i = 0
+    while i < ns {
+        let st = unsafe { items.offset(8 * i).load_addr() }
+        if sysv.tag(st) != layout.TAG_TUPLE {
+            var k = 0
+            while k < i {
+                sys.dealloc(unsafe { plan.offset(32 * k + 16).load_addr() })
+                k += 1
+            }
+            sys.dealloc(plan)
+            return unsafe { sysv.failed(mem_static("each stage is a (program, arguments) pair"), mem_static_len("each stage is a (program, arguments) pair")) }
+        }
+        var nf = 0
+        let fields = lists.items(st, nf)
+        var pn = 0
+        let prog = sysv.text_arg(unsafe { fields.load_addr() }, pn)
+        let av = unsafe { fields.offset(8).load_addr() }
+        var na = 0
+        let texts = if sysv.tag(av) == layout.TAG_LIST { texts_of(av, na) } else { sys.alloc(16) }
+        unsafe {
+            plan.offset(32 * i).store_addr(prog)
+            plan.offset(32 * i + 8).store_i64(pn)
+            plan.offset(32 * i + 16).store_addr(texts)
+            plan.offset(32 * i + 24).store_i64(na)
+        }
+        i += 1
+    }
+    var inn = 0
+    let inp = sysv.text_arg(input, inn)
+    let pids = sys.alloc(8 * ns)
+    var npids = 0
+    var from_previous = -1
+    var to_first = -1
+    var last_out = -1
+    var last_err = -1
+    var failed = unsafe { mem_addr(0) }
+    i = 0
+    while i < ns and sysv.null(failed) {
+        let prog = unsafe { plan.offset(32 * i).load_addr() }
+        let pn = unsafe { plan.offset(32 * i + 8).load_i64() }
+        let is_last = i + 1 == ns
+        var outr = 0
+        var outw = 0
+        var e = new_pipe(outr, outw)
+        if e != 0 {
+            failed = give_up(prog, pn, e, pids, npids, from_previous, to_first, -1, -1)
+            break
+        }
+        var errr = -1
+        var errw = -1
+        if is_last {
+            e = new_pipe(errr, errw)
+            if e != 0 {
+                failed = give_up(prog, pn, e, pids, npids, from_previous, to_first, outr, outw)
+                break
+            }
+        }
+        var stdin_fd = from_previous
+        if i == 0 {
+            var pr = 0
+            var pw = 0
+            e = new_pipe(pr, pw)
+            if e != 0 {
+                failed = give_up(prog, pn, e, pids, npids, outr, outw, errr, -1)
+                break
+            }
+            to_first = pw
+            stdin_fd = pr
+        }
+        let started = unsafe { start(prog, pn, plan.offset(32 * i + 16).load_addr(), plan.offset(32 * i + 24).load_i64(), stdin_fd, outw, errw) }
+        shut(stdin_fd)
+        shut(outw)
+        if errw >= 0 {
+            shut(errw)
+        }
+        if started < 0 {
+            failed = give_up(prog, pn, 0 - started, pids, npids, outr, errr, to_first, -1)
+            break
+        }
+        unsafe { pids.offset(8 * npids).store_i64(started) }
+        npids += 1
+        from_previous = outr
+        if is_last {
+            last_out = outr
+            last_err = errr
+        }
+        i += 1
+    }
+    i = 0
+    while i < ns {
+        sys.dealloc(unsafe { plan.offset(32 * i + 16).load_addr() })
+        i += 1
+    }
+    sys.dealloc(plan)
+    if not sysv.null(failed) {
+        sys.dealloc(pids)
+        return failed
+    }
+    if inn == 0 {
+        shut(to_first)
+    } else {
+        // Written on a thread: a large input and a chatty child deadlock if
+        // everything is written before anything is read.
+        let arg = sys.alloc(24)
+        let copy = sys.alloc(inn)
+        sys.copy(copy, inp, inn)
+        unsafe {
+            arg.store_i64(to_first)
+            arg.offset(8).store_addr(copy)
+            arg.offset(16).store_i64(inn)
+            let t = sys.alloc_zeroed(8)
+            if pthread_create(t, mem_addr(0), mem_fn_addr(feed), arg).as_i64() == 0 {
+                let _ = pthread_detach(t.load_addr())
+            } else {
+                sys.dealloc(copy)
+                sys.dealloc(arg)
+            }
+            sys.dealloc(t)
+        }
+    }
+    let to = display.text_new()
+    let te = display.text_new()
+    drain_both(last_out, last_err, to, te)
+    var code = -1
+    i = 0
+    while i < npids {
+        var st = wait_for(unsafe { pids.offset(8 * i).load_i64() })
+        if st <= -1000 {
+            st = -1
+        }
+        if i + 1 == npids {
+            code = st
+        }
+        i += 1
+    }
+    sys.dealloc(pids)
+    result3(code, to, te)
+}
+
+export fn grt_proc_pipeline(stages: addr, input: addr) -> addr {
+    if journal.active() {
+        let r = unsafe { journal.replayed(mem_static("proc_pipeline"), 13) }
+        if not sysv.null(r) {
+            return r
+        }
+    }
+    let out = proc_pipeline_now(stages, input)
+    unsafe { journal.record(mem_static("proc_pipeline"), 13, out) }
+    out
+}

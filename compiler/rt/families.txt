@@ -10,6 +10,10 @@
 #   uses <name> ...    the Grasm runtime calls the Rust runtime's
 #                      `grasm_<name>`, a family that has not moved, for a part
 #                      of its own work it names (never in place of a moved one)
+#   wrapped <name> ... not moved: the Grasm runtime exports `grt_<name>`,
+#                      which writes out its own standard output and calls the
+#                      Rust runtime's `grasm_<name>`, whose panics and exits
+#                      flush only the Rust runtime's buffer (`wrap.gr`)
 #
 # A moved name the Grasm runtime does not export, an export not listed here,
 # or a call to any other `grasm_` name fails the gate: that is a family
@@ -302,6 +306,14 @@ display out_ref
 display str_from_val
 display panic_value
 
+output out_text
+output out_nl
+output out_to_stderr
+
+exit panic_msg
+exit exit
+exit report_main_err
+
 maps map_new
 maps map_set
 maps map_set_bytes
@@ -318,13 +330,59 @@ maps map_entries
 maps map_add_i64
 maps map_add_i64_bytes
 
-state box_unit          the Rust ledger: a box made there for one this side holds live (leak.gr)
-state val_dec           the Rust ledger: a box of nothing freed there, for one this side freed beyond what it made; and the question whether that build is the poisoned one (alloc.gr)
-state live_allocations  the Rust ledger's count for this thread, added to this side's
-state check_leaks       the Rust check: both ledgers counted and reported, this side's roots (references, channels) released first
-state region_push       the Rust code's own region, opened with this side's
-state region_pop        the Rust code's own region, swept between this side's finding and its freeing
-state out_text     the output buffer every writer shares, flushed by newlines, panics and exits
-state panic_msg    the way out of a panic: flush stdout, write stderr, exit 101
-backend panic_div_zero   `/` checks its divisor
-backend panic_rem_zero   `%` checks its divisor
+
+sys set_args
+sys args
+sys input
+sys env
+sys foreign_call
+sys mem_alloc
+sys mem_free
+sys tls_block
+sys str_c_new
+sys str_c_free
+sys now_millis
+sys monotonic_millis
+sys monotonic_nanos
+sys sleep_millis
+sys random_bytes
+sys file_exists
+sys read_file
+sys write_file
+sys read_bytes
+sys write_bytes
+sys append_bytes
+sys read_bytes_at
+sys file_size
+sys sync_file
+sys rename_file
+sys remove_file
+sys make_dir
+sys make_dir_new
+sys list_dir
+sys tcp_listen
+sys tcp_listen_on
+sys tcp_connect
+sys tcp_accept
+sys tcp_read
+sys tcp_read_bytes
+sys tcp_write
+sys tcp_write_bytes
+sys tcp_peer
+sys net_close
+sys net_wait
+sys net_port
+sys udp_bind
+sys udp_send
+sys udp_recv
+sys udp_recv_from
+sys proc_run
+sys proc_pipeline
+
+tasks par_map_scalar
+tasks par_map_mixed
+tasks par_filter_scalar
+tasks par_filter_boxed
+tasks net_workers
+tasks net_workers_indices
+tasks par_tasks_next

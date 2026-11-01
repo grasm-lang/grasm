@@ -230,6 +230,30 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
             }
         }
     }
+    if lib {
+        // The calls of a runtime entry point the backend makes in the
+        // runtime's own code -- the checks `/` and `%` make on their divisor
+        // -- are calls of the runtime's own definition, `grt_<name>`
+        // ([T-EXPORT] keeps `grasm_` for the toolchain), so it is linked
+        // alone (docs/self-hosting.md §6.12). An entry point it does not
+        // define is still the other runtime's, and so is one the runtime's
+        // source names itself by an `extern fn`: that is a call of the Rust
+        // runtime, which `scripts/rtswap.sh` refuses, never a quiet call of
+        // its own.
+        var defined: Map[str, bool] = {}
+        for q in exports.keys() {
+            let at = q.index_of("::") ?? -1
+            defined.set(if at >= 0 { q.substr(at + 2, q.len() - at - 2) } else { q }, true)
+        }
+        for k in 0..ir.RT_COUNT {
+            if rt_syms[k].starts_with("grasm_") {
+                let mine = "grt_" + rt_syms[k].substr(6, rt_syms[k].len() - 6)
+                if defined.has(mine) {
+                    rt_syms[k] = mine
+                }
+            }
+        }
+    }
     MirProg{
         fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs, files: files, fbase: fbase,
         pcells: pcells, psize: psize, tcells: tcells, tsize: tsize,

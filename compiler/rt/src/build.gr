@@ -1,0 +1,10 @@
+// How this runtime was built (docs/self-hosting.md §6.12).
+//
+// The poisoned build -- the Rust runtime's `grasm_rt/poison` feature, which
+// `usecheck` and the S5 gates' poisoned runs use -- never gives a freed box
+// out again: it keeps it out of circulation counting `POISON`, so a later
+// `inc` or `dec` of it is a use after free, caught and said. The gates make
+// that build from a copy of this package with `true` here
+// (`scripts/lib/rtswap.sh`, `rtswap_runtime_poisoned`); nothing else is
+// different.
+pub let POISON = false

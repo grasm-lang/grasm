@@ -1,0 +1,129 @@
+// The C boundary and raw memory ([T-EXTERN-POINTER], [L-LIB-MEM];
+// docs/self-hosting.md §6.12): a string's NUL-terminated copy for a C call,
+// and its release; `mem_alloc` and `mem_free`; and the block of a
+// program's own thread-local cells ([T-TLS]), one per thread.
+//
+// A C copy is counted (`C_COPIES`), because nothing else counts it: the leak
+// check reports a copy handed to C and never freed.
+import layout
+import sys
+import alloc
+import display
+import panic
+import sysv
+
+extern fn posix_memalign(out: addr, align: i64, size: i64) -> i32
+extern fn memset(p: addr, c: i32, n: i64) -> addr
+
+/// C copies made and not freed, process-wide.
+process_local C_COPIES: i64
+
+/// This thread's block of the program's thread-local cells, 0 until asked.
+thread_local PROG_TLS: i64
+
+/// The largest allocation `mem_alloc` attempts; the interpreter's is the same.
+let MEM_MAX = 1099511627776
+
+pub fn c_copies() -> i64 {
+    unsafe { mem_process(C_COPIES).atomic_load_i64(Acquire) }
+}
+
+/// A NUL-terminated copy of a string for C, freed by `str_c_free`; a NUL
+/// inside the string is a panic, since C would read it as the end.
+export fn grt_str_c_new(v: addr) -> addr {
+    var n = 0
+    let p = sysv.text_arg(v, n)
+    var i = 0
+    while i < n {
+        if unsafe { p.offset(i).load_u8() }.as_i64() == 0 {
+            unsafe { panic.say(mem_static("a `str` passed to C contains a NUL byte, which is what C uses to mark the end of a string"), mem_static_len("a `str` passed to C contains a NUL byte, which is what C uses to mark the end of a string")) }
+        }
+        i += 1
+    }
+    unsafe { mem_process(C_COPIES).atomic_add_i64(1, AcqRel) }
+    sysv.c_copy(p, n)
+}
+
+export fn grt_str_c_free(p: addr) {
+    if not sysv.null(p) {
+        unsafe { mem_process(C_COPIES).atomic_add_i64(-1, AcqRel) }
+        sys.dealloc(p)
+    }
+}
+
+fn mem_panic(lead: addr, ln: i64, v: i64, tail: addr, tn: i64) {
+    let t = display.text_new()
+    display.put(t, lead, ln)
+    display.put_int(t, v)
+    display.put(t, tail, tn)
+    panic.say(display.text_ptr(t), display.text_len(t))
+}
+
+/// `size` zeroed bytes at a multiple of `align`, with a header of
+/// `max(align, 16)` bytes below the answer whose last two words record the
+/// size and the header's length, so `mem_free` takes the address alone. The
+/// panics are the interpreter's, word for word.
+export fn grt_mem_alloc(size: i64, align: i64) -> i64 {
+    unsafe {
+        if size < 0 {
+            mem_panic(mem_static("mem_alloc: negative size "), mem_static_len("mem_alloc: negative size "), size, mem_static(""), 0)
+        }
+        if align < 1 or align > 4096 or align.bit_and(align - 1) != 0 {
+            mem_panic(mem_static("mem_alloc: alignment "), mem_static_len("mem_alloc: alignment "), align, mem_static(" is not a power of two from 1 to 4096"), mem_static_len(" is not a power of two from 1 to 4096"))
+        }
+        if size > MEM_MAX {
+            mem_panic(mem_static("mem_alloc: "), mem_static_len("mem_alloc: "), size, mem_static(" bytes is more than an allocation can hold"), mem_static_len(" bytes is more than an allocation can hold"))
+        }
+        let head = if align > 16 { align } else { 16 }
+        var base = mem_addr(0)
+        if head > 16 {
+            let out = sys.alloc_zeroed(8)
+            if posix_memalign(out, head, head + size).as_i64() == 0 {
+                base = out.load_addr()
+            }
+            sys.dealloc(out)
+        } else {
+            base = sys.alloc(head + size)
+        }
+        if sysv.null(base) {
+            panic.say(mem_static("mem_alloc: out of memory"), mem_static_len("mem_alloc: out of memory"))
+        }
+        let _ = memset(base, 0.as_i32(), head + size)
+        let at = base.offset(head)
+        at.offset(-8).store_i64(size)
+        at.offset(-16).store_i64(head)
+        at.as_i64()
+    }
+}
+
+/// Gives back what `mem_alloc` made.
+export fn grt_mem_free(at: i64) {
+    unsafe {
+        let a = mem_addr(at)
+        let head = a.offset(-16).load_i64()
+        sys.dealloc(a.offset(0 - head))
+    }
+}
+
+fn free_tls(b: addr) {
+    sys.dealloc(b)
+    unsafe { mem_tls(PROG_TLS).store_i64(0) }
+}
+
+/// The calling thread's block of the program's cells, `size` bytes, zero
+/// until written: made once, at the size the first call asks, and freed when
+/// the thread ends.
+export fn grt_tls_block(size: i64) -> i64 {
+    unsafe {
+        let have = mem_tls(PROG_TLS).load_i64()
+        if have != 0 {
+            return have
+        }
+        let words = ((if size > 8 { size } else { 8 }) + 7) / 8
+        let b = sys.alloc(8 * words)
+        let _ = memset(b, 0.as_i32(), 8 * words)
+        mem_tls(PROG_TLS).store_i64(b.as_i64())
+        alloc.at_thread_end(mem_fn_addr(free_tls), b)
+        b.as_i64()
+    }
+}

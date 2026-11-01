@@ -24,7 +24,6 @@ import maps
 import panic
 
 extern fn memchr(p: addr, c: i32, n: i64) -> addr
-extern fn grasm_panic_msg(p: addr, n: i64)
 
 /// The largest buffer the runtime makes, as the Rust runtime's `MAX_ALLOC`.
 let MAX_ALLOC = 8589934592
@@ -45,7 +44,7 @@ fn set_vec(v: addr, p: addr, len: i64, cap: i64) {
 
 /// Panics with the text built in `t`.
 fn say_text(t: addr) {
-    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+    unsafe { panic.say(display.text_ptr(t), display.text_len(t)) }
 }
 
 /// `index {i} out of bounds (len {n})`.

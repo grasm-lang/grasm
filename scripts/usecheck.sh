@@ -19,12 +19,21 @@ cd "$(dirname "$0")/.."
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
 corpus_require
 
-echo "building the runtime with poisoning on"
-if ! cargo build --release --workspace --features grasm_rt/poison >/dev/null 2>&1; then
-    echo "error: the poisoned build failed"
-    exit 1
+# Under `scripts/rtwith.sh` with `RTWITH_POISON=1` (`RT_GRASM_ALONE=1`), every
+# program is linked with the Grasm runtime's poisoned build alone
+# (docs/self-hosting.md §6.12), so the Rust runtime's is neither built nor
+# linked, and `GRASM` names the compiler.
+if [ "${RT_GRASM_ALONE:-}" = 1 ]; then
+    echo "the Grasm runtime's poisoned build, linked alone"
+    GRASM=${GRASM:-./target/release/grasm}
+else
+    echo "building the runtime with poisoning on"
+    if ! cargo build --release --workspace --features grasm_rt/poison >/dev/null 2>&1; then
+        echo "error: the poisoned build failed"
+        exit 1
+    fi
+    GRASM=./target/release/grasm
 fi
-GRASM=./target/release/grasm
 # Straight into `/tmp`, not a directory under it, and not under `$TMPDIR`.
 #
 # The one use-after-free this has found so far — in `packages/aes-demo` — shows
@@ -40,7 +49,11 @@ PREFIX="gu$$"
 
 # Restore the ordinary runtime whatever happens: leaving a poisoned archive in
 # `target` would make every later build leak by design.
-trap 'rm -f "$WORK/$PREFIX"_*; cargo build --release --workspace >/dev/null 2>&1' EXIT
+if [ "${RT_GRASM_ALONE:-}" = 1 ]; then
+    trap 'rm -f "$WORK/$PREFIX"_*' EXIT
+else
+    trap 'rm -f "$WORK/$PREFIX"_*; cargo build --release --workspace >/dev/null 2>&1' EXIT
+fi
 
 n=0
 clean=0

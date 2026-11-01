@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
-# Every corpus program, linked with the runtime written in Grasm in front of
-# the Rust one, must print and exit exactly as it does today
-# (docs/self-hosting.md §6.7, stage S5).
+# Every corpus program, linked with the runtime written in Grasm alone in
+# place of the Rust one, must print and exit exactly as it does with the Rust
+# one (docs/self-hosting.md §6.7, §6.12, stage S5).
 #
 # The Grasm runtime (`compiler/rt`) is built by the Grasm backend (`grasm
-# tir`, `compiler/s3 --runtime`) and held to `compiler/rt/families.txt`
-# (`scripts/lib/rtswap.sh`). Then, for each corpus program with a `main`:
+# tir`, `compiler/s3 --runtime`), with its poisoned build, and held to
+# `compiler/rt/families.txt` (`scripts/lib/rtswap.sh`). Then, for each
+# corpus program with a `main`:
 #
 #   * the Cranelift backend's objects: `grasm build --native` with
 #     `scripts/lib/rtswap_link` as its linker, which links the program as it
-#     ships and again with `compiler/link -interpose`, so the two differ in
-#     the runtime and in nothing else;
+#     ships and again with `compiler/link -interpose` and no Rust runtime
+#     archive on the line, so the two differ in the runtime and in nothing
+#     else;
 #   * the Grasm backend's objects, for the programs in its subset, linked
 #     both ways the same (`RT_S3=0` leaves them out).
 #
 # Both binaries run with stdin closed, and stdout, the exit status and stderr
 # must be identical. Each swapped link says which runtime names the
-# program's objects took from each side (`-interpose_log`); every name that
-# families.txt says has moved must have been taken from Grasm, in every
-# program, and a program that took nothing from Grasm compared nothing and is
-# counted as such. The counts are derived and asserted.
+# program's objects took (`-interpose_log`); every name that families.txt
+# says has moved must have been taken from Grasm, in every program, and a
+# program that took nothing from Grasm compared nothing and is counted as
+# such. The counts are derived and asserted.
 #
-# Then the poisoned runtime's run (`scripts/s3rc.sh`'s method): both links
-# again against the runtime built with `grasm_rt/poison`, run, and required
-# to agree, with no use after free reported. That runtime is built as
-# `s3rc` builds it, into the same directory, or named by
-# `RT_POISON=<archive>`; `RT_POISON=` empty leaves the run out.
+# Then the poisoned runtimes' run (`scripts/s3rc.sh`'s method): the program
+# linked with the Rust runtime built with `grasm_rt/poison` and with the
+# Grasm runtime's poisoned build, run, and required to agree, with no use
+# after free reported. The Rust one is built as `s3rc` builds it, into the
+# same directory, or named by `RT_POISON=<archive>`; `RT_POISON=` empty
+# leaves the run out.
 # `RT_PROGRAMS=<regex>` keeps only the programs whose path matches;
 # `RT_OBJ=`, `S3=`, `LINK=` and `DIRS=` name what to test instead of building
 # it (the controls, `scripts/rtcontrols.sh`, use them).
@@ -108,7 +111,7 @@ compare() {
     if cmp -s "$WORK/a.out" "$WORK/b.out" && [ "$ac" = "$bc" ] && cmp -s "$WORK/a.err" "$WORK/b.err"; then
         return 0
     fi
-    echo "exit $ac (Rust runtime) vs $bc (Grasm runtime in front)"
+    echo "exit $ac (Rust runtime) vs $bc (Grasm runtime alone)"
     diff "$WORK/a.out" "$WORK/b.out" | head -6 | sed 's/^/    /'
     diff "$WORK/a.err" "$WORK/b.err" | head -4 | sed 's/^/    /'
     return 1
@@ -202,7 +205,7 @@ if [ "${RT_S3:-1}" = 1 ]; then
             continue
         fi
         if ! "$LINK" "$WORK/p.o" "$S3_RT" -dead_strip -o "$WORK/s3ref" >"$WORK/l1.log" 2>&1 ||
-            ! "$LINK" -interpose "$RT_OBJ" -interpose_log "$WORK/s3.swaplog" "$WORK/p.o" "$S3_RT" -dead_strip -o "$WORK/s3swap" >"$WORK/l2.log" 2>&1; then
+            ! "$LINK" -interpose "$RT_OBJ" -interpose_log "$WORK/s3.swaplog" "$WORK/p.o" -dead_strip -o "$WORK/s3swap" >"$WORK/l2.log" 2>&1; then
             note "a link fails: $(cat "$WORK/l1.log" "$WORK/l2.log" | head -1)" "$src" s3
             continue
         fi
