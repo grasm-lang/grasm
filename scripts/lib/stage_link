@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# The linker `scripts/withstage.sh` hands the gates for what the Grasm
+# backend writes (S3_LINKER, and frontsmoke's LINKER): the stage's own
+# `link` (STAGE_LINK), with the stage's own runtime alone (STAGE_RT) in
+# place of the Rust runtime archive the gate names -- `scripts/lib/rtswap_link`
+# with RTSWAP_ONLY=1, set here rather than in the environment, where it
+# would change the links the S5 gates make through the same script
+# (docs/self-hosting.md §6.14).
+set -u
+if [ -z "${STAGE_LINK:-}" ] || [ -z "${STAGE_RT:-}" ]; then
+    echo "stage_link: STAGE_LINK and STAGE_RT must name the stage's linker and runtime" >&2
+    exit 2
+fi
+RTSWAP_ONLY=1 RTSWAP_LINK="$STAGE_LINK" RTSWAP_RT="$STAGE_RT" RTSWAP_LOG="${STAGE_LINK_LOG:-}" \
+    exec "$(dirname "$0")/rtswap_link" "$@"
