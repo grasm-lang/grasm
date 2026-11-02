@@ -96,6 +96,8 @@
 #   branch-fold    a branch on a constant goes the other way -> s3subset
 #   imm-bit        a bitmask immediate's run of ones is encoded one longer
 #                  -> encodetest (the bytes against the assembler's)
+#   addr-off       a load or store that absorbed its address's `add` reaches
+#                  one element past it -> s3subset
 #
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
@@ -322,6 +324,11 @@ control imm-bit compiler/aarch64/src/mach.gr \
     "    nimms = nimms.bit_or(ones - 1)" "    nimms = nimms.bit_or(ones - 1).bit_xor(1)" -- \
     scripts/encodetest.sh "MISMATCH and-imm" -
 
+control addr-off compiler/aarch64/src/isel.gr \
+    $'                imms.push(c)\n            } else if k == rules.K_ASLOT {' \
+    $'                imms.push(c + rules.mem_bytes(f.op[i]))\n            } else if k == rules.K_ASLOT {' -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
 # The backend's copy of the runtime's layouts, with a fault in a copy of it,
 # held by `rtlayout` to compiler/rt's (which takes no backend: it reads the
 # file).
@@ -400,10 +407,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Thirty-six gate runs over thirty-one faults, and every one must have
+# Thirty-seven gate runs over thirty-two faults, and every one must have
 # failed.
-if [ "$controls" -ne 36 ] || [ "$caught" -ne 36 ]; then
-    echo "expected 36 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 37 ] || [ "$caught" -ne 37 ]; then
+    echo "expected 37 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0
