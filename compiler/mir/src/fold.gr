@@ -1,0 +1,457 @@
+// Constant folding on SSA MIR: the first pass of the mid-end
+// (docs/self-hosting.md §4).
+//
+// An integer operation whose operands are all constants becomes the constant
+// it computes. What it computes is what the machine instruction it would
+// have been selected as computes, written here with Grasm's own integer
+// operations, which are defined to do the same ([E-ARITH-INT]: `+ - *` wrap
+// in two's complement; `shl`, `shr` and `ushr` take the count modulo 64, as
+// `lslv`, `asrv` and `lsrv` do). An operation that could trap or that the
+// machine and the language might answer differently is left as it is: a
+// division or remainder by zero (the lowering's check panics before the
+// instruction runs, and folding it would only move the question), `MIN / -1`
+// and `MIN % -1`, an unsigned division of anything that is negative as a
+// signed word, and every operation on doubles. Folding them would be
+// correct only by an argument; leaving them is correct by construction.
+//
+// Then each commutative operation with a constant first and a register
+// second is turned round, and a comparison with its condition reversed, so
+// the constant is where the lowering rules take an immediate from: operand b
+// (`aarch64/rules.gr`).
+//
+// No instruction is added or removed, so the line table and every other
+// value are as they were. A constant nothing reads any more is not selected
+// (`aarch64/isel.gr` drops a pure instruction whose result no one reads).
+//
+// A conditional branch on a constant -- a division's zero test of a constant
+// divisor, `while true` -- is a jump, and the blocks only the other way
+// reached are no longer compiled (`fold_branches`); a block that ends in a
+// jump, passing nothing, to a block nothing else enters runs on into it
+// (`merge_blocks`), which also runs together the jumps into and out of an
+// inlined copy (`inline.gr`).
+import ir
+
+let MIN = -9223372036854775807 - 1
+
+/// Whether `op` is an integer operation this pass computes.
+fn foldable(op: i64) -> bool {
+    (op >= ir.M_ADD and op <= ir.M_ICMP) or op == ir.M_ROTR
+}
+
+/// Whether `a op b` equals `b op a`.
+fn commutative(op: i64) -> bool {
+    op == ir.M_ADD or op == ir.M_MUL or op == ir.M_AND or op == ir.M_OR or op == ir.M_XOR
+}
+
+/// The condition that holds of `(b, a)` exactly when `cc` holds of `(a, b)`.
+pub fn swapped_cc(cc: i64) -> i64 {
+    match cc {
+        2 -> 4
+        4 -> 2
+        3 -> 5
+        5 -> 3
+        6 -> 8
+        8 -> 6
+        7 -> 9
+        9 -> 7
+        _ -> cc
+    }
+}
+
+/// `a <u b`, on the bits.
+fn ult(a: i64, b: i64) -> bool {
+    a.bit_xor(MIN) < b.bit_xor(MIN)
+}
+
+/// Whether condition `cc` holds of `a` and `b`.
+pub fn cc_holds(cc: i64, a: i64, b: i64) -> bool {
+    match cc {
+        0 -> a == b
+        1 -> a != b
+        2 -> a < b
+        3 -> a <= b
+        4 -> a > b
+        5 -> a >= b
+        6 -> ult(a, b)
+        7 -> not ult(b, a)
+        8 -> ult(b, a)
+        9 -> not ult(a, b)
+        _ -> false
+    }
+}
+
+/// What operation `op` (with condition `cc`, for a comparison) computes of
+/// `a` and `b`, as the instruction it is selected as computes it; `ok` false
+/// when this pass does not compute it.
+pub fn compute(op: i64, cc: i64, a: i64, b: i64) -> (bool, i64) {
+    if op == ir.M_ADD {
+        return (true, a + b)
+    }
+    if op == ir.M_SUB {
+        return (true, a - b)
+    }
+    if op == ir.M_MUL {
+        return (true, a * b)
+    }
+    if op == ir.M_SDIV or op == ir.M_SREM {
+        if b == 0 or (a == MIN and b == -1) {
+            return (false, 0)
+        }
+        return (true, if op == ir.M_SDIV { a / b } else { a % b })
+    }
+    if op == ir.M_UDIV or op == ir.M_UREM {
+        // Unsigned and signed division agree where neither word has its top
+        // bit set.
+        if b <= 0 or a < 0 {
+            return (false, 0)
+        }
+        return (true, if op == ir.M_UDIV { a / b } else { a % b })
+    }
+    if op == ir.M_AND {
+        return (true, a.bit_and(b))
+    }
+    if op == ir.M_OR {
+        return (true, a.bit_or(b))
+    }
+    if op == ir.M_XOR {
+        return (true, a.bit_xor(b))
+    }
+    if op == ir.M_SHL {
+        return (true, a.shl(b.bit_and(63)))
+    }
+    if op == ir.M_SSHR {
+        return (true, a.shr(b.bit_and(63)))
+    }
+    if op == ir.M_USHR {
+        return (true, a.ushr(b.bit_and(63)))
+    }
+    if op == ir.M_ROTR {
+        let s = b.bit_and(63)
+        return (true, a.ushr(s).bit_or(a.shl((64 - s).bit_and(63))))
+    }
+    if op == ir.M_NEG {
+        return (true, 0 - a)
+    }
+    if op == ir.M_NOT {
+        return (true, a.bit_xor(-1))
+    }
+    if op == ir.M_SEXT8 {
+        return (true, a.shl(56).shr(56))
+    }
+    if op == ir.M_SEXT16 {
+        return (true, a.shl(48).shr(48))
+    }
+    if op == ir.M_SEXT32 {
+        return (true, a.shl(32).shr(32))
+    }
+    if op == ir.M_UEXT8 {
+        return (true, a.bit_and(255))
+    }
+    if op == ir.M_UEXT16 {
+        return (true, a.bit_and(65535))
+    }
+    if op == ir.M_UEXT32 {
+        return (true, a.bit_and(4294967295))
+    }
+    if op == ir.M_ICMP {
+        return (true, if cc_holds(cc, a, b) { 1 } else { 0 })
+    }
+    (false, 0)
+}
+
+/// Folds `f` in place. Answers how many instructions became constants.
+pub fn fold(inout f: MirFn) -> i64 {
+    let n = f.op.len()
+    var def: [i64] = []
+    for x in 0..f.nvals {
+        def.push(-1)
+    }
+    for i in 0..n {
+        if f.res[i] >= 0 {
+            def[f.res[i]] = i
+        }
+    }
+    var folded = 0
+    // A constant made by folding can make another foldable, in a block
+    // before or after it: repeat until nothing changes.
+    var changed = true
+    while changed {
+        changed = false
+        for i in 0..n {
+            let op = f.op[i]
+            if not foldable(op) or f.res[i] < 0 {
+                continue
+            }
+            let nr = ir.nreads(op)
+            let da = if f.a[i] >= 0 { def[f.a[i]] } else { -1 }
+            if da < 0 or f.op[da] != ir.M_ICONST {
+                continue
+            }
+            var bv = 0
+            if nr == 2 {
+                let db = if f.b[i] >= 0 { def[f.b[i]] } else { -1 }
+                if db < 0 or f.op[db] != ir.M_ICONST {
+                    continue
+                }
+                bv = f.imm[db]
+            }
+            let (ok, r) = compute(op, f.imm[i], f.imm[da], bv)
+            if ok {
+                f.op[i] = ir.M_ICONST
+                f.imm[i] = r
+                f.a[i] = -1
+                f.b[i] = -1
+                folded += 1
+                changed = true
+            }
+        }
+    }
+    // The constant where an immediate is taken from.
+    for i in 0..n {
+        let op = f.op[i]
+        if ir.nreads(op) != 2 or f.a[i] < 0 or f.b[i] < 0 {
+            continue
+        }
+        if not (commutative(op) or op == ir.M_ICMP) {
+            continue
+        }
+        let da = def[f.a[i]]
+        let db = def[f.b[i]]
+        let a_const = da >= 0 and f.op[da] == ir.M_ICONST
+        let b_const = db >= 0 and f.op[db] == ir.M_ICONST
+        if a_const and not b_const {
+            let t = f.a[i]
+            f.a[i] = f.b[i]
+            f.b[i] = t
+            if op == ir.M_ICMP {
+                f.imm[i] = swapped_cc(f.imm[i])
+            }
+        }
+    }
+    folded
+}
+
+/// The defining instruction of each value, or -1 (a block parameter).
+pub fn defs(f: MirFn) -> [i64] {
+    var d: [i64] = []
+    for x in 0..f.nvals {
+        d.push(-1)
+    }
+    for i in 0..f.op.len() {
+        if f.res[i] >= 0 {
+            d[f.res[i]] = i
+        }
+    }
+    d
+}
+
+/// Turns each conditional branch on a constant into a jump, and drops the
+/// blocks that leaves unreachable. Answers how many branches.
+pub fn fold_branches(inout f: MirFn) -> i64 {
+    let d = defs(f)
+    var n = 0
+    for b in 0..ir.nblocks(f) {
+        if f.tk[b] != ir.M_BRIF or f.tan[b] != 0 or f.fan[b] != 0 {
+            continue
+        }
+        let c = f.tv[b]
+        if c < 0 or d[c] < 0 or f.op[d[c]] != ir.M_ICONST {
+            continue
+        }
+        let taken = if f.imm[d[c]] != 0 { f.tt[b] } else { f.tf[b] }
+        f.tk[b] = ir.M_JUMP
+        f.tv[b] = -1
+        f.tt[b] = taken
+        f.tf[b] = -1
+        n += 1
+    }
+    if n > 0 {
+        drop_unreachable(f)
+    }
+    n
+}
+
+/// Removes the blocks the entry no longer reaches, renumbering the rest in
+/// their order.
+fn drop_unreachable(inout f: MirFn) {
+    let nb = ir.nblocks(f)
+    var seen: [bool] = []
+    for b in 0..nb {
+        seen.push(false)
+    }
+    var work: [i64] = [0]
+    while not work.is_empty() {
+        let b = work.pop() ?? 0
+        if seen[b] {
+            continue
+        }
+        seen[b] = true
+        if f.tk[b] == ir.M_JUMP or f.tk[b] == ir.M_BRIF {
+            work.push(f.tt[b])
+        }
+        if f.tk[b] == ir.M_BRIF {
+            work.push(f.tf[b])
+        }
+    }
+    var newid: [i64] = []
+    var kept: [i64] = []
+    for b in 0..nb {
+        newid.push(-1)
+        if seen[b] {
+            newid[b] = kept.len()
+            kept.push(b)
+        }
+    }
+    if kept.len() == nb {
+        return
+    }
+    var g = ir.shell(f)
+    for b in kept {
+        g.bp0.push(g.bparams.len())
+        for k in 0..f.bnp[b] {
+            g.bparams.push(f.bparams[f.bp0[b] + k])
+        }
+        g.bnp.push(f.bnp[b])
+        g.bi0.push(g.op.len())
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            g.op.push(f.op[i])
+            g.res.push(f.res[i])
+            g.a.push(f.a[i])
+            g.b.push(f.b[i])
+            g.imm.push(f.imm[i])
+            g.ca0.push(g.cargs.len())
+            for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                g.cargs.push(f.cargs[j])
+            }
+            g.can.push(f.can[i])
+            g.ispan.push(f.ispan[i])
+        }
+        g.bni.push(g.op.len() - g.bi0[g.bi0.len() - 1])
+        g.tk.push(f.tk[b])
+        g.tv.push(f.tv[b])
+        g.tt.push(if f.tt[b] >= 0 { newid[f.tt[b]] } else { -1 })
+        g.tf.push(if f.tf[b] >= 0 { newid[f.tf[b]] } else { -1 })
+        g.ta0.push(g.targs.len())
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            g.targs.push(f.targs[j])
+        }
+        g.tan.push(f.tan[b])
+        g.fa0.push(g.targs.len())
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            g.targs.push(f.targs[j])
+        }
+        g.fan.push(f.fan[b])
+        g.tspan.push(f.tspan[b])
+    }
+    f = g
+}
+
+/// Runs each block that ends in a jump passing nothing to a block nothing
+/// else enters on into that block. Answers how many blocks went.
+pub fn merge_blocks(inout f: MirFn) -> i64 {
+    let nb = ir.nblocks(f)
+    var npred: [i64] = []
+    for b in 0..nb {
+        npred.push(0)
+    }
+    for b in 0..nb {
+        if f.tk[b] == ir.M_JUMP or f.tk[b] == ir.M_BRIF {
+            npred[f.tt[b]] += 1
+        }
+        if f.tk[b] == ir.M_BRIF {
+            npred[f.tf[b]] += 1
+        }
+    }
+    // `into[t]`: the block `t` is run on from, or -1.
+    var into: [i64] = []
+    for b in 0..nb {
+        into.push(-1)
+    }
+    var merged = 0
+    for b in 0..nb {
+        let t = f.tt[b]
+        if f.tk[b] == ir.M_JUMP and f.tan[b] == 0 and t > 0 and t != b and npred[t] == 1 and f.bnp[t] == 0 {
+            into[t] = b
+            merged += 1
+        }
+    }
+    if merged == 0 {
+        return 0
+    }
+    // A chain runs from a block nothing runs into; a cycle of such jumps
+    // would be a loop no edge enters, which SSA construction removed.
+    var newid: [i64] = []
+    for b in 0..nb {
+        newid.push(-1)
+    }
+    var heads: [i64] = []
+    for b in 0..nb {
+        if into[b] < 0 {
+            newid[b] = heads.len()
+            heads.push(b)
+        }
+    }
+    // Each merged block's number is its chain's head's.
+    var next_of: [i64] = []
+    for b in 0..nb {
+        next_of.push(-1)
+    }
+    for t in 0..nb {
+        if into[t] >= 0 {
+            next_of[into[t]] = t
+        }
+    }
+    for h in heads {
+        var x = next_of[h]
+        while x >= 0 {
+            newid[x] = newid[h]
+            x = next_of[x]
+        }
+    }
+    var g = ir.shell(f)
+    for h in heads {
+        g.bp0.push(g.bparams.len())
+        for k in 0..f.bnp[h] {
+            g.bparams.push(f.bparams[f.bp0[h] + k])
+        }
+        g.bnp.push(f.bnp[h])
+        g.bi0.push(g.op.len())
+        var last = h
+        var x = h
+        while x >= 0 {
+            for i in f.bi0[x]..(f.bi0[x] + f.bni[x]) {
+                g.op.push(f.op[i])
+                g.res.push(f.res[i])
+                g.a.push(f.a[i])
+                g.b.push(f.b[i])
+                g.imm.push(f.imm[i])
+                g.ca0.push(g.cargs.len())
+                for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                    g.cargs.push(f.cargs[j])
+                }
+                g.can.push(f.can[i])
+                g.ispan.push(f.ispan[i])
+            }
+            last = x
+            x = next_of[x]
+        }
+        g.bni.push(g.op.len() - g.bi0[g.bi0.len() - 1])
+        g.tk.push(f.tk[last])
+        g.tv.push(f.tv[last])
+        g.tt.push(if f.tt[last] >= 0 { newid[f.tt[last]] } else { -1 })
+        g.tf.push(if f.tf[last] >= 0 { newid[f.tf[last]] } else { -1 })
+        g.ta0.push(g.targs.len())
+        for j in f.ta0[last]..(f.ta0[last] + f.tan[last]) {
+            g.targs.push(f.targs[j])
+        }
+        g.tan.push(f.tan[last])
+        g.fa0.push(g.targs.len())
+        for j in f.fa0[last]..(f.fa0[last] + f.fan[last]) {
+            g.targs.push(f.targs[j])
+        }
+        g.fan.push(f.fan[last])
+        g.tspan.push(f.tspan[last])
+    }
+    f = g
+    merged
+}

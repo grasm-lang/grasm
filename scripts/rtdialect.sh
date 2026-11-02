@@ -17,7 +17,11 @@
 #     getter that signs its return address like any compiled function;
 #   * `ctx_switch` and `ctx_init` as leaves that save and load x19..x30, sp
 #     and d8..d15 and sign nothing (no `pacibsp`, no `retab`), while every
-#     compiled function signs its return address (`pacibsp` ... `retab`).
+#     compiled function -- as many as s3 says it compiled, and the getters --
+#     signs its return address: `pacibsp` on entry and every return a
+#     `retab`, never a plain `ret`. One that never returns (a `while true`
+#     with no way out, which constant folding leaves with no return) has no
+#     return to authenticate.
 #
 # Then `driver.c` is linked with it and the Rust runtime twice -- by
 # `compiler/link` and by `cc` -- and both must print the same checks, every
@@ -63,7 +67,7 @@ if ! "${FRONT:-$GRASM}" tir "$FX/src/main.gr" >"$WORK/fx.tir" 2>"$WORK/tir.log";
     exit 1
 fi
 mkdir -p "$WORK/b"
-if ! "$S3" "$WORK/fx.tir" -o "$WORK/fx.o" --runtime >"$WORK/s3.log" 2>&1 ||
+if ! "$S3" "$WORK/fx.tir" -o "$WORK/fx.o" --runtime --stats >"$WORK/s3.log" 2>&1 ||
     ! "$S3" "$WORK/fx.tir" -o "$WORK/b/fx.o" --runtime >>"$WORK/s3.log" 2>&1; then
     echo "error: the Grasm backend does not compile the fixture:"
     sed 's/^/  /' "$WORK/s3.log" | head -20
@@ -113,15 +117,24 @@ done
 [ "$(body _grt.ctx_switch | grep -cE '\bstp\b')" = 10 ] || fail "ctx_switch does not save x19..x30 and d8..d15 in ten pairs"
 [ "$(body _grt.ctx_switch | grep -cE '\bldp\b')" = 10 ] || fail "ctx_switch does not load x19..x30 and d8..d15 in ten pairs"
 body _grt.ctx_switch | tail -1 | grep -cE '\bret$' >/dev/null || fail "ctx_switch does not end in a plain ret"
+# How many functions s3 compiled, from the first line of its --stats.
+nfns=$(sed -n 's/^functions: \([0-9][0-9]*\) .*/\1/p' "$WORK/s3.log" | head -1)
+[ -n "$nfns" ] || fail "s3 --stats gave no count of functions"
 signed=0
+noreturn=0
 for fn in $(awk '/^[^ \t].*:$/ && $1 != "_grt.ctx_switch:" && $1 != "_grt.ctx_init:" && $1 != "_grt.ctx_start:" && $1 !~ /^[(\/]/ { sub(/:$/, "", $1); print $1 }' "$WORK/text.txt"); do
-    if body "$fn" | head -1 | grep -c pacibsp >/dev/null && body "$fn" | grep -c retab >/dev/null; then
+    if ! body "$fn" | head -1 | grep -c pacibsp >/dev/null || body "$fn" | grep -cE '\bret$' >/dev/null; then
+        fail "$fn does not sign its return address"
+    elif body "$fn" | grep -c retab >/dev/null; then
         signed=$((signed + 1))
     else
-        fail "$fn does not sign its return address"
+        # Signed on entry and with no return at all: it never comes back.
+        signed=$((signed + 1))
+        noreturn=$((noreturn + 1))
     fi
 done
-[ "$signed" -ge 30 ] || fail "only $signed compiled functions were found signing their return address"
+want=$((${nfns:-0} + tlvs))
+[ "$signed" = "$want" ] || fail "$signed compiled functions sign their return address, not the $want s3 compiled ($nfns) with the thread-local getters ($tlvs)"
 if ! dwarfdump --verify "$WORK/fx.o" >"$WORK/verify.txt" 2>&1 || ! grep -cx "No errors." "$WORK/verify.txt" >/dev/null; then
     fail "dwarfdump --verify: $(grep -iE 'error|warning' "$WORK/verify.txt" | head -2 | tr '\n' ' ')"
 fi
@@ -158,7 +171,7 @@ for how in link cc; do
 done
 oks=$(grep -c '^ok ' "$WORK/link.out" 2>/dev/null)
 grep -h '^pointer authentication' "$WORK/link.err" 2>/dev/null | head -1
-echo "object: process cells $cells, thread-local variables $tlvs, TLVP relocations $tlvp, leaves unsigned 3, functions signed $signed"
+echo "object: process cells $cells, thread-local variables $tlvs, TLVP relocations $tlvp, leaves unsigned 3, functions signed $signed of $want (never returning: $noreturn)"
 echo "runs: $ran of 2   checks passed in the compiler/link build: ${oks:-0} of 5"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo

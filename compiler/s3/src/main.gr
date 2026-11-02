@@ -440,6 +440,9 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             }
         }
         print("functions: {p.fns.len()}   checked: {p.fns.len() - ra_failed}   spill slots: {spills}   words: {obj.text.len()}   with doubles: {with_fp}")
+        // The mid-end's counts on a line of their own: gates read the first
+        // line by position (`scripts/ra_check.sh`).
+        print("mid-end: folded: {p.folded}")
     }
     if listing != "" {
         match write_file(listing, text.to_str()) {

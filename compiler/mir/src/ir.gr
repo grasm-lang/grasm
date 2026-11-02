@@ -490,6 +490,21 @@ pub fn new_fn(name: str, sym: str) -> MirFn {
     }
 }
 
+/// A function with `f`'s name, symbol, parameters, frame slots and values,
+/// and no blocks yet: what a pass that rebuilds the blocks starts from.
+pub fn shell(f: MirFn) -> MirFn {
+    var g = new_fn(f.name, f.sym)
+    g.floor = f.floor
+    g.nparams = f.nparams
+    g.returns = f.returns
+    g.global = f.global
+    g.nslots = f.nslots
+    g.span0 = f.span0
+    g.vfp = f.vfp
+    g.nvals = f.nvals
+    g
+}
+
 /// The whole program: every function the subset compiles, in TIR order,
 /// then the C entry; and the string literals they print.
 type MirProg = {
@@ -514,6 +529,9 @@ type MirProg = {
     psize: [i64],
     tcells: [str],
     tsize: [i64],
+    /// How many instructions constant folding turned into constants
+    /// (`fold.gr`), for `s3 --stats`.
+    folded: i64,
 }
 
 /// A struct type's descriptor, as the runtime's `StructDesc` reads it

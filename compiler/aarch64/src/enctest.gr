@@ -321,6 +321,35 @@ pub fn cases() -> EncCases ! str {
                 let r2 = reg_for(g, k, 2, mach.R_ZR)
                 try add(c, m, r0, rn, r2, -1, 0, 0, -1, 0, "")
             }
+        } else if m >= mach.A_LSLI and m <= mach.A_ASRI {
+            // Every count, then random ones.
+            for k in 0..n {
+                let rd = reg_for(g, k, 0, mach.R_ZR)
+                let rn = reg_for(g, k, 1, mach.R_ZR)
+                try add(c, m, rd, rn, -1, -1, if k < 64 { k } else { pick(g, 0, 63) }, 0, -1, 0, "")
+            }
+        } else if m >= mach.A_ANDI and m <= mach.A_EORI {
+            // Encodings made from their fields -- each element size, run
+            // length and rotation, by the architecture's own decoding
+            // (`mach.logimm_value`) -- so the encoder, which works the fields
+            // out from the value, is held to the assembler on values it was
+            // not written around.
+            let tops = [0, 32, 48, 56, 60]
+            for k in 0..(2 * n) {
+                let e = k % 6
+                let size = 2.shl(e)
+                let nb = if e == 5 { 1 } else { 0 }
+                let s = if k < 12 { if k < 6 { 0 } else { size - 2 } } else { pick(g, 0, size - 2) }
+                let rr = if k < 12 { if k < 6 { 0 } else { size - 1 } } else { pick(g, 0, size - 1) }
+                let imms = if e == 5 { s } else { tops[4 - e].bit_or(s) }
+                let value = mach.logimm_value(nb, rr, imms)
+                if value == 0 {
+                    fail("logimm_value({nb}, {rr}, {imms}) stands for no value")
+                }
+                let rd = reg_for(g, k, 0, mach.R_SP)
+                let rn = reg_for(g, k, 1, mach.R_ZR)
+                try add(c, m, rd, rn, -1, -1, value, 0, -1, 0, "")
+            }
         } else if m == mach.A_RORV {
             for k in 0..n {
                 let rd = reg_for(g, k, 0, mach.R_ZR)

@@ -92,6 +92,10 @@
 #   layout-backend the backend's copy of the runtime's layouts has a `Vec`'s
 #                  length where its capacity is -> rtlayout (the copy held to
 #                  compiler/rt's layout.gr, which the Rust runtime holds)
+#   fold-sub       constant folding computes `a - b` as `a + b` -> s3subset
+#   branch-fold    a branch on a constant goes the other way -> s3subset
+#   imm-bit        a bitmask immediate's run of ones is encoded one longer
+#                  -> encodetest (the bytes against the assembler's)
 #
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
@@ -300,10 +304,23 @@ control list-cow compiler/mir/src/lower.gr \
     $'    let alone = unique(v, l)\n    when(v, alone, slow)\n' "" -- \
     scripts/s3subset.sh "MISMATCH:" -
 
+control fold-sub compiler/mir/src/fold.gr \
+    "        return (true, a - b)" "        return (true, a + b)" -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control branch-fold compiler/mir/src/fold.gr \
+    "let taken = if f.imm[d[c]] != 0 { f.tt[b] } else { f.tf[b] }" \
+    "let taken = if f.imm[d[c]] != 0 { f.tf[b] } else { f.tt[b] }" -- \
+    scripts/s3subset.sh "FAILED:" -
+
 control field-slot compiler/mir/src/lower.gr \
     "    let fa = box_at(v, s, layout.STRUCT_VALS + 8 * k)" \
     "    let fa = box_at(v, s, layout.STRUCT_VALS + 8 * k + 8)" -- \
     scripts/s3subset.sh "FAILED:" -
+
+control imm-bit compiler/aarch64/src/mach.gr \
+    "    nimms = nimms.bit_or(ones - 1)" "    nimms = nimms.bit_or(ones - 1).bit_xor(1)" -- \
+    scripts/encodetest.sh "MISMATCH and-imm" -
 
 # The backend's copy of the runtime's layouts, with a fault in a copy of it,
 # held by `rtlayout` to compiler/rt's (which takes no backend: it reads the
@@ -383,10 +400,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Thirty-three gate runs over twenty-eight faults, and every one must have
+# Thirty-six gate runs over thirty-one faults, and every one must have
 # failed.
-if [ "$controls" -ne 33 ] || [ "$caught" -ne 33 ]; then
-    echo "expected 33 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 36 ] || [ "$caught" -ne 36 ]; then
+    echo "expected 36 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

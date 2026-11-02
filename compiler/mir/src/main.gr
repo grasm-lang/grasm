@@ -5,6 +5,7 @@
 //     prog.gr   the whole program: callables, reachability, recursion, symbols
 //     lower.gr  TIR to three-address code over variables; decides the subset
 //     ssa.gr    variables to SSA with block arguments
+//     fold.gr   constant folding, the mid-end's first pass
 //     ir.gr     MIR itself: opcodes, the function record, a printer
 //     layout.gr the runtime's layouts the lowering reads inline
 import sexp
@@ -13,6 +14,7 @@ import ir
 import prog
 import lower
 import ssa
+import fold
 
 /// Reads a program's TIR and builds the MIR of every function `main`
 /// reaches, plus the C entry point. A program outside the subset is an
@@ -83,6 +85,7 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
         }
     }
     var q = 0
+    var folded = 0
     // The runtime has no C entry point of its own.
     var done_own = lib
     while true {
@@ -194,6 +197,10 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
             }
         }
         var f = try ssa.to_ssa(v, name, sym)
+        folded += fold.fold(f)
+        if fold.fold_branches(f) > 0 {
+            fold.merge_blocks(f)
+        }
         if c >= nc and lifts.global[c - nc] {
             f.global = true
         }
@@ -257,7 +264,7 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
     }
     MirProg{
         fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs, files: files, fbase: fbase,
-        pcells: pcells, psize: psize, tcells: tcells, tsize: tsize,
+        pcells: pcells, psize: psize, tcells: tcells, tsize: tsize, folded: folded,
     }
 }
 

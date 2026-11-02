@@ -60,6 +60,8 @@ pub let K_IB = -4
 pub let K_NIB = -5
 pub let K_IMM = -6
 pub let K_SLOT = -7
+/// Operand b's base-2 logarithm, under `G_B_POW2`.
+pub let K_B_LOG2 = -8
 
 // Conditions: through the condition map, from the instruction itself or
 // from the comparison its branch absorbed; through the floating-point map
@@ -107,6 +109,14 @@ pub let G_FUSE_ZERO_EQ = 7
 pub let G_FUSE_ZERO_NE = 8
 /// A `brif` on an `fcmp` in its block that nothing else reads.
 pub let G_FFUSE = 9
+/// Operand b is a constant in 0..63: a shift count.
+pub let G_B_SHIFT = 10
+/// Operand b is a constant a logical instruction can take as a bitmask
+/// immediate (`mach.logimm`).
+pub let G_B_LOGIMM = 11
+/// Operand b is a constant power of two, `1 << k` with k in 0..63 (the
+/// last is the word with only its top bit set).
+pub let G_B_POW2 = 12
 
 pub fn guard_name(g: i64) -> str {
     match g {
@@ -120,6 +130,9 @@ pub fn guard_name(g: i64) -> str {
         7 -> "fuse-icmp eq 0"
         8 -> "fuse-icmp ne 0"
         9 -> "fuse-fcmp"
+        10 -> "b:shift"
+        11 -> "b:bitmask"
+        12 -> "b:pow2"
         _ -> "?"
     }
 }
@@ -214,19 +227,31 @@ pub fn rules() -> [Rule] {
     rs.push(r("sub-negimm", ir.M_SUB, G_B_NIMM12, [ti(mach.A_ADDI, S_RES, S_A, K_NB, 0)]))
     rs.push(plain("sub", ir.M_SUB, mach.A_SUBR))
 
+    // A product with `1 << k` is the value shifted left by k, wrapping as
+    // `mul` does; an unsigned quotient by `1 << k` is the value shifted right.
+    rs.push(r("mul-pow2", ir.M_MUL, G_B_POW2, [ti(mach.A_LSLI, S_RES, S_A, K_B_LOG2, 0)]))
     rs.push(plain("mul", ir.M_MUL, mach.A_MUL))
     rs.push(plain("sdiv", ir.M_SDIV, mach.A_SDIV))
+    rs.push(r("udiv-pow2", ir.M_UDIV, G_B_POW2, [ti(mach.A_LSRI, S_RES, S_A, K_B_LOG2, 0)]))
     rs.push(plain("udiv", ir.M_UDIV, mach.A_UDIV))
     // a % b = a - (a / b) * b; `msub d, n, m, a` is a - n * m.
     var srem_t = t(mach.A_MSUB, S_RES, S_T0, S_B)
     srem_t.a = S_A
     rs.push(r("srem", ir.M_SREM, G_ANY, [t(mach.A_SDIV, S_T0, S_A, S_B), srem_t]))
     rs.push(r("urem", ir.M_UREM, G_ANY, [t(mach.A_UDIV, S_T0, S_A, S_B), srem_t]))
+    rs.push(r("and-imm", ir.M_AND, G_B_LOGIMM, [ti(mach.A_ANDI, S_RES, S_A, K_B, 0)]))
     rs.push(plain("and", ir.M_AND, mach.A_ANDR))
+    rs.push(r("or-imm", ir.M_OR, G_B_LOGIMM, [ti(mach.A_ORRI, S_RES, S_A, K_B, 0)]))
     rs.push(plain("or", ir.M_OR, mach.A_ORRR))
+    rs.push(r("xor-imm", ir.M_XOR, G_B_LOGIMM, [ti(mach.A_EORI, S_RES, S_A, K_B, 0)]))
     rs.push(plain("xor", ir.M_XOR, mach.A_EORR))
+    // A count the register forms would take modulo 64 is a constant already
+    // in range here, so the immediate form shifts by the same amount.
+    rs.push(r("shl-imm", ir.M_SHL, G_B_SHIFT, [ti(mach.A_LSLI, S_RES, S_A, K_B, 0)]))
     rs.push(plain("shl", ir.M_SHL, mach.A_LSLV))
+    rs.push(r("sshr-imm", ir.M_SSHR, G_B_SHIFT, [ti(mach.A_ASRI, S_RES, S_A, K_B, 0)]))
     rs.push(plain("sshr", ir.M_SSHR, mach.A_ASRV))
+    rs.push(r("ushr-imm", ir.M_USHR, G_B_SHIFT, [ti(mach.A_LSRI, S_RES, S_A, K_B, 0)]))
     rs.push(plain("ushr", ir.M_USHR, mach.A_LSRV))
     rs.push(unary("neg", ir.M_NEG, mach.A_NEG))
     rs.push(unary("not", ir.M_NOT, mach.A_MVN))
@@ -371,7 +396,7 @@ fn binary_op(op: i64) -> bool {
 }
 
 fn guard_reads_b(g: i64) -> bool {
-    g == G_B_UIMM12 or g == G_B_UIMM12_HI or g == G_B_NIMM12
+    g == G_B_UIMM12 or g == G_B_UIMM12_HI or g == G_B_NIMM12 or g == G_B_SHIFT or g == G_B_LOGIMM or g == G_B_POW2
 }
 
 /// A guard that absorbs an integer comparison into its branch.
@@ -544,8 +569,19 @@ pub fn check(rs: [Rule]) -> [str] {
                 if (k == K_B or k == K_B_HI or k == K_NB) and not guard_reads_b(ri.guard) {
                     problems.push("rule {ri.name}: uses b as an immediate without a guard that makes it one")
                 }
-                if k == K_B and ri.guard != G_B_UIMM12 {
-                    problems.push("rule {ri.name}: K_B needs the b:uimm12 guard")
+                // b as itself: under a guard that admits only values the
+                // field takes as they are.
+                if k == K_B and ri.guard != G_B_UIMM12 and ri.guard != G_B_SHIFT and ri.guard != G_B_LOGIMM {
+                    problems.push("rule {ri.name}: K_B needs the b:uimm12, b:shift or b:bitmask guard")
+                }
+                if k == K_B and ri.guard == G_B_SHIFT and not (m == mach.A_LSLI or m == mach.A_LSRI or m == mach.A_ASRI) {
+                    problems.push("rule {ri.name}: a shift count is the immediate of a shift")
+                }
+                if k == K_B and ri.guard == G_B_LOGIMM and not (m == mach.A_ANDI or m == mach.A_ORRI or m == mach.A_EORI) {
+                    problems.push("rule {ri.name}: a bitmask is the immediate of a logical instruction")
+                }
+                if k == K_B_LOG2 and ri.guard != G_B_POW2 {
+                    problems.push("rule {ri.name}: K_B_LOG2 needs the b:pow2 guard")
                 }
                 if k == K_B_HI and ri.guard != G_B_UIMM12_HI {
                     problems.push("rule {ri.name}: K_B_HI needs the b:uimm12<<12 guard")
@@ -590,6 +626,9 @@ pub fn check(rs: [Rule]) -> [str] {
     for p in check_fcc(fcc_map()) {
         problems.push(p)
     }
+    for p in check_imm_forms(rs) {
+        problems.push(p)
+    }
     // The condition map, checked against what the conditions mean: for
     // pairs of values at the edges of both orders, the AArch64 condition,
     // read off the flags `cmp a, b` sets, must hold exactly when the MIR
@@ -624,6 +663,147 @@ pub fn check(rs: [Rule]) -> [str] {
         }
     }
     problems
+}
+
+/// The immediate rules, checked against what the operations mean, as the
+/// condition maps are: for words at the edges and between, every rule whose
+/// guard admits a constant b must compute, with the immediate it would take
+/// from b, what the register form computes with b in a register. A guard and
+/// its immediate selector that disagree -- a count off by one, a power of two
+/// read as its own logarithm plus one -- are found here, before any program
+/// is compiled.
+fn check_imm_forms(rs: [Rule]) -> [str] {
+    var problems: [str] = []
+    let mn = -9223372036854775807 - 1
+    let xs = [0, 1, -1, 2, 3, 255, -256, 4096, 81985529216486895, mn, mn + 1, 9223372036854775807, 6148914691236517205, -6148914691236517206]
+    var bs: [i64] = []
+    for k in 0..64 {
+        bs.push(k)
+        bs.push(1.shl(k))
+        bs.push(1.shl(k) - 1)
+        bs.push(0 - 1.shl(k))
+    }
+    for x in [255, 65535, 4294967295, 6148914691236517205, 72340172838076673, 1229782938247303441, -6148914691236517206, 64, 100, 12345] {
+        bs.push(x)
+    }
+    var checked = 0
+    for ru in rs {
+        if not (ru.guard == G_B_SHIFT or ru.guard == G_B_LOGIMM or ru.guard == G_B_POW2) or ru.emit.len() != 1 {
+            continue
+        }
+        let tm = ru.emit[0]
+        var wrong = 0
+        var example = ""
+        for b in bs {
+            if not imm_guard_holds(ru.guard, b) {
+                continue
+            }
+            let k = if tm.imm == K_B_LOG2 { log2(b) } else if tm.imm == K_B { b } else { tm.imm }
+            for x in xs {
+                let want = op_value(ru.op, x, b)
+                let got = mop_value(tm.mop, x, k)
+                checked += 1
+                if want != got {
+                    if wrong == 0 {
+                        example = "{x} with b = {b}"
+                    }
+                    wrong += 1
+                }
+            }
+        }
+        if wrong > 0 {
+            problems.push("rule {ru.name}: {mach.form_name(tm.mop)} disagrees with `{ir.op_name(ru.op)}` on {wrong} cases, first {example}")
+        }
+    }
+    if checked == 0 {
+        problems.push("no immediate rule was checked against its operation")
+    }
+    problems
+}
+
+/// Whether an immediate guard admits constant `b` (`isel.gr` asks the same).
+pub fn imm_guard_holds(g: i64, b: i64) -> bool {
+    if g == G_B_SHIFT {
+        return b >= 0 and b <= 63
+    }
+    if g == G_B_LOGIMM {
+        return mach.logimm(b) >= 0
+    }
+    if g == G_B_POW2 {
+        return b != 0 and b.bit_and(b - 1) == 0
+    }
+    false
+}
+
+/// The k with `1 << k == b`, for a power of two `b`.
+pub fn log2(b: i64) -> i64 {
+    var k = 0
+    while k < 63 and 1.shl(k) != b {
+        k += 1
+    }
+    k
+}
+
+/// What MIR operation `op` computes of `x` and `b`, as its register form does.
+fn op_value(op: i64, x: i64, b: i64) -> i64 {
+    if op == ir.M_AND {
+        x.bit_and(b)
+    } else if op == ir.M_OR {
+        x.bit_or(b)
+    } else if op == ir.M_XOR {
+        x.bit_xor(b)
+    } else if op == ir.M_SHL {
+        x.shl(b.bit_and(63))
+    } else if op == ir.M_SSHR {
+        x.shr(b.bit_and(63))
+    } else if op == ir.M_USHR {
+        x.ushr(b.bit_and(63))
+    } else if op == ir.M_MUL {
+        x * b
+    } else if op == ir.M_UDIV {
+        udiv(x, b)
+    } else {
+        -12345
+    }
+}
+
+/// `x / b` with both read as unsigned, by long division on the bits.
+fn udiv(x: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0
+    }
+    var q = 0
+    var r = 0
+    var i = 63
+    while i >= 0 {
+        r = r.shl(1).bit_or(x.ushr(i).bit_and(1))
+        if not ult(r, b) {
+            r = r - b
+            q = q.bit_or(1.shl(i))
+        }
+        i -= 1
+    }
+    q
+}
+
+/// What machine instruction `m` computes of `x` with immediate `k`, as the
+/// Arm ARM defines it -- the field as it is encoded, not the value it was
+/// worked out from: a shift's count, a logical instruction's mask decoded
+/// from the bits the encoder writes.
+fn mop_value(m: i64, x: i64, k: i64) -> i64 {
+    if m == mach.A_LSLI {
+        x.shl(k)
+    } else if m == mach.A_LSRI {
+        x.ushr(k)
+    } else if m == mach.A_ASRI {
+        x.shr(k)
+    } else if m == mach.A_ANDI or m == mach.A_ORRI or m == mach.A_EORI {
+        let enc = mach.logimm(k)
+        let mask = mach.logimm_value(enc.ushr(12).bit_and(1), enc.ushr(6).bit_and(63), enc.bit_and(63))
+        if m == mach.A_ANDI { x.bit_and(mask) } else if m == mach.A_ORRI { x.bit_or(mask) } else { x.bit_xor(mask) }
+    } else {
+        -54321
+    }
 }
 
 /// `a <u b`, on the bits.

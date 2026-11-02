@@ -48,7 +48,7 @@ fn b_guard(g: i64, k: i64) -> bool {
     } else if g == rules.G_B_NIMM12 {
         k >= -4095 and k <= -1
     } else {
-        false
+        rules.imm_guard_holds(g, k)
     }
 }
 
@@ -58,7 +58,7 @@ fn guard_holds(f: MirFn, s: Sel, g: i64, i: i64, j: i64) -> bool {
     if g == rules.G_ANY {
         return true
     }
-    if g == rules.G_B_UIMM12 or g == rules.G_B_UIMM12_HI or g == rules.G_B_NIMM12 {
+    if g == rules.G_B_UIMM12 or g == rules.G_B_UIMM12_HI or g == rules.G_B_NIMM12 or g == rules.G_B_SHIFT or g == rules.G_B_LOGIMM or g == rules.G_B_POW2 {
         if i < 0 or ir.nreads(f.op[i]) != 2 {
             return false
         }
@@ -348,12 +348,12 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], 
         for k in [tm.imm, tm.imm2] {
             if k >= 0 {
                 imms.push(k)
-            } else if k == rules.K_B or k == rules.K_NB or k == rules.K_B_HI {
+            } else if k == rules.K_B or k == rules.K_NB or k == rules.K_B_HI or k == rules.K_B_LOG2 {
                 let (isk, c) = const_of(f, s, b)
                 if not isk {
                     fail("a rule took operand b as an immediate, and it is not a constant")
                 }
-                imms.push(if k == rules.K_B { c } else if k == rules.K_NB { 0 - c } else { c.shr(12) })
+                imms.push(if k == rules.K_B { c } else if k == rules.K_NB { 0 - c } else if k == rules.K_B_LOG2 { rules.log2(c) } else { c.shr(12) })
             } else if k == rules.K_IB or k == rules.K_NIB {
                 let (isk, c) = const_of(f, s, ib)
                 if not isk {

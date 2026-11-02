@@ -185,6 +185,19 @@ pub let A_FLDP_OFF = 104
 pub let A_ADRP_TLV = 105
 /// `ldr xd, [xn, sym@TLVPPAGEOFF]`: the descriptor's address.
 pub let A_LDR_TLV = 106
+// Immediate forms (S3 part six): shifts by a constant -- `lsl`, `lsr` and
+// `asr` immediate, which are `ubfm` and `sbfm` with the fields worked out
+// from the count -- and `and`, `orr` and `eor` with a bitmask immediate,
+// whose `N:immr:imms` the encoder works out from the 64-bit value itself
+// (`logimm`), refusing one that is not a repeating pattern of rotated ones.
+/// `lsl xd, xn, #s`: `imm` is the count, 0..63.
+pub let A_LSLI = 107
+pub let A_LSRI = 108
+pub let A_ASRI = 109
+/// `and xd, xn, #mask`: `imm` is the mask, as the 64-bit value.
+pub let A_ANDI = 110
+pub let A_ORRI = 111
+pub let A_EORI = 112
 /// Not an instruction: the function's return, which becomes the epilogue.
 /// `imm` 1 when it returns x0, 2 when it returns d0.
 pub let P_RETURN = 150
@@ -197,7 +210,7 @@ pub let NMOPS = 160
 /// The opcodes that are real instructions, for whoever wants all of them.
 pub fn all_mops() -> [i64] {
     var out: [i64] = []
-    for m in 1..107 {
+    for m in 1..113 {
         out.push(m)
     }
     out
@@ -332,6 +345,12 @@ pub fn mop_name(m: i64) -> str {
         104 -> "ldp"
         105 -> "adrp"
         106 -> "ldr"
+        107 -> "lsl"
+        108 -> "lsr"
+        109 -> "asr"
+        110 -> "and"
+        111 -> "orr"
+        112 -> "eor"
         150 -> "<return>"
         151 -> "<movimm>"
         _ -> "<?>"
@@ -447,6 +466,12 @@ pub fn form_name(m: i64) -> str {
         104 -> "ldp-d-off"
         105 -> "adrp-tlvp"
         106 -> "ldr-tlvppageoff"
+        107 -> "lsl-imm"
+        108 -> "lsr-imm"
+        109 -> "asr-imm"
+        110 -> "and-imm"
+        111 -> "orr-imm"
+        112 -> "eor-imm"
         _ -> "?"
     }
 }
@@ -481,6 +506,10 @@ let F_CAS = 22
 let F_LDADD = 23
 /// A load of a global offset table slot: Rt, [Rn, sym@GOTPAGEOFF].
 let F_LDRGOT = 24
+/// A shift by a constant: Rd, Rn, #count.
+let F_SHIFTI = 25
+/// A logical operation with a bitmask immediate: Rd, Rn, #mask.
+let F_LOGI = 26
 
 fn mop_fmt(m: i64) -> i64 {
     if m >= A_FADD {
@@ -566,6 +595,10 @@ fn fp_fmt(m: i64) -> i64 {
         F_LDRGOT
     } else if m >= A_STP_OFF and m <= A_FLDP_OFF {
         F_PAIR
+    } else if m >= A_LSLI and m <= A_ASRI {
+        F_SHIFTI
+    } else if m >= A_ANDI and m <= A_EORI {
+        F_LOGI
     } else {
         0
     }
@@ -702,6 +735,12 @@ fn mop_base(m: i64) -> i64 {
         104 -> 0x6D400000
         105 -> 0x90000000
         106 -> 0xF9400000
+        107 -> 0xD3400000
+        108 -> 0xD3400000
+        109 -> 0x93400000
+        110 -> 0x92000000
+        111 -> 0xB2000000
+        112 -> 0xD2000000
         _ -> 0
     }
 }
@@ -728,7 +767,7 @@ pub fn role_d(m: i64) -> i64 {
 
 pub fn role_n(m: i64) -> i64 {
     let f = mop_fmt(m)
-    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 or f == 19 or (f >= F_LDSTN and f <= F_LDRGOT) {
+    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 or f == 19 or (f >= F_LDSTN and f <= F_LOGI) {
         2
     } else {
         0
@@ -761,6 +800,10 @@ fn sp_field(m: i64, field: i64) -> bool {
         field == 1
     } else if m >= A_STP_OFF and m <= A_FLDP_OFF {
         field == 1
+    } else if m >= A_ANDI and m <= A_EORI {
+        // A logical immediate's 31 is `sp` as its destination and the zero
+        // register as its source.
+        field == 0
     } else if (m >= A_LDRB and m <= A_LDADDALX) or m == A_LDR_GOT or m == A_LDR_TLV {
         // The base of every raw-memory access may be `sp`.
         field == 1
@@ -1039,7 +1082,152 @@ pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, c
         let n = try reg_field(m, 1, rn)
         return base.bit_or(n.shl(5)).bit_or(t)
     }
+    if f == F_SHIFTI {
+        let d = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let s = try uimm(m, "shift count", imm, 6)
+        // `lsl #s` is `ubfm #(-s mod 64), #(63 - s)`; `lsr` and `asr #s` are
+        // `ubfm`/`sbfm #s, #63`.
+        let immr = if m == A_LSLI { (64 - s).bit_and(63) } else { s }
+        let imms = if m == A_LSLI { 63 - s } else { 63 }
+        return base.bit_or(immr.shl(16)).bit_or(imms.shl(10)).bit_or(n.shl(5)).bit_or(d)
+    }
+    if f == F_LOGI {
+        let d = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let enc = logimm(imm)
+        if enc < 0 {
+            fail("{form_name(m)}: {hex64(imm)} is not a bitmask immediate")
+        }
+        return base.bit_or(enc.shl(10)).bit_or(n.shl(5)).bit_or(d)
+    }
     fail("opcode {m} has no encoding")
+}
+
+/// The 64-bit word as the assembler reads it: `0x` and its hex digits.
+pub fn hex64(k: i64) -> str {
+    "0x" + k.as_u64().to_base(16)
+}
+
+/// Whether `x` is a run of ones from bit 0 up: `0..01..1`, not zero.
+fn is_mask(x: i64) -> bool {
+    x != 0 and (x + 1).bit_and(x) == 0
+}
+
+/// Whether `x` is one run of ones somewhere: `0..01..10..0`, not zero.
+fn is_shifted_mask(x: i64) -> bool {
+    x != 0 and is_mask((x - 1).bit_or(x))
+}
+
+fn trailing_zeros(x: i64) -> i64 {
+    var n = 0
+    while n < 64 and x.ushr(n).bit_and(1) == 0 {
+        n += 1
+    }
+    n
+}
+
+fn trailing_ones(x: i64) -> i64 {
+    var n = 0
+    while n < 64 and x.ushr(n).bit_and(1) == 1 {
+        n += 1
+    }
+    n
+}
+
+fn leading_ones(x: i64) -> i64 {
+    var n = 0
+    while n < 64 and x.ushr(63 - n).bit_and(1) == 1 {
+        n += 1
+    }
+    n
+}
+
+/// The bitmask-immediate encoding of `k` -- `N << 12 | immr << 6 | imms`,
+/// thirteen bits -- or -1 when `k` is not one: an element of 2, 4, .. 64
+/// bits, repeated across the word, that is a run of ones rotated (Arm ARM,
+/// DecodeBitMasks; worked out as LLVM's `processLogicalImmediate` does, which
+/// chooses the smallest element, as the assembler does). Zero and all ones
+/// have no encoding.
+pub fn logimm(k: i64) -> i64 {
+    if k == 0 or k == -1 {
+        return -1
+    }
+    // The element's size: halve while both halves agree.
+    var size = 64
+    var going = true
+    while going and size > 2 {
+        let half = size / 2
+        let mask = 1.shl(half) - 1
+        if k.bit_and(mask) != k.ushr(half).bit_and(mask) {
+            going = false
+        } else {
+            size = half
+        }
+    }
+    let emask = if size == 64 { -1 } else { 1.shl(size) - 1 }
+    var x = k.bit_and(emask)
+    var rot = 0
+    var ones = 0
+    if is_shifted_mask(x) {
+        rot = trailing_zeros(x)
+        ones = trailing_ones(x.ushr(rot))
+    } else {
+        x = x.bit_or(emask.bit_xor(-1))
+        if not is_shifted_mask(x.bit_xor(-1)) {
+            return -1
+        }
+        let clo = leading_ones(x)
+        rot = 64 - clo
+        ones = clo + trailing_ones(x) - (64 - size)
+    }
+    let immr = (size - rot).bit_and(size - 1)
+    // imms: the element size in its top bits (`0b0xxxxx` for 32, ...,
+    // `0b11110x` for 2), the run's length less one below; N is set only
+    // for an element of 64 bits.
+    var nimms = (size - 1).bit_xor(-1).shl(1)
+    nimms = nimms.bit_or(ones - 1)
+    let nbit = nimms.ushr(6).bit_and(1).bit_xor(1)
+    nbit.shl(12).bit_or(immr.shl(6)).bit_or(nimms.bit_and(63))
+}
+
+/// The 64-bit value bitmask-immediate fields `n`, `immr` and `imms` stand
+/// for, or 0 for fields that stand for none (Arm ARM, DecodeBitMasks): the
+/// encoder's test cases come from here, so they cover the encodings and not
+/// only the values the encoder was written to expect.
+pub fn logimm_value(n: i64, immr: i64, imms: i64) -> i64 {
+    // The element size is the highest set bit of N:NOT(imms).
+    let combined = n.shl(6).bit_or(imms.bit_xor(63))
+    var len = -1
+    for b in 0..7 {
+        if combined.ushr(b).bit_and(1) == 1 {
+            len = b
+        }
+    }
+    if len < 1 {
+        return 0
+    }
+    let levels = 1.shl(len) - 1
+    let s = imms.bit_and(levels)
+    let r = immr.bit_and(levels)
+    if s == levels {
+        return 0
+    }
+    let esize = 1.shl(len)
+    let emask = if esize == 64 { -1 } else { 1.shl(esize) - 1 }
+    let welem = if s + 1 == 64 { -1 } else { 1.shl(s + 1) - 1 }
+    // Rotated right by r within the element.
+    var e = welem
+    if r > 0 {
+        e = welem.ushr(r).bit_or(welem.shl(esize - r)).bit_and(emask)
+    }
+    var out = 0
+    var at = 0
+    while at < 64 {
+        out = out.bit_or(e.shl(at))
+        at += esize
+    }
+    out
 }
 
 // ----- assembly text -------------------------------------------------------------
@@ -1181,6 +1369,12 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
     }
     if f == F_LDADD {
         return "{name} {mm}, {d}, [{n}]"
+    }
+    if f == F_SHIFTI {
+        return "{name} {d}, {n}, #{imm}"
+    }
+    if f == F_LOGI {
+        return "{name} {d}, {n}, #{hex64(imm)}"
     }
     if m == P_RETURN {
         return "<return>"
