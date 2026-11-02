@@ -3507,13 +3507,17 @@ recorded as the step's gap.
   branch's driver and by master's from the same TIR in the same directory,
   and `fixpoint`.
 
-**Decisions for the owner.** (1) The variadic table of the runtime's two C
-functions on x86-64 (above), or a `...` in `extern fn` that the frontend would
-have to learn -- a Rust change, which this stage does not make. (2) Linux, part
-two: where its binaries run (a Linux machine or VM in CI, or a container on
-this one), which the brief leaves to the owner. (3) SSE4.1 as the floor
-(`roundsd`); calling the C library's `floor` and `ceil` instead would make it
-SSE2.
+**Decisions** (asked of the owner with this note; answered 2026-11-02). (1)
+The runtime's two variadic C functions on x86-64 go through a per-target
+table, as above; no `...` in `extern fn`, since the language is frozen and the
+frontend does not change. (2) Linux, part two, stays with the owner -- where
+its binaries run -- and does not start. (3) SSE4.1 is the floor: `roundsd`
+for `floor` and `ceil`. Every Intel Mac has it, Rosetta provides it, and it
+is part of the x86-64-v2 baseline. On a machine without it -- x86-64-v1, which
+no Mac is -- a program reaching `floor` or `ceil` stops with an illegal
+instruction (SIGILL) the first time it runs one; it never computes a wrong
+answer, since the processor refuses the instruction rather than reading it
+as another.
 
 **Step two: the encoder** (2026-11-02). `compiler/x86_64` (`mach.gr`,
 `enctest.gr`): 102 instruction forms -- every one the table above, the frame,
