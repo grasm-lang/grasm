@@ -3507,7 +3507,9 @@ recorded as the step's gap.
   branch's driver and by master's from the same TIR in the same directory,
   and `fixpoint`.
 
-**Decisions** (asked of the owner with this note; answered 2026-11-02). (1)
+**Decisions** (raised with this note, 2026-11-02; (1) and (3) were taken by
+the coordinating session within the owner's standing rules and the owner may
+reverse them; (2) is the owner's and is open). (1)
 The runtime's two variadic C functions on x86-64 go through a per-target
 table, as above; no `...` in `extern fn`, since the language is frozen and the
 frontend does not change. (2) Linux, part two, stays with the owner -- where
