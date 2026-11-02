@@ -3557,6 +3557,35 @@ files, `tirdiff` 1,914 the same TIR and 67 refused by both, none disagreeing,
 `gatecheck` pass. Not run: the rest of the suite, `stagediff` and
 `s3controls` among them, which this step's change does not reach.
 
+**Step three, part one: the shared package** (2026-11-02). `compiler/vcode`
+holds what the table above calls shared but the rule engine's plan, which
+stays in each target's `isel.gr` for now: `vcode.gr`, `regalloc.gr`,
+`backtrack.gr` and `check.gr` moved out of `compiler/aarch64`, `frameplan.gr`
+(the shrink-wrapping plan, out of `emit.gr`) and `moves.gr` (`mov` and
+`par_moves`, out of `isel.gr`), and `target.gr`, the description. A
+description is a record of tables: per opcode the four fields' roles and
+files, whether it is a call, its form's name; per physical register whether
+it is one a value lives in, whether a call changes or keeps it, whether the
+body may write it, whether touching it needs the frame, its name; the
+argument and result registers, the registers fixed on entry (the frame
+pointer), the allocation, stress and scratch orders by class, the move, load
+and store a rewrite inserts and the move's source field, the stack pointer,
+the direct call, the largest frame. `compiler/aarch64/src/desc.gr` builds
+AArch64's from `mach.gr` and AAPCS64's lists, the answers the allocators
+asked before. The only generalisations the code needed were these: a call
+through a register reads it if its role says so (was: if it is `blr`); every
+field may be written and read as its role says (field 3 had only "read");
+the entry's argument registers and the call's clobbers come from the
+description rather than from register numbers 0..7 and 0..17.
+
+It changed nothing AArch64 emits. From the same TIR in the same directory,
+the branch's driver and master's made the same bytes for all 648 programs of
+the subset and for the runtime (555,152 bytes), and for every eighth program
+the same objects and `--stats` lines under linear scan, with 2 and with 0
+registers under both allocators, and the same counts under each of the three
+planted allocation faults: 567 more compilations, all the same. `s3controls`'
+`allocator` and `backtrack` controls name the files where they now are.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
