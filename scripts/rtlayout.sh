@@ -28,6 +28,13 @@
 # grasm_rt/poison>`; with `RT_POISON=` empty that one is held to the source
 # alone. `RT_LAYOUT=<file>` checks another copy of layout.gr (the controls
 # plant a fault in one).
+#
+# The backend reads some of these layouts inline too -- a scalar list's
+# element and length (`compiler/mir/src/lower.gr`) -- from its own copy,
+# `compiler/mir/src/layout.gr`: every constant there must be one of
+# layout.gr's, by name, with the same value, so it is held to the same
+# witnesses. `BACKEND_LAYOUT=<file>` checks another copy of it (the control in
+# `scripts/s3controls.sh` plants a fault in one).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -64,11 +71,11 @@ if [ -n "${RT_POISON:-}" ]; then
     "$WORK/probe_p" >"$WORK/poisoned.txt" 2>/dev/null </dev/null
 fi
 
-python3 - "$WORK/measured.txt" "$WORK/poisoned.txt" "${RT_LAYOUT:-compiler/rt/src/layout.gr}" crates/grasm_rt/src/lib.rs <<'EOF'
+python3 - "$WORK/measured.txt" "$WORK/poisoned.txt" "${RT_LAYOUT:-compiler/rt/src/layout.gr}" crates/grasm_rt/src/lib.rs "${BACKEND_LAYOUT:-compiler/mir/src/layout.gr}" <<'EOF'
 import re
 import sys
 
-measured_path, poisoned_path, grasm_path, rust_path = sys.argv[1:5]
+measured_path, poisoned_path, grasm_path, rust_path, backend_path = sys.argv[1:6]
 
 
 def pairs(path):
@@ -199,10 +206,29 @@ for name in sorted(measured):
     if name not in grasm:
         print(f"FAIL: the probe measures {name}, which layout.gr does not write down")
         bad = 1
+# The backend's copy: each of its constants one of layout.gr's, by name.
+backend = {}
+for line in open(backend_path):
+    m = re.match(r"pub let (\w+) = (-?\d+)\s*$", line)
+    if m:
+        backend[m.group(1)] = int(m.group(2))
+    elif line.startswith("pub let "):
+        print(f"FAIL: {backend_path} has a constant this gate cannot read: {line.strip()}")
+        bad = 1
+backend_same = 0
+for name, value in sorted(backend.items()):
+    if name not in grasm:
+        print(f"FAIL: {backend_path}'s {name} is not one of layout.gr's constants")
+        bad = 1
+    elif grasm[name] != value:
+        print(f"FAIL: {name} is {value} in {backend_path}, {grasm[name]} in layout.gr")
+        bad = 1
+    else:
+        backend_same += 1
 witnessed = sum(1 for n in grasm if n in source and n not in SOURCE_ONLY)
 poison_note = "measured in the poisoned runtime" if "POISON" in poisoned else "held to the source only"
-print(f"layout constants: {len(grasm)}   measured and equal: {compared}   also stated by the Rust source: {witnessed}   held to the source alone: {source_only}   POISON {poison_note}")
+print(f"layout constants: {len(grasm)}   measured and equal: {compared}   also stated by the Rust source: {witnessed}   held to the source alone: {source_only}   POISON {poison_note}   the backend's: {len(backend)}, all layout.gr's: {backend_same}")
 expected = len(grasm) - len(SOURCE_ONLY) if "POISON" in poisoned else len(grasm) - len(SOURCE_ONLY) - 1
-if bad or compared != expected or source_only != len(SOURCE_ONLY) or len(grasm) < 30:
+if bad or compared != expected or source_only != len(SOURCE_ONLY) or len(grasm) < 30 or not backend or backend_same != len(backend):
     sys.exit(1)
 EOF

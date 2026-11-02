@@ -16,6 +16,7 @@ import sexp
 import ir
 import prog
 import mono
+import layout
 
 /// A function in the variable form, and the state of building it.
 type Vir = {
@@ -928,6 +929,8 @@ fn lower_list(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     for x in sexp.kids(t, e) {
         let xv = value_of(info, v, x)
         if sk >= 0 {
+            // A literal runs once: its pushes stay calls, so a long one is
+            // not thousands of blocks.
             let kc = konst(v, sk)
             let w = word_of(v, xv)
             forget_temp(v, l)
@@ -973,12 +976,571 @@ fn lower_maplit(info: TirInfo, inout v: Vir, e: i64) -> i64 {
 fn list_elem(inout v: Vir, t: TirTree, l: i64, i: i64, te: i64) -> i64 {
     let sk = scalar_kind(t, te)
     if sk >= 0 {
-        let kc = konst(v, sk)
-        let w = rt(v, "grasm_list_get_scalar", [l, i, kc], R_WORD)
+        let w = scalar_get(v, l, i, sk)
         return word_as(v, w, ty_kind(t, te))
     }
     let b = rt(v, "grasm_list_get", [l, i], R_BOX)
     unbox_kind(v, b, ty_kind(t, te))
+}
+
+// ----- scalar list elements, inline ------------------------------------------------
+//
+// An element of a list of scalars is read and written where the code is, as
+// the Cranelift build reads one (`scalar_list_get` in crates/grasm_native):
+// a load, or a store, when the list is a `ListScalar` held in the
+// `ScalarData` its element kind uses -- words, or bytes for `bool`s -- the
+// index is inside it, and, for a store, nothing else holds the list; in every
+// other case the runtime call this lowering made before, which copies a
+// shared list before writing it, reads a tuple or a list of boxes, and
+// panics on an index out of range with the runtime's own message. So the
+// inline path changes nothing a program can see, only what it costs. The
+// layout is the runtime's (`layout.gr`, which `scripts/rtlayout.sh` holds).
+
+/// Whether the function has room for another inline path: each is a few
+/// blocks, and SSA construction's liveness is over blocks and the variables
+/// that cross them, so a function past this many blocks -- a long run of
+/// element reads, say -- takes the runtime's calls instead.
+fn room_to_inline(v: Vir) -> bool {
+    v.bstart.len() < 4096
+}
+
+/// The address `k` bytes into box `l`.
+fn box_at(inout v: Vir, l: i64, k: i64) -> i64 {
+    let c = konst(v, k)
+    op2(v, ir.M_ADD, l, c)
+}
+
+/// `x == k`, as 0 or 1.
+fn is_k(inout v: Vir, x: i64, k: i64) -> i64 {
+    let c = konst(v, k)
+    icmp(v, ir.CC_EQ, x, c)
+}
+
+/// Goes on in a fresh block when `ok` (0 or 1) holds, else to block `no`.
+/// Each test of an inline path is a branch of its own, taken in order, so a
+/// test that fails costs no more of the ones after it: measured against one
+/// branch on every test computed and combined, this was 12% faster on
+/// `sieve` and 16% on `matmul`.
+fn when(inout v: Vir, ok: i64, no: i64) {
+    let yes = new_block(v)
+    term_brif(v, ok, yes, no)
+    switch_to(v, yes)
+}
+
+/// The runtime's `ScalarKind` byte for this lowering's scalar kind `sk`
+/// (`scalar_kind`, where `u64` is 5).
+fn kind_byte(sk: i64) -> i64 {
+    if sk == 0 {
+        layout.SK_I64
+    } else if sk == 1 {
+        layout.SK_F64
+    } else if sk == 2 {
+        layout.SK_BOOL
+    } else if sk == 3 {
+        layout.SK_REF
+    } else {
+        layout.SK_U64
+    }
+}
+
+/// Goes on in a fresh block when list `l` is a `ListScalar` of kind `sk`
+/// held in the `ScalarData` that kind uses -- bytes for `bool`s, words
+/// otherwise -- else to block `no`: its tag and its kind, the byte after the
+/// tag, in one halfword, then its data's tag.
+fn expect_scalar(inout v: Vir, l: i64, sk: i64, no: i64) {
+    if layout.SCALAR_KIND_AT == layout.TAG + 1 {
+        let ta = box_at(v, l, layout.TAG)
+        let th = op1(v, ir.M_LOAD16U, ta)
+        let c = is_k(v, th, layout.TAG_LIST_SCALAR + 256 * kind_byte(sk))
+        when(v, c, no)
+    } else {
+        let ta = box_at(v, l, layout.TAG)
+        let tg = op1(v, ir.M_LOAD8U, ta)
+        let ct = is_k(v, tg, layout.TAG_LIST_SCALAR)
+        when(v, ct, no)
+        let ka = box_at(v, l, layout.SCALAR_KIND_AT)
+        let kd = op1(v, ir.M_LOAD8U, ka)
+        let ck = is_k(v, kd, kind_byte(sk))
+        when(v, ck, no)
+    }
+    let da = box_at(v, l, layout.SCALAR_DISC)
+    let dt = op1(v, ir.M_LOAD8U, da)
+    let c2 = is_k(v, dt, if sk == 2 { layout.SCALAR_BYTES } else { layout.SCALAR_WORDS })
+    when(v, c2, no)
+}
+
+/// A scalar list's length, read from its `Vec`.
+fn scalar_len(inout v: Vir, l: i64) -> i64 {
+    let na = box_at(v, l, layout.SCALAR_VEC + layout.VEC_LEN)
+    op1(v, ir.M_LOAD, na)
+}
+
+/// Whether `0 <= i < ` scalar list `l`'s length, as 0 or 1: one unsigned
+/// comparison.
+fn inside(inout v: Vir, l: i64, i: i64) -> i64 {
+    let n = scalar_len(v, l)
+    icmp(v, ir.CC_ULT, i, n)
+}
+
+/// Whether nothing but its holder here holds box `l`, as 0 or 1.
+fn unique(inout v: Vir, l: i64) -> i64 {
+    let ra = box_at(v, l, layout.RC)
+    let rc = op1(v, ir.M_LOAD, ra)
+    is_k(v, rc, 1)
+}
+
+/// The address of element `i` of a scalar list `l` already known to be one
+/// and to hold it: its buffer plus `i` bytes or words.
+fn scalar_slot(inout v: Vir, l: i64, i: i64, bytes: bool) -> i64 {
+    let pa = box_at(v, l, layout.SCALAR_VEC + layout.VEC_PTR)
+    let p = op1(v, ir.M_LOAD, pa)
+    if bytes {
+        return op2(v, ir.M_ADD, p, i)
+    }
+    let three = konst(v, 3)
+    let off = op2(v, ir.M_SHL, i, three)
+    op2(v, ir.M_ADD, p, off)
+}
+
+/// Element `i` of list `l` (held, not consumed), whose elements are of
+/// scalar kind `sk`, as the word the runtime keeps: `grasm_list_get_scalar`'s
+/// answer, read inline when it can be.
+fn scalar_get(inout v: Vir, l: i64, i: i64, sk: i64) -> i64 {
+    if not room_to_inline(v) {
+        let kc = konst(v, sk)
+        return rt(v, "grasm_list_get_scalar", [l, i, kc], R_WORD)
+    }
+    let bytes = sk == 2
+    let r = new_var(v, ir.TY_I64)
+    let slow = new_block(v)
+    let join = new_block(v)
+    expect_scalar(v, l, sk, slow)
+    let inb = inside(v, l, i)
+    when(v, inb, slow)
+    let at = scalar_slot(v, l, i, bytes)
+    let x = op1(v, if bytes { ir.M_LOAD8U } else { ir.M_LOAD }, at)
+    copy_to(v, r, x)
+    term_jump(v, join)
+    switch_to(v, slow)
+    let kc = konst(v, sk)
+    let w = rt(v, "grasm_list_get_scalar", [l, i, kc], R_WORD)
+    copy_to(v, r, w)
+    switch_to(v, join)
+    r
+}
+
+/// `l[i] = w` on a list whose elements are of scalar kind `sk`, `w` the word
+/// the runtime keeps: the list's reference is consumed and the list to keep
+/// answered, owned -- `grasm_list_set_scalar`'s contract, stored in place
+/// when nothing else holds the list.
+fn scalar_set(inout v: Vir, l: i64, i: i64, w: i64, sk: i64) -> i64 {
+    if not room_to_inline(v) {
+        let kc = konst(v, sk)
+        return rt(v, "grasm_list_set_scalar", [l, i, w, kc], R_BOX)
+    }
+    let bytes = sk == 2
+    let r = new_var(v, ir.TY_BOX)
+    let slow = new_block(v)
+    let join = new_block(v)
+    expect_scalar(v, l, sk, slow)
+    let alone = unique(v, l)
+    when(v, alone, slow)
+    let inb = inside(v, l, i)
+    when(v, inb, slow)
+    let at = scalar_slot(v, l, i, bytes)
+    if bytes {
+        // The runtime keeps a `bool` as the byte `bits != 0`.
+        let z = konst(v, 0)
+        let nz = icmp(v, ir.CC_NE, w, z)
+        emit(v, ir.M_STORE8, -1, at, nz, 0)
+    } else {
+        emit(v, ir.M_STORE, -1, at, w, 0)
+    }
+    copy_to(v, r, l)
+    term_jump(v, join)
+    switch_to(v, slow)
+    let kc = konst(v, sk)
+    let d = rt(v, "grasm_list_set_scalar", [l, i, w, kc], R_BOX)
+    copy_to(v, r, d)
+    forget_temp(v, d)
+    switch_to(v, join)
+    own_temp(v, r)
+    r
+}
+
+/// `l[i] <op>= x` on a list of numbers of type element `te`, the list's
+/// reference consumed and the list to keep answered, owned: read, combined
+/// and written in place when the list is a scalar list nothing else holds
+/// and `i` is inside it, tested once; otherwise as `read_child`, `combine`
+/// and `write_child` do it, by the runtime's calls, which panic, copy and
+/// read other shapes as they always did. A combination that panics (a
+/// division by zero) does so after the read and before the write, either
+/// way.
+fn scalar_update(inout v: Vir, t: TirTree, l: i64, i: i64, te: i64, op: str, x: i64, where_: str) -> i64 {
+    let sk = scalar_kind(t, te)
+    let k = ty_kind(t, te)
+    if is_temp(v, l) {
+        forget_temp(v, l)
+    }
+    let r = new_var(v, ir.TY_BOX)
+    let slow = new_block(v)
+    let join = new_block(v)
+    expect_scalar(v, l, sk, slow)
+    let u = unique(v, l)
+    when(v, u, slow)
+    let inb = inside(v, l, i)
+    when(v, inb, slow)
+    let at = scalar_slot(v, l, i, false)
+    let ow = op1(v, ir.M_LOAD, at)
+    let old = word_as(v, ow, k)
+    let fin = combine(v, t, op, te, old, x, where_)
+    let w = word_of(v, fin)
+    emit(v, ir.M_STORE, -1, at, w, 0)
+    copy_to(v, r, l)
+    term_jump(v, join)
+    switch_to(v, slow)
+    let kc = konst(v, sk)
+    let ow2 = rt(v, "grasm_list_get_scalar", [l, i, kc], R_WORD)
+    let old2 = word_as(v, ow2, k)
+    let fin2 = combine(v, t, op, te, old2, x, where_)
+    let w2 = word_of(v, fin2)
+    let kc2 = konst(v, sk)
+    let d = rt(v, "grasm_list_set_scalar", [l, i, w2, kc2], R_BOX)
+    copy_to(v, r, d)
+    forget_temp(v, d)
+    switch_to(v, join)
+    own_temp(v, r)
+    r
+}
+
+/// `l.push(w)` on a list whose elements are of scalar kind `sk`, `w` the
+/// word the runtime keeps: the list's reference consumed and the list to
+/// keep answered, owned -- `grasm_list_push_scalar`'s contract, as the
+/// Cranelift build's `scalar_list_push` does it: stored at the end and the
+/// length bumped when nothing else holds the list and its buffer has room,
+/// the call (which copies, or grows the buffer) otherwise.
+fn scalar_push(inout v: Vir, l: i64, w: i64, sk: i64) -> i64 {
+    if not room_to_inline(v) {
+        let kc = konst(v, sk)
+        return rt(v, "grasm_list_push_scalar", [l, w, kc], R_BOX)
+    }
+    let bytes = sk == 2
+    let r = new_var(v, ir.TY_BOX)
+    let slow = new_block(v)
+    let join = new_block(v)
+    expect_scalar(v, l, sk, slow)
+    let u = unique(v, l)
+    when(v, u, slow)
+    let n = scalar_len(v, l)
+    let ca = box_at(v, l, layout.SCALAR_VEC + layout.VEC_CAP)
+    let cap = op1(v, ir.M_LOAD, ca)
+    let room = icmp(v, ir.CC_ULT, n, cap)
+    when(v, room, slow)
+    let at = scalar_slot(v, l, n, bytes)
+    if bytes {
+        let z = konst(v, 0)
+        let nz = icmp(v, ir.CC_NE, w, z)
+        emit(v, ir.M_STORE8, -1, at, nz, 0)
+    } else {
+        emit(v, ir.M_STORE, -1, at, w, 0)
+    }
+    let one = konst(v, 1)
+    let n1 = op2(v, ir.M_ADD, n, one)
+    let na2 = box_at(v, l, layout.SCALAR_VEC + layout.VEC_LEN)
+    emit(v, ir.M_STORE, -1, na2, n1, 0)
+    copy_to(v, r, l)
+    term_jump(v, join)
+    switch_to(v, slow)
+    let kc = konst(v, sk)
+    let d = rt(v, "grasm_list_push_scalar", [l, w, kc], R_BOX)
+    copy_to(v, r, d)
+    forget_temp(v, d)
+    switch_to(v, join)
+    own_temp(v, r)
+    r
+}
+
+/// Whether computing index expression `e` leaves every local as it was: it
+/// is made of literals, local reads, operators and element reads alone, so a
+/// list a local held before it ran is the one the local holds after. A
+/// deeper expression than `depth` allows is not looked into.
+fn changes_no_local(t: TirTree, e: i64, depth: i64) -> bool {
+    if depth > 32 or t.kind[e] != 2 {
+        return false
+    }
+    let k = sexp.kw(t, e)
+    if k == "int" or k == "bool" or k == "local" {
+        return true
+    }
+    if k == "binary" or k == "unary" or k == "index" {
+        for c in sexp.kids(t, e) {
+            if not changes_no_local(t, c, depth + 1) {
+                return false
+            }
+        }
+        return true
+    }
+    false
+}
+
+/// Whether type element `x` is a list's.
+fn is_list_te(t: TirTree, x: i64) -> bool {
+    ty_head(t, x) == "list"
+}
+
+/// The runtime's field kind (`FK_*`) of field `j` of named struct type `x`,
+/// as `struct_desc` writes it into the type's descriptor: what the field's
+/// word holds.
+fn field_fk(info: TirInfo, x: i64, j: i64) -> i64 {
+    let t = info.t
+    let body = type_body(info, x)
+    if body < 0 or sexp.kw(t, body) != "struct" or j >= sexp.kids(t, body).len() {
+        return -1
+    }
+    let fd = sexp.kids(t, body)[j]
+    let k = field_kind(t, sexp.at(t, fd, 2), named_args(t, x))
+    if k == ir.TY_U64 { ir.FK_U64 } else if ir.ty_int(k) { ir.FK_I64 } else if ir.ty_fp(k) { ir.FK_F64 } else if k == ir.TY_BOOL { ir.FK_BOOL } else if k == ir.TY_UNIT { ir.FK_UNIT } else if k == ir.TY_REF { ir.FK_REF } else { ir.FK_BOXED }
+}
+
+/// Whether field node `e` reads a field of a struct a local holds, which
+/// can be read in place: the struct is the local's, not a reference's.
+fn local_struct_field(info: TirInfo, e: i64) -> bool {
+    let t = info.t
+    let recv = sexp.kids(t, e)[0]
+    if sexp.kw(t, recv) != "local" or not ir.ty_boxed(kind_at(t, recv, 1)) {
+        return false
+    }
+    let rte = ty_el(t, recv, 1)
+    if is_ref_te(t, rte) or ty_head(t, rte) != "named" {
+        return false
+    }
+    let body = type_body(info, rte)
+    body >= 0 and sexp.kw(t, body) == "struct"
+}
+
+/// Whether expression `e` names a box that can be read without a reference
+/// of its own while nothing changes a local: 1 a local's (`xs`), 2 a field
+/// of a struct a local holds (`f.xs`), 0 neither.
+fn borrow_shape(info: TirInfo, e: i64) -> i64 {
+    let t = info.t
+    if t.kind[e] != 2 or not ir.ty_boxed(kind_at(t, e, 1)) {
+        return 0
+    }
+    let k = sexp.kw(t, e)
+    if k == "local" {
+        return 1
+    }
+    if k != "field" {
+        return 0
+    }
+    let recv = sexp.kids(t, e)[0]
+    if sexp.kw(t, recv) != "local" or not ir.ty_boxed(kind_at(t, recv, 1)) {
+        return 0
+    }
+    let rte = ty_el(t, recv, 1)
+    if is_ref_te(t, rte) or ty_head(t, rte) != "named" {
+        return 0
+    }
+    let body = type_body(info, rte)
+    if body < 0 or sexp.kw(t, body) != "struct" {
+        return 0
+    }
+    2
+}
+
+/// How many fields a struct of named type element `x` has, or -1 when it is
+/// not a struct this lowering can see the declaration of: which of the
+/// runtime's two layouts its fields are in (four or fewer in the box, more in
+/// a vector), which every struct box of the type is built with.
+fn struct_nfields(info: TirInfo, x: i64) -> i64 {
+    let t = info.t
+    let body = type_body(info, x)
+    if body < 0 or sexp.kw(t, body) != "struct" {
+        return -1
+    }
+    sexp.kids(t, body).len()
+}
+
+/// The word field `k` of struct `s` holds (a boxed field's pointer,
+/// borrowed), read inline; to block `no` when `s` is not a struct of
+/// `nfields` fields laid out as such a struct is, where the runtime's call
+/// says why.
+fn struct_word(inout v: Vir, s: i64, k: i64, nfields: i64, no: i64) -> i64 {
+    let at = struct_slot(v, s, k, nfields, no)
+    op1(v, ir.M_LOAD, at)
+}
+
+/// Goes on in a fresh block when box `s` is a struct whose fields are laid
+/// out as one of `nfields` fields is -- in the box for four or fewer, in a
+/// vector for more -- else to block `no`.
+fn expect_struct(inout v: Vir, s: i64, nfields: i64, no: i64) {
+    let ta = box_at(v, s, layout.TAG)
+    let tg = op1(v, ir.M_LOAD8U, ta)
+    let c1 = is_k(v, tg, layout.TAG_STRUCT)
+    when(v, c1, no)
+    let da = box_at(v, s, layout.STRUCT_DISC)
+    let dt = op1(v, ir.M_LOAD8U, da)
+    let c2 = is_k(v, dt, if nfields <= 4 { layout.STRUCT_INLINE } else { layout.STRUCT_HEAP })
+    when(v, c2, no)
+}
+
+/// The address of the word field `k` of struct `s` (of `nfields` fields)
+/// is held in: in the box, or in its vector; to block `no` when `s` is not
+/// laid out as such a struct is.
+fn struct_slot(inout v: Vir, s: i64, k: i64, nfields: i64, no: i64) -> i64 {
+    expect_struct(v, s, nfields, no)
+    if nfields <= 4 {
+        let fa = box_at(v, s, layout.STRUCT_VALS + 8 * k)
+        return fa
+    }
+    let pa = box_at(v, s, layout.STRUCT_VEC + layout.VEC_PTR)
+    let p = op1(v, ir.M_LOAD, pa)
+    box_at(v, p, 8 * k)
+}
+
+/// `s.f = x`, or `s.f <op>= x`, on scalar field `j` of struct `s` (held by
+/// the caller and consumed: the struct to keep is answered, owned), whose
+/// descriptor kind is `fk`, type element `te` and field count `nfields`: the
+/// bits stored in place when nothing else holds the struct, as the
+/// Cranelift build stores them; otherwise `grasm_struct_scalar_at` and
+/// `grasm_struct_set_field_at`, which copy a shared struct first, as
+/// `read_child` and `write_child` call them.
+fn struct_scalar_update(inout v: Vir, t: TirTree, s: i64, j: i64, fk: i64, nfields: i64, te: i64, op: str, x: i64, where_: str) -> i64 {
+    let k = ty_kind(t, te)
+    if is_temp(v, s) {
+        forget_temp(v, s)
+    }
+    let r = new_var(v, ir.TY_BOX)
+    let slow = new_block(v)
+    let join = new_block(v)
+    expect_struct(v, s, nfields, slow)
+    let u = unique(v, s)
+    when(v, u, slow)
+    var at = -1
+    if nfields <= 4 {
+        at = box_at(v, s, layout.STRUCT_VALS + 8 * j)
+    } else {
+        let pa = box_at(v, s, layout.STRUCT_VEC + layout.VEC_PTR)
+        let p = op1(v, ir.M_LOAD, pa)
+        at = box_at(v, p, 8 * j)
+    }
+    var fin = x
+    if op != "set" {
+        let ow = op1(v, ir.M_LOAD, at)
+        let old = word_as(v, ow, k)
+        fin = combine(v, t, op, te, old, x, where_)
+    }
+    var w = word_of(v, fin)
+    if fk == ir.FK_BOOL {
+        let z = konst(v, 0)
+        w = icmp(v, ir.CC_NE, w, z)
+    }
+    emit(v, ir.M_STORE, -1, at, w, 0)
+    copy_to(v, r, s)
+    term_jump(v, join)
+    switch_to(v, slow)
+    var fin2 = x
+    if op != "set" {
+        let jc = konst(v, j)
+        let ow2 = rt(v, "grasm_struct_scalar_at", [s, jc], R_WORD)
+        let old2 = word_as(v, ow2, k)
+        fin2 = combine(v, t, op, te, old2, x, where_)
+    }
+    let b = box_kind(v, fin2, k)
+    forget_temp(v, b)
+    let jc2 = konst(v, j)
+    let d = rt(v, "grasm_struct_set_field_at", [s, jc2, b], R_BOX)
+    copy_to(v, r, d)
+    forget_temp(v, d)
+    switch_to(v, join)
+    own_temp(v, r)
+    r
+}
+
+/// The length of list `l` (held): a scalar list's or a list of boxes',
+/// read inline, `grasm_list_len`'s answer for any other shape (a tuple, a
+/// list of value structs) or for a value that is no list (its panic).
+fn list_len_of(inout v: Vir, l: i64) -> i64 {
+    if not room_to_inline(v) {
+        return rt(v, "grasm_list_len", [l], R_WORD)
+    }
+    let r = new_var(v, ir.TY_I64)
+    let slow = new_block(v)
+    let join = new_block(v)
+    let ta = box_at(v, l, layout.TAG)
+    let tg = op1(v, ir.M_LOAD8U, ta)
+    let scal = new_block(v)
+    let boxes = new_block(v)
+    let is_scalar = is_k(v, tg, layout.TAG_LIST_SCALAR)
+    term_brif(v, is_scalar, scal, boxes)
+    switch_to(v, scal)
+    let sn = scalar_len(v, l)
+    copy_to(v, r, sn)
+    term_jump(v, join)
+    switch_to(v, boxes)
+    let is_list = is_k(v, tg, layout.TAG_LIST)
+    when(v, is_list, slow)
+    let da = box_at(v, l, layout.LIST_DISC)
+    let dt = op1(v, ir.M_LOAD8U, da)
+    let inl = new_block(v)
+    let heap = new_block(v)
+    let is_inl = is_k(v, dt, layout.LIST_INLINE)
+    term_brif(v, is_inl, inl, heap)
+    switch_to(v, inl)
+    let ia = box_at(v, l, layout.LIST_LEN)
+    let iln = op1(v, ir.M_LOAD8U, ia)
+    copy_to(v, r, iln)
+    term_jump(v, join)
+    switch_to(v, heap)
+    let is_heap = is_k(v, dt, layout.LIST_HEAP)
+    when(v, is_heap, slow)
+    let ha = box_at(v, l, layout.LIST_VEC + layout.VEC_LEN)
+    let hn = op1(v, ir.M_LOAD, ha)
+    copy_to(v, r, hn)
+    term_jump(v, join)
+    switch_to(v, slow)
+    let n = rt(v, "grasm_list_len", [l], R_WORD)
+    copy_to(v, r, n)
+    switch_to(v, join)
+    r
+}
+
+/// `xs.len()`: of a list a local holds, or a field of a struct one holds,
+/// borrowed (nothing is computed between the read and the use), else of the
+/// value computed.
+fn lower_list_len(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let recv = sexp.kids(t, e)[0]
+    let shape = if room_to_inline(v) { borrow_shape(info, recv) } else { 0 }
+    if shape == 1 {
+        let w = tvar_of(v, sexp.word(t, recv, 3).parse_int() ?? -1)
+        return list_len_of(v, w)
+    }
+    if shape == 2 {
+        let sv = sexp.kids(t, recv)[0]
+        let s = tvar_of(v, sexp.word(t, sv, 3).parse_int() ?? -1)
+        let k = sexp.word(t, recv, 3).parse_int() ?? 0
+        let nf = struct_nfields(info, ty_el(t, sv, 1))
+        let r = new_var(v, ir.TY_I64)
+        let slow = new_block(v)
+        let join = new_block(v)
+        let fw = struct_word(v, s, k, nf, slow)
+        let n = list_len_of(v, fw)
+        copy_to(v, r, n)
+        term_jump(v, join)
+        switch_to(v, slow)
+        let kc = konst(v, k)
+        let fo = rt(v, "grasm_struct_get_at", [s, kc], R_BOX)
+        let n2 = rt(v, "grasm_list_len", [fo], R_WORD)
+        copy_to(v, r, n2)
+        drop_temp(v, fo)
+        switch_to(v, join)
+        return r
+    }
+    let l = value_of(info, v, recv)
+    let n = list_len_of(v, l)
+    discard(v, l)
+    n
 }
 
 fn lower_index(info: TirInfo, inout v: Vir, e: i64) -> i64 {
@@ -989,6 +1551,74 @@ fn lower_index(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         return konst(v, 0)
     }
     let ks = sexp.kids(t, e)
+    // `xs[i]` of a local list of scalars, with an index that changes no local:
+    // the element is read from the list the local holds, borrowed, rather
+    // than from a copy retained for the read and released after it -- the
+    // local's reference keeps the list alive throughout, as the Cranelift
+    // build's borrowed read does. `f.xs[i]` the same, the field read inline
+    // too, borrowed from the struct the local holds.
+    let sk = scalar_kind(t, te)
+    let shape = if changes_no_local(t, ks[1], 0) and is_list_te(t, ty_el(t, ks[0], 1)) and room_to_inline(v) { borrow_shape(info, ks[0]) } else { 0 }
+    if shape == 1 {
+        let w = tvar_of(v, sexp.word(t, ks[0], 3).parse_int() ?? -1)
+        let i = value_of(info, v, ks[1])
+        return list_elem(v, t, w, i, te)
+    }
+    if shape == 2 and sk < 0 {
+        // A box out of a list in a struct's field: the element retained, as
+        // `grasm_list_get` answers it, neither container.
+        let sv = sexp.kids(t, ks[0])[0]
+        let s = tvar_of(v, sexp.word(t, sv, 3).parse_int() ?? -1)
+        let k = sexp.word(t, ks[0], 3).parse_int() ?? 0
+        let i = value_of(info, v, ks[1])
+        let ek = ty_kind(t, te)
+        let r = new_var(v, ek)
+        let slow = new_block(v)
+        let join = new_block(v)
+        let fw = struct_word(v, s, k, struct_nfields(info, ty_el(t, sv, 1)), slow)
+        let x = list_elem(v, t, fw, i, te)
+        copy_to(v, r, x)
+        if is_temp(v, x) {
+            forget_temp(v, x)
+        }
+        term_jump(v, join)
+        switch_to(v, slow)
+        let kc = konst(v, k)
+        let fo = rt(v, "grasm_struct_get_at", [s, kc], R_BOX)
+        let x2 = list_elem(v, t, fo, i, te)
+        copy_to(v, r, x2)
+        if is_temp(v, x2) {
+            forget_temp(v, x2)
+        }
+        drop_temp(v, fo)
+        switch_to(v, join)
+        if ir.ty_boxed(ek) {
+            own_temp(v, r)
+        }
+        return r
+    }
+    if shape == 2 {
+        let sv = sexp.kids(t, ks[0])[0]
+        let s = tvar_of(v, sexp.word(t, sv, 3).parse_int() ?? -1)
+        let k = sexp.word(t, ks[0], 3).parse_int() ?? 0
+        let i = value_of(info, v, ks[1])
+        let r = new_var(v, ir.TY_I64)
+        let slow = new_block(v)
+        let join = new_block(v)
+        let fw = struct_word(v, s, k, struct_nfields(info, ty_el(t, sv, 1)), slow)
+        let x = scalar_get(v, fw, i, sk)
+        copy_to(v, r, x)
+        term_jump(v, join)
+        switch_to(v, slow)
+        let kc = konst(v, k)
+        let fo = rt(v, "grasm_struct_get_at", [s, kc], R_BOX)
+        let skc = konst(v, sk)
+        let x2 = rt(v, "grasm_list_get_scalar", [fo, i, skc], R_WORD)
+        copy_to(v, r, x2)
+        drop_temp(v, fo)
+        switch_to(v, join)
+        return word_as(v, r, ty_kind(t, te))
+    }
     let l = value_of(info, v, ks[0])
     let i = value_of(info, v, ks[1])
     let r = list_elem(v, t, l, i, te)
@@ -1017,7 +1647,7 @@ fn for_over_list(info: TirInfo, inout v: Vir, e: i64, l: i64) -> i64 {
     let ks = sexp.kids(t, e)
     let var_node = ks[0]
     let te = ty_el(t, var_node, 4)
-    let n = rt(v, "grasm_list_len", [l], R_WORD)
+    let n = list_len_of(v, l)
     let ctr = new_var(v, ir.TY_I64)
     let zero = konst(v, 0)
     copy_to(v, ctr, zero)
@@ -2296,6 +2926,39 @@ fn lower_field(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     if ty_head(t, rte) != "named" or not held(ty_kind(t, ty_el(t, recv, 1))) {
         bad(v, "outside the subset: a field of {ty_text(t, recv, 1)} {span_of(t, e)}")
         return konst(v, 0)
+    }
+    // A field of a struct a local holds: read in place, the struct borrowed
+    // from the local -- a scalar's bits, or a box retained for the reader --
+    // the runtime's call where the box is not the struct it should be.
+    let j = sexp.word(t, e, 3).parse_int() ?? 0
+    let fk = if local_struct_field(info, e) and room_to_inline(v) { field_fk(info, ty_el(t, recv, 1), j) } else { -1 }
+    if fk >= 0 and fk != ir.FK_UNIT and (fk == ir.FK_BOXED) == ir.ty_boxed(k) {
+        let s = tvar_of(v, sexp.word(t, recv, 3).parse_int() ?? -1)
+        let r = new_var(v, if ir.ty_boxed(k) { ir.TY_BOX } else { ir.TY_I64 })
+        let slow = new_block(v)
+        let join = new_block(v)
+        let fw = struct_word(v, s, j, struct_nfields(info, ty_el(t, recv, 1)), slow)
+        if ir.ty_boxed(k) {
+            emit(v, ir.M_INC, -1, fw, -1, 0)
+        }
+        copy_to(v, r, fw)
+        term_jump(v, join)
+        switch_to(v, slow)
+        let jc = konst(v, j)
+        if ir.ty_boxed(k) {
+            let x = rt(v, "grasm_struct_get_at", [s, jc], R_BOX)
+            copy_to(v, r, x)
+            forget_temp(v, x)
+        } else {
+            let x = rt(v, "grasm_struct_scalar_at", [s, jc], R_WORD)
+            copy_to(v, r, x)
+        }
+        switch_to(v, join)
+        if ir.ty_boxed(k) {
+            own_temp(v, r)
+            return r
+        }
+        return word_as(v, r, k)
     }
     let s0 = value_of(info, v, recv)
     let (s, _ste) = through_refs(v, t, s0, ty_el(t, recv, 1))
@@ -4168,9 +4831,8 @@ fn write_child(inout v: Vir, t: TirTree, c: i64, is_field: bool, key: i64, te: i
     }
     let sk = scalar_kind(t, te)
     if sk >= 0 {
-        let kc = konst(v, sk)
         let w = word_of(v, x)
-        return rt(v, "grasm_list_set_scalar", [c, key, w, kc], R_BOX)
+        return scalar_set(v, c, key, w, sk)
     }
     let b = box_kind(v, x, k)
     forget_temp(v, b)
@@ -4526,7 +5188,7 @@ fn mut_method(info: TirInfo, inout v: Vir, e: i64, fname: str, codes: str, extra
     for x in extra {
         call.push(x)
     }
-    let r = rt(v, fn_name, call, R_BOX)
+    let r = if push_scalar >= 0 and extra.is_empty() and av.len() == 1 { scalar_push(v, leaf, av[0], push_scalar) } else { rt(v, fn_name, call, R_BOX) }
     for i in 0..av.len() {
         if codes.substr(i, 1) == "B" or codes.substr(i, 1) == "K" {
             discard(v, av[i])
@@ -4961,7 +5623,7 @@ fn lower_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         "str.lines/0" -> read_method(info, v, e, "grasm_str_lines", "", [], R_BOX)
         "str.words/0" -> read_method(info, v, e, "grasm_str_words", "", [], R_BOX)
         "str.to_bytes/0" -> read_method(info, v, e, "grasm_str_to_bytes", "", [], R_BOX)
-        "list.len/0" -> read_method(info, v, e, "grasm_list_len", "", [], R_WORD)
+        "list.len/0" -> lower_list_len(info, v, e)
         "list.is_empty/0" -> read_method(info, v, e, "grasm_list_is_empty", "", [], R_BOOL8)
         "list.get/1" -> read_method(info, v, e, "grasm_list_get_opt", "w", [], R_BOX)
         "list.contains/1" -> read_method(info, v, e, "grasm_list_contains", "x", [], R_BOOL8)
@@ -5557,19 +6219,31 @@ fn read_path(inout v: Vir, t: TirTree, pp: PlacePath, kv: [i64], upto: i64) -> i
 /// the leaf replaced by `x`, or combined with it by `op`; each container
 /// written back into its parent. Answers the new `base`, owned, for the
 /// caller to store.
-fn write_steps(inout v: Vir, t: TirTree, pp: PlacePath, kv: [i64], from: i64, base: i64, op: str, x: i64, where_: str) -> i64 {
+fn write_steps(info: TirInfo, inout v: Vir, t: TirTree, pp: PlacePath, kv: [i64], from: i64, base: i64, op: str, x: i64, where_: str) -> i64 {
     let n = pp.kinds.len()
     var cs: [i64] = [base]
     for j in (from + 1)..n {
         cs.push(take_child(v, cs[cs.len() - 1], pp.kinds[j - 1] == STEP_FIELD, kv[j - 1], pp.names[j - 1]))
     }
     let leafc = cs[cs.len() - 1]
-    var fin = x
-    if op != "set" {
-        let old = read_child(v, t, leafc, pp.kinds[n - 1] == STEP_FIELD, kv[n - 1], pp.tes[n])
-        fin = combine(v, t, op, pp.tes[n], old, x, where_)
+    var nv = -1
+    let lk = ty_kind(t, pp.tes[n])
+    let sfk = if pp.kinds[n - 1] == STEP_FIELD { field_fk(info, pp.tes[n - 1], kv[n - 1]) } else { -1 }
+    if op != "set" and pp.kinds[n - 1] == STEP_INDEX and scalar_kind(t, pp.tes[n]) >= 0 and (ir.ty_int(lk) or ir.ty_fp(lk)) and room_to_inline(v) {
+        // `xs[i] += x` on a list of numbers: one test of the list and the
+        // index for the read and the write.
+        nv = scalar_update(v, t, leafc, kv[n - 1], pp.tes[n], op, x, where_)
+    } else if sfk >= 0 and sfk != ir.FK_BOXED and sfk != ir.FK_UNIT and not ir.ty_boxed(lk) and (op == "set" or ir.ty_int(lk) or ir.ty_fp(lk)) and room_to_inline(v) {
+        // `s.n += 1`: a scalar field of a struct nobody else holds, in place.
+        nv = struct_scalar_update(v, t, leafc, kv[n - 1], sfk, struct_nfields(info, pp.tes[n - 1]), pp.tes[n], op, x, where_)
+    } else {
+        var fin = x
+        if op != "set" {
+            let old = read_child(v, t, leafc, pp.kinds[n - 1] == STEP_FIELD, kv[n - 1], pp.tes[n])
+            fin = combine(v, t, op, pp.tes[n], old, x, where_)
+        }
+        nv = write_child(v, t, leafc, pp.kinds[n - 1] == STEP_FIELD, kv[n - 1], pp.tes[n], fin)
     }
-    var nv = write_child(v, t, leafc, pp.kinds[n - 1] == STEP_FIELD, kv[n - 1], pp.tes[n], fin)
     var j = n - 2
     while j >= from {
         nv = write_child(v, t, cs[j - from], pp.kinds[j] == STEP_FIELD, kv[j], pp.tes[j + 1], nv)
@@ -5622,7 +6296,7 @@ fn lower_place_assign(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     let where_ = span_of(t, ks[1])
     let l = last_deref(pp)
     if l < 0 {
-        let nv = write_steps(v, t, pp, kv, 0, pp.root, op, x, where_)
+        let nv = write_steps(info, v, t, pp, kv, 0, pp.root, op, x, where_)
         copy_to(v, pp.root, nv)
         forget_temp(v, nv)
         return -1
@@ -5645,7 +6319,7 @@ fn lower_place_assign(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     // the referent where it lies, answering it back.
     let referent = rt(v, "grasm_ref_make_unique", [raw], R_WORD)
     v.vty[referent] = ir.TY_BOX
-    let nv = write_steps(v, t, pp, kv, l + 1, referent, op, x, where_)
+    let nv = write_steps(info, v, t, pp, kv, l + 1, referent, op, x, where_)
     forget_temp(v, nv)
     -1
 }
@@ -6456,7 +7130,8 @@ fn walk_src(info: TirInfo, inout v: Vir, recv: i64, elem_te: i64) -> Walk {
     }
     w.te = ty_arg(t, ty_el(t, recv, 1), 1)
     w.l = value_of(info, v, recv)
-    w.n = rt(v, "grasm_list_len", [w.l], R_WORD)
+    let wl = w.l
+    w.n = list_len_of(v, wl)
     w.ctr = new_var(v, ir.TY_I64)
     let z = konst(v, 0)
     copy_to(v, w.ctr, z)
@@ -6535,9 +7210,8 @@ fn push_elem(inout v: Vir, t: TirTree, out: i64, x: i64, te: i64) {
     forget_temp(v, out)
     var nl = -1
     if sk >= 0 {
-        let kc = konst(v, sk)
         let w = word_of(v, x)
-        nl = rt(v, "grasm_list_push_scalar", [out, w, kc], R_BOX)
+        nl = scalar_push(v, out, w, sk)
     } else {
         let b = box_kind(v, x, ty_kind(t, te))
         forget_temp(v, b)
@@ -6708,9 +7382,8 @@ fn hof_method(info: TirInfo, inout v: Vir, e: i64, name: str) -> i64 {
         term_brif(v, keep, yes, no)
         switch_to(v, yes)
         if w.is_range {
-            let kc = konst(v, 0)
             forget_temp(v, out)
-            let nl = rt(v, "grasm_list_push_scalar", [out, x, kc], R_BOX)
+            let nl = scalar_push(v, out, x, 0)
             replace_temp(v, out, nl)
             own_temp(v, out)
         } else {
@@ -6795,7 +7468,7 @@ fn sort_by_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
 /// of elements of type `te`.
 fn walk_list(inout v: Vir, l: i64, te: i64) -> Walk {
     var w = Walk{ is_range: false, l: l, te: te, ctr: -1, end: -1, incl: false, n: -1, head: -1, body: -1, step: -1, exit: -1 }
-    w.n = rt(v, "grasm_list_len", [l], R_WORD)
+    w.n = list_len_of(v, l)
     w.ctr = new_var(v, ir.TY_I64)
     let z = konst(v, 0)
     copy_to(v, w.ctr, z)

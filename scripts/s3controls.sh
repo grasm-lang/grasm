@@ -80,6 +80,19 @@
 #                  range is, whoever holds it -> fuzz_s3 (the allocation
 #                  checker)
 #
+# Part six's mid-end (docs/self-hosting.md §6.15):
+#
+#   list-stride    an inline scalar list element is read and written at
+#                  four bytes an element, not eight -> s3subset
+#   list-cow       an inline store into a scalar list skips the test that
+#                  nothing else holds it, so a shared list changes under its
+#                  other holders -> s3subset
+#   field-slot     a struct's field read in place is read from the word after
+#                  its own -> s3subset
+#   layout-backend the backend's copy of the runtime's layouts has a `Vec`'s
+#                  length where its capacity is -> rtlayout (the copy held to
+#                  compiler/rt's layout.gr, which the Rust runtime holds)
+#
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
 # under a second for any subset program), and counts as caught.
@@ -278,6 +291,48 @@ control backtrack compiler/aarch64/src/backtrack.gr \
     " or busy(occ[r], sg.seg_s[k], sg.seg_e[k])) {" ") {" -- \
     scripts/fuzz_s3.py "register allocation check failed" -
 
+# Part six: the mid-end.
+control list-stride compiler/mir/src/lower.gr \
+    "    let three = konst(v, 3)" "    let three = konst(v, 2)" -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control list-cow compiler/mir/src/lower.gr \
+    $'    let alone = unique(v, l)\n    when(v, alone, slow)\n' "" -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control field-slot compiler/mir/src/lower.gr \
+    "    let fa = box_at(v, s, layout.STRUCT_VALS + 8 * k)" \
+    "    let fa = box_at(v, s, layout.STRUCT_VALS + 8 * k + 8)" -- \
+    scripts/s3subset.sh "FAILED:" -
+
+# The backend's copy of the runtime's layouts, with a fault in a copy of it,
+# held by `rtlayout` to compiler/rt's (which takes no backend: it reads the
+# file).
+layout_control() {
+    local name=$1 old=$2 new=$3 symptom=$4
+    controls=$((controls + 1))
+    mkdir -p "$WORK/$name"
+    cp compiler/mir/src/layout.gr "$WORK/$name/layout.gr"
+    if ! python3 scripts/s3_mutate.py "$WORK/$name/layout.gr" "$old" "$new"; then
+        MISSED+=("$name: the mutation does not apply")
+        return
+    fi
+    local log="$WORK/$name.log" code
+    BACKEND_LAYOUT="$WORK/$name/layout.gr" RT_POISON= scripts/rtlayout.sh >"$log" 2>&1
+    code=$?
+    if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
+        caught=$((caught + 1))
+        echo "caught: $name by rtlayout (exit $code; \"$symptom\")"
+    elif [ "$code" != 0 ]; then
+        MISSED+=("$name: rtlayout failed (exit $code) but not with \"$symptom\"; see its last lines below")
+        tail -5 "$log" | sed 's/^/    /'
+    else
+        MISSED+=("$name: rtlayout passed with the fault in place")
+    fi
+}
+
+layout_control layout-backend "pub let VEC_LEN = 16" "pub let VEC_LEN = 0" "VEC_LEN is 0 in"
+
 # script_control NAME FILE OLD NEW GATE SYMPTOM
 # The fault is planted in a copy of `scripts/` -- the generators' shared
 # engine (`scripts/lib/s3engine.py`) or a generator -- and the copied
@@ -328,10 +383,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Twenty-nine gate runs over twenty-four faults, and every one must have
+# Thirty-three gate runs over twenty-eight faults, and every one must have
 # failed.
-if [ "$controls" -ne 29 ] || [ "$caught" -ne 29 ]; then
-    echo "expected 29 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 33 ] || [ "$caught" -ne 33 ]; then
+    echo "expected 33 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

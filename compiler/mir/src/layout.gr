@@ -1,0 +1,47 @@
+// The runtime's memory layout, as far as the code this backend writes reads
+// it inline: a scalar list's elements, length, capacity and count, a list's
+// length, a struct's field (`lower.gr`, "Scalar list elements, inline"). Every box either runtime makes, compiled code
+// reads, so these are the runtime's numbers -- the same names and values as
+// `compiler/rt/src/layout.gr`, whose every constant `scripts/rtlayout.sh`
+// holds to a probe of the Rust runtime; that gate holds each of these to the
+// constant of the same name there.
+
+/// The reference count, a word at the start of every box.
+pub let RC = 0
+/// The payload's variant tag, a byte.
+pub let TAG = 8
+/// `ListScalar`'s tag.
+pub let TAG_LIST_SCALAR = 12
+/// A scalar list's `ScalarData`: its tag byte, the tag's two values (words,
+/// or bytes for a list of `bool`s), and where its `Vec` is.
+pub let SCALAR_DISC = 16
+pub let SCALAR_WORDS = 0
+pub let SCALAR_BYTES = 1
+pub let SCALAR_VEC = 24
+/// Its elements' kind, a byte after the tag: the runtime's `ScalarKind`.
+pub let SCALAR_KIND_AT = 9
+pub let SK_I64 = 0
+pub let SK_F64 = 1
+pub let SK_BOOL = 2
+pub let SK_REF = 3
+pub let SK_U64 = 4
+/// A list of boxes, `ListData` (`repr(u8)` at 16): inline, a length byte and
+/// the boxes; or on the heap, a `Vec`.
+pub let TAG_LIST = 10
+pub let LIST_DISC = 16
+pub let LIST_INLINE = 0
+pub let LIST_HEAP = 1
+pub let LIST_LEN = 17
+pub let LIST_VEC = 24
+/// A struct, `StructFields` (`repr(u8)` at 24): inline, the field words from
+/// 32 (four or fewer fields); or on the heap, a `Vec` of them at 32.
+pub let TAG_STRUCT = 14
+pub let STRUCT_DISC = 24
+pub let STRUCT_INLINE = 0
+pub let STRUCT_HEAP = 1
+pub let STRUCT_VALS = 32
+pub let STRUCT_VEC = 32
+/// Where a `Vec` keeps its buffer's address, its length and its capacity.
+pub let VEC_PTR = 8
+pub let VEC_LEN = 16
+pub let VEC_CAP = 0

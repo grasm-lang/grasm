@@ -6,6 +6,7 @@
 //     lower.gr  TIR to three-address code over variables; decides the subset
 //     ssa.gr    variables to SSA with block arguments
 //     ir.gr     MIR itself: opcodes, the function record, a printer
+//     layout.gr the runtime's layouts the lowering reads inline
 import sexp
 import mono
 import ir
