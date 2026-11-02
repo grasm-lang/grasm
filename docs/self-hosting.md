@@ -3584,7 +3584,14 @@ the subset and for the runtime (555,152 bytes), and for every eighth program
 the same objects and `--stats` lines under linear scan, with 2 and with 0
 registers under both allocators, and the same counts under each of the three
 planted allocation faults: 567 more compilations, all the same. `s3controls`'
-`allocator` and `backtrack` controls name the files where they now are.
+`allocator` and `backtrack` controls name the files where they now are, and
+each, run alone against its moved file, was caught (`ra_check` and
+`fuzz_s3`, "register allocation check failed"). On the moved tree: `ra_check`
+"programs: 648   stressed runs: 3240   identical: 3240   failed: 0" with
+34,625, 2,061 and 3,308 planted errors of its three kinds caught; `fixpoint`
+48 of 48 identical; `encodetest` 6,992 and `encodetest_x64` 5,558
+encodings as the assemblers'; `tokentest`, `asttest` and `tirdiff` over the
+1,986 tracked files; `fmttest`, `linttest` and `gatecheck`.
 
 ## 7. Bootstrap and trust
 
