@@ -45,18 +45,25 @@ type Segs = {
 /// before it) span it.
 fn loop_depth(vc: VCode) -> [i64] {
     let nb = vcode.nblocks(vc)
-    var depth: [i64] = []
-    for b in 0..nb {
-        depth.push(0)
+    // Each back edge adds one from its target to its source: as differences,
+    // summed once.
+    var step: [i64] = []
+    for b in 0..(nb + 1) {
+        step.push(0)
     }
     for b in 0..nb {
         for s in vcode.succs(vc, b) {
             if s <= b {
-                for x in s..(b + 1) {
-                    depth[x] = depth[x] + 1
-                }
+                step[s] = step[s] + 1
+                step[b + 1] = step[b + 1] - 1
             }
         }
+    }
+    var depth: [i64] = []
+    var d = 0
+    for b in 0..nb {
+        d += step[b]
+        depth.push(d)
     }
     depth
 }
@@ -64,94 +71,9 @@ fn loop_depth(vc: VCode) -> [i64] {
 fn segments(vc: VCode) -> Segs {
     let nb = vcode.nblocks(vc)
     let nv = vc.nvregs
-    // Block liveness, as `regalloc.intervals` computes it: only the
-    // registers read in a block they were not written in first need it.
-    var defstamp: [i64] = []
-    var global: [bool] = []
-    for v in 0..nv {
-        defstamp.push(-1)
-        global.push(false)
-    }
-    for b in 0..nb {
-        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
-            for u in regalloc.uses_at(vc, i) {
-                if mach.is_vreg(u) and defstamp[u - mach.VR] != b {
-                    global[u - mach.VR] = true
-                }
-            }
-            for d in regalloc.defs_at(vc, i) {
-                if mach.is_vreg(d) {
-                    defstamp[d - mach.VR] = b
-                }
-            }
-        }
-    }
-    var gvars: [i64] = []
-    var gidx: [i64] = []
-    for v in 0..nv {
-        if global[v] {
-            gidx.push(gvars.len())
-            gvars.push(v)
-        } else {
-            gidx.push(-1)
-        }
-    }
-    let ng = gvars.len()
-    var ue: [bool] = []
-    var df: [bool] = []
-    var lin: [bool] = []
-    for k in 0..(nb * ng) {
-        ue.push(false)
-        df.push(false)
-        lin.push(false)
-    }
-    for b in 0..nb {
-        let base = b * ng
-        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
-            for u in regalloc.uses_at(vc, i) {
-                if mach.is_vreg(u) {
-                    let g = gidx[u - mach.VR]
-                    if g >= 0 and not df[base + g] {
-                        ue[base + g] = true
-                    }
-                }
-            }
-            for d in regalloc.defs_at(vc, i) {
-                if mach.is_vreg(d) {
-                    let g = gidx[d - mach.VR]
-                    if g >= 0 {
-                        df[base + g] = true
-                    }
-                }
-            }
-        }
-    }
-    var succ: [[i64]] = []
-    for b in 0..nb {
-        succ.push(vcode.succs(vc, b))
-    }
-    var changed = true
-    while changed {
-        changed = false
-        var b = nb - 1
-        while b >= 0 {
-            let base = b * ng
-            for g in 0..ng {
-                var out = false
-                for s in succ[b] {
-                    if lin[s * ng + g] {
-                        out = true
-                    }
-                }
-                let now = ue[base + g] or (out and not df[base + g])
-                if now != lin[base + g] {
-                    lin[base + g] = now
-                    changed = true
-                }
-            }
-            b -= 1
-        }
-    }
+    // Block liveness, as `regalloc.intervals` takes it: only the registers
+    // read in a block they were not written in first need it.
+    let bl = regalloc.block_live(vc)
     let depth = loop_depth(vc)
     // The segments, block by block: a register opens where it becomes live
     // in the block (its start, if it is live in) and closes at its last
@@ -173,7 +95,6 @@ fn segments(vc: VCode) -> Segs {
         if be < bs {
             continue
         }
-        let base = b * ng
         var w = 1
         var dd = depth[b]
         while dd > 0 and w < 32768 {
@@ -181,13 +102,10 @@ fn segments(vc: VCode) -> Segs {
             dd -= 1
         }
         var opened: [i64] = []
-        for g in 0..ng {
-            if lin[base + g] {
-                let v = gvars[g]
-                open_s[v] = bs
-                open_e[v] = bs
-                opened.push(v)
-            }
+        for v in bl.live_in[b] {
+            open_s[v] = bs
+            open_e[v] = bs
+            opened.push(v)
         }
         for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
             for u in regalloc.uses_at(vc, i) {
@@ -215,21 +133,12 @@ fn segments(vc: VCode) -> Segs {
                 }
             }
         }
-        for g in 0..ng {
-            var out = false
-            for s in succ[b] {
-                if lin[s * ng + g] {
-                    out = true
-                }
+        for v in bl.live_out[b] {
+            if open_s[v] < 0 {
+                open_s[v] = bs
+                opened.push(v)
             }
-            if out {
-                let v = gvars[g]
-                if open_s[v] < 0 {
-                    open_s[v] = bs
-                    opened.push(v)
-                }
-                open_e[v] = be
-            }
+            open_e[v] = be
         }
         for v in opened {
             sv.push(v)

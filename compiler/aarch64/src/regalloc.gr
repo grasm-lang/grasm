@@ -256,97 +256,121 @@ type Live = {
     pr_maxto: [[i64]],
 }
 
-pub fn intervals(vc: VCode) -> Live {
+/// Block liveness of the virtual registers that cross a block boundary --
+/// read in a block they were not written in first; the others are local to
+/// a block by construction. `live_in[b]` and `live_out[b]` list them, as
+/// virtual register numbers in ascending order: the least fixed point of
+/// in = upward-exposed uses + (out - defined), out = the successors' ins,
+/// found a register at a time by walking back from its uses through the
+/// predecessors until a block that defines it, so a function costs the
+/// liveness it has, not its blocks times its registers.
+type BlockLive = {
+    live_in: [[i64]],
+    live_out: [[i64]],
+}
+
+pub fn block_live(vc: VCode) -> BlockLive {
     let nb = vcode.nblocks(vc)
     let nv = vc.nvregs
-    // Which virtual registers are read in a block they were not written in
-    // first: only those need block liveness.
+    // Per register, the blocks it is read in before any write there
+    // (upward-exposed), and the blocks it is written in, each once.
     var defstamp: [i64] = []
-    var global: [bool] = []
+    var uestamp: [i64] = []
+    var dstamp: [i64] = []
     for v in 0..nv {
         defstamp.push(-1)
-        global.push(false)
+        uestamp.push(-1)
+        dstamp.push(-1)
     }
-    for b in 0..nb {
-        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
-            for u in uses_at(vc, i) {
-                if mach.is_vreg(u) and defstamp[u - mach.VR] != b {
-                    global[u - mach.VR] = true
-                }
-            }
-            for d in defs_at(vc, i) {
-                if mach.is_vreg(d) {
-                    defstamp[d - mach.VR] = b
-                }
-            }
-        }
-    }
-    var gvars: [i64] = []
-    var gidx: [i64] = []
+    var ue_b: [[i64]] = []
+    var def_b: [[i64]] = []
     for v in 0..nv {
-        if global[v] {
-            gidx.push(gvars.len())
-            gvars.push(v)
-        } else {
-            gidx.push(-1)
-        }
-    }
-    let ng = gvars.len()
-    var ue: [bool] = []
-    var df: [bool] = []
-    var lin: [bool] = []
-    for k in 0..(nb * ng) {
-        ue.push(false)
-        df.push(false)
-        lin.push(false)
+        ue_b.push([])
+        def_b.push([])
     }
     for b in 0..nb {
-        let base = b * ng
         for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
             for u in uses_at(vc, i) {
                 if mach.is_vreg(u) {
-                    let g = gidx[u - mach.VR]
-                    if g >= 0 and not df[base + g] {
-                        ue[base + g] = true
+                    let v = u - mach.VR
+                    if defstamp[v] != b and uestamp[v] != b {
+                        uestamp[v] = b
+                        ue_b[v].push(b)
                     }
                 }
             }
             for d in defs_at(vc, i) {
                 if mach.is_vreg(d) {
-                    let g = gidx[d - mach.VR]
-                    if g >= 0 {
-                        df[base + g] = true
+                    let v = d - mach.VR
+                    defstamp[v] = b
+                    if dstamp[v] != b {
+                        dstamp[v] = b
+                        def_b[v].push(b)
                     }
                 }
             }
         }
     }
-    var succ: [[i64]] = []
+    var preds: [[i64]] = []
     for b in 0..nb {
-        succ.push(vcode.succs(vc, b))
+        preds.push([])
     }
-    var changed = true
-    while changed {
-        changed = false
-        var b = nb - 1
-        while b >= 0 {
-            let base = b * ng
-            for g in 0..ng {
-                var out = false
-                for s in succ[b] {
-                    if lin[s * ng + g] {
-                        out = true
-                    }
-                }
-                let now = ue[base + g] or (out and not df[base + g])
-                if now != lin[base + g] {
-                    lin[base + g] = now
-                    changed = true
-                }
-            }
-            b -= 1
+    for b in 0..nb {
+        for t in vcode.succs(vc, b) {
+            preds[t].push(b)
         }
     }
+    var bl = BlockLive{ live_in: [], live_out: [] }
+    for b in 0..nb {
+        bl.live_in.push([])
+        bl.live_out.push([])
+    }
+    // Marks, keyed by the register being walked, so nothing is cleared
+    // between registers.
+    var defd: [i64] = []
+    var inm: [i64] = []
+    var outm: [i64] = []
+    for b in 0..nb {
+        defd.push(-1)
+        inm.push(-1)
+        outm.push(-1)
+    }
+    for v in 0..nv {
+        if ue_b[v].is_empty() {
+            continue
+        }
+        for b in def_b[v] {
+            defd[b] = v
+        }
+        var work: [i64] = []
+        for b in ue_b[v] {
+            work.push(b)
+        }
+        while not work.is_empty() {
+            let b = work.pop() ?? 0
+            if inm[b] == v {
+                continue
+            }
+            inm[b] = v
+            bl.live_in[b].push(v)
+            for p in preds[b] {
+                if outm[p] != v {
+                    outm[p] = v
+                    bl.live_out[p].push(v)
+                }
+                if defd[p] != v and inm[p] != v {
+                    work.push(p)
+                }
+            }
+        }
+    }
+    bl
+}
+
+pub fn intervals(vc: VCode) -> Live {
+    let nb = vcode.nblocks(vc)
+    let nv = vc.nvregs
+    let bl = block_live(vc)
     var lv = Live{ start: [], end: [], fr_reg: [], fr_from: [], fr_to: [], calls: [], pr_from: [], pr_maxto: [] }
     let big = 9223372036854775807
     for v in 0..nv {
@@ -356,22 +380,12 @@ pub fn intervals(vc: VCode) -> Live {
     for b in 0..nb {
         let bs = 2 * vc.bi0[b]
         let be = 2 * (vc.bi0[b] + vc.bni[b]) - 1
-        let base = b * ng
-        for g in 0..ng {
-            let v = gvars[g]
-            if lin[base + g] {
-                extend(lv, v, bs)
-            }
-            var out = false
-            for s in succ[b] {
-                if lin[s * ng + g] {
-                    out = true
-                }
-            }
-            if out {
-                extend(lv, v, bs)
-                extend(lv, v, be)
-            }
+        for v in bl.live_in[b] {
+            extend(lv, v, bs)
+        }
+        for v in bl.live_out[b] {
+            extend(lv, v, bs)
+            extend(lv, v, be)
         }
         // Physical registers, block-local by construction: from the write
         // to the last read before the next write. The entry's parameter

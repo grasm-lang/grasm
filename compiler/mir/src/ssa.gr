@@ -103,120 +103,107 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
         newid[order[i]] = i
     }
 
-    // Which variables cross a block boundary.
+    // Which variables cross a block boundary, and where: per variable, the
+    // blocks it is read in before any write there (upward-exposed), and the
+    // blocks it is written in -- the entry writes the parameters before its
+    // first instruction.
     let nv = v.nvars
     var defstamp: [i64] = []
-    var global: [bool] = []
+    var uestamp: [i64] = []
+    var dstamp: [i64] = []
+    var ue_b: [[i64]] = []
+    var def_b: [[i64]] = []
     for x in 0..nv {
         defstamp.push(-1)
-        global.push(false)
+        uestamp.push(-1)
+        dstamp.push(-1)
+        ue_b.push([])
+        def_b.push([])
     }
     for x in 0..v.nparams {
         defstamp[x] = 0
+        dstamp[x] = 0
+        def_b[x].push(0)
     }
     for nbi in 0..nb {
         let b = order[nbi]
         for i in v.bstart[b]..v.bend[b] {
             for x in reads_of(v, i) {
-                if defstamp[x] != nbi {
-                    global[x] = true
-                }
-            }
-            if v.dst[i] >= 0 {
-                defstamp[v.dst[i]] = nbi
-            }
-        }
-        for x in term_reads(v, b) {
-            if defstamp[x] != nbi {
-                global[x] = true
-            }
-        }
-    }
-    var gidx: [i64] = []
-    var gvars: [i64] = []
-    for x in 0..nv {
-        if global[x] {
-            gidx.push(gvars.len())
-            gvars.push(x)
-        } else {
-            gidx.push(-1)
-        }
-    }
-    let ng = gvars.len()
-
-    // Liveness of those, per block.
-    var ue: [bool] = []
-    var df: [bool] = []
-    var lin: [bool] = []
-    for k in 0..(nb * ng) {
-        ue.push(false)
-        df.push(false)
-        lin.push(false)
-    }
-    for nbi in 0..nb {
-        let b = order[nbi]
-        let base = nbi * ng
-        if nbi == 0 {
-            for x in 0..v.nparams {
-                if gidx[x] >= 0 {
-                    df[base + gidx[x]] = true
-                }
-            }
-        }
-        for i in v.bstart[b]..v.bend[b] {
-            for x in reads_of(v, i) {
-                let g = gidx[x]
-                if g >= 0 and not df[base + g] {
-                    ue[base + g] = true
+                if defstamp[x] != nbi and uestamp[x] != nbi {
+                    uestamp[x] = nbi
+                    ue_b[x].push(nbi)
                 }
             }
             let d = v.dst[i]
-            if d >= 0 and gidx[d] >= 0 {
-                df[base + gidx[d]] = true
+            if d >= 0 {
+                defstamp[d] = nbi
+                if dstamp[d] != nbi {
+                    dstamp[d] = nbi
+                    def_b[d].push(nbi)
+                }
             }
         }
         for x in term_reads(v, b) {
-            let g = gidx[x]
-            if g >= 0 and not df[base + g] {
-                ue[base + g] = true
+            if defstamp[x] != nbi and uestamp[x] != nbi {
+                uestamp[x] = nbi
+                ue_b[x].push(nbi)
             }
         }
     }
-    var nsucc: [[i64]] = []
+    var npred: [[i64]] = []
     for nbi in 0..nb {
-        var ss: [i64] = []
-        for s in succs_of(v, order[nbi]) {
-            ss.push(newid[s])
-        }
-        nsucc.push(ss)
+        npred.push([])
     }
-    var changed = true
-    while changed {
-        changed = false
-        var nbi = nb - 1
-        while nbi >= 0 {
-            let base = nbi * ng
-            for g in 0..ng {
-                var out = false
-                for s in nsucc[nbi] {
-                    if lin[s * ng + g] {
-                        out = true
-                    }
-                }
-                let now = ue[base + g] or (out and not df[base + g])
-                if now != lin[base + g] {
-                    lin[base + g] = now
-                    changed = true
-                }
-            }
-            nbi -= 1
+    for nbi in 0..nb {
+        for s in succs_of(v, order[nbi]) {
+            npred[newid[s]].push(nbi)
         }
     }
 
-    // Each block's parameters: the global variables live into it. The
-    // entry's are the function's own; a variable live into the entry that is
-    // not a parameter is read before any assignment on some path, and starts
-    // at zero.
+    // Liveness of those, per block: the least fixed point of in = upward-
+    // exposed reads + (out - written), out = the successors' ins, found a
+    // variable at a time by walking back from its reads through the
+    // predecessors until a block that writes it, so it costs the liveness
+    // there is rather than the blocks times the variables. `live_in[nbi]`
+    // lists the variables in ascending order.
+    var live_in: [[i64]] = []
+    var defd: [i64] = []
+    var inm: [i64] = []
+    for nbi in 0..nb {
+        live_in.push([])
+        defd.push(-1)
+        inm.push(-1)
+    }
+    for x in 0..nv {
+        if ue_b[x].is_empty() {
+            continue
+        }
+        for nbi in def_b[x] {
+            defd[nbi] = x
+        }
+        var work: [i64] = []
+        for nbi in ue_b[x] {
+            work.push(nbi)
+        }
+        while not work.is_empty() {
+            let nbi = work.pop() ?? 0
+            if inm[nbi] == x {
+                continue
+            }
+            inm[nbi] = x
+            live_in[nbi].push(x)
+            for p in npred[nbi] {
+                if defd[p] != x and inm[p] != x {
+                    work.push(p)
+                }
+            }
+        }
+    }
+
+    // Each block's parameters: the variables live into it. The entry's are
+    // the function's own; a variable live into the entry that is not a
+    // parameter is read before any assignment on some path, and starts at
+    // zero.
     var pvars: [[i64]] = []
     var zero_init: [i64] = []
     for nbi in 0..nb {
@@ -225,17 +212,13 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
             for x in 0..v.nparams {
                 ps.push(x)
             }
-            for g in 0..ng {
-                if lin[g] and gvars[g] >= v.nparams {
-                    zero_init.push(gvars[g])
+            for x in live_in[0] {
+                if x >= v.nparams {
+                    zero_init.push(x)
                 }
             }
         } else {
-            for g in 0..ng {
-                if lin[nbi * ng + g] {
-                    ps.push(gvars[g])
-                }
-            }
+            ps = live_in[nbi]
         }
         pvars.push(ps)
     }
@@ -443,10 +426,33 @@ fn find(repl: [i64], x: i64) -> i64 {
     y
 }
 
+/// Each block's incoming edges, in the order of the blocks they leave and,
+/// for a conditional branch to one block both ways, its true edge first:
+/// where each edge's arguments start in `targs`.
+fn incoming(f: MirFn) -> [[i64]] {
+    let nb = ir.nblocks(f)
+    var inc: [[i64]] = []
+    for b in 0..nb {
+        inc.push([])
+    }
+    for pb in 0..nb {
+        if f.tk[pb] == ir.M_JUMP or f.tk[pb] == ir.M_BRIF {
+            inc[f.tt[pb]].push(f.ta0[pb])
+        }
+        if f.tk[pb] == ir.M_BRIF {
+            inc[f.tf[pb]].push(f.fa0[pb])
+        }
+    }
+    inc
+}
+
 /// A block parameter that every incoming edge passes the same value for
-/// (or itself, round a loop) is that value.
+/// (or itself, round a loop) is that value. Each parameter is looked at
+/// through its block's incoming edges alone, so a function of many blocks
+/// costs its edges, not its blocks squared.
 fn remove_trivial_params(inout f: MirFn) {
     let nb = ir.nblocks(f)
+    let inc = incoming(f)
     var repl: [i64] = []
     var gone: [bool] = []
     for x in 0..f.nvals {
@@ -464,27 +470,13 @@ fn remove_trivial_params(inout f: MirFn) {
                 }
                 var same = -1
                 var trivial = true
-                for pb in 0..nb {
-                    if f.tk[pb] == ir.M_JUMP or f.tk[pb] == ir.M_BRIF {
-                        if f.tt[pb] == b {
-                            let a = find(repl, f.targs[f.ta0[pb] + k])
-                            if a != p {
-                                if same < 0 {
-                                    same = a
-                                } else if same != a {
-                                    trivial = false
-                                }
-                            }
-                        }
-                    }
-                    if f.tk[pb] == ir.M_BRIF and f.tf[pb] == b {
-                        let a = find(repl, f.targs[f.fa0[pb] + k])
-                        if a != p {
-                            if same < 0 {
-                                same = a
-                            } else if same != a {
-                                trivial = false
-                            }
+                for a0 in inc[b] {
+                    let a = find(repl, f.targs[a0 + k])
+                    if a != p {
+                        if same < 0 {
+                            same = a
+                        } else if same != a {
+                            trivial = false
                         }
                     }
                 }
@@ -578,6 +570,7 @@ fn rebuild(inout f: MirFn, repl: [i64], gone: [bool]) {
 fn remove_dead(inout f: MirFn) {
     let nb = ir.nblocks(f)
     let nv = f.nvals
+    let inc = incoming(f)
     var def_inst: [i64] = []
     var def_blk: [i64] = []
     var def_pos: [i64] = []
@@ -643,13 +636,8 @@ fn remove_dead(inout f: MirFn) {
         } else if def_blk[x] >= 0 {
             let b = def_blk[x]
             let k = def_pos[x]
-            for pb in 0..nb {
-                if (f.tk[pb] == ir.M_JUMP or f.tk[pb] == ir.M_BRIF) and f.tt[pb] == b {
-                    work.push(f.targs[f.ta0[pb] + k])
-                }
-                if f.tk[pb] == ir.M_BRIF and f.tf[pb] == b {
-                    work.push(f.targs[f.fa0[pb] + k])
-                }
+            for a0 in inc[b] {
+                work.push(f.targs[a0 + k])
             }
         }
     }
