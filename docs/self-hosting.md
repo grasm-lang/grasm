@@ -3538,6 +3538,21 @@ r12, no displacement for 0 from rbp and r13, `lock` before the operand-size
 prefix, a short branch's displacement one long, a RIP-relative address
 relocated as a GOT load, and a form the target claims to emit with no cases.
 
+On the step's tree (2026-11-02, a one-minute load of 3 to 5): `encodetest_x64`
+"forms: 102   cases: 5558   bytes: 28464   relocated: 51   identical: 5558
+different: 0"; `x64controls` "controls: 9   caught: 9   missed: 0";
+`encodetest` 112 forms, 6,992 encodings identical to `clang`'s, as before.
+Nothing on the AArch64 path changed, and that was checked rather than
+assumed: every program of the subset, 648 of 648, and the runtime (555,152
+bytes) compile from the same TIR in the same directory to the same object
+bytes with this driver as with master's; `fixpoint` 48 of 48 artifacts
+identical, stage 3 being stage 2; and, since the new package's files are
+among the `.gr` files git tracks, `tokentest` and `asttest` 1,981 of 1,981
+files, `tirdiff` 1,914 the same TIR and 67 refused by both, none disagreeing,
+`diagdiff` 4,251 programs, none differing, and `fmttest`, `linttest` and
+`gatecheck` pass. Not run: the rest of the suite, `stagediff` and
+`s3controls` among them, which this step's change does not reach.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
