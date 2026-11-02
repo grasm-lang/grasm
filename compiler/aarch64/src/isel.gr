@@ -16,8 +16,9 @@
 // (`MirFn.vfp`), and a move is `mov` or `fmov` by it.
 import mach
 import rules
-import vcode
 import mir.ir
+import vcode.vcode
+import vcode.moves
 
 type Sel = {
     def_inst: [i64],
@@ -473,64 +474,6 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], 
     ()
 }
 
-/// A register-to-register move within one class: `mov` (an `orr` with the
-/// zero register, Rm the source) for integers, `fmov` (Rn the source) for
-/// doubles.
-fn mov(inout vc: VCode, d: i64, src: i64) {
-    if vcode.cls_of(vc, d) == mach.CLS_FP {
-        vcode.push(vc, mach.A_FMOV, d, src, -1)
-    } else {
-        vcode.push(vc, mach.A_MOV, d, -1, src)
-    }
-    ()
-}
-
-/// Moves that happen at once: each `dsts[k]` gets the value `srcs[k]` had
-/// before any of them. Emitted one at a time, a destination is written only
-/// once nothing still to come reads it; a cycle is broken through a fresh
-/// register.
-fn par_moves(inout vc: VCode, dsts: [i64], srcs: [i64]) {
-    var pd: [i64] = []
-    var ps: [i64] = []
-    for k in 0..dsts.len() {
-        if dsts[k] != srcs[k] {
-            pd.push(dsts[k])
-            ps.push(srcs[k])
-        }
-    }
-    while pd.len() > 0 {
-        var done = -1
-        for k in 0..pd.len() {
-            if done < 0 {
-                var read_later = false
-                for q in 0..ps.len() {
-                    if q != k and ps[q] == pd[k] {
-                        read_later = true
-                    }
-                }
-                if not read_later {
-                    done = k
-                }
-            }
-        }
-        if done >= 0 {
-            mov(vc, pd[done], ps[done])
-            pd.remove(done)
-            ps.remove(done)
-        } else {
-            // A cycle: keep the first destination's value, then it is free.
-            let keep = pd[0]
-            let t = vcode.new_vreg(vc, vcode.cls_of(vc, keep))
-            mov(vc, t, keep)
-            for q in 0..ps.len() {
-                if ps[q] == keep {
-                    ps[q] = t
-                }
-            }
-        }
-    }
-}
-
 /// Where AAPCS64 puts each of a call's (or a function's) arguments, given
 /// which are doubles: integers in x0..x7 and doubles in d0..d7, counted
 /// apart, and whatever does not fit in its file on the stack, eight bytes
@@ -574,7 +517,7 @@ fn call_fp(f: MirFn, i: i64) -> [bool] {
 }
 
 /// Selects machine instructions for a whole function.
-pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
+pub fn select(t: Target, f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
     let s = try plan(f, rs)
     var vc = vcode.new_vcode(f.sym)
     vc.nvregs = f.nvals
@@ -616,7 +559,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
             for k in 0..f.bnp[0] {
                 let p = vr(f.bparams[f.bp0[0] + k])
                 if pp.reg[k] >= 0 {
-                    mov(vc, p, pp.reg[k])
+                    moves.mov(t, vc, p, pp.reg[k])
                 } else {
                     let x = vcode.push(vc, if pfp[k] { mach.A_FLDR } else { mach.A_LDR }, p, mach.R_FP, -1)
                     vc.imm[x] = 16 + 8 * pp.slot[k]
@@ -643,7 +586,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
                 }
                 for k in 0..n {
                     if ap.reg[k] >= 0 {
-                        mov(vc, ap.reg[k], vr(f.cargs[f.ca0[i] + k]))
+                        moves.mov(t, vc, ap.reg[k], vr(f.cargs[f.ca0[i] + k]))
                     }
                 }
                 // A call through a function value's code is `blr` on the
@@ -659,7 +602,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
                     vc.sym_id[x] = f.imm[i]
                 }
                 if f.res[i] >= 0 {
-                    mov(vc, vr(f.res[i]), if res_fp { mach.R_D0 } else { 0 })
+                    moves.mov(t, vc, vr(f.res[i]), if res_fp { mach.R_D0 } else { 0 })
                 }
                 continue
             }
@@ -667,7 +610,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
                 // Reference counting is the runtime's: a call, so the count
                 // is changed atomically and a release that reaches zero frees
                 // what it must, exactly as for the Cranelift build.
-                mov(vc, 0, vr(f.a[i]))
+                moves.mov(t, vc, 0, vr(f.a[i]))
                 let x = vcode.push(vc, mach.A_BL, -1, -1, -1)
                 vc.imm[x] = vcode.RES_NONE
                 vc.imm2[x] = vcode.call_args_code(1, 0)
@@ -684,10 +627,10 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
             var rk = vcode.RES_NONE
             if f.tv[b] >= 0 {
                 if f.vfp[f.tv[b]] {
-                    mov(vc, mach.R_D0, vr(f.tv[b]))
+                    moves.mov(t, vc, mach.R_D0, vr(f.tv[b]))
                     rk = vcode.RES_D0
                 } else {
-                    mov(vc, 0, vr(f.tv[b]))
+                    moves.mov(t, vc, 0, vr(f.tv[b]))
                     rk = vcode.RES_X0
                 }
             }
@@ -695,14 +638,14 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
             vc.imm[x] = rk
         } else {
             if k == ir.M_JUMP {
-                let t = f.tt[b]
+                let tb = f.tt[b]
                 var dsts: [i64] = []
                 var srcs: [i64] = []
                 for q in 0..f.tan[b] {
-                    dsts.push(vr(f.bparams[f.bp0[t] + q]))
+                    dsts.push(vr(f.bparams[f.bp0[tb] + q]))
                     srcs.push(vr(f.targs[f.ta0[b] + q]))
                 }
-                par_moves(vc, dsts, srcs)
+                moves.par_moves(t, vc, dsts, srcs)
             } else if k == ir.M_BRIF and (f.tan[b] > 0 or f.fan[b] > 0) {
                 fail("a conditional branch passes arguments: its edges were not split")
             }

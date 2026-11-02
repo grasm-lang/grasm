@@ -2,24 +2,27 @@
 //
 //     rules.gr     instruction selection, as data, and the table's checker
 //     isel.gr      MIR to VCode by those rules, plus the calling convention
-//     vcode.gr     machine instructions over virtual registers
-//     regalloc.gr  linear-scan allocation, for fast builds
-//     backtrack.gr the release allocator: backtracking by spill weight
-//     check.gr     the symbolic checker every allocation must pass
 //     emit.gr      frame, branches, relocations, bytes
 //     mach.gr      the instructions: roles, encodings, assembly text
+//     desc.gr      the target description the shared code reads
 //     enctest.gr   the encoder's test cases
+//     leaves.gr    the runtime dialect's leaves
+//
+// VCode, both register allocators, the allocation checker, the frame's
+// placement and parallel moves are `compiler/vcode`'s, shared with the
+// x86-64 target (docs/self-hosting.md §6.16).
 import mach
 import rules
-import vcode
+import desc
 import isel
-import regalloc
-import backtrack
-import check
 import emit
 import enctest
 import leaves
 import mir.ir
+import vcode.vcode
+import vcode.regalloc
+import vcode.backtrack
+import vcode.check
 
 type A64Opts = {
     /// Registers the allocator may hand out; negative for all of them.
@@ -30,13 +33,15 @@ type A64Opts = {
     want_asm: bool,
     /// Which allocator: `RA_LINEAR` or `RA_BACKTRACK`.
     ra: i64,
+    /// The target description (`desc.gr`), made once.
+    tg: Target,
 }
 
 pub let RA_LINEAR = 0
 pub let RA_BACKTRACK = 1
 
 pub fn default_opts() -> A64Opts {
-    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false, ra: RA_BACKTRACK }
+    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false, ra: RA_BACKTRACK, tg: desc.description() }
 }
 
 /// The kinds of planted allocation error, by the names the driver takes.
@@ -61,12 +66,13 @@ type A64Result = {
 /// Selects, allocates, checks and encodes one function. `rt_syms` names the
 /// runtime functions its calls reach, by id (`MirProg.rt_syms`).
 pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, callee_sym: [str], rt_syms: [str]) -> A64Result ! str {
-    let vc = try isel.select(f, rs, ccm, fccm)
-    let al = if opts.ra == RA_BACKTRACK { try backtrack.allocate(vc, opts.max_regs, opts.corrupt) } else { try regalloc.allocate(vc, opts.max_regs, opts.corrupt) }
-    let errs = check.check(al)
+    let t = opts.tg
+    let vc = try isel.select(t, f, rs, ccm, fccm)
+    let al = if opts.ra == RA_BACKTRACK { try backtrack.allocate(t, vc, opts.max_regs, opts.corrupt) } else { try regalloc.allocate(t, vc, opts.max_regs, opts.corrupt) }
+    let errs = check.check(t, al)
     var vtext = ""
     if opts.want_asm {
-        vtext = vcode.print_vcode(vc)
+        vtext = print_vcode(vc)
     }
     if errs.len() > 0 {
         // Code the checker refused is not encoded: an operand in the wrong
@@ -74,8 +80,27 @@ pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, 
         let none = A64Code{ sym: f.sym, words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [], frame: 0, nspill: al.nspill, nsaved: 0, frame_at: 0, row_word: [], row_src: [] }
         return A64Result{ code: none, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
     }
-    let code = try emit.emit(al, f.sym, opts.want_asm, callee_sym, rt_syms)
+    let code = try emit.emit(t, al, f.sym, opts.want_asm, callee_sym, rt_syms)
     A64Result{ code: code, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
+}
+
+/// The function as text, for reading.
+fn print_vcode(vc: VCode) -> str {
+    var out = str_builder()
+    out.push_str("vcode {vc.sym} vregs={vc.nvregs} params={vc.nparams} slots={vc.nslots} out={vc.nout}\n")
+    for b in 0..vcode.nblocks(vc) {
+        out.push_str("  b{b}:\n")
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            var target = ""
+            if vc.tgt[i] >= 0 {
+                target = "b{vc.tgt[i]}"
+            } else if vc.symk[i] > 0 {
+                target = "sym{vc.symk[i]}:{vc.sym_id[i]}"
+            }
+            out.push_str("    " + mach.asm_text(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i], vc.cc[i], 0, target) + "\n")
+        }
+    }
+    out.to_str()
 }
 
 pub fn rule_table() -> [Rule] {

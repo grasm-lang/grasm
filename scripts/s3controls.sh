@@ -221,7 +221,7 @@ control objwriter compiler/macho/src/main.gr \
     scripts/objtest.sh "has no BRANCH26 relocation" - \
     scripts/s3subset.sh "FAILED:" -
 
-control allocator compiler/aarch64/src/regalloc.gr \
+control allocator compiler/vcode/src/regalloc.gr \
     "let rslot = l - LOC_SPILL" "let rslot = l - LOC_SPILL + 1" -- \
     scripts/ra_check.sh "register allocation check failed" -
 
@@ -305,7 +305,7 @@ control dwarf-line compiler/s3/src/main.gr \
     "    (k + 1, lo + 1)" "    (k + 1, lo + 2)" -- \
     scripts/objtest.sh "maps to line" -
 
-control backtrack compiler/aarch64/src/backtrack.gr \
+control backtrack compiler/vcode/src/backtrack.gr \
     " or busy(occ[r], sg.seg_s[k], sg.seg_e[k])) {" ") {" -- \
     scripts/fuzz_s3.py "register allocation check failed" -
 

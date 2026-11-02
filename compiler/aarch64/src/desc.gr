@@ -1,0 +1,133 @@
+// AArch64 as the shared allocators, checker and frame planner see it
+// (`compiler/vcode/src/target.gr`, docs/self-hosting.md §6.16): the tables
+// below are `mach.gr`'s roles and register files and AAPCS64's registers, the
+// same answers the allocators asked of `mach.gr` and of their own register
+// lists before they were shared.
+import mach
+import vcode.target
+
+/// Registers a call may change: everything below x18, the callee-saved ones
+/// excepted (AAPCS64; x18 is the platform's on Darwin and never used), and
+/// every floating-point register but d8..d15, whose low 64 bits the callee
+/// preserves.
+fn caller_saved(r: i64) -> bool {
+    (r >= 0 and r <= 17) or (mach.is_fpr(r) and not callee_saved(r))
+}
+
+fn callee_saved(r: i64) -> bool {
+    (r >= 19 and r <= 28) or (r >= mach.R_D0 + 8 and r <= mach.R_D0 + 15)
+}
+
+fn reg_name(r: i64) -> str {
+    if mach.is_fpr(r) {
+        "d{r - mach.R_D0}"
+    } else {
+        "x{r}"
+    }
+}
+
+/// The description, built once per compilation.
+pub fn description() -> Target {
+    var t = target.blank("aarch64")
+    var rd: [i64] = []
+    var rn: [i64] = []
+    var rm: [i64] = []
+    var ra: [i64] = []
+    var fd: [bool] = []
+    var fn_: [bool] = []
+    var fm: [bool] = []
+    var fa: [bool] = []
+    var call: [bool] = []
+    var form: [str] = []
+    for m in 0..target.NMOPS {
+        rd.push(mach.role_d(m))
+        rn.push(mach.role_n(m))
+        rm.push(mach.role_m(m))
+        ra.push(mach.role_a(m))
+        fd.push(mach.fp_field(m, 0))
+        fn_.push(mach.fp_field(m, 1))
+        fm.push(mach.fp_field(m, 2))
+        fa.push(mach.fp_field(m, 3))
+        call.push(mach.is_call(m))
+        form.push(mach.form_name(m))
+    }
+    t.role_d = rd
+    t.role_n = rn
+    t.role_m = rm
+    t.role_a = ra
+    t.fp_d = fd
+    t.fp_n = fn_
+    t.fp_m = fm
+    t.fp_a = fa
+    t.call = call
+    t.form = form
+    var notreg: [bool] = []
+    var cs: [bool] = []
+    var ce: [bool] = []
+    var nw: [bool] = []
+    var fr: [bool] = []
+    var names: [str] = []
+    for r in 0..target.NPHYS {
+        notreg.push(r == mach.R_ZR or r == mach.R_SP)
+        cs.push(caller_saved(r))
+        ce.push(callee_saved(r))
+        // x18 is the platform's; x29 and x30 the frame record's.
+        nw.push(r == 18 or r == mach.R_FP or r == 30)
+        // Reached only with the frame set up: `sp`, the frame pointer, and
+        // the link register a call overwrites.
+        fr.push(r == mach.R_SP or r == mach.R_FP or r == 30)
+        names.push(reg_name(r))
+    }
+    t.notreg = notreg
+    t.caller_saved = cs
+    t.callee_saved = ce
+    t.no_write = nw
+    t.frame_reg = fr
+    t.reg_name = names
+    var ai: [i64] = []
+    var af: [i64] = []
+    for k in 0..8 {
+        ai.push(k)
+        af.push(mach.R_D0 + k)
+    }
+    t.arg_int = ai
+    t.arg_fp = af
+    t.res_int = 0
+    t.res_fp = mach.R_D0
+    t.entry_fixed = [mach.R_FP]
+    // Handed out: x9..x14, then x8 down to x0, among what a call changes; d16..d28,
+    // then d7 down to d0.
+    var fcaller: [i64] = []
+    for k in 16..29 {
+        fcaller.push(mach.R_D0 + k)
+    }
+    for k in 0..8 {
+        fcaller.push(mach.R_D0 + 7 - k)
+    }
+    var fcallee: [i64] = []
+    for k in 8..16 {
+        fcallee.push(mach.R_D0 + k)
+    }
+    t.caller_order = [[9, 10, 11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1, 0], fcaller]
+    t.callee_order = [[19, 20, 21, 22, 23, 24, 25, 26, 27, 28], fcallee]
+    // Under `max_regs`, the registers kept, in this order: a few of each
+    // kind, so a starved allocation still has somewhere to put a value that
+    // lives across a call. The same count is kept of each file.
+    let d = mach.R_D0
+    t.stress_order = [
+        [9, 19, 10, 20, 11, 21, 12, 22, 13, 23, 14, 24, 8, 25, 7, 26, 6, 27, 5, 28, 4, 3, 2, 1, 0],
+        [d + 16, d + 8, d + 17, d + 9, d + 18, d + 10, d + 19, d + 11, d + 20, d + 12, d + 21, d + 13, d + 22, d + 14, d + 23, d + 15, d + 24, d + 25, d + 26, d + 27, d + 28, d + 7, d + 6, d + 5, d + 4, d + 3, d + 2, d + 1, d],
+    ]
+    // Reloads go through x16, x17, x15 and d29..d31, never handed out.
+    t.scratch = [[16, 17, 15], [d + 29, d + 30, d + 31]]
+    t.mov = [mach.A_MOV, mach.A_FMOV]
+    t.mov_src = [2, 1]
+    t.load = [mach.A_LDR, mach.A_FLDR]
+    t.store = [mach.A_STR, mach.A_FSTR]
+    t.sp = mach.R_SP
+    t.call_op = mach.A_BL
+    // A spill slot is reached by `ldr`/`str` with a 12-bit offset scaled by
+    // eight.
+    t.max_frame = 32760
+    t
+}

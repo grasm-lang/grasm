@@ -1,0 +1,10 @@
+[package]
+name = "vcode"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# What every target of the Grasm backend shares below instruction selection
+# (docs/self-hosting.md §6.16): VCode, both register allocators, the
+# allocation checker, the frame's placement and block arguments as parallel
+# moves, each driven by a target description. Pure computation.
+capabilities = []

@@ -1,0 +1,148 @@
+// A target description: what the shared allocators, the allocation checker
+// and the frame's placement need to know about an instruction set, as tables
+// rather than functions (docs/self-hosting.md §6.16, and §3's principle 5).
+// Each target (`compiler/aarch64`, `compiler/x86_64`) builds one, once, from
+// its own `mach.gr`; nothing in this package names a register or an opcode of
+// either.
+//
+// Operands are numbered the same way on every target: general registers
+// below 64 (each target its own, in its hardware's order), floating-point
+// registers from `R_FP0` (d0 or xmm0), virtual registers from `VR`. A number
+// below `NPHYS` that is not a register a value can live in -- AArch64's zero
+// register and `sp`, x86-64's `rsp` -- is marked `notreg`.
+
+pub let VR = 128
+/// The first floating-point register: AArch64's d0, x86-64's xmm0.
+pub let R_FP0 = 64
+/// The physical registers, as a table index.
+pub let NPHYS = 96
+/// The size of a table indexed by opcode.
+pub let NMOPS = 160
+/// Not an instruction: the function's return, which becomes the epilogue.
+/// `imm` says what it returns (`vcode.RES_*`).
+pub let P_RETURN = 150
+
+/// The register classes.
+pub let CLS_INT = 0
+pub let CLS_FP = 1
+
+/// Operand roles: 0 unused, 1 written, 2 read, 3 read and written.
+pub let ROLE_NONE = 0
+pub let ROLE_DEF = 1
+pub let ROLE_USE = 2
+pub let ROLE_USEDEF = 3
+
+type Target = {
+    name: str,
+    /// Per opcode (`NMOPS` entries): each field's role -- field 0 the
+    /// destination, 1 and 2 sources or a base, 3 a fourth register -- and
+    /// whether the field is a floating-point register; whether the opcode is
+    /// a call; its form's name, for messages.
+    role_d: [i64],
+    role_n: [i64],
+    role_m: [i64],
+    role_a: [i64],
+    fp_d: [bool],
+    fp_n: [bool],
+    fp_m: [bool],
+    fp_a: [bool],
+    call: [bool],
+    form: [str],
+    /// Per physical register (`NPHYS` entries): an operand number that is not
+    /// a register a value lives in; one a call may change; one the callee
+    /// preserves (and the prologue saves when the body writes it); one the
+    /// body must never write; one whose use needs the frame set up (the stack
+    /// and frame pointers, a link register); its name, for messages.
+    notreg: [bool],
+    caller_saved: [bool],
+    callee_saved: [bool],
+    no_write: [bool],
+    frame_reg: [bool],
+    reg_name: [str],
+    /// The calling convention: argument registers by class, in order, and
+    /// the result registers.
+    arg_int: [i64],
+    arg_fp: [i64],
+    res_int: i64,
+    res_fp: i64,
+    /// Registers that hold a known value of their own on entry and that no
+    /// instruction writes (AArch64's frame pointer, x86-64's rbp): what a
+    /// stack argument is read through.
+    entry_fixed: [i64],
+    /// Per class: the registers handed out, in the order they are tried,
+    /// among those a call may change and among those it preserves; the
+    /// order kept under `--max-regs`; the scratch registers reloads go
+    /// through, which are never handed out.
+    caller_order: [[i64]],
+    callee_order: [[i64]],
+    stress_order: [[i64]],
+    scratch: [[i64]],
+    /// Per class: the register move -- its opcode, and the field its source
+    /// is in (the destination is field 0) -- and the load and store a reload
+    /// and a spill are, each `op reg, [sp, #off]` with the register in field
+    /// 0 and the base in field 1.
+    mov: [i64],
+    mov_src: [i64],
+    load: [i64],
+    store: [i64],
+    /// The stack pointer, the base of every spill slot.
+    sp: i64,
+    /// The direct call, which the checker's control plants an error at.
+    call_op: i64,
+    /// The largest frame, in bytes, a spill slot's offset can reach.
+    max_frame: i64,
+}
+
+pub fn is_vreg(o: i64) -> bool {
+    o >= VR
+}
+
+/// A physical floating-point register.
+pub fn is_fpr(o: i64) -> bool {
+    o >= R_FP0 and o < R_FP0 + 32
+}
+
+/// A register operand: given, and a register a value can be in (or a
+/// virtual one).
+pub fn keep(t: Target, o: i64) -> bool {
+    o >= 0 and not (o < NPHYS and t.notreg[o])
+}
+
+pub fn fp_field(t: Target, m: i64, field: i64) -> bool {
+    if field == 0 {
+        t.fp_d[m]
+    } else if field == 1 {
+        t.fp_n[m]
+    } else if field == 2 {
+        t.fp_m[m]
+    } else {
+        t.fp_a[m]
+    }
+}
+
+/// An empty description, every table its full size and false or zero, for a
+/// target to fill.
+pub fn blank(name: str) -> Target {
+    var ri: [i64] = []
+    var rb: [bool] = []
+    var rs: [str] = []
+    for m in 0..NMOPS {
+        ri.push(0)
+        rb.push(false)
+        rs.push("?")
+    }
+    var pb: [bool] = []
+    var ps: [str] = []
+    for r in 0..NPHYS {
+        pb.push(false)
+        ps.push("?")
+    }
+    Target{
+        name: name, role_d: ri, role_n: ri, role_m: ri, role_a: ri,
+        fp_d: rb, fp_n: rb, fp_m: rb, fp_a: rb, call: rb, form: rs,
+        notreg: pb, caller_saved: pb, callee_saved: pb, no_write: pb, frame_reg: pb, reg_name: ps,
+        arg_int: [], arg_fp: [], res_int: -1, res_fp: -1, entry_fixed: [],
+        caller_order: [[], []], callee_order: [[], []], stress_order: [[], []], scratch: [[], []],
+        mov: [-1, -1], mov_src: [2, 2], load: [-1, -1], store: [-1, -1], sp: -1, call_op: -1, max_frame: 0,
+    }
+}

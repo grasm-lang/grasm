@@ -1,0 +1,885 @@
+// Register allocation: linear scan (Poletto and Sarkar, "Linear Scan
+// Register Allocation", TOPLAS 1999), the fast one; `backtrack.gr` is the
+// release one, and shares what follows the choice of locations.
+//
+// Each virtual register gets one lifetime interval, from the first point it
+// is live to the last, computed from block liveness, and keeps one location
+// for all of it: a register of its own class, or a stack slot when there are
+// not enough. The two classes are allocated from two files that do not
+// interfere: general registers for integers and addresses, floating-point
+// registers for doubles. The calling convention is respected by the
+// intervals of physical registers, which no virtual register may overlap in
+// the same register, and by calls, which clobber what the target says a call
+// may change: an interval that spans a call goes to a register the callee
+// preserves or to the stack (on AArch64, x19..x28 and d8..d15; on x86-64,
+// rbx and r12..r15, and no xmm register).
+//
+// A spilled register is reloaded into a scratch register of its class (the
+// target's, which the allocator never hands out: x15..x17 and d29..d31 on
+// AArch64) before every instruction that reads it, and stored after every
+// instruction that writes it. Spill slots are eight bytes and serve either
+// class.
+//
+// Everything about the instruction set comes from the target description
+// (`target.gr`, docs/self-hosting.md §6.16). Nothing here is trusted:
+// `check.gr` replays the result symbolically and fails the build on any
+// error.
+import target
+import vcode
+
+pub let LOC_NONE = -1
+/// A location at or above this is spill slot `loc - LOC_SPILL`.
+pub let LOC_SPILL = 1000
+pub let K_ORIG = 0
+pub let K_RELOAD = 1
+pub let K_SPILL = 2
+/// The physical registers, as a table index: general registers below 32,
+/// floating-point ones from `target.R_FP0`.
+pub let NPHYS = 96
+
+/// The code after allocation: every operand physical, with what it was
+/// before beside it.
+type Alloc = {
+    mop: [i64],
+    rd: [i64],
+    rn: [i64],
+    rm: [i64],
+    ra: [i64],
+    imm: [i64],
+    imm2: [i64],
+    cc: [i64],
+    tgt: [i64],
+    symk: [i64],
+    sym_id: [i64],
+    od: [i64],
+    on: [i64],
+    om: [i64],
+    oa: [i64],
+    kind: [i64],
+    slot: [i64],
+    bi0: [i64],
+    bni: [i64],
+    nparams: i64,
+    /// How many parameters arrived in the integer and the floating-point
+    /// argument registers.
+    nreg_int: i64,
+    nreg_fp: i64,
+    nslots: i64,
+    /// Words of outgoing stack arguments at the bottom of the frame.
+    nout: i64,
+    nspill: i64,
+    loc: [i64],
+    /// Per virtual register, its class, as selection made it.
+    vcls: [i64],
+    /// Per physical register, whether the body writes it and the prologue
+    /// must save it.
+    used_callee: [bool],
+    /// How many functions a deliberate corruption was applied to: the
+    /// checker's control (`ra_check`).
+    corrupted: i64,
+    /// Per instruction, its source offset (`VCode.src`): a reload or a
+    /// spill is its instruction's. `span0` is the function's.
+    src: [i64],
+    cur_src: i64,
+    span0: i64,
+}
+
+// ----- operands ----------------------------------------------------------------
+
+/// The registers an instruction reads, each with whether its field is a
+/// floating-point one: `regs[k]` and `fps[k]`.
+type Opnds = {
+    regs: [i64],
+    fps: [bool],
+}
+
+fn push_opnd(inout o: Opnds, r: i64, fp: bool) {
+    o.regs.push(r)
+    o.fps.push(fp)
+}
+
+fn reads(role: i64) -> bool {
+    role == target.ROLE_USE or role == target.ROLE_USEDEF
+}
+
+fn writes(role: i64) -> bool {
+    role == target.ROLE_DEF or role == target.ROLE_USEDEF
+}
+
+/// The registers an instruction reads: a call's code register, if it calls
+/// through one, and its argument registers; a return's result register;
+/// otherwise each field its role reads, in field order.
+pub fn uses_of(t: Target, m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, imm2: i64) -> Opnds {
+    var out = Opnds{ regs: [], fps: [] }
+    if t.call[m] {
+        // A call through a register reads it first.
+        if t.role_n[m] == target.ROLE_USE and target.keep(t, n) {
+            push_opnd(out, n, false)
+        }
+        for k in 0..vcode.call_nint(imm2) {
+            push_opnd(out, t.arg_int[k], false)
+        }
+        for k in 0..vcode.call_nfp(imm2) {
+            push_opnd(out, t.arg_fp[k], true)
+        }
+        return out
+    }
+    if m == target.P_RETURN {
+        if imm == vcode.RES_X0 {
+            push_opnd(out, t.res_int, false)
+        } else if imm == vcode.RES_D0 {
+            push_opnd(out, t.res_fp, true)
+        }
+        return out
+    }
+    if reads(t.role_d[m]) and target.keep(t, d) {
+        push_opnd(out, d, t.fp_d[m])
+    }
+    if reads(t.role_n[m]) and target.keep(t, n) {
+        push_opnd(out, n, t.fp_n[m])
+    }
+    if reads(t.role_m[m]) and target.keep(t, mm) {
+        push_opnd(out, mm, t.fp_m[m])
+    }
+    if reads(t.role_a[m]) and target.keep(t, a) {
+        push_opnd(out, a, t.fp_a[m])
+    }
+    out
+}
+
+/// The registers an instruction writes (a call's clobbers aside).
+pub fn defs_of(t: Target, m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, imm2: i64) -> Opnds {
+    var out = Opnds{ regs: [], fps: [] }
+    if t.call[m] {
+        if imm == vcode.RES_X0 {
+            push_opnd(out, t.res_int, false)
+        } else if imm == vcode.RES_D0 {
+            push_opnd(out, t.res_fp, true)
+        }
+        return out
+    }
+    if writes(t.role_d[m]) and target.keep(t, d) {
+        push_opnd(out, d, t.fp_d[m])
+    }
+    if writes(t.role_n[m]) and target.keep(t, n) {
+        push_opnd(out, n, t.fp_n[m])
+    }
+    if writes(t.role_m[m]) and target.keep(t, mm) {
+        push_opnd(out, mm, t.fp_m[m])
+    }
+    if writes(t.role_a[m]) and target.keep(t, a) {
+        push_opnd(out, a, t.fp_a[m])
+    }
+    out
+}
+
+pub fn uses_at(t: Target, vc: VCode, i: i64) -> [i64] {
+    uses_of(t, vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i]).regs
+}
+
+pub fn defs_at(t: Target, vc: VCode, i: i64) -> [i64] {
+    defs_of(t, vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i]).regs
+}
+
+// ----- liveness and intervals ----------------------------------------------------
+
+type Live = {
+    start: [i64],
+    end: [i64],
+    fr_reg: [i64],
+    fr_from: [i64],
+    fr_to: [i64],
+    calls: [i64],
+    /// Per physical register, its ranges' starts in ascending order, and the
+    /// furthest end of any range up to each: so whether a range of `r`
+    /// overlaps `[s, e]` is one binary search (`fixed_overlap`). A function
+    /// made mostly of runtime calls has a fixed range per argument per call.
+    pr_from: [[i64]],
+    pr_maxto: [[i64]],
+}
+
+/// Block liveness of the virtual registers that cross a block boundary --
+/// read in a block they were not written in first; the others are local to
+/// a block by construction. `live_in[b]` and `live_out[b]` list them, as
+/// virtual register numbers in ascending order: the least fixed point of
+/// in = upward-exposed uses + (out - defined), out = the successors' ins,
+/// found a register at a time by walking back from its uses through the
+/// predecessors until a block that defines it, so a function costs the
+/// liveness it has, not its blocks times its registers.
+type BlockLive = {
+    live_in: [[i64]],
+    live_out: [[i64]],
+}
+
+pub fn block_live(t: Target, vc: VCode) -> BlockLive {
+    let nb = vcode.nblocks(vc)
+    let nv = vc.nvregs
+    // Per register, the blocks it is read in before any write there
+    // (upward-exposed), and the blocks it is written in, each once.
+    var defstamp: [i64] = []
+    var uestamp: [i64] = []
+    var dstamp: [i64] = []
+    for v in 0..nv {
+        defstamp.push(-1)
+        uestamp.push(-1)
+        dstamp.push(-1)
+    }
+    var ue_b: [[i64]] = []
+    var def_b: [[i64]] = []
+    for v in 0..nv {
+        ue_b.push([])
+        def_b.push([])
+    }
+    for b in 0..nb {
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in uses_at(t, vc, i) {
+                if target.is_vreg(u) {
+                    let v = u - target.VR
+                    if defstamp[v] != b and uestamp[v] != b {
+                        uestamp[v] = b
+                        ue_b[v].push(b)
+                    }
+                }
+            }
+            for d in defs_at(t, vc, i) {
+                if target.is_vreg(d) {
+                    let v = d - target.VR
+                    defstamp[v] = b
+                    if dstamp[v] != b {
+                        dstamp[v] = b
+                        def_b[v].push(b)
+                    }
+                }
+            }
+        }
+    }
+    var preds: [[i64]] = []
+    for b in 0..nb {
+        preds.push([])
+    }
+    for b in 0..nb {
+        for t in vcode.succs(vc, b) {
+            preds[t].push(b)
+        }
+    }
+    var bl = BlockLive{ live_in: [], live_out: [] }
+    for b in 0..nb {
+        bl.live_in.push([])
+        bl.live_out.push([])
+    }
+    // Marks, keyed by the register being walked, so nothing is cleared
+    // between registers.
+    var defd: [i64] = []
+    var inm: [i64] = []
+    var outm: [i64] = []
+    for b in 0..nb {
+        defd.push(-1)
+        inm.push(-1)
+        outm.push(-1)
+    }
+    for v in 0..nv {
+        if ue_b[v].is_empty() {
+            continue
+        }
+        for b in def_b[v] {
+            defd[b] = v
+        }
+        var work: [i64] = []
+        for b in ue_b[v] {
+            work.push(b)
+        }
+        while not work.is_empty() {
+            let b = work.pop() ?? 0
+            if inm[b] == v {
+                continue
+            }
+            inm[b] = v
+            bl.live_in[b].push(v)
+            for p in preds[b] {
+                if outm[p] != v {
+                    outm[p] = v
+                    bl.live_out[p].push(v)
+                }
+                if defd[p] != v and inm[p] != v {
+                    work.push(p)
+                }
+            }
+        }
+    }
+    bl
+}
+
+pub fn intervals(t: Target, vc: VCode) -> Live {
+    let nb = vcode.nblocks(vc)
+    let nv = vc.nvregs
+    let bl = block_live(t, vc)
+    var lv = Live{ start: [], end: [], fr_reg: [], fr_from: [], fr_to: [], calls: [], pr_from: [], pr_maxto: [] }
+    let big = 9223372036854775807
+    for v in 0..nv {
+        lv.start.push(big)
+        lv.end.push(-1)
+    }
+    for b in 0..nb {
+        let bs = 2 * vc.bi0[b]
+        let be = 2 * (vc.bi0[b] + vc.bni[b]) - 1
+        for v in bl.live_in[b] {
+            extend(lv, v, bs)
+        }
+        for v in bl.live_out[b] {
+            extend(lv, v, bs)
+            extend(lv, v, be)
+        }
+        // Physical registers, block-local by construction: from the write
+        // to the last read before the next write. The entry's parameter
+        // registers are written before the function starts.
+        var is_open: [bool] = []
+        var from: [i64] = []
+        var last: [i64] = []
+        for r in 0..NPHYS {
+            is_open.push(false)
+            from.push(0)
+            last.push(0)
+        }
+        if b == 0 {
+            for k in 0..vc.nreg_int {
+                let r = t.arg_int[k]
+                is_open[r] = true
+                from[r] = -1
+                last[r] = -1
+            }
+            for k in 0..vc.nreg_fp {
+                let r = t.arg_fp[k]
+                is_open[r] = true
+                from[r] = -1
+                last[r] = -1
+            }
+        }
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in uses_at(t, vc, i) {
+                if target.is_vreg(u) {
+                    extend(lv, u - target.VR, 2 * i)
+                } else if is_open[u] {
+                    last[u] = 2 * i
+                } else {
+                    lv.fr_reg.push(u)
+                    lv.fr_from.push(bs)
+                    lv.fr_to.push(2 * i)
+                }
+            }
+            for d in defs_at(t, vc, i) {
+                if target.is_vreg(d) {
+                    extend(lv, d - target.VR, 2 * i + 1)
+                } else {
+                    if is_open[d] {
+                        lv.fr_reg.push(d)
+                        lv.fr_from.push(from[d])
+                        lv.fr_to.push(last[d])
+                    }
+                    is_open[d] = true
+                    from[d] = 2 * i + 1
+                    last[d] = 2 * i + 1
+                }
+            }
+            if t.call[vc.mop[i]] {
+                lv.calls.push(2 * i + 1)
+            }
+        }
+        for r in 0..NPHYS {
+            if is_open[r] {
+                lv.fr_reg.push(r)
+                lv.fr_from.push(from[r])
+                lv.fr_to.push(last[r])
+            }
+        }
+    }
+    index_fixed(lv)
+    lv
+}
+
+/// Sorts each register's fixed ranges by start and keeps the running
+/// furthest end, for `fixed_overlap`.
+fn index_fixed(inout lv: Live) {
+    var keys: [[i64]] = []
+    for r in 0..NPHYS {
+        keys.push([])
+    }
+    let fr = lv.fr_reg
+    let ff = lv.fr_from
+    for k in 0..fr.len() {
+        // Starts are at least -1; shifted so the key sorts by start, then
+        // by range.
+        keys[fr[k]].push((ff[k] + 1) * 4194304 + k)
+    }
+    let ft = lv.fr_to
+    var pf: [[i64]] = []
+    var pm: [[i64]] = []
+    for r in 0..NPHYS {
+        var ks = keys[r]
+        ks.sort()
+        var froms: [i64] = []
+        var maxto: [i64] = []
+        var m = -9223372036854775807
+        for key in ks {
+            let k = key.bit_and(4194303)
+            froms.push(ff[k])
+            if ft[k] > m {
+                m = ft[k]
+            }
+            maxto.push(m)
+        }
+        pf.push(froms)
+        pm.push(maxto)
+    }
+    lv.pr_from = pf
+    lv.pr_maxto = pm
+}
+
+fn extend(inout lv: Live, v: i64, p: i64) {
+    if p < lv.start[v] {
+        lv.start[v] = p
+    }
+    if p > lv.end[v] {
+        lv.end[v] = p
+    }
+}
+
+/// Whether a fixed range of register `r` overlaps `[s, e]`: among the
+/// ranges starting at or before `e`, whether the furthest end reaches `s`.
+pub fn fixed_overlap(lv: Live, r: i64, s: i64, e: i64) -> bool {
+    let froms = lv.pr_from[r]
+    var lo = 0
+    var hi = froms.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if froms[mid] <= e {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo > 0 and lv.pr_maxto[r][lo - 1] >= s
+}
+
+/// Whether a call lies strictly inside `(s, e)`; the calls are in program
+/// order.
+pub fn crosses_call(lv: Live, s: i64, e: i64) -> bool {
+    let calls = lv.calls
+    var lo = 0
+    var hi = calls.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if calls[mid] <= s {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo < calls.len() and calls[lo] < e
+}
+
+// ----- the scan ----------------------------------------------------------------------
+
+/// What `--ra-corrupt` plants (`plant`).
+pub let PLANT_NONE = 0
+/// The classic allocator bugs, in whichever class they can be planted first.
+pub let PLANT_ANY = 1
+/// The same bugs, planted only among doubles: so the checker is seen to cover
+/// the floating-point file and not only the general one.
+pub let PLANT_FP = 2
+/// A double given a general register: the class confusion the checker must
+/// catch before the encoder does.
+pub let PLANT_CLASS = 3
+
+/// Allocates every virtual register of `vc`. `max_regs` < 0 hands out every
+/// allocatable register; otherwise only that many of each class, which
+/// forces spilling (the stress mode the `ra_check` gate runs). `corrupt`
+/// plants an allocation error of that kind for the checker to find.
+pub fn allocate(t: Target, vc: VCode, max_regs: i64, corrupt: i64) -> Alloc ! str {
+    let lv = intervals(t, vc)
+    let nv = vc.nvregs
+    if nv >= 1048576 {
+        fail("{vc.sym}: too many virtual registers ({nv})")
+    }
+    var allowed: [bool] = []
+    for r in 0..NPHYS {
+        allowed.push(max_regs < 0)
+    }
+    if max_regs >= 0 {
+        for cls in [target.CLS_INT, target.CLS_FP] {
+            let so = t.stress_order[cls]
+            for k in 0..so.len() {
+                if k < max_regs {
+                    allowed[so[k]] = true
+                }
+            }
+        }
+    }
+    var cand_caller: [[i64]] = []
+    var cand_callee: [[i64]] = []
+    for cls in [target.CLS_INT, target.CLS_FP] {
+        var a: [i64] = []
+        for r in t.caller_order[cls] {
+            if allowed[r] {
+                a.push(r)
+            }
+        }
+        cand_caller.push(a)
+        var b: [i64] = []
+        for r in t.callee_order[cls] {
+            if allowed[r] {
+                b.push(r)
+            }
+        }
+        cand_callee.push(b)
+    }
+    // Intervals by start, ties by number: deterministic.
+    var keys: [i64] = []
+    for v in 0..nv {
+        if lv.start[v] <= lv.end[v] {
+            keys.push((lv.start[v] + 1) * 1048576 + v)
+        }
+    }
+    keys.sort()
+    var loc: [i64] = []
+    for v in 0..nv {
+        loc.push(LOC_NONE)
+    }
+    // Per spill slot, the furthest end of any interval it has held.
+    var slot_end: [i64] = []
+    // The intervals holding a register, per class.
+    var actives: [[i64]] = [[], []]
+    for key in keys {
+        let v = key.bit_and(1048575)
+        let cls = vc.vcls[v]
+        let s = lv.start[v]
+        let e = lv.end[v]
+        // Expire what ended before this starts.
+        var still: [i64] = []
+        for w in actives[cls] {
+            if lv.end[w] >= s {
+                still.push(w)
+            }
+        }
+        var active = still
+        let across = crosses_call(lv, s, e)
+        var cands: [i64] = []
+        if not across {
+            for r in cand_caller[cls] {
+                cands.push(r)
+            }
+        }
+        for r in cand_callee[cls] {
+            cands.push(r)
+        }
+        var chosen = -1
+        for r in cands {
+            if chosen < 0 {
+                var busy = false
+                for w in active {
+                    if loc[w] == r {
+                        busy = true
+                    }
+                }
+                if not busy and not fixed_overlap(lv, r, s, e) {
+                    chosen = r
+                }
+            }
+        }
+        if chosen >= 0 {
+            loc[v] = chosen
+            active.push(v)
+            actives[cls] = active
+            continue
+        }
+        // Nothing free: spill whichever of this and the intervals holding a
+        // register it could use ends last.
+        var victim = -1
+        for w in active {
+            let r = loc[w]
+            var usable = false
+            for c in cands {
+                if c == r {
+                    usable = true
+                }
+            }
+            if usable and not fixed_overlap(lv, r, s, e) {
+                if victim < 0 or lv.end[w] > lv.end[victim] {
+                    victim = w
+                }
+            }
+        }
+        if victim >= 0 and lv.end[victim] > e {
+            loc[v] = loc[victim]
+            loc[victim] = LOC_SPILL + spill_slot(slot_end, lv.start[victim], lv.end[victim])
+            var kept: [i64] = []
+            for w in active {
+                if w != victim {
+                    kept.push(w)
+                }
+            }
+            kept.push(v)
+            active = kept
+        } else {
+            loc[v] = LOC_SPILL + spill_slot(slot_end, s, e)
+        }
+        actives[cls] = active
+    }
+    let nspill = slot_end.len()
+    var corrupted = 0
+    if corrupt != PLANT_NONE {
+        corrupted = plant(t, vc, loc, corrupt)
+    }
+    rewrite(t, vc, loc, nspill, corrupted)
+}
+
+/// A spill slot for an interval `[s, e]`: the first whose every earlier
+/// holder ended before `s`, else a new one. Intervals arrive by start, so a
+/// slot is shared only by intervals that never overlap, and a function whose
+/// spilled values each live briefly -- a long list literal -- needs a few
+/// slots, not one per value.
+pub fn spill_slot(inout slot_end: [i64], s: i64, e: i64) -> i64 {
+    for k in 0..slot_end.len() {
+        if slot_end[k] < s {
+            slot_end[k] = e
+            return k
+        }
+    }
+    slot_end.push(e)
+    slot_end.len() - 1
+}
+
+/// Whether `o` is a virtual register held in a physical register.
+fn in_reg(loc: [i64], o: i64) -> bool {
+    target.is_vreg(o) and loc[o - target.VR] >= 0 and loc[o - target.VR] < LOC_SPILL
+}
+
+fn is_fp_vreg(vc: VCode, o: i64) -> bool {
+    target.is_vreg(o) and vc.vcls[o - target.VR] == target.CLS_FP
+}
+
+/// The checker's control: makes the allocation wrong in a way no correct
+/// checker can miss, and answers 1 when it could. Two kinds of allocator bug,
+/// first found first:
+///
+///   * a missed interference -- an instruction reads two virtual registers
+///     held in two registers, and one is given the other's register for its
+///     whole life, so one of the two reads finds the wrong value;
+///   * a missed fixed register -- a call's second argument (of the file in
+///     question) is given the first's register, which the move of the first
+///     argument has already filled.
+///
+/// With `PLANT_FP` only doubles are touched, so the floating-point file is
+/// seen to be checked; with `PLANT_CLASS` a double is given the general
+/// register of the same number -- a value in the wrong file.
+///
+/// A mere overlap of two intervals is not enough: an interval is a
+/// conservative hull, and two that overlap may never be live at once, in
+/// which case sharing a register is a correct allocation and the checker is
+/// right to accept it.
+pub fn plant(t: Target, vc: VCode, inout loc: [i64], kind: i64) -> i64 {
+    let fp_only = kind == PLANT_FP
+    if kind == PLANT_CLASS {
+        for v in 0..loc.len() {
+            if vc.vcls[v] == target.CLS_FP and loc[v] >= target.R_FP0 and loc[v] < LOC_SPILL {
+                loc[v] = loc[v] - target.R_FP0
+                return 1
+            }
+        }
+        return 0
+    }
+    for i in 0..vc.mop.len() {
+        let us = uses_at(t, vc, i)
+        for p in 0..us.len() {
+            for q in 0..us.len() {
+                let v = us[p]
+                let w = us[q]
+                if fp_only and not (is_fp_vreg(vc, v) and is_fp_vreg(vc, w)) {
+                    continue
+                }
+                if v != w and in_reg(loc, v) and in_reg(loc, w) and loc[v - target.VR] != loc[w - target.VR] and vc.vcls[v - target.VR] == vc.vcls[w - target.VR] {
+                    loc[w - target.VR] = loc[v - target.VR]
+                    return 1
+                }
+            }
+        }
+    }
+    let cls = if fp_only { target.CLS_FP } else { target.CLS_INT }
+    let args = if fp_only { t.arg_fp } else { t.arg_int }
+    let base = args[0]
+    for i in 0..vc.mop.len() {
+        let nargs = if fp_only { vcode.call_nfp(vc.imm2[i]) } else { vcode.call_nint(vc.imm2[i]) }
+        if vc.mop[i] == t.call_op and nargs >= 2 and i >= 2 {
+            // The argument moves just before it: into the first argument
+            // register ... into the second.
+            let mv = t.mov[cls]
+            var first = -1
+            var second = -1
+            for j in 0..i {
+                if vc.mop[j] == mv and vc.rd[j] == base {
+                    first = j
+                }
+                if vc.mop[j] == mv and vc.rd[j] == args[1] {
+                    second = j
+                }
+            }
+            let src = if t.mov_src[cls] == 1 { vc.rn[second] } else { vc.rm[second] }
+            if first >= 0 and second > first and in_reg(loc, src) and loc[src - target.VR] != base {
+                loc[src - target.VR] = base
+                return 1
+            }
+        }
+    }
+    0
+}
+
+fn push_a(inout al: Alloc, m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, kind: i64, slot: i64) -> i64 {
+    let i = al.mop.len()
+    al.mop.push(m)
+    al.rd.push(d)
+    al.rn.push(n)
+    al.rm.push(mm)
+    al.ra.push(a)
+    al.imm.push(imm)
+    al.imm2.push(0)
+    al.cc.push(-1)
+    al.tgt.push(-1)
+    al.symk.push(0)
+    al.sym_id.push(-1)
+    al.od.push(-1)
+    al.on.push(-1)
+    al.om.push(-1)
+    al.oa.push(-1)
+    al.kind.push(kind)
+    al.slot.push(slot)
+    al.src.push(al.cur_src)
+    i
+}
+
+/// Scratch register `k` of class `cls` for a reload or a spill: the target's
+/// list in order, its last for any past the end.
+pub fn scratch(t: Target, cls: i64, k: i64) -> i64 {
+    let rs = t.scratch[cls]
+    if k < rs.len() { rs[k] } else { rs[rs.len() - 1] }
+}
+
+/// The frame offset of spill slot `k`: above the `inout` slots.
+pub fn spill_offset(al: Alloc, k: i64) -> i64 {
+    8 * (al.nout + al.nslots + k)
+}
+
+/// Rewrites every operand to its location, with reloads and spills around
+/// the instructions that touch a spilled register.
+pub fn rewrite(t: Target, vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
+    var al = Alloc{
+        mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
+        symk: [], sym_id: [], od: [], on: [], om: [], oa: [], kind: [], slot: [],
+        bi0: [], bni: [], nparams: vc.nparams, nreg_int: vc.nreg_int, nreg_fp: vc.nreg_fp,
+        nslots: vc.nslots, nout: vc.nout, nspill: nspill, loc: loc, vcls: vc.vcls,
+        used_callee: [], corrupted: corrupted, src: [], cur_src: vc.span0, span0: vc.span0,
+    }
+    for r in 0..NPHYS {
+        al.used_callee.push(false)
+    }
+    for v in 0..loc.len() {
+        if loc[v] >= 0 and loc[v] < LOC_SPILL and t.callee_saved[loc[v]] {
+            al.used_callee[loc[v]] = true
+        }
+    }
+    if 8 * (vc.nout + vc.nslots + nspill) > t.max_frame {
+        fail("{vc.sym}: the frame needs {vc.nout + vc.nslots + nspill} slots, more than one load can reach")
+    }
+    let nb = vcode.nblocks(vc)
+    for b in 0..nb {
+        al.bi0.push(al.mop.len())
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            let m = vc.mop[i]
+            al.cur_src = vc.src[i]
+            var ops = [vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i]]
+            let roles = [t.role_d[m], t.role_n[m], t.role_m[m], t.role_a[m]]
+            var phys = [-1, -1, -1, -1]
+            // Reads of spilled registers: reload each into a scratch of its
+            // class.
+            var sv: [i64] = []
+            var sr: [i64] = []
+            var nscr = [0, 0]
+            for k in 0..4 {
+                let o = ops[k]
+                if o < 0 {
+                    continue
+                }
+                if not target.is_vreg(o) {
+                    phys[k] = o
+                    continue
+                }
+                let l = loc[o - target.VR]
+                if l == LOC_NONE {
+                    fail("{vc.sym}: v{o - target.VR} has no location")
+                }
+                if l < LOC_SPILL {
+                    phys[k] = l
+                } else if roles[k] == target.ROLE_USE or roles[k] == target.ROLE_USEDEF {
+                    var sc = -1
+                    for q in 0..sv.len() {
+                        if sv[q] == o {
+                            sc = sr[q]
+                        }
+                    }
+                    if sc < 0 {
+                        let fp = vc.vcls[o - target.VR] == target.CLS_FP
+                        let ci = if fp { 1 } else { 0 }
+                        sc = scratch(t, ci, nscr[ci])
+                        nscr[ci] = nscr[ci] + 1
+                        sv.push(o)
+                        sr.push(sc)
+                        let rslot = l - LOC_SPILL
+                        let off = spill_offset(al, rslot)
+                        push_a(al, t.load[ci], sc, t.sp, -1, -1, off, K_RELOAD, rslot)
+                    }
+                    phys[k] = sc
+                }
+            }
+            // Writes of spilled registers: into a scratch, stored after.
+            var after_reg: [i64] = []
+            var after_slot: [i64] = []
+            for k in 0..4 {
+                let o = ops[k]
+                if o < 0 or not target.is_vreg(o) {
+                    continue
+                }
+                let l = loc[o - target.VR]
+                if l < LOC_SPILL {
+                    continue
+                }
+                if roles[k] == target.ROLE_DEF or roles[k] == target.ROLE_USEDEF {
+                    var sc = phys[k]
+                    if sc < 0 {
+                        let fp = vc.vcls[o - target.VR] == target.CLS_FP
+                        let ci = if fp { 1 } else { 0 }
+                        sc = scratch(t, ci, nscr[ci])
+                        nscr[ci] = nscr[ci] + 1
+                    }
+                    phys[k] = sc
+                    after_reg.push(sc)
+                    after_slot.push(l - LOC_SPILL)
+                }
+            }
+            let x = push_a(al, m, phys[0], phys[1], phys[2], phys[3], vc.imm[i], K_ORIG, -1)
+            al.imm2[x] = vc.imm2[i]
+            al.cc[x] = vc.cc[i]
+            al.tgt[x] = vc.tgt[i]
+            al.symk[x] = vc.symk[i]
+            al.sym_id[x] = vc.sym_id[i]
+            al.od[x] = ops[0]
+            al.on[x] = ops[1]
+            al.om[x] = ops[2]
+            al.oa[x] = ops[3]
+            for q in 0..after_reg.len() {
+                let off = spill_offset(al, after_slot[q])
+                let st = if target.is_fpr(after_reg[q]) { t.store[target.CLS_FP] } else { t.store[target.CLS_INT] }
+                push_a(al, st, after_reg[q], t.sp, -1, -1, off, K_SPILL, after_slot[q])
+            }
+        }
+        al.bni.push(al.mop.len() - al.bi0[b])
+    }
+    al
+}

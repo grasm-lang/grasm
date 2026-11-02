@@ -1,0 +1,289 @@
+// The register allocation checker: replays the allocated code symbolically
+// and proves every read gets the value the code before allocation meant it
+// to get (the design regalloc2 ships, after Chris Fallin's "A symbolic
+// checker for register allocation").
+//
+// The state says, for every location -- each general register, each
+// floating-point register and each spill slot -- which value it holds: a
+// virtual register, the value an explicit move put in a physical register
+// (the calling convention's), or nothing known. An instruction that read
+// virtual register v from register r is correct exactly when r holds v at
+// that point on every path. Writes set their location and forget the value
+// anywhere else it was; a reload or a spill copies what its source holds; a
+// call forgets every register it may change. Where paths meet, a location
+// keeps a value only if every path agrees on it.
+//
+// Every operand is also of the right class: a field of a form is a general
+// or a floating-point register (the target's `fp_*` tables), and both what selection
+// put there (a virtual register's class) and what allocation put there (a
+// physical register's file) must be that. A double in a general register,
+// or an integer in a floating-point one, is an error here before the encoder
+// ever sees it.
+//
+// It knows nothing of how the allocator decided: it reads the code before
+// and after, nothing else. That is the point -- an allocator bug that the
+// corpus happens not to reach is still an error here, in every function
+// compiled.
+import target
+import regalloc
+
+let UNKNOWN = -1
+let TOP = -2
+/// Locations: the general registers at their own numbers below 32, the
+/// floating-point ones at 32..63, spill slots from 64.
+let SLOT0 = 64
+
+fn nloc(al: Alloc) -> i64 {
+    SLOT0 + al.nspill
+}
+
+/// The location index of physical register `r`, or -1 for one that is not a
+/// location (AArch64's zero register and `sp`, x86-64's `rsp`, anything
+/// else).
+fn loc_of(t: Target, r: i64) -> i64 {
+    if r >= 0 and r < 32 and not t.notreg[r] {
+        r
+    } else if target.is_fpr(r) {
+        32 + (r - target.R_FP0)
+    } else {
+        -1
+    }
+}
+
+/// The physical register at location `l` below `SLOT0`.
+fn reg_at(l: i64) -> i64 {
+    if l < 32 { l } else { target.R_FP0 + (l - 32) }
+}
+
+fn meet(a: i64, b: i64) -> i64 {
+    if a == TOP {
+        b
+    } else if b == TOP or a == b {
+        a
+    } else {
+        UNKNOWN
+    }
+}
+
+fn reg_name(t: Target, r: i64) -> str {
+    if r >= 0 and r < target.NPHYS {
+        t.reg_name[r]
+    } else {
+        "{r}"
+    }
+}
+
+fn show(t: Target, v: i64) -> str {
+    if v == UNKNOWN {
+        "nothing known"
+    } else if v == TOP {
+        "nothing (unreached)"
+    } else if target.is_vreg(v) {
+        "v{v - target.VR}"
+    } else {
+        "the value moved into {reg_name(t, v)}"
+    }
+}
+
+fn class_name(fp: bool) -> str {
+    if fp { "floating-point" } else { "general" }
+}
+
+/// Whether operand `o` as selection wrote it is of the class `fp` says.
+fn orig_class_ok(al: Alloc, o: i64, fp: bool) -> bool {
+    if target.is_vreg(o) {
+        return (al.vcls[o - target.VR] == target.CLS_FP) == fp
+    }
+    target.is_fpr(o) == fp
+}
+
+/// Applies instruction `i` to `st`. With `errs` collecting, also checks it.
+fn step(t: Target, al: Alloc, inout st: [i64], i: i64, checking: bool, inout errs: [str]) {
+    let k = al.kind[i]
+    if k == regalloc.K_RELOAD or k == regalloc.K_SPILL {
+        // A slot or a register the frame does not have is an error in
+        // itself, not something to index with; so is a register of the
+        // wrong file for the load or store that moves it.
+        let s = al.slot[i]
+        let r = al.rd[i]
+        let lr = loc_of(t, r)
+        let fp_form = t.fp_d[al.mop[i]]
+        if s < 0 or s >= al.nspill or lr < 0 or target.is_fpr(r) != fp_form {
+            if checking {
+                let what = if k == regalloc.K_RELOAD { "reload" } else { "spill" }
+                errs.push("instruction {i}: {what} between {reg_name(t, r)} and spill slot {s}, of {al.nspill} slots, by a {class_name(fp_form)} {t.form[al.mop[i]]}")
+            }
+            if lr >= 0 and k == regalloc.K_RELOAD {
+                st[lr] = UNKNOWN
+            }
+            return
+        }
+        if k == regalloc.K_RELOAD {
+            st[lr] = st[SLOT0 + s]
+        } else {
+            st[SLOT0 + s] = st[lr]
+        }
+        return
+    }
+    let m = al.mop[i]
+    let ou = regalloc.uses_of(t, m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
+    let pu = regalloc.uses_of(t, m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
+    if checking {
+        if ou.regs.len() != pu.regs.len() {
+            errs.push("instruction {i} ({t.form[m]}): reads {ou.regs.len()} registers before allocation and {pu.regs.len()} after")
+        } else {
+            for q in 0..ou.regs.len() {
+                let want = ou.regs[q]
+                let r = pu.regs[q]
+                let fp = pu.fps[q]
+                let lr = loc_of(t, r)
+                if lr < 0 {
+                    errs.push("instruction {i} ({t.form[m]}): reads a register that is not one ({r})")
+                } else if target.is_fpr(r) != fp {
+                    errs.push("instruction {i} ({t.form[m]}): reads {show(t, want)} from {reg_name(t, r)}, in a field that holds a {class_name(fp)} register")
+                } else if not orig_class_ok(al, want, fp) {
+                    errs.push("instruction {i} ({t.form[m]}): reads {show(t, want)}, of the other class, in a {class_name(fp)} field")
+                } else if st[lr] != want {
+                    errs.push("instruction {i} ({t.form[m]}): reads {show(t, want)} from {reg_name(t, r)}, which holds {show(t, st[lr])}")
+                }
+            }
+        }
+    }
+    if t.call[m] {
+        // A call forgets every register it may change.
+        for l in 0..SLOT0 {
+            if t.caller_saved[reg_at(l)] {
+                st[l] = UNKNOWN
+            }
+        }
+    }
+    let od = regalloc.defs_of(t, m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
+    let pd = regalloc.defs_of(t, m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
+    if checking and od.regs.len() != pd.regs.len() {
+        errs.push("instruction {i} ({t.form[m]}): writes {od.regs.len()} registers before allocation and {pd.regs.len()} after")
+        return
+    }
+    for q in 0..od.regs.len() {
+        let o = od.regs[q]
+        let r = pd.regs[q]
+        let fp = pd.fps[q]
+        let lr = loc_of(t, r)
+        if lr < 0 {
+            if checking {
+                errs.push("instruction {i} ({t.form[m]}): writes a register that is not one ({r})")
+            }
+            continue
+        }
+        if checking {
+            if t.no_write[r] {
+                errs.push("instruction {i} ({t.form[m]}): writes {reg_name(t, r)}, which the function body must not touch")
+            }
+            if t.callee_saved[r] and not al.used_callee[r] {
+                errs.push("instruction {i} ({t.form[m]}): writes {reg_name(t, r)}, which the prologue does not save")
+            }
+            if target.is_fpr(r) != fp {
+                errs.push("instruction {i} ({t.form[m]}): writes {show(t, o)} to {reg_name(t, r)}, in a field that holds a {class_name(fp)} register")
+            } else if not orig_class_ok(al, o, fp) {
+                errs.push("instruction {i} ({t.form[m]}): writes {show(t, o)}, of the other class, in a {class_name(fp)} field")
+            }
+        }
+        if target.is_vreg(o) {
+            for l in 0..st.len() {
+                if st[l] == o {
+                    st[l] = UNKNOWN
+                }
+            }
+        }
+        st[lr] = o
+    }
+}
+
+fn succs(al: Alloc, b: i64) -> [i64] {
+    var out: [i64] = []
+    for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+        if al.tgt[i] >= 0 {
+            out.push(al.tgt[i])
+        }
+    }
+    out
+}
+
+/// Every allocation error in the function, or none.
+pub fn check(t: Target, al: Alloc) -> [str] {
+    let nb = al.bi0.len()
+    let nl = nloc(al)
+    var errs: [str] = []
+    var inst: [i64] = []
+    for k in 0..(nb * nl) {
+        inst.push(TOP)
+    }
+    // At entry the parameters are in the argument registers, put there by
+    // the caller.
+    for l in 0..nl {
+        inst[l] = UNKNOWN
+    }
+    for k in 0..al.nreg_int {
+        let r = t.arg_int[k]
+        inst[loc_of(t, r)] = r
+    }
+    for k in 0..al.nreg_fp {
+        let r = t.arg_fp[k]
+        inst[loc_of(t, r)] = r
+    }
+    // The frame pointer, which the prologue sets and nothing in the body
+    // writes: what a stack argument is read through.
+    for r in t.entry_fixed {
+        inst[loc_of(t, r)] = r
+    }
+    var queued: [bool] = []
+    for b in 0..nb {
+        queued.push(false)
+    }
+    var work: [i64] = [0]
+    queued[0] = true
+    var none: [str] = []
+    while not work.is_empty() {
+        let b = work.pop() ?? 0
+        queued[b] = false
+        var st: [i64] = []
+        for l in 0..nl {
+            st.push(inst[b * nl + l])
+        }
+        for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+            step(t, al, st, i, false, none)
+        }
+        for s in succs(al, b) {
+            if s < 0 or s >= nb {
+                errs.push("block {b} branches to block {s}, which does not exist")
+                return errs
+            }
+            var changed = false
+            for l in 0..nl {
+                let x = meet(inst[s * nl + l], st[l])
+                if x != inst[s * nl + l] {
+                    inst[s * nl + l] = x
+                    changed = true
+                }
+            }
+            if changed and not queued[s] {
+                queued[s] = true
+                work.push(s)
+            }
+        }
+    }
+    // The states have settled: check every instruction against them.
+    for b in 0..nb {
+        if inst[b * nl] == TOP {
+            errs.push("block {b} is never reached")
+            continue
+        }
+        var st: [i64] = []
+        for l in 0..nl {
+            st.push(inst[b * nl + l])
+        }
+        for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+            step(t, al, st, i, true, errs)
+        }
+    }
+    errs
+}

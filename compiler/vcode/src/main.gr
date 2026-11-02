@@ -1,0 +1,22 @@
+// `vcode`: what every target of the Grasm backend shares below instruction
+// selection (docs/self-hosting.md §6.16).
+//
+//     target.gr    the target description each instruction set fills in
+//     vcode.gr     machine instructions over virtual registers
+//     regalloc.gr  linear-scan allocation, for fast builds, and the spill
+//                  rewrite both allocators end in
+//     backtrack.gr the release allocator: backtracking by spill weight
+//     check.gr     the symbolic checker every allocation must pass
+//     frameplan.gr where the frame is set up (shrink-wrapping)
+//     moves.gr     moves, and block arguments as parallel moves
+//
+// Nothing here names a register or an opcode of any instruction set: each
+// target (`compiler/aarch64`, `compiler/x86_64`) describes itself in a
+// `Target` and selects, encodes and lays out frames itself.
+import target
+import vcode
+import regalloc
+import backtrack
+import check
+import frameplan
+import moves

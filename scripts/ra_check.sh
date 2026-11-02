@@ -3,7 +3,7 @@
 # (docs/self-hosting.md §4: "a symbolic checker that verifies every
 # allocation").
 #
-# `compiler/aarch64/src/check.gr` replays every allocated function and fails
+# `compiler/vcode/src/check.gr` replays every allocated function and fails
 # the build -- exit 4 -- on any read of a location that does not hold the
 # value the code before allocation meant. It runs on every function of every
 # compilation, so `scripts/s3subset.sh` already fails on a checker error. This

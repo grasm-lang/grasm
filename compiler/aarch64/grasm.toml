@@ -9,3 +9,6 @@ capabilities = []
 
 [dependencies.mir]
 path = "../mir"
+
+[dependencies.vcode]
+path = "../vcode"

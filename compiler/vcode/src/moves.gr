@@ -1,0 +1,63 @@
+// Register moves as VCode, for every target (docs/self-hosting.md §6.16):
+// one move within a class, and block arguments as moves that happen at once.
+import target
+import vcode
+
+/// A register-to-register move within one class, by the target's move of
+/// that class (on AArch64 `mov`, an `orr` with its source in field 2, and
+/// `fmov`, with its source in field 1; on x86-64 `movq` and `movaps`).
+pub fn mov(t: Target, inout vc: VCode, d: i64, src: i64) {
+    let cls = vcode.cls_of(vc, d)
+    if t.mov_src[cls] == 1 {
+        vcode.push(vc, t.mov[cls], d, src, -1)
+    } else {
+        vcode.push(vc, t.mov[cls], d, -1, src)
+    }
+    ()
+}
+
+/// Moves that happen at once: each `dsts[k]` gets the value `srcs[k]` had
+/// before any of them. Emitted one at a time, a destination is written only
+/// once nothing still to come reads it; a cycle is broken through a fresh
+/// register.
+pub fn par_moves(t: Target, inout vc: VCode, dsts: [i64], srcs: [i64]) {
+    var pd: [i64] = []
+    var ps: [i64] = []
+    for k in 0..dsts.len() {
+        if dsts[k] != srcs[k] {
+            pd.push(dsts[k])
+            ps.push(srcs[k])
+        }
+    }
+    while pd.len() > 0 {
+        var done = -1
+        for k in 0..pd.len() {
+            if done < 0 {
+                var read_later = false
+                for q in 0..ps.len() {
+                    if q != k and ps[q] == pd[k] {
+                        read_later = true
+                    }
+                }
+                if not read_later {
+                    done = k
+                }
+            }
+        }
+        if done >= 0 {
+            mov(t, vc, pd[done], ps[done])
+            pd.remove(done)
+            ps.remove(done)
+        } else {
+            // A cycle: keep the first destination's value, then it is free.
+            let keep = pd[0]
+            let tmp = vcode.new_vreg(vc, vcode.cls_of(vc, keep))
+            mov(t, vc, tmp, keep)
+            for q in 0..ps.len() {
+                if ps[q] == keep {
+                    ps[q] = tmp
+                }
+            }
+        }
+    }
+}
