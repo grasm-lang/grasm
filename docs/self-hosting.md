@@ -2959,6 +2959,282 @@ the fixed point holds for builds from one directory (the executables from
 any). Until S8 the Rust `grasm` stays stage 0 and the driver of everything
 the Grasm compiler does not yet do.
 
+### 6.15 S3 part six: the mid-end
+
+Written 2026-11-01. §9's risk table answers "our backend's code is slower
+than Cranelift's" with "the release allocator and mid-end close the gap
+before S9". This part is that mid-end's first five steps, taken in the order
+a profile and the disassembly put them, each bounded before it was built
+where a bound could be had, and each held to the S3 to S6 gates with its own
+controls in `s3controls`. Everything is in `compiler/mir` and
+`compiler/aarch64`; nothing in the language, the runtimes or the Rust
+toolchain changed. Every measurement below was taken on this machine at a
+one-minute load average of 2.4 to 5.7 from other work, above `bench.sh`'s
+0.35 of the cores: none is to be quoted.
+
+**Step 0: what the passes before them cost.** SSA construction and both
+register allocators computed block liveness as a dense array of blocks by
+variables iterated to a fixed point, and SSA construction found a block
+parameter's incoming edges by scanning every block. Liveness is now found a
+variable at a time, walking back from its upward-exposed reads through the
+predecessors until a block that writes it, and a parameter's incoming edges
+are read from a list made once; the release allocator's loop depths are
+summed from differences. The results are the same -- the same parameters in
+the same order, the same intervals and segments, the objects the same bytes
+-- and only the cost changes: `compiler/s3`'s TIR compiled with step 1's
+inline paths in 20.7 s before this and 4.7 s after (master's driver, without
+them, 3.4 s, and 2.1 s with this step alone).
+
+**Step 1: list elements, lengths and struct fields, inline.** An element of
+a list of integers, `u64`s, floats, `bool`s or references is read, written,
+pushed and updated where the code is, as the Cranelift build reads and pushes
+one (`scalar_list_get`, `scalar_list_push`): a load or a store when the list
+is a `ListScalar` of the element's kind (its tag and the kind byte after it,
+one halfword) held in the `ScalarData` that kind uses -- words, or bytes for
+`bool`s -- the index is inside it, and, for a store or a push, nothing else
+holds the list (and, for a push, the buffer has room); in every other case the
+runtime's call, which copies a shared list, grows a full one, reads a tuple
+or a list of boxes, and panics on an index out of range with its own
+message. `xs[i] += x` tests once for the read and the write. A list's length
+is read the same way -- `len`, and the length every `for` over a list and
+every `map`, `filter` and `fold` takes -- and so is a field of a struct: a
+struct's fields are in the box for four or fewer and in a vector for more,
+the same for every box of its type, so one test of the tag and the layout
+reaches the field's word. A store into a scalar field of a struct nothing
+else holds (`p.n += 1`) is a store of its bits, as the Cranelift build does
+it. A list or a struct a local holds, read by an expression that changes no
+local -- literals, local reads, operators and element reads -- is read
+borrowed, with no `inc` before and `dec` after: the local's reference keeps it
+alive throughout, as the Cranelift build's borrowed reads rely on. Each test
+is a branch of its own; every test computed first and combined into one
+branch, as `scalar_list_ok` does, measured 12% slower on `sieve` and 16% on
+`matmul`. The offsets and tags are the runtime's, in
+`compiler/mir/src/layout.gr`, the same names and values as
+`compiler/rt/src/layout.gr`, and `rtlayout` now holds every one of them to
+that file and so to its probe of the Rust runtime ("the backend's: 28, all
+layout.gr's: 28"). A function past 4,096 blocks takes the calls instead, and
+a list literal, which runs once, keeps its pushes as calls: a corpus program
+of 133,000 instructions, most of them one literal, took over a minute to
+compile when its pushes were inline.
+
+**Step 2: constant folding and immediate forms.** `compiler/mir/src/fold.gr`
+computes every integer operation whose operands are constants with Grasm's
+own integer operations, which [E-ARITH-INT] and [T-INT-FIXED] define as the
+machine instructions behave (wrapping `+ - *`, shift counts modulo 64);
+division and remainder by zero, `MIN / -1`, an unsigned division of a word
+with its top bit set, and every operation on doubles are left as they are. It
+turns commutative operations and comparisons round so that a constant is
+operand b, where the rules take immediates from; turns a branch on a
+constant into a jump and drops what that leaves unreachable (a constant
+divisor's zero test, `while true`); and runs a block that ends in a jump to a
+block nothing else enters into it. New rules: `lsl`, `lsr` and `asr` by a
+constant count (`ubfm` and `sbfm`); `and`, `orr` and `eor` with a bitmask
+immediate, the encoder working out `N:immr:imms` from the 64-bit value as
+LLVM's `processLogicalImmediate` does and refusing one that is not a rotated
+run of ones repeated; a product with a power of two as a left shift and an
+unsigned quotient by one as a right shift. The rule table's own check now
+computes every immediate rule against its register form on edge words and
+counts -- the mask decoded from the bits the encoder writes, not the value it
+was given -- and `encodetest` holds the six new forms to `clang`, the bitmask
+cases made from every element size, run and rotation by the architecture's
+own decoding (`logimm_value`): 112 forms, 6,992 encodings.
+
+**Step 3: addressing modes.** A load or a store whose address is an `add` of
+a constant the access can take as its unsigned scaled offset -- not negative,
+a multiple of the bytes it moves, at most 4,095 of them -- is `ldr`/`str` at
+that offset from the `add`'s base, in the 64-bit, byte, halfword, word and
+`d` forms, and one at a frame slot's address is at an offset from `sp`; the
+`add` is not emitted when nothing else reads it. The rule table checks that a
+rule absorbing an address is a load or a store whose instruction moves the
+bytes its offset was admitted for. Register-offset forms (`ldr x, [x, x, lsl
+#3]`) are not built: on `matmul`'s inner loop they would remove two
+instructions of about fifty per element read.
+
+**Step 4: inlining.** `compiler/mir/src/inline.gr`, once every function is
+built, replaces a call of a function of at most 32 MIR instructions and
+terminators by a copy of its body, bottom-up over the call graph's strongly
+connected components (Tarjan's, iterative, each component after every one it
+calls), so a callee's own small calls are part of it first. Never inlined: a
+function on a cycle of calls, one that reads the stack pointer (so every
+thread's stack floor, [E-RECURSION-DEPTH], is taken in the frame it was), one
+that never returns; and nothing is inlined into a function C calls -- the
+program's `main` entry, an `export fn`'s, a function address's -- so what C
+calls is the wrapper it was. The copy's parameters are the call's arguments,
+its values are renumbered, its frame slots are a region past the caller's own
+that every copy shares (each copy's are in use only while it runs), a copy
+that returns at one place answers that place's value, and every instruction
+keeps its source offset, so the line table maps a copy to the callee's lines.
+What runs is the same instructions in the same order: the same counts, calls
+and panics; only the call, the callee's frame and the moves of the calling
+convention go. A function nothing calls any more and whose address nothing
+takes is no longer compiled. Before inlining, a call through a function value
+the same function made a moment before from a function's address --
+`xs.map(|x| ..)`, the closure written as the argument -- becomes `inc` of the
+environment the value was made with and a direct call (`grasm_fn_code`
+answers that address, `grasm_fn_env` that environment retained), so the
+closure is inlined too; after it, an `inc` and a `dec` of one value with only
+register arithmetic between them cancel (`compiler/mir/src/tidy.gr`).
+`objtest`'s sample of instructions whose line is known now takes a literal
+written once and loaded more than once, once per copy, when no other name in
+the program is that text (a field's, a variant's or a C function's name, which
+the compiler loads where the field is read or the function called, is the
+same string in the pool), and holds every copy to the literal's own line:
+137,906 loads on their lines, 31,366 of them of literals loaded more than
+once. `s3 --inline=N`
+sets the bound, 0 none. The bound was chosen from a sweep before it was
+fixed: the runtime's object built at each bound, `wordfreq` and `tree` timed
+on it, two sessions of 9 rounds. At 0, 24, 32, 48 and 64, `wordfreq` took
+37.8, 29.0, 26.7, 26.1 and 25.8 ms and `tree` 37.6, 32.2, 32.5, 32.1 and 31.5
+ms (8 and 16, in the other session against 38.2 ms at 0: 31.2 and 30.1, and
+`tree` 35.3 and 32.8 against 37.7), for an object of 50,377, 53,506, 53,594,
+64,609 and 73,963 words (47,057 and 51,371 at 8 and 16): 32 takes most of
+what 64 does for a seventh of its growth.
+Inlining into a function C calls as well -- the runtime's entry points'
+wrappers -- measured 3% on `front tir` and is not done; whether "no `export
+fn`'s C entry changed" allows it is the owner's to say.
+
+**Step 5: shrink-wrapping.** `compiler/aarch64/src/emit.gr`: the frame -- the
+frame record, the callee-saved registers the body writes, the stack area --
+is set up at the start of the nearest block that dominates every instruction
+needing it (a call, a spill or a reload, a frame slot, a stack argument, a
+callee-saved register), moved up the dominator tree until it is in no loop
+and dominates every return it can reach, and on entry at worst. A return on a
+path that never set it up is `retab` alone: `pacibsp` stays on entry in
+every function, signing the return address, which every path authenticates.
+A leaf that touches no callee-saved register has no frame at all. The plan is
+linear in the blocks, a preorder of the dominator tree answering each
+dominance in two comparisons, with at most eight moves up the tree. Of the
+runtime's 1,037 functions 57 run with no frame and 33 set theirs up past the
+entry; a function whose parameters live across a call is given callee-saved
+registers for them from its first instruction, so its entry needs the frame,
+and splitting those live ranges is the allocator's work, not done here.
+
+**What holds it.** Thirteen new controls in `s3controls`, each a fault in
+the step's own code that the gate named catches for its reason:
+`list-stride` (an inline element read and written at four bytes an element),
+`list-cow` (an inline store with no test that nothing else holds the list),
+`field-slot` (a field read from the word after its own), `fold-sub` (folding
+`a - b` as `a + b`), `branch-fold` (a branch on a constant going the other
+way), `addr-off` (an absorbed offset one element out), `csr-slot` (each pair
+of callee-saved registers restored from the other's slot) and `shrink-ret` (a
+return past the entry taking the frameless way out whether or not its path set
+up the frame), all by `s3subset`; `imm-bit` (a bitmask immediate's run one
+longer) by `encodetest`; `layout-backend` (a `Vec`'s length where its capacity
+is, in the backend's copy of the layouts) by `rtlayout`; `direct-env` (a
+closure called directly handed its environment released, not retained) and
+`rc-cancel` (a pair cancelled across a call) by `s3rc`; `inline-line` (a
+copy's instructions mapped to the call's line) by `objtest`. `s3 --stats`
+prints the mid-end's counts on a second line, as `ra_check` reads the first by
+its fields' positions. The constant folding left a fixture function
+with no return (its `while true` has no way out once the branch is folded),
+so `rtdialect` now holds every compiled function to `pacibsp` on entry and no
+plain `ret`, counted against the functions s3 says it compiled rather than a
+floor of 30 that inlining went under, and `rtdialectcontrols` gains
+`frameless-ret` (a frameless return left a plain `ret`). On the last step's
+tree: `s3subset` and `difftest` 648 of 648 identical; `objtest` 648 objects
+reproducible; `ra_check` 3,240 stressed runs identical and 34,625 of 34,625
+planted errors caught; `s3rc` no program leaking, none using freed memory
+under poison; `fuzz_s3` 60 of 60; `fixpoint` 48 of 48 artifacts the same,
+stage 3 being stage 2, and `stagediff` 757 executables the same;
+`fixpointcontrols` 6 of 6, `s3controls` 42 of 42, `rtdialectcontrols` 6 of 6,
+`rtcontrols` 80 of 80; `encodetest` 6,992 encodings as `clang`'s;
+`linktest`, `linkdiff`, `rtswap`, `rtlayout`, the runtime's fuzzers and the
+generators that build natively, `leakcheck` and `usecheck` through `rtwith`
+(623 leak-free, 648 clean) all pass.
+
+**The ceilings, measured before building.** Step 1: `sieve` and `matmul`
+built with every scalar element read an unchecked load and every write an
+unchecked store, the list read borrowed (wrong for a shared or short list,
+right for these two), ran at 0.447 and 0.169 of master's backend's time;
+the built step, its tests in place, at 0.545 and 0.319 in the same session.
+Testing an updated element once rather than twice was bounded by removing a
+write's tests altogether: `matmul` at 0.816 of its time with them; built, it
+ran at 0.817. Step 4's bound was the sweep above, taken before the bound was
+fixed. Steps 2, 3 and 5 were not bounded before they were built; what they
+removed is in the sizes below.
+
+**What it measures**, 2026-11-01 in the evening. The benchmarks, against the
+Cranelift build (`scripts/bench.sh`'s eight programs, master's backend and
+this one built from the same TIR, linked with the Rust runtime, 21 rounds
+interleaving the three binaries, medians; `s3bench.py`'s own run the same
+evening gave a geometric mean of 2.079):
+
+| program | Cranelift | master's backend | this backend | before / after, over Cranelift | after / before |
+|---|---:|---:|---:|---|---:|
+| fib | 5.69 ms | 8.23 ms | 8.25 ms | 1.445 / 1.448 | 1.002 |
+| sieve | 7.05 ms | 46.68 ms | 14.14 ms | 6.617 / 2.005 | 0.303 |
+| matmul | 5.82 ms | 71.22 ms | 14.65 ms | 12.230 / 2.516 | 0.206 |
+| wordfreq | 16.48 ms | 50.67 ms | 49.99 ms | 3.074 / 3.033 | 0.987 |
+| tree | 20.05 ms | 37.73 ms | 27.71 ms | 1.882 / 1.383 | 0.735 |
+| sort | 10.62 ms | 13.63 ms | 11.21 ms | 1.283 / 1.056 | 0.823 |
+| parmap | 60.16 ms | 120.18 ms | 120.76 ms | 1.998 / 2.007 | 1.005 |
+| parwords | 11.23 ms | 65.63 ms | 53.89 ms | 5.842 / 4.797 | 0.821 |
+| geometric mean | | | | 3.17 / 2.05 | 0.647 |
+
+The Grasm runtime compiled by each backend against the Rust runtime, the
+programs Cranelift's (`rtbench.py`'s shape, the two runtime objects and the
+Rust archive in one run, 21 rounds; `rtbench.py`'s own run gave 1.133):
+
+| program | Rust runtime | Grasm runtime by master's backend | by this one | after / before |
+|---|---:|---:|---:|---:|
+| fib | 5.37 ms | 5.33 ms | 5.48 ms | 1.028 |
+| sieve | 6.68 ms | 7.23 ms | 7.28 ms | 1.007 |
+| matmul | 5.55 ms | 5.57 ms | 5.40 ms | 0.970 |
+| wordfreq | 16.00 ms | 38.64 ms | 25.25 ms | 0.654 |
+| tree | 19.98 ms | 37.78 ms | 31.80 ms | 0.842 |
+| sort | 10.70 ms | 10.91 ms | 9.90 ms | 0.907 |
+| parmap | 61.23 ms | 62.05 ms | 61.34 ms | 0.989 |
+| parwords | 11.55 ms | 12.46 ms | 11.13 ms | 0.893 |
+| geometric mean over the Rust runtime | | 1.237 | 1.117 | 0.903 |
+
+The compiler building itself, as §6.14 measured it: each tree's stage 1
+(Rust), stage 2 (by stage 1) and stage 3 (by stage 2), every step timed, three
+rounds interleaving the stages and the two trees -- master and this one,
+each compiling its own sources -- medians, loads 2.9 to 4.8:
+
+| | stage 1 | stage 2 | stage 3 | stage 3 / stage 2 |
+|---|---:|---:|---:|---:|
+| master | 9.6 s | 48.2 s | 182.9 s | 3.80x |
+| this part | 9.8 s | 53.9 s | 97.4 s | 1.81x |
+
+Stage 3 takes 0.53 of master's time; stage 2 takes 12% longer, the price of
+the passes and the larger code, which the Cranelift-built stage 1 pays. By
+tool, stage 3 over stage 2 -- our backend's code against Cranelift's on the
+same work -- `front tir` 2.05x (36.3 s against 74.6 s; master 3.75x), `s3`
+1.29x (16.0 s against 20.6 s; 3.97x), `link` 1.39x (1.4 s against 2.0 s;
+2.87x). Stage 3's executables: `front` 1,820,856 bytes, `s3` 1,362,576, `link`
+572,136, `tirinterp` 677,384 (master's 1,504,040, 909,680, 467,144, 608,168;
+stage 1's, Cranelift's, 2,083,208, 1,320,192, 643,624, 867,208).
+
+Code size, step by step: the 648 programs of the subset and the runtime,
+`__text` words (and the runtime's object in bytes):
+
+| | corpus | runtime |
+|---|---:|---:|
+| master | 11,201,063 | 53,707 (595,200 bytes) |
+| step 0 | 11,201,063 | 53,707 |
+| step 1 | 13,222,957 | 53,707 |
+| step 2 | 13,061,830 | 51,857 |
+| step 3 | 12,352,108 | 50,043 |
+| step 4 | 12,739,708 | 52,891 |
+| step 5 | 12,737,217 | 52,614 (555,152 bytes) |
+
+The corpus's code grew 13.7% (its objects 5.2%), most of it the inline paths'
+tests and their calls kept for the cases that fail them; the runtime, which
+holds no Grasm lists, shrank 2.0% (6.7% in bytes), its 1,739 functions now
+1,037.
+
+**What is left.** Where the gap to Cranelift is now: `wordfreq` (3.0x) and
+`parwords` (4.8x) spend their time in reference counting, string building and
+map calls that the Cranelift build elides or makes inline -- the Perceus-style
+pass of §4, not built here, and a division by a constant, which Cranelift
+makes a multiplication; `front tir` at 2.05x of Cranelift's time spends much of it
+in `inc` and `dec` (a profile's leaves put a third of its samples there, and
+leaves overstate; it was not priced by removing them). Not built: register-offset
+addressing, live-range splitting (which shrink-wrapping needs to leave most
+non-leaf fast paths frameless), inlining into C entries, the SCCP, GVN and LICM
+of §4's mid-end.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
@@ -3026,7 +3302,7 @@ the plan depends on.
 | The compiler in Grasm is slow (refcounted trees are Grasm's slowest path) | data-oriented design (§3.5); Perceus RC (§4); `selfperf` budgets from S2 on |
 | A ten-times-larger program exposes Rust-compiler bugs | expected and wanted: each one is fixed in the Rust compiler with a test while it is still the reference |
 | Deep recursion in parser and checker | iterative algorithms where depth is input-controlled; the `depth` gate |
-| Our backend's code is slower than Cranelift's | measured from S3; the release allocator and mid-end close the gap before S9, and S9 does not ship a regression |
+| Our backend's code is slower than Cranelift's | measured from S3; the release allocator and mid-end close the gap before S9 (§6.15's first steps: 3.17 to 2.05 times Cranelift's time on `bench.sh`'s programs, under load), and S9 does not ship a regression |
 | Apple's linker conventions (ld-prime layouts, chained fixups, signatures) | the existing reader packages are checked against `dyld_info`, `codesign` and `nm`; `linkdiff` compares with ld-prime on every object |
 | Two compilers to keep in step | the language freeze (§3.4) |
 | macOS changes underneath | libSystem only; no private interfaces |
@@ -3099,7 +3375,17 @@ Measured, not estimated; each line is a gate's result on master.
   rose to 2.81-3.37 from fib to sort and 5.0-6.4 over the two parallel
   rows, which swing by about 10% under load: these figures are as taken,
   not as `bench.sh` would publish them, and want repeating on a quiet
-  machine. Why the gap is what it is per program was not measured.
+  machine. Why the gap is what it is per program was not measured. Part six
+  (§6.15), the mid-end: scalar list elements, lengths and struct fields read
+  and written inline, constant folding and immediate forms, loads and stores
+  at an offset, inlining, and the frame set up where it is first needed. In
+  one evening's runs interleaving master's backend and this one, at loads of
+  2.4 to 5.7 (not to quote), the eight programs' geometric mean over
+  Cranelift went from 3.17 to 2.05 (`sieve` 6.62 to 2.01, `matmul` 12.23 to
+  2.52, `tree` 1.88 to 1.38), the Grasm runtime's over the Rust runtime's
+  from 1.24 to 1.12, and the compiler's build of itself by stage 2 from
+  182.9 s to 97.4 s: our backend's code 1.81 times Cranelift's on that work,
+  from 3.80.
 - **S4 done.** `compiler/link` (§6.6, about 4,400 lines of Grasm) links
   the native build on arm64 macOS, and `cc` is left as `GRASM_LINKER=cc`
   for one release. `linktest`: all 651 corpus programs with a `main` --
