@@ -1,0 +1,9 @@
+[package]
+name = "x86_64"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The x86-64 target of the Grasm backend (docs/self-hosting.md §6.16, stage
+# S7): the instructions, their encodings and their assembly text, held to the
+# system assembler by `scripts/encodetest_x64.sh`. Pure computation.
+capabilities = []

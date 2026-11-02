@@ -122,10 +122,12 @@ run_gate tirinterp     scripts/tirinterp.sh
 run_gate tirccall      python3 scripts/tirinterp_ccall.py --check
 run_gate s3subset      scripts/s3subset.sh
 run_gate encodetest    scripts/encodetest.sh
+run_gate encodetest_x64 scripts/encodetest_x64.sh
 run_gate objtest       scripts/objtest.sh
 run_gate ra_check      scripts/ra_check.sh
 run_gate s3rc          scripts/s3rc.sh
 run_gate s3controls    scripts/s3controls.sh
+run_gate x64controls   scripts/x64controls.sh
 run_gate linktest      scripts/linktest.sh
 run_gate linkdiff      scripts/linkdiff.sh
 run_gate linkcontrols  scripts/linkcontrols.sh

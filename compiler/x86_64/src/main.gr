@@ -1,0 +1,32 @@
+// `x86_64`: the x86-64 target of the Grasm backend (docs/self-hosting.md
+// §6.16, stage S7 part one).
+//
+//     mach.gr      the instructions: roles, fixed registers, encodings,
+//                  assembly text
+//     enctest.gr   the encoder's test cases
+//
+// This is step two of the part: the encoder, held to the system assembler
+// (`scripts/encodetest_x64.sh`) across every form the design's selection
+// will emit. Instruction selection, the calling convention, allocation
+// through the shared allocators and the frame come in step three; until then
+// `emittable_forms` is every form the encoder knows, and the driver compiles
+// nothing for this target.
+import mach
+import enctest
+
+/// Every instruction form compiled code for this target can contain. Until
+/// the rule table exists (step three) that is every form the encoder knows,
+/// each of which the design (§6.16) has a use for; the table will then name
+/// the ones it emits, as `compiler/aarch64`'s `emittable_forms` derives its
+/// list from its rules.
+pub fn emittable_forms() -> [str] {
+    var out: [str] = []
+    for m in mach.all_mops() {
+        out.push(mach.form_name(m))
+    }
+    out
+}
+
+pub fn encode_cases() -> X64Cases ! str {
+    enctest.cases()
+}

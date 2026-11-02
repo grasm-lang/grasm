@@ -3235,6 +3235,307 @@ addressing, live-range splitting (which shrink-wrapping needs to leave most
 non-leaf fast paths frameless), inlining into C entries, the SCCP, GVN and LICM
 of §4's mid-end.
 
+### 6.16 S7 part one: an x86-64 backend, Mach-O, under Rosetta
+
+Written 2026-11-02, before the code past the encoder, as the design to build
+to. S7 is "x86-64 Mach-O (crosstest becomes self-hosted), then Linux ELF on
+x86-64 and arm64". This part is the first half: `compiler/s3` compiling the
+corpus subset for x86-64 macOS, the runtime in Grasm compiled for it, both
+linked into executables that run on this arm64 machine under Rosetta 2
+(`arch -x86_64 ./prog`) and print and exit as the Cranelift x86-64 build and
+the interpreter do -- what `crosstest` holds the Cranelift build to today.
+Linux is part two, and waits on a decision of the owner's: where its
+binaries run.
+
+**What runs it.** Rosetta here offers an x86-64 with SSE through SSE4.2,
+CMOV, CMPXCHG16B and AES, and nothing past them: no AVX (the
+`hw.optional.avx*` flags are 0 under `arch -x86_64`), no POPCNT, LZCNT or
+BMI, and an empty leaf-7 feature list, so no CET; pages are 4 KiB to an x86-64 process. So the backend targets
+x86-64 with SSE4.1 -- `roundsd` for `floor` and `ceil` is the one instruction
+past SSE2 it uses -- and counts bits with the instructions every x86-64 has
+(`bsr` and `cmov` for leading zeros), as the Cranelift build does without
+its optional features. x86-64 has no counterpart of pointer authentication
+here: CET's shadow stack and indirect-branch tracking are absent under
+Rosetta and not enabled for x86-64 processes on macOS, so no `endbr64` is
+emitted and a return address is not signed. Nothing replaces `pacibsp` on
+this target; the Cranelift x86-64 build and clang's default for
+`x86_64-apple-macos` do the same, and the arm64 target keeps its signing
+unchanged (the two targets share no frame code; below).
+
+**Choosing the target.** `s3 --target x86_64` (the default stays `aarch64`,
+so no command line that works today changes meaning). One driver, one MIR,
+two instruction sets: `compiler/mir` stays target-neutral -- nothing in it
+names a register, an instruction or a convention -- and everything from VCode
+down is chosen by the target. TIR is target-neutral already (both targets are
+64-bit little-endian with the same layouts, which `rtlayout` holds to the
+runtime's), so `grasm tir` makes the same TIR for both and the S3 gates' TIR
+collection serves both. MIR has one limit worth naming: a program's C
+function takes eight integer and eight double arguments at most
+(`extern_ok_for`), which AAPCS64 passes in registers and System V passes six
+integers of in registers and the other two on the stack -- both conventions
+the targets' own selection implements, so MIR does not change.
+
+**What becomes shared, and what each target owns.** `compiler/aarch64` mixes
+code that is about AArch64 with code that is about VCode. The second kind
+moves into a package of its own, `compiler/vcode`, parameterised by a
+*target description* -- a record of tables, not functions, as principle 5
+asks, built once by each target:
+
+| shared (`compiler/vcode`) | per target (`compiler/aarch64`, `compiler/x86_64`) |
+|---|---|
+| `VCode` itself (`vcode.gr`) | `mach.gr`: opcodes, encoder, assembly text |
+| linear scan and its spill rewrite (`regalloc.gr`) | `rules.gr`: the selection table and its own checks (the condition maps against the flags, the immediate forms against the operations) |
+| the release allocator (`backtrack.gr`) | `isel.gr`'s convention half: argument and result registers, stack arguments, how a call and a return are written |
+| the allocation checker (`check.gr`) | `emit.gr`'s target half: prologue, epilogue, branch encoding and relaxation, relocations |
+| the planted faults of `ra_check` (`plant`) | `leaves.gr`: the runtime dialect's context switch and thread-local getters |
+| the frame's placement (`frame_plan`: dominators, shrink-wrapping) | `enctest.gr`: the encoder's cases |
+| block arguments as parallel moves (`par_moves`) | the target description |
+| the rule engine's plan: which rule each instruction takes, what is absorbed, what is left unread (`isel.plan`, `choose`, `expand`), with the guards and immediates a target defines | |
+
+The target description is what the allocators and the checker read where
+they now call `mach.*` and `regalloc.*`'s AArch64 tables -- about twenty-five
+places, counted: per opcode, the four fields' roles (written, read, both) and
+files (general or floating-point), and whether it is a call; the registers a
+call reads (its argument registers, by file) and writes (its result's) and
+clobbers; which registers are callee-saved, which are never allocated (sp and
+x29, x30 and x18 on AArch64; rsp and rbp on x86-64) and which are scratch for
+reloads (x15..x17 and d29..d31; r10, r11 and xmm14, xmm15); the orders the
+allocators try registers in, normally and under `--max-regs`; the move,
+load and store opcodes a rewrite inserts. Operand numbering is already
+common: general registers below 64, floating-point from 64 (`R_D0`, `R_X0`),
+virtual from 128 (`VR`). The refactor is a step of its own, and its gate is
+that it changes nothing: `stagediff`'s objects for all 757 programs with a
+`main`, the runtime's object and `fixpoint`'s stages byte-identical to
+master's. The allocator is parameterised, not forked.
+
+Two things about x86-64 the shared code must allow, both of which the
+AArch64 forms already exercise:
+
+- *Two-address arithmetic.* `add %rm, %rd` reads and writes `rd`. Field 0 is
+  `ROLE_USEDEF`, as `movk`'s and `casal`'s are, and a rule writes `mov a,
+  res; add b, res`. The release allocator's move hints make most of those
+  moves a register to itself, which emission drops.
+- *Registers an instruction does not name.* `idiv` reads and writes rax and
+  rdx, `cqo` writes rdx from rax, a shift by a register counts in cl,
+  `cmpxchg` compares with rax. Each is a field of the VCode instruction, fixed
+  to its one register (`mach.fixed_reg`), with a role: the allocator sees a
+  physical register's range exactly as it sees a call's argument registers
+  today, and keeps every value live across it out of that register; the
+  checker checks the read like any other; the encoder refuses any other
+  register there. Field 3 (`ra`) gains roles other than "read" for this:
+  `idiv`'s remainder is read and written there.
+
+The flags are not modelled as a register. A comparison and its reader
+(`setcc`, `jcc`, `cmovcc`) are adjacent in one rule's template, and the only
+instructions anything inserts between two instructions -- a reload, a spill,
+a block argument's move, a constant -- are `mov`s, which do not touch the
+flags; `P_MOVIMM` becomes `movl`, `movq` or `movabsq`, never `xor`. The rule
+table's own check will refuse a template that puts an instruction which sets
+the flags between a setter and its reader.
+
+**The convention: System V AMD64, as Apple uses it.** Integer and pointer
+arguments in rdi, rsi, rdx, rcx, r8, r9 and doubles in xmm0..xmm7, counted
+apart; the rest on the stack, eight bytes each in argument order, the first
+at the lowest address, which is `0(%rsp)` at the call and `16(%rbp)` in the
+callee; the result in rax or xmm0. A call clobbers rax, rcx, rdx, rsi, rdi,
+r8..r11 and every xmm register; rbx, rbp and r12..r15 are callee-saved, and
+so are the control bits of MXCSR and the x87 control word, which nothing
+compiled changes. The stack is 16-byte aligned at every call, so on entry
+`rsp` is 8 past a multiple of 16. A variadic call puts in al an upper bound
+on the xmm registers it used. Narrow arguments: clang extends 8- and
+16-bit arguments to 32 bits at the caller, which the System V document does
+not promise, so the Grasm C entry keeps re-extending each narrow argument from
+its own width (it does so on AArch64 already) and a narrow C result is read
+at its width -- the same code on both targets. The 128-byte red zone below
+`rsp` is not used. The hidden stack-floor argument of a recursive function,
+the `inout` slots, the split result's word, and the closure convention are
+MIR's and do not change: they are ordinary arguments.
+
+**The frame and unwinding.** Kept as on AArch64 but for the return address,
+which `call` pushes:
+
+    [args in] [return address] [rbp] [rbx, r12..r15 as written] [pad] [spill] [slots] [args out] <- rsp
+
+`pushq %rbp; movq %rsp, %rbp`, then a `pushq` of each callee-saved register
+the body writes, then `subq $n, %rsp` with `n` keeping `rsp` 16-aligned; the
+epilogue undoes it and `retq`. The frame-pointer chain is kept, so debuggers,
+`sample` and the panic path walk the stack as they do now. Shrink-wrapping is
+the shared `frame_plan`: a path that never sets the frame up returns with a
+bare `retq`, its return address never having left the stack. Spill slots and
+outgoing arguments are reached from `rsp` with a 32-bit displacement, so the
+32,760-byte limit the AArch64 frame has from its 12-bit offsets does not
+apply. Unwinding: the backend writes no unwind information on either target
+-- no `__compact_unwind`, no `__eh_frame` -- because nothing unwinds: a panic
+prints and exits (101), and no C function the runtime or a program calls
+unwinds through its caller. A debugger needs only the frame-pointer chain, and
+dwarfdump's line table is the same `dwarf.gr` with one relocation type
+renamed (`X86_64_RELOC_UNSIGNED` is 0, as `ARM64_RELOC_UNSIGNED` is).
+
+**Selection, MIR operation by operation.** Every form named here is in the
+encoder now and held to the assembler (below); the table is what step three
+writes as rules.
+
+| MIR | x86-64 |
+|---|---|
+| `iconst` | `movl $k, %r32` (0..2^32-1, the upper half cleared), `movq $k, %r` (a sign-extended 32-bit k), else `movabsq` |
+| `add sub and or xor` | `mov a, res` then the operation with b; with b a sign-extended 32-bit constant, `op $k, res` (the encoder picks the 8-bit or 32-bit immediate, or the short `rax` form, as the assembler does) |
+| `mul` | `imulq b, res`; by a constant, `imulq $k, a, res`; by a power of two, `shlq $k` |
+| `sdiv srem` | a into rax, then `cqo; idivq b`, the quotient in rax or the remainder in rdx; when b is -1 the quotient is `negq` of a and the remainder 0, since `idiv` faults on `MIN / -1` where [E-ARITH-INT] answers MIN -- a pseudo-instruction expanded at emission into `cmpq $-1, b; jne; ...`, as Cranelift's x86-64 backend expands `srem` (`CheckedSRemSeq`) |
+| `udiv urem` | a into rax, `movl $0, %edx`, `divq b`; by a power of two, `shrq $k` |
+| `shl sshr ushr rotr` | b into rcx, `shlq/sarq/shrq/rorq %cl, res`; by a constant, the immediate form; x86-64 counts modulo 64 as Grasm does |
+| `neg not` | `negq`, `notq` after the move |
+| `sext8/16/32`, `uext8/16/32` | `movsbq`, `movswq`, `movslq`; `movzbl`, `movzwl`, `movl` |
+| `icmp` | `cmpq b, a` (or `$k`), `setcc t`, `movzbl t, res` |
+| `straddr dataaddr fnaddr celladdr` | `leaq sym(%rip), res` (X86_64_RELOC_SIGNED) |
+| `gotaddr` | `movq sym@GOTPCREL(%rip), res` (X86_64_RELOC_GOT_LOAD) |
+| `getsp`, `slotaddr` | `movq %rsp, res`; `leaq off(%rsp), res` |
+| loads and stores, every width | `movq`, `movzbl`, `movsbq`, `movzwl`, `movswq`, `movl`, `movslq` from `disp(%base)`; `movq`, `movb`, `movw`, `movl` to it; an absorbed `add` of any 32-bit constant is the displacement |
+| `fconst` | its bits by `P_MOVIMM` into a general register, then `movq` across |
+| `fadd fsub fmul fdiv` | `movaps a, res` then `addsd`/`subsd`/`mulsd`/`divsd b, res` |
+| `fneg fabs` | the sign bit's mask made as a constant and moved across, then `xorpd`/`andpd` |
+| `fsqrt ffloor fceil` | `sqrtsd`; `roundsd $9` and `$10` |
+| `fcmp` | `ucomisd`, with the operands swapped for `<` and `<=` so that unordered reads false through `a`/`ae` (CF and ZF set); `==` is `setnp` and `sete` and'ed, `!=` `setp` or'ed with `setne` |
+| `scvtf`, `fcvtzs`, `fbits`, `ffrombits` | `cvtsi2sdq`; `cvttsd2si` with the saturation and NaN-to-0 [L-LIB-AS-I64] asks for (`cvttsd2si` answers MIN for both), a pseudo-instruction like `sdiv`'s, as Cranelift's `CvtFloatToSintSeq` is; `movq` out and in |
+| `ucvtf`, `fcvtzu` | the unsigned conversions x86-64 lacks, by the sequences Cranelift uses (`CvtUint64ToFloatSeq`, `CvtFloatToUintSeq`): halve with the low bit kept and double for a word with its top bit set; subtract 2^63 for a double at or past it -- pseudo-instructions too |
+| `clz rbit bswap*` | `bsrq`, `cmovzq` of -1 for a zero word, and 63 less the index; a bit reversal by `bswapq` and three mask-and-shift swaps; `bswapq`, `bswapl`, `rolw $8` then `movzwl` |
+| `aload*` | the plain load: x86-64 is total-store-ordered, and every sequentially consistent store below locks, so a load is sequentially consistent, as LLVM and Cranelift make it |
+| `astore*` | `xchg`, which locks |
+| `aadd*` | `lock xadd`, which answers the old value; a narrow one widened by `movzbl`/`movzwl`/`movl` after, as AArch64's `w` forms clear the upper bits |
+| `acas*` | the expected value into rax, `lock cmpxchg new, (a)`, the old value out of rax, widened the same way |
+| `brif` | a fused comparison as `cmpq` and `jcc`; a fused `fcmp` as `ucomisd` and one or two `jcc`s (`==` jumps to the else block on parity first); otherwise `testq a, a; jne` |
+| `jump`, `trap` | `jmp`; `ud2` |
+| `call callrt callind` | arguments by the convention, `callq sym` (X86_64_RELOC_BRANCH) or `callq *%r` |
+| `inc dec` | calls of the runtime, as on AArch64 |
+
+Branches are relaxed at emission: every block branch starts with an 8-bit
+displacement and is widened to 32 bits until no displacement overflows, a
+fixpoint that only grows, so it ends. A call or a RIP-relative form always
+carries its relocation, with its four bytes zero, as the assembler leaves
+them.
+
+**The object.** `compiler/macho` gains a CPU type (`CPU_TYPE_X86_64`,
+subtype 3) and byte-addressed code in place of words; its relocations are
+x86-64's: `BRANCH`, `SIGNED`, `GOT_LOAD` and `TLV`, all PC-relative and four
+bytes, at the displacement that ends the instruction (`mach.reloc_kind`),
+and `UNSIGNED` (8 bytes) for the descriptors in `__data`, the thread-local
+descriptors and the DWARF addresses, as on arm64. `__text` is 16-byte
+aligned and each function starts at a multiple of 16, as clang places them.
+The line table is
+`dwarf.gr`'s, its rows at byte offsets.
+
+**The runtime.** `compiler/rt` is target-neutral Grasm but for four things,
+found by reading every `extern fn` and every constant in it:
+
+1. *The dialect's leaves* (`compiler/aarch64/src/leaves.gr`) get x86-64
+   counterparts in `compiler/x86_64`. A context is rbx, rbp, r12..r15, rsp,
+   MXCSR and the x87 control word (64 bytes, within the 176 `fiber.gr`
+   reserves). `ctx_switch(from: rdi, to: rsi)` stores them at `from`, loads
+   them from `to` and `retq`s: the return address it returns through is the
+   one on the stack it switched to. `ctx_init(ctx, top, entry, arg)` aligns
+   `top` down to 16, stores `_grt.ctx_start`'s address at `top - 8` and that
+   as the saved `rsp`, entry and argument as rbx and r12, rbp zero (so a
+   backtrace ends there), and the control words as they are; the first switch
+   to it `retq`s into `_grt.ctx_start` with `rsp` 16-aligned, which moves r12
+   to rdi, `callq *%rbx` and `ud2`s if that returns. The thread-local getter
+   is `pushq %rbp; movq %rsp, %rbp; movq var@TLVP(%rip), %rdi; callq
+   *(%rdi); popq %rbp; retq`, the address in rax. Every form they need is in
+   the encoder (`stmxcsr`, `ldmxcsr`, `fnstcw`, `fldcw`, `call-m`, `load-tlv`
+   among them).
+2. *Variadic C functions.* `open`'s mode and `fcntl`'s argument are variadic
+   in C, and the runtime declares each with eight register parameters before
+   it so that AAPCS64 puts it in the first stack slot, where Apple's arm64
+   `va_arg` reads it (`fsys.gr`). System V passes a variadic argument as a
+   fixed one, in the next register, so on x86-64 that declaration would leave
+   the mode in rdx as 0 and pass the real one on the stack, where `open` never
+   looks -- a file created with mode 0, the defect docs/binary-size.md
+   records for the Rust runtime's arm64 build. The language cannot say
+   "variadic" (the systems subset left it out, §5.2) and the frontend is not
+   to change, so the x86-64 target keeps a table of the two C functions the
+   runtime calls that C declares variadic -- `open` and `fcntl`, with two
+   fixed parameters each -- and passes such a call's first two arguments and
+   its last as the first three, the six between dropped, with `movl $0,
+   %eax` for al. It is the fact a C compiler would read from `<fcntl.h>`,
+   kept where the convention is, and it applies only to `s3 --runtime`.
+3. *`$INODE64`.* On x86-64 the 64-bit-inode `opendir` and `readdir` are
+   `_opendir$INODE64` and `_readdir$INODE64` (plain `_readdir` returns the
+   old 32-bit-inode `struct dirent`); on arm64 there is only the plain name.
+   The x86-64 target names those two as the C library does, and then
+   `files.gr`'s `DIRENT_NAME` of 21 is right on both, as the struct is the
+   same.
+4. *Nothing else.* The page size (16 KiB on arm64, 4 KiB under Rosetta) only
+   rounds a fiber stack's guard up; the error numbers, `open` flags,
+   `kevent`, `sockaddr`, `pthread` sizes and `dlsym`'s `RTLD_DEFAULT` are the
+   same on both; maps hash and probe eight control bytes at a time in plain
+   Grasm on both (the Rust runtime's x86-64 build probes sixteen with SSE2,
+   which changes no program's output: iteration is in sorted order).
+
+`s3 --runtime --target x86_64` makes `rt.o` for x86-64; `rtswap`'s shape
+holds it to the Rust runtime's x86-64 build (`target/x86_64-apple-darwin`),
+which `crosstest` already builds.
+
+**The linker.** `compiler/link` refuses x86_64 by name today (§6.6). Step
+four teaches it the x86-64 half of what it does for arm64, measured against
+ld-prime's output for x86-64 as the arm64 half was: the five relocation types
+the objects carry -- `BRANCH` to the function or to a 6-byte `__stubs` entry
+(`jmp *slot(%rip)`), `SIGNED`, `GOT_LOAD` (with ld's relaxation of a GOT load
+of something defined here to `leaq`), `TLV`, `UNSIGNED` -- 4 KiB pages, the
+`__PAGEZERO` and segment layout ld gives x86-64, chained fixups in the
+format ld-prime writes for x86-64 (read off its output, as the arm64 half's
+`DYLD_CHAINED_PTR_64_OFFSET` was), and whatever signature ld writes for
+x86-64 (none is required to run there). Until then the
+system linker links x86-64 objects, as it linked the arm64 backend's during
+S3, and that is recorded as the step's gap.
+
+**Gates.** Built with this note: `encodetest_x64` and `x64controls`
+(below). To come, each with its controls in `x64controls`:
+
+- `xs3subset`: every program of `s3subset`'s subset compiled by `s3 --target
+  x86_64`, linked, run under Rosetta, and held to the Cranelift x86-64 build
+  (`grasm build --native --target x86_64-apple-darwin`, `crosstest`'s
+  reference) and so to the interpreter -- stdout, exit status and stderr --
+  with the subset's floor. This is crosstest with the Grasm backend as the
+  compiler, which is what "crosstest becomes self-hosted" asks.
+- `objtest` for x86-64 objects: `otool`, `nm`, `dwarfdump --verify` and the
+  linker accept every one; relocations against instruction classes
+  (`scripts/x64_macho.py`, which reads x86-64 objects as `s3_macho.py` reads
+  arm64 ones); each object compiled twice the same bytes.
+- `ra_check --target x86_64`: the allocation checker over every function
+  under register pressure, with its planted faults.
+- `xrtswap`: the corpus on the x86-64 Grasm runtime, then on it alone.
+- The existing gates all still pass, and AArch64 output is byte-identical to
+  master's: `stagediff`'s objects and executables, `fixpoint`.
+
+**Decisions for the owner.** (1) The variadic table of the runtime's two C
+functions on x86-64 (above), or a `...` in `extern fn` that the frontend would
+have to learn -- a Rust change, which this stage does not make. (2) Linux, part
+two: where its binaries run (a Linux machine or VM in CI, or a container on
+this one), which the brief leaves to the owner. (3) SSE4.1 as the floor
+(`roundsd`); calling the C library's `floor` and `ceil` instead would make it
+SSE2.
+
+**Step two: the encoder** (2026-11-02). `compiler/x86_64` (`mach.gr`,
+`enctest.gr`): 102 instruction forms -- every one the table above, the frame,
+the calling convention, the allocator's spills and the runtime's leaves use --
+each with its roles, its register files, the registers it fixes, its
+encoding and its AT&T text. Where the assembler chooses between encodings the
+encoder chooses as it does: an 8-bit immediate or displacement when the value
+fits, the short `rax` forms of the arithmetic group, `d1` for a shift by one,
+no displacement for 0 but from rbp or r13, a SIB byte for rsp and r12, the
+REX prefix an 8-bit spl, bpl, sil or dil needs, and a 16-bit locked
+instruction's operand-size prefix before `lock`. `s3 --encode-test <p>
+--target x86_64` writes 5,558 cases -- every general and xmm register in every
+field, immediates, displacements and branch offsets at both ends of each width
+and between, all sixteen conditions, every base register -- and
+`scripts/encodetest_x64.sh` assembles them with `as -arch x86_64` and
+compares, case by case and in total length, the bytes and, for the 51 that
+name a symbol, the relocation the assembler wrote: its type, its place, its
+symbol. `x64controls` plants nine faults in a copy of the target and requires
+the gate to fail on each for its reason: `add`'s opcode one bit off, REX.R
+written as REX.W, 128 taken for an 8-bit immediate, no SIB byte for rsp and
+r12, no displacement for 0 from rbp and r13, `lock` before the operand-size
+prefix, a short branch's displacement one long, a RIP-relative address
+relocated as a GOT load, and a form the target claims to emit with no cases.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
@@ -3278,7 +3579,8 @@ against the Rust loader's), `tomldiff` (every manifest read by
 frontend refuses, the Grasm one refuses), `fuzz_tir`, `frontsmoke` (front to
 binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
 = stage 3), `stagediff` (two stages' output on the corpus) and
-`fixpointcontrols` (§6.14), `ddc`,
+`fixpointcontrols` (§6.14), `encodetest_x64` (the x86-64 encoder against
+`as -arch x86_64`) and `x64controls` (§6.16), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -3579,7 +3881,14 @@ Measured, not estimated; each line is a gate's result on master.
   was compiled in. Building the compiler takes 48 s by stage 1 and 181 s by
   stage 2 -- our backend's code 3.8 times Cranelift's on the compiler's own
   work -- measured under load and not to be quoted.
-- **Not started:** S7-S9.
+- **S7 part one begun** (§6.16): the design of the x86-64 Mach-O target, run
+  under Rosetta, and its first piece, the encoder (`compiler/x86_64`): 102
+  forms, 5,558 generated cases each byte-identical to `as -arch x86_64`'s,
+  the 51 that name a symbol carrying the assembler's relocation
+  (`encodetest_x64`), and nine planted faults caught (`x64controls`). No
+  program is compiled for x86-64 yet: selection, the shared allocators, the
+  object writer, the runtime and the linker are steps three and four.
+- **Not started:** S8, S9, and S7's part two (Linux).
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
 subcommands in Grasm, so that the gates which build, run, check and test

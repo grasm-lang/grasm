@@ -1,0 +1,1443 @@
+// The x86-64 instructions this backend will emit (docs/self-hosting.md
+// §6.16): what each one is called, which of its operands it reads and writes,
+// how it is encoded and how the system assembler spells it.
+//
+// It mirrors `compiler/aarch64/src/mach.gr`: every attribute is a lookup on
+// the opcode, so one table answers the register allocator and its checker
+// (roles, register files, the registers a form fixes), the encoder (bytes)
+// and the assembly printer (AT&T syntax, as `as -arch x86_64` reads it). The
+// encoder is held to the assembler by `scripts/encodetest_x64.sh`, across
+// every form, with generated operands -- the printer is how that gate asks the
+// assembler.
+//
+// What differs from AArch64 is the shape of an instruction, not the model:
+//
+//   * An instruction is 1 to 15 bytes, so `encode` answers a list of bytes,
+//     and where several encodings spell one instruction the encoder picks the
+//     one the assembler picks (an 8-bit immediate when the value fits, the
+//     short `rax` forms of the arithmetic group, `d1` for a shift by one, a
+//     displacement of 8 bits when it fits and none when it is 0 but for a
+//     base of `rbp` or `r13`), so the two can be compared byte for byte.
+//   * Most arithmetic is two-address: `add %rm, %rd` writes `rd + rm` to
+//     `rd`. Field 0 is then read and written (`ROLE_USEDEF`), as `movk`'s is
+//     on AArch64, and selection moves the first operand into the result
+//     first.
+//   * Some forms read or write a register the instruction does not name:
+//     `idiv` divides `rdx:rax` and leaves the quotient in `rax` and the
+//     remainder in `rdx`, `cqo` widens `rax` into `rdx`, a shift by a
+//     register counts by `cl`, `cmpxchg` compares with `rax`. Each such
+//     register is still a field of the instruction here, fixed to the one
+//     register it must be (`fixed_reg`), so the allocator sees the read and
+//     the write and the checker checks them like any other; the encoder
+//     refuses any other register there, and the printer leaves it out, as
+//     the assembler does.
+//   * Comparisons set the flags and `setcc`, `jcc` and `cmovcc` read them. No
+//     field says so: a rule writes the comparison and its reader next to each
+//     other, and the only instructions the allocator ever inserts between two
+//     instructions -- a reload, a spill, a move -- are `mov`s, which leave
+//     the flags alone.
+//
+// Registers are numbered as operands: 0..15 are the general registers in the
+// hardware's own order (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15), so
+// a register's number is its encoding; `R_X0 + k` is xmmk, of which only the
+// low 64 bits -- a double -- are ever meant; `VR + n` is virtual register n
+// before allocation. Every register field of every form is a general register
+// or an xmm one (`fp_field`), as on AArch64.
+
+pub let RAX = 0
+pub let RCX = 1
+pub let RDX = 2
+pub let RBX = 3
+pub let RSP = 4
+pub let RBP = 5
+pub let RSI = 6
+pub let RDI = 7
+pub let R8 = 8
+pub let R9 = 9
+pub let R10 = 10
+pub let R11 = 11
+pub let R12 = 12
+pub let R13 = 13
+pub let R14 = 14
+pub let R15 = 15
+/// xmm0; xmmk is `R_X0 + k`.
+pub let R_X0 = 64
+pub let VR = 128
+
+/// The register classes.
+pub let CLS_INT = 0
+pub let CLS_FP = 1
+
+pub fn is_vreg(o: i64) -> bool {
+    o >= VR
+}
+
+/// A physical xmm register.
+pub fn is_xmm(o: i64) -> bool {
+    o >= R_X0 and o < R_X0 + 16
+}
+
+/// A physical general register.
+pub fn is_gpr(o: i64) -> bool {
+    o >= 0 and o < 16
+}
+
+// ----- opcodes ---------------------------------------------------------------
+//
+// The 64-bit arithmetic and logic, two-address: field 0 is read and written,
+// field 2 read.
+pub let X_ADD = 1
+pub let X_SUB = 2
+pub let X_AND = 3
+pub let X_OR = 4
+pub let X_XOR = 5
+/// `imul %rm, %rd`: the low 64 bits of the product, signed or not.
+pub let X_IMUL = 6
+/// `cmp %rm, %rn`: the flags of `rn - rm`; `test %rm, %rn`: of `rn & rm`.
+pub let X_CMP = 7
+pub let X_TEST = 8
+/// With a 32-bit immediate, sign-extended: `add $k, %rd`.
+pub let X_ADDI = 9
+pub let X_SUBI = 10
+pub let X_ANDI = 11
+pub let X_ORI = 12
+pub let X_XORI = 13
+/// `cmp $k, %rn`.
+pub let X_CMPI = 14
+/// `imul $k, %rn, %rd`: three-address.
+pub let X_IMULI = 15
+/// Shifts by `cl` (field 2, fixed to rcx), modulo 64 as Grasm's are.
+pub let X_SHL = 16
+pub let X_SHR = 17
+pub let X_SAR = 18
+pub let X_ROR = 19
+/// Shifts by a constant, 0..63.
+pub let X_SHLI = 20
+pub let X_SHRI = 21
+pub let X_SARI = 22
+pub let X_RORI = 23
+pub let X_NEG = 24
+pub let X_NOT = 25
+/// `cqo`: rax sign-extended into rdx (field 0 rdx, written; field 1 rax,
+/// read).
+pub let X_CQO = 26
+/// `idiv %rm` and `div %rm`: `rdx:rax` divided by `rm`, the quotient in rax
+/// (field 0) and the remainder in rdx (field 3), both read and written.
+pub let X_IDIV = 27
+pub let X_DIV = 28
+/// `mov %rm, %rd`, and its 32-bit form, which clears the upper half.
+pub let X_MOV = 29
+pub let X_MOV32 = 30
+/// Widening moves: `movsbq`, `movswq`, `movslq`, and `movzbl`, `movzwl`,
+/// whose 32-bit result clears the upper half.
+pub let X_MOVSXB = 31
+pub let X_MOVSXW = 32
+pub let X_MOVSXD = 33
+pub let X_MOVZXB = 34
+pub let X_MOVZXW = 35
+/// `setcc %rd8`: the low byte 1 when the condition holds, else 0. Only a
+/// `movzbl` of the same byte reads it, so it counts as writing the register.
+pub let X_SETCC = 36
+/// Constants: `movl $k, %rd32` for 0..2^32-1 (the upper half cleared),
+/// `movq $k, %rd` for a sign-extended 32-bit k, `movabsq` for any other.
+pub let X_MOVI32 = 37
+pub let X_MOVSI = 38
+pub let X_MOVABS = 39
+// Memory, at `imm(%rn)`: a 32-bit signed displacement from a base register,
+// `rsp` among them.
+pub let X_LOAD = 40
+/// `movq %rd, imm(%rn)`: field 0 is read.
+pub let X_STORE = 41
+pub let X_LEA = 42
+// Raw memory ([L-LIB-MEM]): loads of a byte, a halfword and a word, zero- or
+// sign-extended into the whole register, and the stores of each.
+pub let X_LOAD8U = 43
+pub let X_LOAD8S = 44
+pub let X_LOAD16U = 45
+pub let X_LOAD16S = 46
+pub let X_LOAD32U = 47
+pub let X_LOAD32S = 48
+pub let X_STORE8 = 49
+pub let X_STORE16 = 50
+pub let X_STORE32 = 51
+// Atomics ([L-LIB-ATOMIC]), each sequentially consistent: a load is a plain
+// `mov` (x86-64 is total-store-ordered, and every sequentially consistent
+// store below is a locked instruction); a store is `xchg`, which locks; a
+// fetch-add is `lock xadd`, which answers what memory held in field 0; a
+// compare-and-swap is `lock cmpxchg`, which compares memory with rax (field
+// 0, fixed), stores field 2 when they are equal, and answers what memory held
+// in rax either way. At four widths each; a narrow answer leaves the upper
+// bits of its register as they were, so a rule widens it after.
+pub let X_XCHG8 = 52
+pub let X_XCHG16 = 53
+pub let X_XCHG32 = 54
+pub let X_XCHG64 = 55
+pub let X_XADD8 = 56
+pub let X_XADD16 = 57
+pub let X_XADD32 = 58
+pub let X_XADD64 = 59
+pub let X_CMPXCHG8 = 60
+pub let X_CMPXCHG16 = 61
+pub let X_CMPXCHG32 = 62
+pub let X_CMPXCHG64 = 63
+// Addresses the linker completes, relative to the next instruction: a
+// symbol's (`leaq sym(%rip)`, X86_64_RELOC_SIGNED), the address in a C
+// function's global offset table slot ([T-FN-ADDR], X86_64_RELOC_GOT_LOAD),
+// and a thread-local variable's descriptor ([T-RUNTIME], X86_64_RELOC_TLV).
+// Each ends in the 32-bit displacement the relocation fills.
+pub let X_LEA_RIP = 64
+pub let X_LOAD_GOT = 65
+pub let X_LOAD_TLV = 66
+// Control.
+/// `call sym` (X86_64_RELOC_BRANCH on its 32-bit displacement).
+pub let X_CALL = 67
+/// `call *%rn`: a function value's code; `call *imm(%rn)`: a thread-local
+/// variable's thunk, through its descriptor.
+pub let X_CALLR = 68
+pub let X_CALLM = 69
+pub let X_RET = 70
+/// Branches to a byte offset from the instruction's own start: with an
+/// 8-bit displacement, which emission uses when the target is near, or a
+/// 32-bit one.
+pub let X_JMP8 = 71
+pub let X_JMP32 = 72
+pub let X_JCC8 = 73
+pub let X_JCC32 = 74
+/// `ud2`: the trap.
+pub let X_UD2 = 75
+pub let X_PUSH = 76
+pub let X_POP = 77
+// Doubles, in the low half of an xmm register (SSE2, and `roundsd` of
+// SSE4.1).
+/// `movaps %rm, %rd`: the register-to-register move.
+pub let X_MOVAPS = 78
+pub let X_ADDSD = 79
+pub let X_SUBSD = 80
+pub let X_MULSD = 81
+pub let X_DIVSD = 82
+pub let X_SQRTSD = 83
+/// `andpd` and `xorpd`: `fabs` and `fneg`, with a mask of the sign bit.
+pub let X_ANDPD = 84
+pub let X_XORPD = 85
+/// `roundsd $k, %rm, %rd`: 9 rounds toward minus infinity (`floor`), 10
+/// toward plus infinity (`ceil`), neither raising the inexact exception.
+pub let X_ROUNDSD = 86
+/// `ucomisd %rm, %rn`: the flags of comparing rn with rm; unordered sets ZF,
+/// PF and CF.
+pub let X_UCOMISD = 87
+/// `cvtsi2sdq %rm, %rd`: a signed integer to a double.
+pub let X_CVTSI2SD = 88
+/// `cvttsd2si %rm, %rd`: a double to a signed integer, toward zero; NaN and
+/// what does not fit give the word with only its top bit set.
+pub let X_CVTTSD2SI = 89
+/// `movq %rm, %rd` between the files: into an xmm register, and out of one.
+pub let X_MOVQ_TOX = 90
+pub let X_MOVQ_FROMX = 91
+/// `movsd imm(%rn), %rd` and `movsd %rd, imm(%rn)`.
+pub let X_MOVSD_LOAD = 92
+pub let X_MOVSD_STORE = 93
+// Bits.
+/// `bsrq %rm, %rd`: the index of the highest set bit (rd unchanged for 0).
+pub let X_BSR = 94
+/// `cmovccq %rm, %rd`: rd becomes rm when the condition holds.
+pub let X_CMOV = 95
+/// `bswapq`, `bswapl` (the upper half cleared), and `rolw $8` (the two low
+/// bytes swapped, the rest unchanged).
+pub let X_BSWAP = 96
+pub let X_BSWAP32 = 97
+pub let X_ROLW8 = 98
+// The runtime dialect's context switch ([T-RUNTIME]): the SSE control and
+// status word and the x87 control word, which the System V ABI has a callee
+// preserve, saved and restored at `imm(%rn)`.
+pub let X_STMXCSR = 99
+pub let X_LDMXCSR = 100
+pub let X_FNSTCW = 101
+pub let X_FLDCW = 102
+/// One past the last real instruction.
+pub let X_LAST = 103
+/// Not an instruction: the function's return, which becomes the epilogue.
+pub let P_RETURN = 150
+/// Not an instruction: a 64-bit constant, which selection expands into the
+/// shortest of `movl`, `movq` and `movabsq`.
+pub let P_MOVIMM = 151
+/// The size of a table indexed by opcode.
+pub let NMOPS = 160
+
+/// The opcodes that are real instructions.
+pub fn all_mops() -> [i64] {
+    var out: [i64] = []
+    for m in 1..X_LAST {
+        out.push(m)
+    }
+    out
+}
+
+/// Whether `m` is a call: it reads its argument registers, writes its
+/// result's and clobbers what a call may change.
+pub fn is_call(m: i64) -> bool {
+    m == X_CALL or m == X_CALLR or m == X_CALLM
+}
+
+/// The bytes a memory access moves (1, 2, 4 or 8).
+pub fn access_size(m: i64) -> i64 {
+    if m == X_LOAD8U or m == X_LOAD8S or m == X_STORE8 or m == X_XCHG8 or m == X_XADD8 or m == X_CMPXCHG8 {
+        1
+    } else if m == X_LOAD16U or m == X_LOAD16S or m == X_STORE16 or m == X_XCHG16 or m == X_XADD16 or m == X_CMPXCHG16 {
+        2
+    } else if m == X_LOAD32U or m == X_LOAD32S or m == X_STORE32 or m == X_XCHG32 or m == X_XADD32 or m == X_CMPXCHG32 {
+        4
+    } else {
+        8
+    }
+}
+
+/// A short name for the form, unique per opcode, for gate output.
+pub fn form_name(m: i64) -> str {
+    match m {
+        1 -> "add-rr"
+        2 -> "sub-rr"
+        3 -> "and-rr"
+        4 -> "or-rr"
+        5 -> "xor-rr"
+        6 -> "imul-rr"
+        7 -> "cmp-rr"
+        8 -> "test-rr"
+        9 -> "add-ri"
+        10 -> "sub-ri"
+        11 -> "and-ri"
+        12 -> "or-ri"
+        13 -> "xor-ri"
+        14 -> "cmp-ri"
+        15 -> "imul-rri"
+        16 -> "shl-cl"
+        17 -> "shr-cl"
+        18 -> "sar-cl"
+        19 -> "ror-cl"
+        20 -> "shl-ri"
+        21 -> "shr-ri"
+        22 -> "sar-ri"
+        23 -> "ror-ri"
+        24 -> "neg"
+        25 -> "not"
+        26 -> "cqo"
+        27 -> "idiv"
+        28 -> "div"
+        29 -> "mov-rr"
+        30 -> "mov-rr32"
+        31 -> "movsbq"
+        32 -> "movswq"
+        33 -> "movslq"
+        34 -> "movzbl"
+        35 -> "movzwl"
+        36 -> "setcc"
+        37 -> "mov-i32"
+        38 -> "mov-si32"
+        39 -> "movabs"
+        40 -> "load"
+        41 -> "store"
+        42 -> "lea"
+        43 -> "load8u"
+        44 -> "load8s"
+        45 -> "load16u"
+        46 -> "load16s"
+        47 -> "load32u"
+        48 -> "load32s"
+        49 -> "store8"
+        50 -> "store16"
+        51 -> "store32"
+        52 -> "xchg8"
+        53 -> "xchg16"
+        54 -> "xchg32"
+        55 -> "xchg64"
+        56 -> "xadd8"
+        57 -> "xadd16"
+        58 -> "xadd32"
+        59 -> "xadd64"
+        60 -> "cmpxchg8"
+        61 -> "cmpxchg16"
+        62 -> "cmpxchg32"
+        63 -> "cmpxchg64"
+        64 -> "lea-rip"
+        65 -> "load-got"
+        66 -> "load-tlv"
+        67 -> "call"
+        68 -> "call-r"
+        69 -> "call-m"
+        70 -> "ret"
+        71 -> "jmp8"
+        72 -> "jmp32"
+        73 -> "jcc8"
+        74 -> "jcc32"
+        75 -> "ud2"
+        76 -> "push"
+        77 -> "pop"
+        78 -> "movaps"
+        79 -> "addsd"
+        80 -> "subsd"
+        81 -> "mulsd"
+        82 -> "divsd"
+        83 -> "sqrtsd"
+        84 -> "andpd"
+        85 -> "xorpd"
+        86 -> "roundsd"
+        87 -> "ucomisd"
+        88 -> "cvtsi2sd"
+        89 -> "cvttsd2si"
+        90 -> "movq-tox"
+        91 -> "movq-fromx"
+        92 -> "movsd-load"
+        93 -> "movsd-store"
+        94 -> "bsr"
+        95 -> "cmov"
+        96 -> "bswap"
+        97 -> "bswap32"
+        98 -> "rolw8"
+        99 -> "stmxcsr"
+        100 -> "ldmxcsr"
+        101 -> "fnstcw"
+        102 -> "fldcw"
+        150 -> "<return>"
+        151 -> "<movimm>"
+        _ -> "?"
+    }
+}
+
+/// The AT&T mnemonic, as the assembler reads it; a conditional form's is
+/// completed by its condition (`cond_name`).
+fn mnem(m: i64) -> str {
+    match m {
+        1 -> "addq"
+        2 -> "subq"
+        3 -> "andq"
+        4 -> "orq"
+        5 -> "xorq"
+        6 -> "imulq"
+        7 -> "cmpq"
+        8 -> "testq"
+        9 -> "addq"
+        10 -> "subq"
+        11 -> "andq"
+        12 -> "orq"
+        13 -> "xorq"
+        14 -> "cmpq"
+        15 -> "imulq"
+        16 -> "shlq"
+        17 -> "shrq"
+        18 -> "sarq"
+        19 -> "rorq"
+        20 -> "shlq"
+        21 -> "shrq"
+        22 -> "sarq"
+        23 -> "rorq"
+        24 -> "negq"
+        25 -> "notq"
+        26 -> "cqto"
+        27 -> "idivq"
+        28 -> "divq"
+        29 -> "movq"
+        30 -> "movl"
+        31 -> "movsbq"
+        32 -> "movswq"
+        33 -> "movslq"
+        34 -> "movzbl"
+        35 -> "movzwl"
+        36 -> "set"
+        37 -> "movl"
+        38 -> "movq"
+        39 -> "movabsq"
+        40 -> "movq"
+        41 -> "movq"
+        42 -> "leaq"
+        43 -> "movzbl"
+        44 -> "movsbq"
+        45 -> "movzwl"
+        46 -> "movswq"
+        47 -> "movl"
+        48 -> "movslq"
+        49 -> "movb"
+        50 -> "movw"
+        51 -> "movl"
+        52 -> "xchgb"
+        53 -> "xchgw"
+        54 -> "xchgl"
+        55 -> "xchgq"
+        56 -> "lock xaddb"
+        57 -> "lock xaddw"
+        58 -> "lock xaddl"
+        59 -> "lock xaddq"
+        60 -> "lock cmpxchgb"
+        61 -> "lock cmpxchgw"
+        62 -> "lock cmpxchgl"
+        63 -> "lock cmpxchgq"
+        64 -> "leaq"
+        65 -> "movq"
+        66 -> "movq"
+        67 -> "callq"
+        68 -> "callq"
+        69 -> "callq"
+        70 -> "retq"
+        71 -> "jmp.d8"
+        72 -> "jmp.d32"
+        73 -> "j"
+        74 -> "j"
+        75 -> "ud2"
+        76 -> "pushq"
+        77 -> "popq"
+        78 -> "movaps"
+        79 -> "addsd"
+        80 -> "subsd"
+        81 -> "mulsd"
+        82 -> "divsd"
+        83 -> "sqrtsd"
+        84 -> "andpd"
+        85 -> "xorpd"
+        86 -> "roundsd"
+        87 -> "ucomisd"
+        88 -> "cvtsi2sdq"
+        89 -> "cvttsd2si"
+        90 -> "movq"
+        91 -> "movq"
+        92 -> "movsd"
+        93 -> "movsd"
+        94 -> "bsrq"
+        95 -> "cmov"
+        96 -> "bswapq"
+        97 -> "bswapl"
+        98 -> "rolw"
+        99 -> "stmxcsr"
+        100 -> "ldmxcsr"
+        101 -> "fnstcw"
+        102 -> "fldcw"
+        _ -> "?"
+    }
+}
+
+// ----- operand roles ---------------------------------------------------------
+// 0: unused, 1: written, 2: read, 3: read and written. Field 0 is the
+// destination (or the stored value), 1 a base register or the first operand
+// of a comparison, 2 the source, 3 a second register an instruction writes
+// without naming it (`idiv`'s remainder).
+
+pub let ROLE_NONE = 0
+pub let ROLE_DEF = 1
+pub let ROLE_USE = 2
+pub let ROLE_USEDEF = 3
+
+fn is_load(m: i64) -> bool {
+    m == X_LOAD or m == X_LEA or (m >= X_LOAD8U and m <= X_LOAD32S) or m == X_MOVSD_LOAD
+}
+
+fn is_store(m: i64) -> bool {
+    m == X_STORE or (m >= X_STORE8 and m <= X_STORE32) or m == X_MOVSD_STORE
+}
+
+fn is_atomic(m: i64) -> bool {
+    m >= X_XCHG8 and m <= X_CMPXCHG64
+}
+
+/// The memory forms whose address is `imm(%rn)`.
+pub fn is_mem(m: i64) -> bool {
+    is_load(m) or is_store(m) or is_atomic(m) or m == X_CALLM or (m >= X_STMXCSR and m <= X_FLDCW)
+}
+
+pub fn role_d(m: i64) -> i64 {
+    if (m >= X_ADD and m <= X_IMUL) or (m >= X_ADDI and m <= X_XORI) or (m >= X_SHL and m <= X_NOT) {
+        ROLE_USEDEF
+    } else if m == X_IDIV or m == X_DIV or is_atomic(m) or (m >= X_ADDSD and m <= X_DIVSD) or m == X_ANDPD or m == X_XORPD {
+        ROLE_USEDEF
+    } else if m == X_CMOV or (m >= X_BSWAP and m <= X_ROLW8) {
+        ROLE_USEDEF
+    } else if is_store(m) {
+        ROLE_USE
+    } else if m == X_IMULI or m == X_CQO or (m >= X_MOV and m <= X_MOVABS) or is_load(m) {
+        ROLE_DEF
+    } else if (m >= X_LEA_RIP and m <= X_LOAD_TLV) or m == X_POP or m == X_MOVAPS or m == X_SQRTSD or m == X_ROUNDSD {
+        ROLE_DEF
+    } else if (m >= X_CVTSI2SD and m <= X_MOVQ_FROMX) or m == X_BSR {
+        ROLE_DEF
+    } else {
+        ROLE_NONE
+    }
+}
+
+pub fn role_n(m: i64) -> i64 {
+    if m == X_CMP or m == X_TEST or m == X_CMPI or m == X_IMULI or m == X_CQO or m == X_UCOMISD {
+        ROLE_USE
+    } else if is_mem(m) or m == X_CALLR or m == X_PUSH {
+        ROLE_USE
+    } else {
+        ROLE_NONE
+    }
+}
+
+pub fn role_m(m: i64) -> i64 {
+    if (m >= X_ADD and m <= X_TEST) or (m >= X_SHL and m <= X_ROR) or m == X_IDIV or m == X_DIV {
+        ROLE_USE
+    } else if (m >= X_MOV and m <= X_MOVZXW) or (m >= X_CMPXCHG8 and m <= X_CMPXCHG64) {
+        ROLE_USE
+    } else if (m >= X_MOVAPS and m <= X_MOVQ_FROMX) or m == X_BSR or m == X_CMOV {
+        ROLE_USE
+    } else {
+        ROLE_NONE
+    }
+}
+
+pub fn role_a(m: i64) -> i64 {
+    if m == X_IDIV or m == X_DIV { ROLE_USEDEF } else { ROLE_NONE }
+}
+
+/// Whether field `field` of opcode `m` is an xmm register; every other
+/// register field is a general one.
+pub fn fp_field(m: i64, field: i64) -> bool {
+    if (m >= X_MOVAPS and m <= X_ROUNDSD) {
+        field == 0 or field == 2
+    } else if m == X_UCOMISD {
+        field == 1 or field == 2
+    } else if m == X_CVTSI2SD or m == X_MOVQ_TOX or m == X_MOVSD_LOAD or m == X_MOVSD_STORE {
+        field == 0
+    } else if m == X_CVTTSD2SI or m == X_MOVQ_FROMX {
+        field == 2
+    } else {
+        false
+    }
+}
+
+/// The one register field `field` of `m` must be, or -1 when any will do:
+/// the operands the instruction reads or writes without naming them.
+pub fn fixed_reg(m: i64, field: i64) -> i64 {
+    if m == X_CQO {
+        if field == 0 { RDX } else if field == 1 { RAX } else { -1 }
+    } else if m == X_IDIV or m == X_DIV {
+        if field == 0 { RAX } else if field == 3 { RDX } else { -1 }
+    } else if m >= X_CMPXCHG8 and m <= X_CMPXCHG64 {
+        if field == 0 { RAX } else { -1 }
+    } else if m >= X_SHL and m <= X_ROR {
+        if field == 2 { RCX } else { -1 }
+    } else {
+        -1
+    }
+}
+
+// ----- conditions --------------------------------------------------------------
+// The condition codes, as the low four bits of `jcc`, `setcc` and `cmovcc`.
+
+pub let C_O = 0
+pub let C_NO = 1
+/// Below (unsigned <): CF.
+pub let C_B = 2
+/// Above or equal (unsigned >=): not CF.
+pub let C_AE = 3
+pub let C_E = 4
+pub let C_NE = 5
+/// Below or equal (unsigned <=): CF or ZF.
+pub let C_BE = 6
+/// Above (unsigned >): neither CF nor ZF.
+pub let C_A = 7
+pub let C_S = 8
+pub let C_NS = 9
+/// Parity: after `ucomisd`, unordered.
+pub let C_P = 10
+pub let C_NP = 11
+pub let C_L = 12
+pub let C_GE = 13
+pub let C_LE = 14
+pub let C_G = 15
+
+pub fn cond_name(c: i64) -> str {
+    match c {
+        0 -> "o"
+        1 -> "no"
+        2 -> "b"
+        3 -> "ae"
+        4 -> "e"
+        5 -> "ne"
+        6 -> "be"
+        7 -> "a"
+        8 -> "s"
+        9 -> "ns"
+        10 -> "p"
+        11 -> "np"
+        12 -> "l"
+        13 -> "ge"
+        14 -> "le"
+        _ -> "g"
+    }
+}
+
+/// The condition that holds exactly when `c` does not.
+pub fn cond_invert(c: i64) -> i64 {
+    c.bit_xor(1)
+}
+
+// ----- relocations ---------------------------------------------------------------
+// The x86-64 Mach-O relocation types a form's last four bytes take, as
+// <mach-o/x86_64/reloc.h> numbers them.
+
+pub let REL_NONE = -1
+pub let REL_SIGNED = 1
+pub let REL_BRANCH = 2
+pub let REL_GOT_LOAD = 3
+pub let REL_TLV = 9
+
+/// The relocation type the 32-bit field at the end of form `m` takes when it
+/// names a symbol, or `REL_NONE`.
+pub fn reloc_kind(m: i64) -> i64 {
+    if m == X_CALL {
+        REL_BRANCH
+    } else if m == X_LEA_RIP {
+        REL_SIGNED
+    } else if m == X_LOAD_GOT {
+        REL_GOT_LOAD
+    } else if m == X_LOAD_TLV {
+        REL_TLV
+    } else {
+        REL_NONE
+    }
+}
+
+// ----- encoding ------------------------------------------------------------------
+
+/// A register operand of field `field` as its 4-bit number, refusing one of
+/// the wrong file, a virtual one, or another register where the form fixes
+/// one.
+fn reg_field(m: i64, field: i64, o: i64) -> i64 ! str {
+    if o < 0 {
+        fail("{form_name(m)}: operand {field} is missing")
+    }
+    if is_vreg(o) {
+        fail("{form_name(m)}: operand {field} is still virtual (v{o - VR})")
+    }
+    let fixed = fixed_reg(m, field)
+    if fixed >= 0 and o != fixed {
+        fail("{form_name(m)}: operand {field} must be %{reg_name(fixed, 64)}, not {reg_text(m, field, o)}")
+    }
+    if fp_field(m, field) {
+        if not is_xmm(o) {
+            fail("{form_name(m)}: operand {field} is an xmm register, not {reg_text(X_ADD, 0, o)}")
+        }
+        return o - R_X0
+    }
+    if is_xmm(o) {
+        fail("{form_name(m)}: operand {field} is a general register, not %xmm{o - R_X0}")
+    }
+    if not is_gpr(o) {
+        fail("{form_name(m)}: no register {o}")
+    }
+    o
+}
+
+fn fits8(v: i64) -> bool {
+    v >= -128 and v <= 127
+}
+
+fn fits32(v: i64) -> bool {
+    v >= -2147483648 and v <= 2147483647
+}
+
+fn put32(inout b: [i64], v: i64) {
+    for k in 0..4 {
+        b.push(v.ushr(8 * k).bit_and(255))
+    }
+}
+
+fn put64(inout b: [i64], v: i64) {
+    for k in 0..8 {
+        b.push(v.ushr(8 * k).bit_and(255))
+    }
+}
+
+/// A REX prefix when one is needed: W for a 64-bit operation, R, X and B the
+/// fourth bits of the ModRM `reg` field, the SIB index and the ModRM `rm` (or
+/// SIB base, or opcode register) field; and a bare 0x40 when `force`, which
+/// an 8-bit operand in spl, bpl, sil or dil needs (without a REX prefix their
+/// numbers mean ah, ch, dh and bh).
+fn rex(inout b: [i64], w: bool, r: i64, x: i64, rb: i64, force: bool) {
+    var v = 64
+    if w {
+        v = v.bit_or(8)
+    }
+    v = v.bit_or(r.shr(3).bit_and(1).shl(2))
+    v = v.bit_or(x.shr(3).bit_and(1).shl(1))
+    v = v.bit_or(rb.shr(3).bit_and(1))
+    if v != 64 or force {
+        b.push(v)
+    }
+    ()
+}
+
+/// Whether an 8-bit operand in register `r` needs a REX prefix to be named.
+fn byte_rex(r: i64) -> bool {
+    r >= 4 and r <= 7
+}
+
+fn put_all(inout b: [i64], xs: [i64]) {
+    for x in xs {
+        b.push(x)
+    }
+    ()
+}
+
+/// `prefixes`, REX, `op`, then a ModRM byte naming two registers.
+fn enc_rr(pre: [i64], w: bool, op: [i64], reg: i64, rm: i64, force: bool) -> [i64] {
+    var b: [i64] = []
+    put_all(b, pre)
+    rex(b, w, reg, 0, rm, force)
+    put_all(b, op)
+    b.push(192 + reg.bit_and(7).shl(3) + rm.bit_and(7))
+    b
+}
+
+/// The ModRM byte for `disp(%base)`, with a SIB byte for a base of rsp or r12
+/// (whose `rm` encoding means "a SIB byte follows"), and the displacement in
+/// the fewest bytes: none for 0 but for a base of rbp or r13 (whose mode-0
+/// encoding means another thing: RIP-relative and no base), else one byte
+/// when it fits, else four.
+fn put_mem(inout b: [i64], reg: i64, base: i64, disp: i64) {
+    let lo = base.bit_and(7)
+    var md = 2
+    if disp == 0 and lo != 5 {
+        md = 0
+    } else if fits8(disp) {
+        md = 1
+    }
+    b.push(md.shl(6) + reg.bit_and(7).shl(3) + lo)
+    if lo == 4 {
+        b.push(36)
+    }
+    if md == 1 {
+        b.push(disp.bit_and(255))
+    } else if md == 2 {
+        put32(b, disp)
+    }
+    ()
+}
+
+/// `prefixes`, REX, `op`, then `disp(%base)` with `reg` in the ModRM `reg`
+/// field.
+fn enc_mem(pre: [i64], w: bool, op: [i64], reg: i64, base: i64, disp: i64, force: bool) -> [i64] {
+    var b: [i64] = []
+    put_all(b, pre)
+    rex(b, w, reg, 0, base, force)
+    put_all(b, op)
+    put_mem(b, reg, base, disp)
+    b
+}
+
+/// The arithmetic group's digit (the ModRM `reg` field of `81`/`83`) and its
+/// short `rax` opcode.
+fn group_digit(m: i64) -> i64 {
+    match m {
+        9 -> 0
+        10 -> 5
+        11 -> 4
+        12 -> 1
+        13 -> 6
+        _ -> 7
+    }
+}
+
+fn group_rax_op(m: i64) -> i64 {
+    match m {
+        9 -> 5
+        10 -> 45
+        11 -> 37
+        12 -> 13
+        13 -> 53
+        _ -> 61
+    }
+}
+
+/// The shift group's digit: `rol` 0, `ror` 1, `shl` 4, `shr` 5, `sar` 7.
+fn shift_digit(m: i64) -> i64 {
+    if m == X_SHL or m == X_SHLI {
+        4
+    } else if m == X_SHR or m == X_SHRI {
+        5
+    } else if m == X_SAR or m == X_SARI {
+        7
+    } else {
+        1
+    }
+}
+
+fn rel_text(off: i64) -> str {
+    if off < 0 {
+        ".-{0 - off}"
+    } else {
+        ".+{off}"
+    }
+}
+
+/// One instruction's bytes. `off` is a branch's byte offset from its own
+/// start to its target; an instruction a relocation completes (`call sym`,
+/// the RIP-relative forms) is encoded with its 32-bit field zero, as the
+/// assembler leaves it for the linker.
+pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, cc: i64, off: i64) -> [i64] ! str {
+    let none: [i64] = []
+    if (m >= X_ADD and m <= X_XOR) or m == X_MOV or m == X_MOV32 {
+        // MR: `op %rm, %rd`, the source in the ModRM `reg` field.
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        let op = match m {
+            1 -> 1
+            2 -> 41
+            3 -> 33
+            4 -> 9
+            5 -> 49
+            _ -> 137
+        }
+        return enc_rr(none, m != X_MOV32, [op], s, d, false)
+    }
+    if m == X_CMP or m == X_TEST {
+        let a = try reg_field(m, 1, rn)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr(none, true, [if m == X_CMP { 57 } else { 133 }], s, a, false)
+    }
+    if m == X_IMUL {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr(none, true, [15, 175], d, s, false)
+    }
+    if (m >= X_ADDI and m <= X_XORI) or m == X_CMPI {
+        let r = if m == X_CMPI { try reg_field(m, 1, rn) } else { try reg_field(m, 0, rd) }
+        if not fits32(imm) {
+            fail("{form_name(m)}: immediate {imm} does not fit in 32 bits")
+        }
+        let dg = group_digit(m)
+        if fits8(imm) {
+            var b = enc_rr(none, true, [131], dg, r, false)
+            b.push(imm.bit_and(255))
+            return b
+        }
+        if r == RAX {
+            var b: [i64] = [72, group_rax_op(m)]
+            put32(b, imm)
+            return b
+        }
+        var b = enc_rr(none, true, [129], dg, r, false)
+        put32(b, imm)
+        return b
+    }
+    if m == X_IMULI {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 1, rn)
+        if not fits32(imm) {
+            fail("{form_name(m)}: immediate {imm} does not fit in 32 bits")
+        }
+        if fits8(imm) {
+            var b = enc_rr(none, true, [107], d, s, false)
+            b.push(imm.bit_and(255))
+            return b
+        }
+        var b = enc_rr(none, true, [105], d, s, false)
+        put32(b, imm)
+        return b
+    }
+    if m >= X_SHL and m <= X_ROR {
+        let d = try reg_field(m, 0, rd)
+        let _c = try reg_field(m, 2, rm)
+        return enc_rr(none, true, [211], shift_digit(m), d, false)
+    }
+    if m >= X_SHLI and m <= X_RORI {
+        let d = try reg_field(m, 0, rd)
+        if imm < 0 or imm > 63 {
+            fail("{form_name(m)}: shift count {imm} is not in 0..63")
+        }
+        if imm == 1 {
+            return enc_rr(none, true, [209], shift_digit(m), d, false)
+        }
+        var b = enc_rr(none, true, [193], shift_digit(m), d, false)
+        b.push(imm)
+        return b
+    }
+    if m == X_NEG or m == X_NOT {
+        let d = try reg_field(m, 0, rd)
+        return enc_rr(none, true, [247], if m == X_NEG { 3 } else { 2 }, d, false)
+    }
+    if m == X_CQO {
+        let _d = try reg_field(m, 0, rd)
+        let _n = try reg_field(m, 1, rn)
+        return [72, 153]
+    }
+    if m == X_IDIV or m == X_DIV {
+        let _q = try reg_field(m, 0, rd)
+        let _r = try reg_field(m, 3, ra)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr(none, true, [247], if m == X_IDIV { 7 } else { 6 }, s, false)
+    }
+    if m >= X_MOVSXB and m <= X_MOVZXW {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        if m == X_MOVSXB {
+            return enc_rr(none, true, [15, 190], d, s, false)
+        }
+        if m == X_MOVSXW {
+            return enc_rr(none, true, [15, 191], d, s, false)
+        }
+        if m == X_MOVSXD {
+            return enc_rr(none, true, [99], d, s, false)
+        }
+        if m == X_MOVZXB {
+            return enc_rr(none, false, [15, 182], d, s, byte_rex(s))
+        }
+        return enc_rr(none, false, [15, 183], d, s, false)
+    }
+    if m == X_SETCC {
+        let d = try reg_field(m, 0, rd)
+        if cc < 0 or cc > 15 {
+            fail("setcc: condition {cc} is not one")
+        }
+        return enc_rr(none, false, [15, 144 + cc], 0, d, byte_rex(d))
+    }
+    if m == X_MOVI32 {
+        let d = try reg_field(m, 0, rd)
+        if imm < 0 or imm > 4294967295 {
+            fail("{form_name(m)}: immediate {imm} is not in 0..2^32-1")
+        }
+        var b: [i64] = []
+        rex(b, false, 0, 0, d, false)
+        b.push(184 + d.bit_and(7))
+        put32(b, imm)
+        return b
+    }
+    if m == X_MOVSI {
+        let d = try reg_field(m, 0, rd)
+        if not fits32(imm) {
+            fail("{form_name(m)}: immediate {imm} does not fit in 32 bits")
+        }
+        var b = enc_rr(none, true, [199], 0, d, false)
+        put32(b, imm)
+        return b
+    }
+    if m == X_MOVABS {
+        let d = try reg_field(m, 0, rd)
+        var b: [i64] = []
+        rex(b, true, 0, 0, d, false)
+        b.push(184 + d.bit_and(7))
+        put64(b, imm)
+        return b
+    }
+    if is_load(m) or is_store(m) {
+        let r = try reg_field(m, 0, rd)
+        let base = try reg_field(m, 1, rn)
+        if not fits32(imm) {
+            fail("{form_name(m)}: displacement {imm} does not fit in 32 bits")
+        }
+        return match m {
+            40 -> enc_mem(none, true, [139], r, base, imm, false)
+            41 -> enc_mem(none, true, [137], r, base, imm, false)
+            42 -> enc_mem(none, true, [141], r, base, imm, false)
+            43 -> enc_mem(none, false, [15, 182], r, base, imm, false)
+            44 -> enc_mem(none, true, [15, 190], r, base, imm, false)
+            45 -> enc_mem(none, false, [15, 183], r, base, imm, false)
+            46 -> enc_mem(none, true, [15, 191], r, base, imm, false)
+            47 -> enc_mem(none, false, [139], r, base, imm, false)
+            48 -> enc_mem(none, true, [99], r, base, imm, false)
+            49 -> enc_mem(none, false, [136], r, base, imm, byte_rex(r))
+            50 -> enc_mem([102], false, [137], r, base, imm, false)
+            51 -> enc_mem(none, false, [137], r, base, imm, false)
+            92 -> enc_mem([242], false, [15, 16], r, base, imm, false)
+            _ -> enc_mem([242], false, [15, 17], r, base, imm, false)
+        }
+    }
+    if is_atomic(m) {
+        // `xchg` and `xadd` name their register in field 0, `cmpxchg` its new
+        // value in field 2 (rax, field 0, is implicit). A 16-bit form's
+        // operand-size prefix comes before `lock`, as the assembler writes it.
+        let sz = access_size(m)
+        let w = sz == 8
+        let reg = if m >= X_CMPXCHG8 { try reg_field(m, 2, rm) } else { try reg_field(m, 0, rd) }
+        if m >= X_CMPXCHG8 {
+            let _a = try reg_field(m, 0, rd)
+        }
+        let base = try reg_field(m, 1, rn)
+        if not fits32(imm) {
+            fail("{form_name(m)}: displacement {imm} does not fit in 32 bits")
+        }
+        var pre: [i64] = []
+        if sz == 2 {
+            pre.push(102)
+        }
+        if m >= X_XADD8 {
+            pre.push(240)
+        }
+        // `xchg` is 86 (a byte) or 87; `xadd` 0F C0 or C1; `cmpxchg` 0F B0
+        // or B1.
+        let narrow = sz == 1
+        var op: [i64] = []
+        if m <= X_XCHG64 {
+            op.push(if narrow { 134 } else { 135 })
+        } else {
+            op.push(15)
+            if m <= X_XADD64 {
+                op.push(if narrow { 192 } else { 193 })
+            } else {
+                op.push(if narrow { 176 } else { 177 })
+            }
+        }
+        return enc_mem(pre, w, op, reg, base, imm, narrow and byte_rex(reg))
+    }
+    if m >= X_LEA_RIP and m <= X_LOAD_TLV {
+        // ModRM mode 0 with rm 101: a 32-bit displacement from the next
+        // instruction, left zero for the relocation.
+        let d = try reg_field(m, 0, rd)
+        var b: [i64] = []
+        rex(b, true, d, 0, 0, false)
+        b.push(if m == X_LEA_RIP { 141 } else { 139 })
+        b.push(d.bit_and(7).shl(3) + 5)
+        put32(b, 0)
+        return b
+    }
+    if m == X_CALL {
+        return [232, 0, 0, 0, 0]
+    }
+    if m == X_CALLR {
+        let r = try reg_field(m, 1, rn)
+        return enc_rr(none, false, [255], 2, r, false)
+    }
+    if m == X_CALLM or (m >= X_STMXCSR and m <= X_FLDCW) {
+        let base = try reg_field(m, 1, rn)
+        if not fits32(imm) {
+            fail("{form_name(m)}: displacement {imm} does not fit in 32 bits")
+        }
+        return match m {
+            69 -> enc_mem(none, false, [255], 2, base, imm, false)
+            99 -> enc_mem(none, false, [15, 174], 3, base, imm, false)
+            100 -> enc_mem(none, false, [15, 174], 2, base, imm, false)
+            101 -> enc_mem(none, false, [217], 7, base, imm, false)
+            _ -> enc_mem(none, false, [217], 5, base, imm, false)
+        }
+    }
+    if m == X_RET {
+        return [195]
+    }
+    if m == X_UD2 {
+        return [15, 11]
+    }
+    if m == X_JMP8 or m == X_JCC8 {
+        if m == X_JCC8 and (cc < 0 or cc > 15) {
+            fail("jcc8: condition {cc} is not one")
+        }
+        let rel = off - 2
+        if not fits8(rel) {
+            fail("{form_name(m)}: branch offset {off} is out of the 8-bit range")
+        }
+        return [if m == X_JMP8 { 235 } else { 112 + cc }, rel.bit_and(255)]
+    }
+    if m == X_JMP32 {
+        let rel = off - 5
+        if not fits32(rel) {
+            fail("jmp32: branch offset {off} is out of range")
+        }
+        var b: [i64] = [233]
+        put32(b, rel)
+        return b
+    }
+    if m == X_JCC32 {
+        if cc < 0 or cc > 15 {
+            fail("jcc32: condition {cc} is not one")
+        }
+        let rel = off - 6
+        if not fits32(rel) {
+            fail("jcc32: branch offset {off} is out of range")
+        }
+        var b: [i64] = [15, 128 + cc]
+        put32(b, rel)
+        return b
+    }
+    if m == X_PUSH or m == X_POP {
+        let r = if m == X_PUSH { try reg_field(m, 1, rn) } else { try reg_field(m, 0, rd) }
+        let op = if m == X_PUSH { 80 } else { 88 }
+        var b: [i64] = []
+        rex(b, false, 0, 0, r, false)
+        b.push(op + r.bit_and(7))
+        return b
+    }
+    if m == X_MOVAPS or (m >= X_ADDSD and m <= X_ROUNDSD) {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        if m == X_MOVAPS {
+            return enc_rr(none, false, [15, 40], d, s, false)
+        }
+        if m == X_ANDPD or m == X_XORPD {
+            return enc_rr([102], false, [15, if m == X_ANDPD { 84 } else { 87 }], d, s, false)
+        }
+        if m == X_ROUNDSD {
+            if imm < 0 or imm > 255 {
+                fail("roundsd: mode {imm} does not fit in 8 bits")
+            }
+            var b = enc_rr([102], false, [15, 58, 11], d, s, false)
+            b.push(imm)
+            return b
+        }
+        let op = match m {
+            79 -> 88
+            80 -> 92
+            81 -> 89
+            82 -> 94
+            _ -> 81
+        }
+        return enc_rr([242], false, [15, op], d, s, false)
+    }
+    if m == X_UCOMISD {
+        let a = try reg_field(m, 1, rn)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr([102], false, [15, 46], a, s, false)
+    }
+    if m == X_CVTSI2SD or m == X_CVTTSD2SI {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr([242], true, [15, if m == X_CVTSI2SD { 42 } else { 44 }], d, s, false)
+    }
+    if m == X_MOVQ_TOX {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr([102], true, [15, 110], d, s, false)
+    }
+    if m == X_MOVQ_FROMX {
+        // `66 REX.W 0F 7E`: the xmm source in the `reg` field, the general
+        // destination in `rm`.
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        return enc_rr([102], true, [15, 126], s, d, false)
+    }
+    if m == X_BSR or m == X_CMOV {
+        let d = try reg_field(m, 0, rd)
+        let s = try reg_field(m, 2, rm)
+        if m == X_BSR {
+            return enc_rr(none, true, [15, 189], d, s, false)
+        }
+        if cc < 0 or cc > 15 {
+            fail("cmov: condition {cc} is not one")
+        }
+        return enc_rr(none, true, [15, 64 + cc], d, s, false)
+    }
+    if m == X_BSWAP or m == X_BSWAP32 {
+        let d = try reg_field(m, 0, rd)
+        var b: [i64] = []
+        rex(b, m == X_BSWAP, 0, 0, d, false)
+        b.push(15)
+        b.push(200 + d.bit_and(7))
+        return b
+    }
+    if m == X_ROLW8 {
+        let d = try reg_field(m, 0, rd)
+        var b = enc_rr([102], false, [193], 0, d, false)
+        b.push(8)
+        return b
+    }
+    fail("opcode {m} has no encoding")
+}
+
+// ----- assembly text -------------------------------------------------------------
+
+/// General register `r`'s name at `bits` (64, 32, 16 or 8).
+pub fn reg_name(r: i64, bits: i64) -> str {
+    if r >= 8 {
+        return if bits == 64 { "r{r}" } else if bits == 32 { "r{r}d" } else if bits == 16 { "r{r}w" } else { "r{r}b" }
+    }
+    let base = match r {
+        0 -> "ax"
+        1 -> "cx"
+        2 -> "dx"
+        3 -> "bx"
+        4 -> "sp"
+        5 -> "bp"
+        6 -> "si"
+        _ -> "di"
+    }
+    if bits == 64 {
+        return "r" + base
+    }
+    if bits == 32 {
+        return "e" + base
+    }
+    if bits == 16 {
+        return base
+    }
+    match r {
+        0 -> "al"
+        1 -> "cl"
+        2 -> "dl"
+        3 -> "bl"
+        _ -> base + "l"
+    }
+}
+
+/// The width at which field `field` of `m` names a general register.
+fn field_bits(m: i64, field: i64) -> i64 {
+    if m == X_MOV32 or m == X_MOVI32 or m == X_BSWAP32 {
+        return 32
+    }
+    if (m == X_MOVZXB or m == X_MOVZXW or m == X_LOAD8U or m == X_LOAD16U or m == X_LOAD32U) and field == 0 {
+        return 32
+    }
+    if (m == X_MOVSXB or m == X_MOVZXB) and field == 2 {
+        return 8
+    }
+    if (m == X_MOVSXW or m == X_MOVZXW) and field == 2 {
+        return 16
+    }
+    if m == X_MOVSXD and field == 2 {
+        return 32
+    }
+    if m == X_SHL or m == X_SHR or m == X_SAR or m == X_ROR {
+        return if field == 2 { 8 } else { 64 }
+    }
+    if m == X_SETCC {
+        return 8
+    }
+    if m == X_ROLW8 {
+        return 16
+    }
+    if is_store(m) or is_atomic(m) {
+        if field == 1 {
+            return 64
+        }
+        return access_size(m) * 8
+    }
+    64
+}
+
+/// Operand `o` of field `field` of `m`, as the assembler reads it.
+pub fn reg_text(m: i64, field: i64, o: i64) -> str {
+    if is_vreg(o) {
+        return "%v{o - VR}"
+    }
+    if is_xmm(o) {
+        return "%xmm{o - R_X0}"
+    }
+    if o < 0 {
+        return "%?"
+    }
+    "%" + reg_name(o, field_bits(m, field))
+}
+
+fn mem_text(base: i64, disp: i64) -> str {
+    let b = if is_vreg(base) { "%v{base - VR}" } else { "%" + reg_name(base, 64) }
+    if disp == 0 {
+        "({b})"
+    } else {
+        "{disp}({b})"
+    }
+}
+
+/// The instruction as the system assembler reads it. `target` is what a
+/// call or a RIP-relative form refers to; a branch is written as an offset
+/// from itself.
+pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, cc: i64, off: i64, target: str) -> str {
+    let name = mnem(m)
+    let d = reg_text(m, 0, rd)
+    let n = reg_text(m, 1, rn)
+    let s = reg_text(m, 2, rm)
+    if (m >= X_ADD and m <= X_IMUL) or (m >= X_MOV and m <= X_MOVZXW) {
+        return "{name} {s}, {d}"
+    }
+    if m == X_CMP or m == X_TEST or m == X_UCOMISD {
+        return "{name} {s}, {n}"
+    }
+    if (m >= X_ADDI and m <= X_XORI) or (m >= X_SHLI and m <= X_RORI) {
+        return "{name} ${imm}, {d}"
+    }
+    if m == X_CMPI {
+        return "{name} ${imm}, {n}"
+    }
+    if m == X_IMULI {
+        return "{name} ${imm}, {n}, {d}"
+    }
+    if m >= X_SHL and m <= X_ROR {
+        return "{name} %cl, {d}"
+    }
+    if m == X_NEG or m == X_NOT or m == X_BSWAP or m == X_BSWAP32 {
+        return "{name} {d}"
+    }
+    if m == X_CQO or m == X_RET or m == X_UD2 {
+        return name
+    }
+    if m == X_IDIV or m == X_DIV {
+        return "{name} {s}"
+    }
+    if m == X_SETCC {
+        return "set{cond_name(cc)} {d}"
+    }
+    if m == X_MOVI32 or m == X_MOVSI or m == X_MOVABS {
+        return "{name} ${imm}, {d}"
+    }
+    if is_load(m) {
+        return "{name} {mem_text(rn, imm)}, {d}"
+    }
+    if is_store(m) or (m >= X_XCHG8 and m <= X_XADD64) {
+        return "{name} {d}, {mem_text(rn, imm)}"
+    }
+    if m >= X_CMPXCHG8 and m <= X_CMPXCHG64 {
+        return "{name} {s}, {mem_text(rn, imm)}"
+    }
+    if m == X_LEA_RIP {
+        return "{name} {target}(%rip), {d}"
+    }
+    if m == X_LOAD_GOT {
+        return "{name} {target}@GOTPCREL(%rip), {d}"
+    }
+    if m == X_LOAD_TLV {
+        return "{name} {target}@TLVP(%rip), {d}"
+    }
+    if m == X_CALL {
+        return if target != "" { "{name} {target}" } else { "{name} {rel_text(off)}" }
+    }
+    if m == X_CALLR {
+        return "{name} *{n}"
+    }
+    if m == X_CALLM {
+        return "{name} *{mem_text(rn, imm)}"
+    }
+    if m == X_JMP8 or m == X_JMP32 {
+        return if target != "" { "jmp {target}" } else { "{name} {rel_text(off)}" }
+    }
+    if m == X_JCC8 or m == X_JCC32 {
+        let sfx = if m == X_JCC8 { ".d8" } else { ".d32" }
+        return if target != "" { "j{cond_name(cc)} {target}" } else { "j{cond_name(cc)}{sfx} {rel_text(off)}" }
+    }
+    if m == X_PUSH {
+        return "{name} {n}"
+    }
+    if m == X_POP {
+        return "{name} {d}"
+    }
+    if m == X_MOVAPS or (m >= X_ADDSD and m <= X_XORPD) or (m >= X_CVTSI2SD and m <= X_MOVQ_FROMX) or m == X_BSR {
+        return "{name} {s}, {d}"
+    }
+    if m == X_ROUNDSD {
+        return "{name} ${imm}, {s}, {d}"
+    }
+    if m == X_CMOV {
+        return "cmov{cond_name(cc)}q {s}, {d}"
+    }
+    if m == X_ROLW8 {
+        return "{name} $8, {d}"
+    }
+    if m >= X_STMXCSR and m <= X_FLDCW {
+        return "{name} {mem_text(rn, imm)}"
+    }
+    if m == P_RETURN {
+        return "<return>"
+    }
+    if m == P_MOVIMM {
+        return "<movimm> ${imm}, {d}"
+    }
+    "<?>"
+}
+
+/// The form `P_MOVIMM` of constant `k` becomes: the 32-bit move for a value
+/// whose upper half is zero, the sign-extending 32-bit one for a small
+/// negative value, and the 64-bit immediate for any other -- none of which
+/// touches the flags, so a constant may sit between a comparison and its
+/// reader.
+pub fn movimm_form(k: i64) -> i64 {
+    if k >= 0 and k <= 4294967295 {
+        X_MOVI32
+    } else if fits32(k) {
+        X_MOVSI
+    } else {
+        X_MOVABS
+    }
+}

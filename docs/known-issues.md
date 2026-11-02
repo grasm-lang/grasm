@@ -9,14 +9,42 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
 two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: nine, a nested
-interpolation's spans, a backslash at the end of a file, six in `grasm
+branches' values differ, refused natively. Open S4: ten, a nested
+interpolation's spans, a backslash at the end of a file, a space `grasm fmt`
+drops before a brace, six in `grasm
 check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
 a type shown as `_`, a contract's row breach reported twice, a ceiling
 refusal without its reason, and a `match`'s names unbound after an error;
 and one in `compiler/s3`, which no release ships yet, an object naming the
 directory it was compiled in. Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches.**
+
+## Found on 2026-11-02 by S7 part one (the x86-64 encoder)
+
+**`grasm fmt` drops the space before the brace of a multi-line `if` in a
+`let` whose condition ends in a capitalised name -- *open, S4*.** The
+formatted text still parses as the same `if` and runs the same, so nothing
+but the look of the code is wrong, and `fmttest` passes the formatter's own
+output; it showed in `compiler/x86_64/src/mach.gr`, whose condition was
+`m <= X_XCHG64`, and that code was rewritten as statements. A one-line `if`,
+an `if` statement and a lower-case name are formatted correctly:
+
+```
+let X_A = 3
+
+fn f(m: i64) -> i64 {
+    let j = if m == X_A {     // grasm fmt writes `if m == X_A{`
+        7
+    } else {
+        8
+    }
+    j
+}
+```
+
+The formatter seems to read `X_A {` as the start of a struct literal, as the
+parser may not in a condition; not investigated further, since the Rust
+toolchain is not changed during S7.
 
 ## Found on 2026-11-01 by S6 (the compiler built by itself)
 

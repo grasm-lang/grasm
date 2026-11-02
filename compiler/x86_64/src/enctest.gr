@@ -1,0 +1,261 @@
+// The x86-64 encoder's test cases: for every instruction form, operands
+// generated across their ranges -- every register in every field it may take,
+// immediates and displacements at the edges of each encoding the assembler
+// chooses between (8 and 32 bits, the short `rax` forms, a shift by one) and
+// between them, every condition, branch offsets to the edge of their reach,
+// every base register a memory operand can have (rsp and r12, which need a SIB
+// byte; rbp and r13, which need a displacement even when it is 0) -- each
+// with the bytes the encoder makes, the line the system assembler reads, and
+// where the relocation a symbol needs must land. `scripts/encodetest_x64.sh`
+// assembles the lines and compares the bytes, case by case, and the
+// relocations, as `scripts/encodetest.sh` does for AArch64.
+import mach
+
+type X64Cases = {
+    form: [str],
+    asm: [str],
+    /// Each case's bytes, as hex.
+    hex: [str],
+    /// The offset in the instruction of the relocation the assembler must
+    /// write, and its type (`mach.REL_*`); -1 for none.
+    rel_off: [i64],
+    rel_kind: [i64],
+}
+
+type X64Rng = {
+    s: i64,
+}
+
+fn next(inout g: X64Rng) -> i64 {
+    g.s = g.s * 6364136223846793005 + 1442695040888963407
+    g.s.ushr(17)
+}
+
+/// A number in `lo..=hi`.
+fn pick(inout g: X64Rng, lo: i64, hi: i64) -> i64 {
+    let n = next(g)
+    lo + n % (hi - lo + 1)
+}
+
+/// A full 64-bit word.
+fn word(inout g: X64Rng) -> i64 {
+    let a = next(g)
+    let b = next(g)
+    a.shl(32).bit_xor(b)
+}
+
+/// The register for case `k` of field `f`: every one of the sixteen once in
+/// the first 16 cases, each field in a different order, then random ones.
+fn reg_for(inout g: X64Rng, k: i64, f: i64) -> i64 {
+    if k < 16 {
+        (k * (2 * f + 1) + 5 * f) % 16
+    } else {
+        pick(g, 0, 15)
+    }
+}
+
+/// The register for field `f` of form `m`: the fixed one where the form fixes
+/// it, an xmm register where it takes one, else a general one.
+fn reg_of(inout g: X64Rng, m: i64, k: i64, f: i64) -> i64 {
+    let fixed = mach.fixed_reg(m, f)
+    if fixed >= 0 {
+        return fixed
+    }
+    let r = reg_for(g, k, f)
+    if mach.fp_field(m, f) {
+        mach.R_X0 + r
+    } else {
+        r
+    }
+}
+
+fn hex2(b: i64) -> str {
+    b.to_base(16).pad_start(2, "0")
+}
+
+fn add(inout c: X64Cases, m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, cc: i64, off: i64, target: str) -> () ! str {
+    let bs = try mach.encode(m, rd, rn, rm, ra, imm, 0, cc, off)
+    var h = str_builder()
+    for b in bs {
+        h.push_str(hex2(b))
+    }
+    c.form.push(mach.form_name(m))
+    c.asm.push(mach.asm_text(m, rd, rn, rm, ra, imm, 0, cc, off, target))
+    c.hex.push(h.to_str())
+    let rk = if target != "" { mach.reloc_kind(m) } else { mach.REL_NONE }
+    c.rel_kind.push(rk)
+    c.rel_off.push(if rk == mach.REL_NONE { -1 } else { bs.len() - 4 })
+    ()
+}
+
+/// A signed 32-bit value: the edges of the 8-bit and 32-bit encodings first,
+/// then random ones of either size.
+fn simm32_for(inout g: X64Rng, k: i64) -> i64 {
+    let edges = [0, 1, -1, 127, -128, 128, -129, 2147483647, -2147483648, 255, 65535, 4096, -4096, 8, 16]
+    if k < edges.len() {
+        edges[k]
+    } else if k % 2 == 0 {
+        pick(g, -128, 127)
+    } else {
+        pick(g, -2147483648, 2147483647)
+    }
+}
+
+/// A displacement: as `simm32_for`, so 0 (no displacement but for rbp and
+/// r13), 8 bits and 32 bits are each met with every base register.
+fn disp_for(inout g: X64Rng, k: i64) -> i64 {
+    simm32_for(g, k)
+}
+
+/// A branch offset from the instruction's start for a form of `len` bytes
+/// whose displacement is `bits` wide: the ends of the reach, near zero both
+/// ways, and random ones.
+fn off_for(inout g: X64Rng, k: i64, len: i64, bits: i64) -> i64 {
+    let lo = 0 - 1.shl(bits - 1)
+    let hi = 1.shl(bits - 1) - 1
+    let edges = [len, len + 1, len - 1, 0, hi + len, lo + len, hi + len - 1, lo + len + 1, 2, 64]
+    if k < edges.len() {
+        edges[k]
+    } else {
+        pick(g, lo, hi) + len
+    }
+}
+
+pub fn cases() -> X64Cases ! str {
+    var c = X64Cases{ form: [], asm: [], hex: [], rel_off: [], rel_kind: [] }
+    var g = X64Rng{ s: 20261102 }
+    let n = 64
+    for m in mach.all_mops() {
+        if (m >= mach.X_ADD and m <= mach.X_IMUL) or (m >= mach.X_MOV and m <= mach.X_MOVZXW) or m == mach.X_MOVAPS or (m >= mach.X_ADDSD and m <= mach.X_XORPD) or (m >= mach.X_CVTSI2SD and m <= mach.X_MOVQ_FROMX) or m == mach.X_BSR {
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), -1, reg_of(g, m, k, 2), -1, 0, -1, 0, "")
+            }
+        } else if m == mach.X_CMP or m == mach.X_TEST or m == mach.X_UCOMISD {
+            for k in 0..n {
+                try add(c, m, -1, reg_of(g, m, k, 1), reg_of(g, m, k, 2), -1, 0, -1, 0, "")
+            }
+        } else if m >= mach.X_ADDI and m <= mach.X_XORI {
+            // Every register with the edge values, rax among them for the
+            // short form; then rax alone across the 32-bit range.
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, simm32_for(g, k), -1, 0, "")
+            }
+            for k in 0..16 {
+                try add(c, m, mach.RAX, -1, -1, -1, simm32_for(g, k), -1, 0, "")
+            }
+        } else if m == mach.X_CMPI {
+            for k in 0..n {
+                try add(c, m, -1, reg_of(g, m, k, 1), -1, -1, simm32_for(g, k), -1, 0, "")
+            }
+            for k in 0..16 {
+                try add(c, m, -1, mach.RAX, -1, -1, simm32_for(g, k), -1, 0, "")
+            }
+        } else if m == mach.X_IMULI {
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), reg_of(g, m, k, 1), -1, -1, simm32_for(g, k), -1, 0, "")
+            }
+        } else if m >= mach.X_SHL and m <= mach.X_ROR {
+            for k in 0..16 {
+                try add(c, m, reg_of(g, m, k, 0), -1, mach.RCX, -1, 0, -1, 0, "")
+            }
+        } else if m >= mach.X_SHLI and m <= mach.X_RORI {
+            // Every count, 1 (its own encoding) among them.
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, k, -1, 0, "")
+            }
+        } else if m == mach.X_NEG or m == mach.X_NOT or m == mach.X_BSWAP or m == mach.X_BSWAP32 or m == mach.X_ROLW8 or m == mach.X_POP {
+            for k in 0..16 {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, 0, -1, 0, "")
+            }
+        } else if m == mach.X_CQO {
+            try add(c, m, mach.RDX, mach.RAX, -1, -1, 0, -1, 0, "")
+        } else if m == mach.X_IDIV or m == mach.X_DIV {
+            for k in 0..16 {
+                try add(c, m, mach.RAX, -1, reg_of(g, m, k, 2), mach.RDX, 0, -1, 0, "")
+            }
+        } else if m == mach.X_SETCC {
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, 0, k % 16, 0, "")
+            }
+        } else if m == mach.X_CMOV {
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), -1, reg_of(g, m, k, 2), -1, 0, k % 16, 0, "")
+            }
+        } else if m == mach.X_MOVI32 {
+            let edges = [0, 1, 4294967295, 2147483648, 2147483647, 255, 65536, 127, 128]
+            for k in 0..n {
+                let v = if k < edges.len() { edges[k] } else { pick(g, 0, 4294967295) }
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, v, -1, 0, "")
+            }
+        } else if m == mach.X_MOVSI {
+            for k in 0..n {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, simm32_for(g, k), -1, 0, "")
+            }
+        } else if m == mach.X_MOVABS {
+            let mn = -9223372036854775807 - 1
+            let edges = [0, 1, -1, mn, 9223372036854775807, 4294967296, -2147483649, 81985529216486895, -6148914691236517206]
+            for k in 0..n {
+                let v = if k < edges.len() { edges[k] } else { word(g) }
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, v, -1, 0, "")
+            }
+        } else if m == mach.X_CALLM or (m >= mach.X_STMXCSR and m <= mach.X_FLDCW) {
+            for k in 0..n {
+                try add(c, m, -1, reg_of(g, m, k, 1), -1, -1, disp_for(g, k), -1, 0, "")
+            }
+        } else if mach.is_mem(m) {
+            // Loads, stores and atomics: the register (or a compare-and-swap's
+            // new value) and the base, each across the sixteen, and the
+            // displacement across its encodings.
+            for k in 0..n {
+                let r0 = reg_of(g, m, k, 0)
+                let base = reg_of(g, m, k, 1)
+                let r2 = if m >= mach.X_CMPXCHG8 and m <= mach.X_CMPXCHG64 { reg_of(g, m, k, 2) } else { -1 }
+                try add(c, m, r0, base, r2, -1, disp_for(g, k), -1, 0, "")
+            }
+        } else if m == mach.X_LEA_RIP {
+            for k in 0..16 {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, 0, -1, 0, "_s3_encode_data{k % 3}")
+            }
+        } else if m == mach.X_LOAD_GOT {
+            for k in 0..16 {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, 0, -1, 0, "_s3_encode_ext{k % 3}")
+            }
+        } else if m == mach.X_LOAD_TLV {
+            // A descriptor, left undefined here as the GOT cases' symbols are.
+            for k in 0..16 {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, 0, -1, 0, "_s3_encode_tlv{k % 3}")
+            }
+        } else if m == mach.X_CALL {
+            for k in 0..3 {
+                try add(c, m, -1, -1, -1, -1, 0, -1, 0, "_s3_encode_callee{k}")
+            }
+        } else if m == mach.X_CALLR or m == mach.X_PUSH {
+            for k in 0..16 {
+                try add(c, m, -1, reg_of(g, m, k, 1), -1, -1, 0, -1, 0, "")
+            }
+        } else if m == mach.X_RET or m == mach.X_UD2 {
+            try add(c, m, -1, -1, -1, -1, 0, -1, 0, "")
+        } else if m == mach.X_JMP8 or m == mach.X_JCC8 {
+            for k in 0..n {
+                try add(c, m, -1, -1, -1, -1, 0, k % 16, off_for(g, k, 2, 8), "")
+            }
+        } else if m == mach.X_JMP32 {
+            for k in 0..n {
+                try add(c, m, -1, -1, -1, -1, 0, -1, off_for(g, k, 5, 32), "")
+            }
+        } else if m == mach.X_JCC32 {
+            for k in 0..n {
+                try add(c, m, -1, -1, -1, -1, 0, k % 16, off_for(g, k, 6, 32), "")
+            }
+        } else if m == mach.X_ROUNDSD {
+            let modes = [9, 10, 0, 1, 2, 3, 8, 11, 12, 255]
+            for k in 0..n {
+                let v = if k < modes.len() { modes[k] } else { pick(g, 0, 255) }
+                try add(c, m, reg_of(g, m, k, 0), -1, reg_of(g, m, k, 2), -1, v, -1, 0, "")
+            }
+        } else {
+            fail("no test cases for opcode {m} ({mach.form_name(m)})")
+        }
+    }
+    c
+}

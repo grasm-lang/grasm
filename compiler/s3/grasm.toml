@@ -14,3 +14,6 @@ path = "../aarch64"
 
 [dependencies.macho]
 path = "../macho"
+
+[dependencies.x86_64]
+path = "../x86_64"

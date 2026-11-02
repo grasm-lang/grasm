@@ -33,6 +33,11 @@
 //     s3 --forms              every instruction form compiled code can hold
 //     s3 --encode-test <p>    writes <p>.s and <p>.tsv for scripts/encodetest.sh
 //
+// `--target x86_64` (docs/self-hosting.md §6.16, stage S7) asks the same two
+// questions of the x86-64 target -- its forms, and its encoder's cases for
+// scripts/encodetest_x64.sh -- whose instruction selection is not written yet,
+// so it compiles no program. `--target aarch64` is the default.
+//
 // TIR from the Rust frontend (`grasm tir`) goes to MIR (`compiler/mir`), to
 // AArch64 code through the lowering rules, a register allocator and its
 // checker (`compiler/aarch64`), and into a relocatable Mach-O object
@@ -54,6 +59,7 @@
 import mir
 import mir.ir
 import aarch64
+import x86_64
 import macho
 
 /// The largest callee inlined, in MIR instructions and terminators
@@ -63,6 +69,7 @@ let INLINE_LIMIT = 32
 fn usage() {
     eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats] [--runtime] [--inline=N]")
     eprint("       s3 --check-rules | --forms | --encode-test <prefix>")
+    eprint("       s3 --forms --target x86_64 | --encode-test <prefix> --target x86_64")
     exit(2)
 }
 
@@ -85,6 +92,52 @@ fn forms() -> i64 {
         print(f)
     }
     0
+}
+
+/// Every form compiled code for the x86-64 target can hold
+/// (`compiler/x86_64`).
+fn forms_x64() -> i64 {
+    for f in x86_64.emittable_forms() {
+        print(f)
+    }
+    0
+}
+
+/// The x86-64 encoder's cases: `<prefix>.s` for the assembler, and
+/// `<prefix>.tsv` with each case's form, bytes, assembly, and the offset and
+/// type of the relocation it must carry (-1 for none).
+fn encode_test_x64(prefix: str) -> i64 {
+    match x86_64.encode_cases() {
+        Ok(c) -> {
+            var s = str_builder()
+            s.push_str("\t.text\n")
+            var t = str_builder()
+            for k in 0..c.asm.len() {
+                s.push_str("\t" + c.asm[k] + "\n")
+                t.push_str(c.form[k] + "\t" + c.hex[k] + "\t" + c.asm[k] + "\t{c.rel_off[k]}\t{c.rel_kind[k]}\n")
+            }
+            match write_file(prefix + ".s", s.to_str()) {
+                Ok(_) -> ()
+                Err(e) -> {
+                    eprint("s3: cannot write {prefix}.s: {e}")
+                    return 2
+                }
+            }
+            match write_file(prefix + ".tsv", t.to_str()) {
+                Ok(_) -> ()
+                Err(e) -> {
+                    eprint("s3: cannot write {prefix}.tsv: {e}")
+                    return 2
+                }
+            }
+            print("encode cases: {c.asm.len()}")
+            0
+        }
+        Err(msg) -> {
+            eprint("s3: the x86-64 encoder refused one of its own test cases: {msg}")
+            1
+        }
+    }
 }
 
 fn hex8(w: i64) -> str {
@@ -481,6 +534,26 @@ fn main() {
     if a.len() == 2 and a[0] == "--encode-test" {
         exit(encode_test(a[1]))
     }
+    if a.len() == 3 and a[0] == "--forms" and a[1] == "--target" {
+        if a[2] == "x86_64" {
+            exit(forms_x64())
+        }
+        if a[2] == "aarch64" {
+            exit(forms())
+        }
+        usage()
+        return
+    }
+    if a.len() == 4 and a[0] == "--encode-test" and a[2] == "--target" {
+        if a[3] == "x86_64" {
+            exit(encode_test_x64(a[1]))
+        }
+        if a[3] == "aarch64" {
+            exit(encode_test(a[1]))
+        }
+        usage()
+        return
+    }
     var inp = ""
     var out = ""
     var listing = ""
@@ -527,6 +600,16 @@ fn main() {
         } else if x == "--runtime" {
             lib = true
             i += 1
+        } else if x == "--target" and i + 1 < a.len() {
+            if a[i + 1] == "x86_64" {
+                eprint("s3: --target x86_64 compiles no program yet: its instruction selection is S7 part one's step three (docs/self-hosting.md §6.16)")
+                exit(2)
+            }
+            if a[i + 1] != "aarch64" {
+                usage()
+                return
+            }
+            i += 2
         } else if x.starts_with("--inline=") {
             inline_limit = x.substr(9, x.len() - 9).parse_int() ?? -1
             if inline_limit < 0 {
