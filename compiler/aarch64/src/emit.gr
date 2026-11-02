@@ -14,6 +14,16 @@
 //
 //     [args in] [x29, x30] [x pairs] [d pairs] [spill] [slots] [args out] <- sp
 //
+// The frame is set up where it is first needed, not always on entry
+// (shrink-wrapping, `frame_plan`): code that makes no call, touches no
+// stack slot or stack argument and no callee-saved register runs before it,
+// with the return address still in x30, signed by `pacibsp` on entry as
+// always, and a path that returns without reaching the frame returns with a
+// bare `retab`. So a leaf -- or a function's fast path -- saves and restores
+// nothing it does not use. Every return the frame's setup can reach is one
+// it dominates, and that setup is in no loop, so a return knows from where
+// it stands whether a frame is there to take down.
+//
 // Branches to the next block are dropped; a conditional branch to the next
 // block followed by a jump becomes the inverted branch. A call, and an
 // address of a string, leaves its field zero and a relocation for the
@@ -41,6 +51,9 @@ type A64Code = {
     frame: i64,
     nspill: i64,
     nsaved: i64,
+    /// The block the frame is set up at (`frame_plan`): -1 none, 0 the
+    /// entry.
+    frame_at: i64,
     /// The line table's rows for this function: from word `row_word[k]` on,
     /// the code is source offset `row_src[k]`'s (-1: no source line), each
     /// row a change from the one before.
@@ -132,6 +145,332 @@ fn is_cond_branch(m: i64) -> bool {
     m == mach.A_BCOND or m == mach.A_CBZ or m == mach.A_CBNZ
 }
 
+/// Whether instruction `i` needs the frame: a call (which writes x30 and
+/// needs the frame record), anything at an offset from `sp` (a spill, a
+/// reload, a frame slot, an outgoing stack argument, the stack pointer read)
+/// or from x29 (an incoming stack argument), or a callee-saved register,
+/// which must be saved before it is touched.
+fn needs_frame(al: Alloc, i: i64) -> bool {
+    let m = al.mop[i]
+    if mach.is_call(m) or al.kind[i] != regalloc.K_ORIG {
+        return true
+    }
+    if m == mach.P_RETURN {
+        return false
+    }
+    for r in [al.rd[i], al.rn[i], al.rm[i], al.ra[i]] {
+        if r == mach.R_SP or r == mach.R_FP or r == 30 or (r >= 0 and r < regalloc.NPHYS and regalloc.callee_saved(r)) {
+            return true
+        }
+    }
+    false
+}
+
+fn block_succs(al: Alloc, b: i64) -> [i64] {
+    var out: [i64] = []
+    for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+        if al.tgt[i] >= 0 {
+            out.push(al.tgt[i])
+        }
+    }
+    out
+}
+
+/// Each block's immediate dominator (the entry's is itself; -1 for a block
+/// the entry does not reach), by Cooper, Harvey and Kennedy's iteration over
+/// a reverse postorder.
+fn dominators(al: Alloc, succ: [[i64]]) -> [i64] {
+    let nb = al.bi0.len()
+    // Reverse postorder, by an explicit stack.
+    var seen: [bool] = []
+    var post: [i64] = []
+    for b in 0..nb {
+        seen.push(false)
+    }
+    var sb: [i64] = [0]
+    var si: [i64] = [0]
+    seen[0] = true
+    while not sb.is_empty() {
+        let top = sb.len() - 1
+        let b = sb[top]
+        let k = si[top]
+        if k < succ[b].len() {
+            si[top] = k + 1
+            let c = succ[b][k]
+            if not seen[c] {
+                seen[c] = true
+                sb.push(c)
+                si.push(0)
+            }
+        } else {
+            sb.pop()
+            si.pop()
+            post.push(b)
+        }
+    }
+    var rpo_num: [i64] = []
+    for b in 0..nb {
+        rpo_num.push(-1)
+    }
+    var rpo: [i64] = []
+    var k = post.len() - 1
+    while k >= 0 {
+        rpo_num[post[k]] = rpo.len()
+        rpo.push(post[k])
+        k -= 1
+    }
+    var preds: [[i64]] = []
+    for b in 0..nb {
+        preds.push([])
+    }
+    for b in 0..nb {
+        if seen[b] {
+            for c in succ[b] {
+                preds[c].push(b)
+            }
+        }
+    }
+    var idom: [i64] = []
+    for b in 0..nb {
+        idom.push(-1)
+    }
+    idom[0] = 0
+    var changed = true
+    while changed {
+        changed = false
+        for b in rpo {
+            if b == 0 {
+                continue
+            }
+            var nd = -1
+            for p in preds[b] {
+                if idom[p] < 0 {
+                    continue
+                }
+                if nd < 0 {
+                    nd = p
+                } else {
+                    // The two fingers, up the tree by postorder number.
+                    var x = p
+                    var y = nd
+                    while x != y {
+                        while rpo_num[x] > rpo_num[y] {
+                            x = idom[x]
+                        }
+                        while rpo_num[y] > rpo_num[x] {
+                            y = idom[y]
+                        }
+                    }
+                    nd = x
+                }
+            }
+            if nd != idom[b] {
+                idom[b] = nd
+                changed = true
+            }
+        }
+    }
+    idom
+}
+
+/// The dominator tree's preorder: each block's number, and the largest
+/// number in its subtree, so `a` dominates `b` exactly when `b`'s number is
+/// within `a`'s range (`dominates`). Iterative.
+type DomOrder = {
+    pre: [i64],
+    last: [i64],
+}
+
+fn dom_order(idom: [i64]) -> DomOrder {
+    let nb = idom.len()
+    var kids: [[i64]] = []
+    for b in 0..nb {
+        kids.push([])
+    }
+    for b in 1..nb {
+        if idom[b] >= 0 {
+            kids[idom[b]].push(b)
+        }
+    }
+    var o = DomOrder{ pre: [], last: [] }
+    for b in 0..nb {
+        o.pre.push(-1)
+        o.last.push(-1)
+    }
+    var n = 0
+    var sb: [i64] = [0]
+    var si: [i64] = [0]
+    o.pre[0] = n
+    n += 1
+    while not sb.is_empty() {
+        let top = sb.len() - 1
+        let b = sb[top]
+        let k = si[top]
+        if k < kids[b].len() {
+            si[top] = k + 1
+            let c = kids[b][k]
+            o.pre[c] = n
+            n += 1
+            sb.push(c)
+            si.push(0)
+        } else {
+            o.last[b] = n - 1
+            sb.pop()
+            si.pop()
+        }
+    }
+    o
+}
+
+fn dominates(o: DomOrder, a: i64, b: i64) -> bool {
+    o.pre[a] >= 0 and o.pre[b] >= o.pre[a] and o.pre[b] <= o.last[a]
+}
+
+/// Whether block `s` can reach itself.
+fn in_cycle(succ: [[i64]], s: i64) -> bool {
+    var seen: [bool] = []
+    for b in 0..succ.len() {
+        seen.push(false)
+    }
+    var work: [i64] = []
+    for c in succ[s] {
+        work.push(c)
+    }
+    while not work.is_empty() {
+        let b = work.pop() ?? 0
+        if b == s {
+            return true
+        }
+        if seen[b] {
+            continue
+        }
+        seen[b] = true
+        for c in succ[b] {
+            work.push(c)
+        }
+    }
+    false
+}
+
+/// Whether every return block `s` can reach is one it dominates.
+fn returns_dominated(rets: [bool], succ: [[i64]], o: DomOrder, s: i64) -> bool {
+    var seen: [bool] = []
+    for b in 0..succ.len() {
+        seen.push(false)
+    }
+    var work: [i64] = [s]
+    while not work.is_empty() {
+        let b = work.pop() ?? 0
+        if seen[b] {
+            continue
+        }
+        seen[b] = true
+        if rets[b] and not dominates(o, s, b) {
+            return false
+        }
+        for c in succ[b] {
+            work.push(c)
+        }
+    }
+    true
+}
+
+/// Where the frame is set up, and which blocks run with it up.
+type FramePlan = {
+    /// -1 when nothing needs a frame, else the block at whose start it is set
+    /// up: 0, the entry, as before shrink-wrapping, or a later one.
+    at: i64,
+    framed: [bool],
+}
+
+/// How many times the frame's place is moved up the dominator tree, out of a
+/// loop or to cover a return, before it is put on entry: each move is a walk
+/// of the blocks.
+let FRAME_MOVES = 8
+
+/// Where the frame is set up: nowhere when nothing needs it, else at the
+/// nearest common dominator of every block that needs it, moved up the
+/// dominator tree until it is in no loop and every return it reaches is one
+/// it dominates; on entry at worst. Linear in the blocks but for the moves.
+pub fn frame_plan(al: Alloc) -> FramePlan {
+    let nb = al.bi0.len()
+    var plan = FramePlan{ at: -1, framed: [] }
+    for b in 0..nb {
+        plan.framed.push(false)
+    }
+    var need: [bool] = []
+    var rets: [bool] = []
+    var any = false
+    for b in 0..nb {
+        var nd = false
+        var rt = false
+        for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+            if needs_frame(al, i) {
+                nd = true
+            }
+            if al.mop[i] == mach.P_RETURN {
+                rt = true
+            }
+        }
+        need.push(nd)
+        rets.push(rt)
+        if nd {
+            any = true
+        }
+    }
+    if not any {
+        return plan
+    }
+    if need[0] {
+        plan.at = 0
+        for b in 0..nb {
+            plan.framed[b] = true
+        }
+        return plan
+    }
+    var succ: [[i64]] = []
+    for b in 0..nb {
+        succ.push(block_succs(al, b))
+    }
+    let idom = dominators(al, succ)
+    let o = dom_order(idom)
+    // The nearest common dominator: up from one needing block until its
+    // subtree holds every other.
+    var lo = nb
+    var hi = -1
+    var first = -1
+    for b in 0..nb {
+        if need[b] and o.pre[b] >= 0 {
+            if first < 0 {
+                first = b
+            }
+            if o.pre[b] < lo {
+                lo = o.pre[b]
+            }
+            if o.pre[b] > hi {
+                hi = o.pre[b]
+            }
+        }
+    }
+    var s = 0
+    if first >= 0 {
+        s = first
+        while s != 0 and not (o.pre[s] <= lo and hi <= o.last[s]) {
+            s = idom[s]
+        }
+    }
+    var moves = 0
+    while s != 0 and (in_cycle(succ, s) or not returns_dominated(rets, succ, o, s)) {
+        moves += 1
+        s = if moves > FRAME_MOVES { 0 } else { idom[s] }
+    }
+    plan.at = s
+    for b in 0..nb {
+        plan.framed[b] = dominates(o, s, b)
+    }
+    plan
+}
+
 /// Encodes a function. `callee_sym` and `rt_names` only name things in the
 /// assembly listing.
 pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [str]) -> A64Code ! str {
@@ -162,23 +501,19 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
     }
     let slots = al.nout + al.nslots + al.nspill
     let frame = (8 * slots + 15).bit_and(-16)
-    // Prologue: the function's own line.
+    // Where the frame goes up, and which returns take it down.
+    let plan = frame_plan(al)
+    let fp_block = plan.at
+    let framed = plan.framed
+    let nb = al.bi0.len()
+    // Prologue: the function's own line. The return address is signed on
+    // entry, whatever comes after.
     at_src(e, al.span0)
     let pac = try mach.encode(mach.A_PACIBSP, -1, -1, -1, -1, 0, 0, -1, 0)
     e.words.push(pac)
     if want_asm {
         e.asm.push("pacibsp")
     }
-    try word(e, mach.A_STP_PRE, 29, mach.R_SP, 30, -16, 0)
-    try word(e, mach.A_ADDI, 29, mach.R_SP, -1, 0, 0)
-    for k in 0..pairs_a.len() {
-        try word(e, mach.A_STP_PRE, pairs_a[k], mach.R_SP, pairs_b[k], -16, 0)
-    }
-    for k in 0..fpairs_a.len() {
-        try word(e, mach.A_FSTP_PRE, fpairs_a[k], mach.R_SP, fpairs_b[k], -16, 0)
-    }
-    try adjust_sp(e, frame, true)
-    let nb = al.bi0.len()
     var label: [i64] = []
     for b in 0..nb {
         label.push(-1)
@@ -187,6 +522,19 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
         label[b] = e.words.len()
         if want_asm {
             e.asm.push("Lb{b}:")
+        }
+        if b == fp_block {
+            // The frame, where it is first needed; on the function's line.
+            at_src(e, al.span0)
+            try word(e, mach.A_STP_PRE, 29, mach.R_SP, 30, -16, 0)
+            try word(e, mach.A_ADDI, 29, mach.R_SP, -1, 0, 0)
+            for k in 0..pairs_a.len() {
+                try word(e, mach.A_STP_PRE, pairs_a[k], mach.R_SP, pairs_b[k], -16, 0)
+            }
+            for k in 0..fpairs_a.len() {
+                try word(e, mach.A_FSTP_PRE, fpairs_a[k], mach.R_SP, fpairs_b[k], -16, 0)
+            }
+            try adjust_sp(e, frame, true)
         }
         let end = al.bi0[b] + al.bni[b]
         var i = al.bi0[b]
@@ -201,6 +549,12 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
                 continue
             }
             at_src(e, al.src[i])
+            if m == mach.P_RETURN and not framed[b] {
+                // No frame on this path: the return address never left x30.
+                try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)
+                i += 1
+                continue
+            }
             if m == mach.P_RETURN {
                 try adjust_sp(e, frame, false)
                 var fk = fpairs_a.len() - 1
@@ -287,7 +641,7 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
     A64Code{
         sym: sym, words: e.words, rel_off: e.rel_off, rel_kind: e.rel_kind,
         rel_symk: e.rel_symk, rel_sym: e.rel_sym, asm: e.asm,
-        frame: frame, nspill: al.nspill, nsaved: 2 * (pairs_a.len() + fpairs_a.len()),
+        frame: frame, nspill: al.nspill, nsaved: 2 * (pairs_a.len() + fpairs_a.len()), frame_at: fp_block,
         row_word: e.row_word, row_src: e.row_src,
     }
 }

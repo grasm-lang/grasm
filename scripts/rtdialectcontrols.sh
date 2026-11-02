@@ -11,6 +11,9 @@
 #   static-len     `mem_static_len` one byte long
 #   tlv-shared     the thread-local getter answers the descriptor, which every
 #                  thread shares, instead of calling its thunk
+#   frameless-ret  a return on a path with no frame (docs/self-hosting.md
+#                  §6.15's shrink-wrapping) is a plain `ret`, the address it
+#                  returns to signed on entry and never authenticated
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -87,6 +90,11 @@ control tlv-shared 'FAIL: linked by (link|cc).*tls' aarch64/src/leaves.gr \
     '    try put(l, mach.A_LDR, 16, 0, -1, 0)
     try put(l, mach.A_BLR, -1, 16, -1, 0)' \
     '    try put(l, mach.A_ADDI, 16, 0, -1, 0)'
+control frameless-ret 'FAIL: _g_main_[a-z_]* does not sign its return address' aarch64/src/emit.gr \
+    '                // No frame on this path: the return address never left x30.
+                try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)' \
+    '                // No frame on this path: the return address never left x30.
+                try word(e, mach.A_RET, -1, -1, -1, 0, 0)'
 
 echo
 echo "controls: $ran   caught: $caught   missed: $((ran - caught))"
@@ -94,5 +102,5 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-[ "$ran" -ge 5 ] || exit 1
+[ "$ran" -ge 6 ] || exit 1
 exit 0

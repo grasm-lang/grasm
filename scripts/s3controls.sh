@@ -106,6 +106,10 @@
 #                  -> s3rc (programs killed by a signal)
 #   rc-cancel      an `inc` and a `dec` are cancelled across a call that takes
 #                  the reference -> s3rc (a use after free)
+#   csr-slot       the epilogue restores each pair of callee-saved registers
+#                  from the other's slot -> s3subset
+#   shrink-ret     a return past the entry block takes the frameless way out
+#                  whether or not its path set up a frame -> s3subset
 #
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
@@ -350,6 +354,16 @@ control inline-line compiler/mir/src/inline.gr \
     $'                    copy_inst(g, callee, ci, pmap, vbase, slot0)\n                    g.ispan[g.ispan.len() - 1] = f.ispan[i]' -- \
     scripts/objtest.sh "maps to line" -
 
+control csr-slot compiler/aarch64/src/emit.gr \
+    "try word(e, mach.A_LDP_POST, pairs_a[k], mach.R_SP, pairs_b[k], 16, 0)" \
+    "try word(e, mach.A_LDP_POST, pairs_b[k], mach.R_SP, pairs_a[k], 16, 0)" -- \
+    scripts/s3subset.sh "FAILED:" -
+
+control shrink-ret compiler/aarch64/src/emit.gr \
+    "if m == mach.P_RETURN and not framed[b] {" \
+    "if m == mach.P_RETURN and (not framed[b] or b > 0) {" -- \
+    scripts/s3subset.sh "FAILED:" -
+
 # The backend's copy of the runtime's layouts, with a fault in a copy of it,
 # held by `rtlayout` to compiler/rt's (which takes no backend: it reads the
 # file).
@@ -428,10 +442,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Forty gate runs over thirty-five faults, and every one must have
+# Forty-two gate runs over thirty-seven faults, and every one must have
 # failed.
-if [ "$controls" -ne 40 ] || [ "$caught" -ne 40 ]; then
-    echo "expected 40 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 42 ] || [ "$caught" -ne 42 ]; then
+    echo "expected 42 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

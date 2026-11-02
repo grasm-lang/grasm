@@ -288,6 +288,8 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
     var corrupted = 0
     var caught = 0
     var spills = 0
+    var frameless = 0
+    var late_frame = 0
     // The line table's rows, function by function: the byte offset in the
     // function, and the source offset of the code from there on.
     var unit = macho.new_unit()
@@ -315,6 +317,11 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
                     }
                 }
                 spills += r.code.nspill
+                if r.code.frame_at < 0 {
+                    frameless += 1
+                } else if r.code.frame_at > 0 {
+                    late_frame += 1
+                }
                 let base = 4 * obj.text.len()
                 let fk = obj.fsym.len()
                 for q in 0..r.code.row_word.len() {
@@ -449,7 +456,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
         print("functions: {p.fns.len()}   checked: {p.fns.len() - ra_failed}   spill slots: {spills}   words: {obj.text.len()}   with doubles: {with_fp}")
         // The mid-end's counts on a line of their own: gates read the first
         // line by position (`scripts/ra_check.sh`).
-        print("mid-end: folded: {p.folded}   inlined: {p.inlined} calls of {p.inlinees} functions, {p.dropped} no longer called, {p.direct} closures called directly, {p.rcpairs} count pairs cancelled")
+        print("mid-end: folded: {p.folded}   inlined: {p.inlined} calls of {p.inlinees} functions, {p.dropped} no longer called, {p.direct} closures called directly, {p.rcpairs} count pairs cancelled   frameless: {frameless}   frame past the entry: {late_frame}")
     }
     if listing != "" {
         match write_file(listing, text.to_str()) {
