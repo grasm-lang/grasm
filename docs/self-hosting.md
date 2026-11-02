@@ -3250,16 +3250,16 @@ binaries run.
 **What runs it.** Rosetta here offers an x86-64 with SSE through SSE4.2,
 CMOV, CMPXCHG16B and AES, and nothing past them: no AVX (the
 `hw.optional.avx*` flags are 0 under `arch -x86_64`), no POPCNT, LZCNT or
-BMI, and an empty leaf-7 feature list, so no CET; pages are 4 KiB to an x86-64 process. So the backend targets
-x86-64 with SSE4.1 -- `roundsd` for `floor` and `ceil` is the one instruction
-past SSE2 it uses -- and counts bits with the instructions every x86-64 has
-(`bsr` and `cmov` for leading zeros), as the Cranelift build does without
-its optional features. x86-64 has no counterpart of pointer authentication
-here: CET's shadow stack and indirect-branch tracking are absent under
-Rosetta and not enabled for x86-64 processes on macOS, so no `endbr64` is
-emitted and a return address is not signed. Nothing replaces `pacibsp` on
-this target; the Cranelift x86-64 build and clang's default for
-`x86_64-apple-macos` do the same, and the arm64 target keeps its signing
+BMI, and an empty leaf-7 feature list, so no CET; pages are 4 KiB to an
+x86-64 process. So the backend targets x86-64 with SSE4.1 -- `roundsd` for
+`floor` and `ceil` is the one instruction past SSE2 it uses -- and counts
+bits with the instructions every x86-64 has (`bsr` and `cmov` for leading
+zeros), as Cranelift does without its optional features. x86-64 has no
+counterpart of pointer authentication here: CET's shadow stack and
+indirect-branch tracking are not offered under Rosetta, so no `endbr64` is
+emitted and no return address is protected. Nothing replaces `pacibsp` on
+this target, as nothing does in the Cranelift x86-64 build or in clang's
+default for `x86_64-apple-macos`; the arm64 target keeps its signing
 unchanged (the two targets share no frame code; below).
 
 **Choosing the target.** `s3 --target x86_64` (the default stays `aarch64`,
@@ -3304,17 +3304,18 @@ allocators try registers in, normally and under `--max-regs`; the move,
 load and store opcodes a rewrite inserts. Operand numbering is already
 common: general registers below 64, floating-point from 64 (`R_D0`, `R_X0`),
 virtual from 128 (`VR`). The refactor is a step of its own, and its gate is
-that it changes nothing: `stagediff`'s objects for all 757 programs with a
-`main`, the runtime's object and `fixpoint`'s stages byte-identical to
-master's. The allocator is parameterised, not forked.
+that it changes nothing: every object the subset's programs and the runtime
+compile to is the same bytes from the refactored driver as from master's (the
+check step two ran for its own change, below), and `fixpoint` holds. The
+allocator is parameterised, not forked.
 
 Two things about x86-64 the shared code must allow, both of which the
 AArch64 forms already exercise:
 
 - *Two-address arithmetic.* `add %rm, %rd` reads and writes `rd`. Field 0 is
   `ROLE_USEDEF`, as `movk`'s and `casal`'s are, and a rule writes `mov a,
-  res; add b, res`. The release allocator's move hints make most of those
-  moves a register to itself, which emission drops.
+  res; add b, res`. The release allocator's move hints can make such a move
+  one from a register to itself, which emission drops.
 - *Registers an instruction does not name.* `idiv` reads and writes rax and
   rdx, `cqo` writes rdx from rax, a shift by a register counts in cl,
   `cmpxchg` compares with rax. Each is a field of the VCode instruction, fixed
@@ -3420,8 +3421,7 @@ bytes, at the displacement that ends the instruction (`mach.reloc_kind`),
 and `UNSIGNED` (8 bytes) for the descriptors in `__data`, the thread-local
 descriptors and the DWARF addresses, as on arm64. `__text` is 16-byte
 aligned and each function starts at a multiple of 16, as clang places them.
-The line table is
-`dwarf.gr`'s, its rows at byte offsets.
+The line table is `dwarf.gr`'s, its rows at byte offsets.
 
 **The runtime.** `compiler/rt` is target-neutral Grasm but for four things,
 found by reading every `extern fn` and every constant in it:
@@ -3482,9 +3482,9 @@ of something defined here to `leaq`), `TLV`, `UNSIGNED` -- 4 KiB pages, the
 `__PAGEZERO` and segment layout ld gives x86-64, chained fixups in the
 format ld-prime writes for x86-64 (read off its output, as the arm64 half's
 `DYLD_CHAINED_PTR_64_OFFSET` was), and whatever signature ld writes for
-x86-64 (none is required to run there). Until then the
-system linker links x86-64 objects, as it linked the arm64 backend's during
-S3, and that is recorded as the step's gap.
+x86-64 (none is required to run there). Until then the system linker links
+x86-64 objects, as it linked the arm64 backend's during S3, and that is
+recorded as the step's gap.
 
 **Gates.** Built with this note: `encodetest_x64` and `x64controls`
 (below). To come, each with its controls in `x64controls`:
@@ -3503,7 +3503,9 @@ S3, and that is recorded as the step's gap.
   under register pressure, with its planted faults.
 - `xrtswap`: the corpus on the x86-64 Grasm runtime, then on it alone.
 - The existing gates all still pass, and AArch64 output is byte-identical to
-  master's: `stagediff`'s objects and executables, `fixpoint`.
+  master's: every object of the subset and the runtime's, compiled by the
+  branch's driver and by master's from the same TIR in the same directory,
+  and `fixpoint`.
 
 **Decisions for the owner.** (1) The variadic table of the runtime's two C
 functions on x86-64 (above), or a `...` in `extern fn` that the frontend would
