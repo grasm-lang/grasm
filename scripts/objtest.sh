@@ -25,7 +25,10 @@
 #     and line that literal is on, and no row past the end of its file
 #     (`s3_macho.py lines`). The literals are the sample of instructions
 #     whose right line is known from the source alone; their count is held
-#     to a floor, so a table that maps nothing cannot pass.
+#     to a floor, so a table that maps nothing cannot pass. A literal in a
+#     function whose calls were inlined (`compiler/mir/src/inline.gr`) is
+#     loaded once per copy, and every copy must map to the literal's line,
+#     the callee's, not the caller's; those loads are counted apart too.
 #
 # `S3_STOP_AT_FIRST=1` (the mutation controls', `scripts/s3controls.sh`)
 # stops at the first program with a problem: a planted fault needs one object
@@ -53,6 +56,7 @@ checked=0
 identical=0
 problems=0
 lines_checked=0
+lines_repeated=0
 declare -a FAILED=()
 mkdir -p "$WORK/a" "$WORK/b/deeper"
 
@@ -104,6 +108,8 @@ for k in "${!S3_SRC[@]}"; do
     if python3 scripts/s3_macho.py lines "$a" "$tir" >"$WORK/lines.txt" 2>&1; then
         n=$(sed -n 's/.*literal loads checked: \([0-9]*\).*/\1/p' "$WORK/lines.txt" | tail -1)
         lines_checked=$((lines_checked + ${n:-0}))
+        n=$(sed -n 's/.*of literals loaded more than once: \([0-9]*\).*/\1/p' "$WORK/lines.txt" | tail -1)
+        lines_repeated=$((lines_repeated + ${n:-0}))
     else
         bad="$bad; line table: $(head -2 "$WORK/lines.txt" | tr '\n' ' ')"
     fi
@@ -158,7 +164,7 @@ for entry in compiler/rt/src/main.gr scripts/fixtures/rtdialect/src/main.gr; do
 done
 
 echo "runtime objects: $rt_checked   reproducible: $rt_identical"
-echo "objects: $checked   reproducible: $identical   literal loads on their lines: $lines_checked   with problems: $problems"
+echo "objects: $checked   reproducible: $identical   literal loads on their lines: $lines_checked (of literals loaded more than once, as inlined copies are: $lines_repeated)   with problems: $problems"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"

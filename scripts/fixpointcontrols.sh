@@ -171,8 +171,8 @@ fn planted_hash(s: str, seed: i64) -> i64 {
         let f = p.fns[ok]'
 
 if control self-miscompile 'NOT A FIXED POINT: stage 3.s [a-z.]+\.o is not stage 2.s' "$S3_MAIN" \
-    '    let p = match mir.build(src, lib) {' \
-    '    var p = match mir.build(src, lib) {' \
+    '    let p = match mir.build(src, lib, inline_limit) {' \
+    '    var p = match mir.build(src, lib, inline_limit) {' \
     '    if check {
         let problems = aarch64.check_rules()' \
     '    // PLANTED (scripts/fixpointcontrols.sh): in `main::file_line`, a 1

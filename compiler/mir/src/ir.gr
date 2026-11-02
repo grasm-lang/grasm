@@ -439,6 +439,9 @@ type MirFn = {
     returns: bool,
     /// Whether its symbol is global: an `export fn`'s C entry ([T-EXPORT]).
     global: bool,
+    /// Whether C calls it: the program's `main` entry, an `export fn`'s
+    /// entry or a function address's (`inline.gr` inlines nothing into it).
+    centry: bool,
     /// 8-byte frame slots for `inout` arguments.
     nslots: i64,
     nvals: i64,
@@ -482,7 +485,7 @@ type MirFn = {
 
 pub fn new_fn(name: str, sym: str) -> MirFn {
     MirFn{
-        name: name, sym: sym, floor: false, nparams: 0, returns: false, global: false, nslots: 0, nvals: 0, vfp: [],
+        name: name, sym: sym, floor: false, nparams: 0, returns: false, global: false, centry: false, nslots: 0, nvals: 0, vfp: [],
         bp0: [], bnp: [], bparams: [], bi0: [], bni: [],
         tk: [], tv: [], tt: [], tf: [], ta0: [], tan: [], fa0: [], fan: [], targs: [],
         op: [], res: [], a: [], b: [], imm: [], ca0: [], can: [], cargs: [],
@@ -498,6 +501,7 @@ pub fn shell(f: MirFn) -> MirFn {
     g.nparams = f.nparams
     g.returns = f.returns
     g.global = f.global
+    g.centry = f.centry
     g.nslots = f.nslots
     g.span0 = f.span0
     g.vfp = f.vfp
@@ -530,8 +534,17 @@ type MirProg = {
     tcells: [str],
     tsize: [i64],
     /// How many instructions constant folding turned into constants
-    /// (`fold.gr`), for `s3 --stats`.
+    /// (`fold.gr`), and how many calls were inlined, of how many callees
+    /// (`inline.gr`), for `s3 --stats`.
     folded: i64,
+    inlined: i64,
+    inlinees: i64,
+    /// Functions no longer compiled: every call of them inlined.
+    dropped: i64,
+    /// Calls through a function value made in place turned direct, and
+    /// `inc`/`dec` pairs that cancelled (`tidy.gr`).
+    direct: i64,
+    rcpairs: i64,
 }
 
 /// A struct type's descriptor, as the runtime's `StructDesc` reads it

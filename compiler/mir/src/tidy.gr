@@ -1,0 +1,196 @@
+// What lets inlining inline more, and what it leaves to tidy: two small
+// passes on SSA MIR (docs/self-hosting.md §4's mid-end), after `fold.gr`'s
+// `merge_blocks` has run the jumps into and out of each inlined copy together.
+//
+//   * `direct_calls`: a call through a function value that the same function
+//     made, from a function's address, a moment before -- `map(|x| ..)` with
+//     the closure written as the argument -- is a call of that function.
+//     `grasm_fn_code` answers the address the value was made with and
+//     `grasm_fn_env` the environment it was made with, retained, so the
+//     call becomes `inc` of that environment and a direct call of that
+//     function, with the same arguments, which `inline.gr` can then inline.
+//     Only where the value's every word is known: made by `grasm_fn_new`
+//     from `fnaddr` in this function, its code and environment each read
+//     once, for that call.
+//   * `cancel_rc`: an `inc` of a value and a `dec` of the same value with
+//     nothing between them but instructions that compute from registers --
+//     no call, no load, no store -- leave its count as it was and nothing
+//     could have seen it otherwise, so both go. That is what an inlined
+//     closure that captures nothing leaves of its environment.
+//
+// Neither adds an instruction, and each keeps every other instruction's
+// source offset.
+import ir
+import fold
+
+/// How many times each value is read.
+fn use_counts(f: MirFn) -> [i64] {
+    var u: [i64] = []
+    for x in 0..f.nvals {
+        u.push(0)
+    }
+    for i in 0..f.op.len() {
+        let n = ir.nreads(f.op[i])
+        if n >= 1 and f.a[i] >= 0 {
+            u[f.a[i]] += 1
+        }
+        if n >= 2 and f.b[i] >= 0 {
+            u[f.b[i]] += 1
+        }
+        for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+            u[f.cargs[j]] += 1
+        }
+    }
+    for b in 0..ir.nblocks(f) {
+        if f.tv[b] >= 0 {
+            u[f.tv[b]] += 1
+        }
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            u[f.targs[j]] += 1
+        }
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            u[f.targs[j]] += 1
+        }
+    }
+    u
+}
+
+/// Whether instruction `i` calls runtime function `name`.
+fn calls_rt(f: MirFn, rt_syms: [str], i: i64, name: str) -> bool {
+    f.op[i] == ir.M_CALLRT and f.imm[i] >= 0 and f.imm[i] < rt_syms.len() and rt_syms[f.imm[i]] == name
+}
+
+/// Turns calls through a function value made here into direct calls. Answers
+/// how many.
+pub fn direct_calls(inout f: MirFn, rt_syms: [str]) -> i64 {
+    let d = fold.defs(f)
+    let u = use_counts(f)
+    var n = 0
+    for i in 0..f.op.len() {
+        if f.op[i] != ir.M_CALLIND or f.can[i] < 1 {
+            continue
+        }
+        let code = f.a[i]
+        let env = f.cargs[f.ca0[i]]
+        let dc = d[code]
+        let de = d[env]
+        if dc < 0 or de < 0 or u[code] != 1 or u[env] != 1 {
+            continue
+        }
+        if not calls_rt(f, rt_syms, dc, "grasm_fn_code") or not calls_rt(f, rt_syms, de, "grasm_fn_env") {
+            continue
+        }
+        let fv = f.cargs[f.ca0[dc]]
+        if f.cargs[f.ca0[de]] != fv or d[fv] < 0 {
+            continue
+        }
+        let dn = d[fv]
+        if not calls_rt(f, rt_syms, dn, "grasm_fn_new") or f.can[dn] < 2 {
+            continue
+        }
+        let addr = f.cargs[f.ca0[dn]]
+        let env0 = f.cargs[f.ca0[dn] + 1]
+        if d[addr] < 0 or f.op[d[addr]] != ir.M_FNADDR {
+            continue
+        }
+        // The code word is the address it was made with: the call of
+        // `grasm_fn_code` becomes that address, which nothing reads now.
+        f.op[dc] = ir.M_FNADDR
+        f.imm[dc] = f.imm[d[addr]]
+        f.can[dc] = 0
+        // The environment, retained, as `grasm_fn_env` answers it.
+        f.op[de] = ir.M_INC
+        f.res[de] = -1
+        f.a[de] = env0
+        f.can[de] = 0
+        f.cargs[f.ca0[i]] = env0
+        f.op[i] = ir.M_CALL
+        f.imm[i] = f.imm[d[addr]]
+        f.a[i] = -1
+        n += 1
+    }
+    n
+}
+
+/// Whether instruction op `op` only computes from registers: no call, no
+/// memory, no count.
+fn neutral(op: i64) -> bool {
+    ir.pure_op(op) and op != ir.M_LOAD and op != ir.M_FLOAD and not (op >= ir.M_LOAD8U and op <= ir.M_LOAD32S) and not (op >= ir.M_ALOAD8 and op <= ir.M_ALOAD64) and op != ir.M_GETSP
+}
+
+/// Removes each `inc x` ... `dec x` pair in one block with only neutral
+/// instructions between. Answers how many pairs.
+pub fn cancel_rc(inout f: MirFn) -> i64 {
+    let n = f.op.len()
+    var gone: [bool] = []
+    for i in 0..n {
+        gone.push(false)
+    }
+    var pairs = 0
+    for b in 0..ir.nblocks(f) {
+        let end = f.bi0[b] + f.bni[b]
+        for i in f.bi0[b]..end {
+            if f.op[i] != ir.M_INC or gone[i] {
+                continue
+            }
+            var j = i + 1
+            var found = -1
+            while j < end and found < 0 {
+                let op = f.op[j]
+                if op == ir.M_DEC and f.a[j] == f.a[i] and not gone[j] {
+                    found = j
+                } else if gone[j] or neutral(op) {
+                    j += 1
+                } else {
+                    j = end
+                }
+            }
+            if found >= 0 {
+                gone[i] = true
+                gone[found] = true
+                pairs += 1
+            }
+        }
+    }
+    if pairs == 0 {
+        return 0
+    }
+    var op: [i64] = []
+    var res: [i64] = []
+    var a: [i64] = []
+    var bb: [i64] = []
+    var imm: [i64] = []
+    var ca0: [i64] = []
+    var can: [i64] = []
+    var ispan: [i64] = []
+    var bi0: [i64] = []
+    var bni: [i64] = []
+    for b in 0..ir.nblocks(f) {
+        bi0.push(op.len())
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            if gone[i] {
+                continue
+            }
+            op.push(f.op[i])
+            res.push(f.res[i])
+            a.push(f.a[i])
+            bb.push(f.b[i])
+            imm.push(f.imm[i])
+            ca0.push(f.ca0[i])
+            can.push(f.can[i])
+            ispan.push(f.ispan[i])
+        }
+        bni.push(op.len() - bi0[b])
+    }
+    f.op = op
+    f.res = res
+    f.a = a
+    f.b = bb
+    f.imm = imm
+    f.ca0 = ca0
+    f.can = can
+    f.ispan = ispan
+    f.bi0 = bi0
+    f.bni = bni
+    pairs
+}

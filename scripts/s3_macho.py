@@ -371,6 +371,7 @@ def cmd_lines(obj, tir):
     if not files:
         print(f"{tir} names no source file")
         return 1
+    tir_text = open(tir, encoding="utf-8").read()
     seqs = line_table(obj)
     nrows = sum(len(rows) for rows, _ in seqs)
     problems = []
@@ -411,18 +412,30 @@ def cmd_lines(obj, tir):
         if (info >> 27) & 1 and rtype in (3, 4) and symnum in text_of:
             refs.setdefault(symnum, []).append((rtype, addr))
     checked = 0
+    repeated = 0
     for symnum, rs in sorted(refs.items()):
         s = text_of[symnum]
-        # A literal written once in the program and loaded once, by one
-        # `adrp` and one `add`. A string the compiler makes itself, or one
-        # written twice, says nothing about which line is right.
+        # A literal written once in the program, loaded by one `adrp` and
+        # one `add`; or by several pairs, one per copy of its function a call
+        # was replaced by (`compiler/mir/src/inline.gr`), each on the
+        # literal's own line -- when nothing else in the program is that text:
+        # a field's or a variant's name the compiler loads to find it by, or
+        # a C function's the backend reports a call of by, is the same string
+        # in the pool, loaded where the field is read or the function called.
+        # A string the compiler makes itself, or one written twice, says
+        # nothing about which line is right.
         where = pieces.get(s, [])
-        if len(s) < 3 or len(where) != 1 or sorted(r for r, _ in rs) != [3, 4]:
+        kinds = [r for r, _ in rs]
+        if len(s) < 3 or len(where) != 1 or kinds.count(3) != kinds.count(4) or len(kinds) != 2 * kinds.count(3):
+            continue
+        if len(kinds) > 2 and tir_text.count('"' + s + '"') + tir_text.count('::' + s + '"') != 1:
             continue
         path, want = where[0]
         for _rtype, addr in rs:
             row = lookup(seqs, addr)
             checked += 1
+            if len(rs) > 2:
+                repeated += 1
             if row is None:
                 problems.append(f"no line row covers {addr:#x}, which loads {s!r}")
             elif row[1] != path or row[2] != want:
@@ -430,7 +443,7 @@ def cmd_lines(obj, tir):
                                 f"maps to line {row[2]} of {row[1]}")
     for p in problems[:12]:
         print(p)
-    print(f"line rows: {nrows}   literal loads checked: {checked}   wrong: {len(problems)}")
+    print(f"line rows: {nrows}   literal loads checked: {checked}   wrong: {len(problems)}   of literals loaded more than once: {repeated}")
     return 1 if problems else 0
 
 

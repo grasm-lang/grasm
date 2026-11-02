@@ -1,0 +1,552 @@
+// Inlining small functions at MIR level (docs/self-hosting.md §4's mid-end).
+//
+// A call of a compiled function whose body is small enough is replaced by a
+// copy of that body: the block holding the call ends where the call was,
+// with a jump into the copy; every return of the copy jumps to a new block
+// that goes on after the call, passing the returned value as that block's
+// parameter, which is the value the call defined. The copy's values are
+// renumbered past the caller's, its parameters are the call's arguments, its
+// frame slots (an `inout` argument's home, a split result's word) are slots
+// of the caller's frame past the caller's own -- one region every copy
+// shares, since each copy's are in use only while it runs -- and every
+// instruction keeps the source offset it had, so the line table maps the
+// copy to the callee's lines, as a debugger stepping into it would show them.
+// A copy that returns at one place answers that place's value directly.
+//
+// What runs is what ran: the same instructions in the same order with the
+// same operands, reference counts, runtime calls and panics; only the `bl`,
+// the callee's frame and the moves of the calling convention are gone. So a
+// callee is inlined only when that is all that changes:
+//
+//   * it is not recursive, nor part of any cycle of direct calls, so its body
+//     is finite and the stack check ([E-RECURSION-DEPTH]) is the same: a
+//     function that reads the stack pointer (`getsp`, the start of a
+//     recursion's floor) is not inlined either, so the floor every thread
+//     computes is computed in the same frame;
+//   * it is small: at most `limit` instructions and terminators, counted
+//     after its own calls were inlined, so code does not grow without bound;
+//   * the call passes as many arguments as the callee has parameters, and
+//     defines a result exactly when the callee returns one.
+//
+// A function made from C (an `export fn`'s entry, a function address's C
+// entry) has nothing inlined into it: it stays the wrapper it was, so what C
+// calls is unchanged. A callee every call of which was inlined, and whose
+// address nothing takes, is no longer compiled (`referenced`): nothing
+// could call it -- its symbol is local to the object -- and the functions C
+// calls are kept whatever happens, as roots.
+//
+// Callees are inlined into their callers bottom-up, in the order Tarjan's
+// algorithm finds the strongly connected components of the call graph --
+// each after every component it calls -- so a callee's own small calls are
+// already part of it. Deterministic: the order is the functions' own and the
+// calls' own, never a hash's.
+import ir
+
+/// What inlining did, for `s3 --stats`.
+type InlineStats = {
+    sites: i64,
+    callees: i64,
+}
+
+/// The size inlining counts: instructions and terminators.
+pub fn fn_size(f: MirFn) -> i64 {
+    f.op.len() + ir.nblocks(f)
+}
+
+/// Whether some branch targets block 0, the entry: a body that loops back
+/// to its own entry block cannot have that block's parameters replaced by
+/// arguments.
+fn entry_targeted(f: MirFn) -> bool {
+    for b in 0..ir.nblocks(f) {
+        if (f.tk[b] == ir.M_JUMP or f.tk[b] == ir.M_BRIF) and f.tt[b] == 0 {
+            return true
+        }
+        if f.tk[b] == ir.M_BRIF and f.tf[b] == 0 {
+            return true
+        }
+    }
+    false
+}
+
+/// Whether the body returns at all, and, when it answers a value, answers
+/// one at every return: the block after an inlined call is reached by the
+/// copy's returns, and takes what they pass.
+fn returns_well(f: MirFn) -> bool {
+    var any = false
+    for b in 0..ir.nblocks(f) {
+        if f.tk[b] == ir.M_RET {
+            any = true
+            if f.returns and f.tv[b] < 0 {
+                return false
+            }
+        }
+    }
+    any
+}
+
+fn reads_sp(f: MirFn) -> bool {
+    for op in f.op {
+        if op == ir.M_GETSP {
+            return true
+        }
+    }
+    false
+}
+
+/// Per function, whether it lies on a cycle of direct calls; and the
+/// functions in an order where each comes after every function it calls
+/// that is not on its cycle (Tarjan's strongly connected components, which
+/// come out callee first). Iterative, so a long call chain uses no stack.
+fn components(fns: [MirFn], fn_of: [i64]) -> ([bool], [i64]) {
+    let n = fns.len()
+    // Each function's direct callees, in call order.
+    var e0: [i64] = []
+    var en: [i64] = []
+    var edges: [i64] = []
+    var self_call: [bool] = []
+    for k in 0..n {
+        e0.push(edges.len())
+        var me = false
+        let f = fns[k]
+        for i in 0..f.op.len() {
+            if f.op[i] == ir.M_CALL {
+                let c = f.imm[i]
+                if c >= 0 and c < fn_of.len() and fn_of[c] >= 0 {
+                    edges.push(fn_of[c])
+                    if fn_of[c] == k {
+                        me = true
+                    }
+                }
+            }
+        }
+        en.push(edges.len() - e0[k])
+        self_call.push(me)
+    }
+    var index: [i64] = []
+    var low: [i64] = []
+    var on_stack: [bool] = []
+    var cyclic: [bool] = []
+    for k in 0..n {
+        index.push(-1)
+        low.push(0)
+        on_stack.push(false)
+        cyclic.push(self_call[k])
+    }
+    var order: [i64] = []
+    var stack: [i64] = []
+    var next_index = 0
+    // The walk's own stack: a function, and how many of its edges are done.
+    var wf: [i64] = []
+    var we: [i64] = []
+    for root in 0..n {
+        if index[root] >= 0 {
+            continue
+        }
+        wf.push(root)
+        we.push(0)
+        index[root] = next_index
+        low[root] = next_index
+        next_index += 1
+        stack.push(root)
+        on_stack[root] = true
+        while not wf.is_empty() {
+            let top = wf.len() - 1
+            let v = wf[top]
+            let j = we[top]
+            if j < en[v] {
+                we[top] = j + 1
+                let w = edges[e0[v] + j]
+                if index[w] < 0 {
+                    index[w] = next_index
+                    low[w] = next_index
+                    next_index += 1
+                    stack.push(w)
+                    on_stack[w] = true
+                    wf.push(w)
+                    we.push(0)
+                } else if on_stack[w] and index[w] < low[v] {
+                    low[v] = index[w]
+                }
+                continue
+            }
+            // Every edge of `v` is done.
+            wf.pop()
+            we.pop()
+            if not wf.is_empty() {
+                let u = wf[wf.len() - 1]
+                if low[v] < low[u] {
+                    low[u] = low[v]
+                }
+            }
+            if low[v] == index[v] {
+                var members: [i64] = []
+                var going = true
+                while going {
+                    let w = stack.pop() ?? v
+                    on_stack[w] = false
+                    members.push(w)
+                    if w == v {
+                        going = false
+                    }
+                }
+                if members.len() > 1 {
+                    for w in members {
+                        cyclic[w] = true
+                    }
+                }
+                // Within a component, the functions' own order.
+                members.sort()
+                for w in members {
+                    order.push(w)
+                }
+            }
+        }
+    }
+    (cyclic, order)
+}
+
+/// Inlines every small enough callee into its callers, `fns` in place.
+/// `fn_of[c]` is the function a callable id `c` compiles to, or -1;
+/// `centry[k]` says function `k` is a C entry, which nothing is inlined into.
+pub fn inline_all(inout fns: [MirFn], fn_of: [i64], centry: [bool], limit: i64) -> InlineStats {
+    var st = InlineStats{ sites: 0, callees: 0 }
+    if limit <= 0 {
+        return st
+    }
+    let (cyclic, order) = components(fns, fn_of)
+    let n = fns.len()
+    var used: [bool] = []
+    for k in 0..n {
+        used.push(false)
+    }
+    for k in order {
+        if centry[k] {
+            continue
+        }
+        let f = fns[k]
+        // The calls of this function to inline, in order.
+        var sites: [i64] = []
+        for i in 0..f.op.len() {
+            if f.op[i] != ir.M_CALL {
+                continue
+            }
+            let c = f.imm[i]
+            if c < 0 or c >= fn_of.len() or fn_of[c] < 0 {
+                continue
+            }
+            let g = fns[fn_of[c]]
+            let ck = fn_of[c]
+            if cyclic[ck] or ck == k or g.floor or reads_sp(g) or entry_targeted(g) or centry[ck] or not returns_well(g) {
+                continue
+            }
+            if fn_size(g) > limit or f.can[i] != g.bnp[0] {
+                continue
+            }
+            // A result exactly when the callee answers one.
+            if (f.res[i] >= 0) != g.returns {
+                continue
+            }
+            sites.push(i)
+            if not used[ck] {
+                used[ck] = true
+                st.callees += 1
+            }
+        }
+        if sites.is_empty() {
+            continue
+        }
+        st.sites += sites.len()
+        fns[k] = splice(f, sites, fns, fn_of)
+    }
+    st
+}
+
+/// The functions still needed once calls were inlined: those C calls (the
+/// program's `main` entry, `export fn` and function-address entries, every
+/// one the runtime's `export fn`s are), and every function one of them
+/// calls or takes the address of, transitively. `keep[k]` per function.
+pub fn referenced(fns: [MirFn], fn_of: [i64]) -> [bool] {
+    var keep: [bool] = []
+    var work: [i64] = []
+    for k in 0..fns.len() {
+        keep.push(false)
+    }
+    for k in 0..fns.len() {
+        if fns[k].centry or fns[k].global {
+            keep[k] = true
+            work.push(k)
+        }
+    }
+    while not work.is_empty() {
+        let k = work.pop() ?? 0
+        let f = fns[k]
+        for i in 0..f.op.len() {
+            if f.op[i] == ir.M_CALL or f.op[i] == ir.M_FNADDR {
+                let c = f.imm[i]
+                if c >= 0 and c < fn_of.len() and fn_of[c] >= 0 and not keep[fn_of[c]] {
+                    keep[fn_of[c]] = true
+                    work.push(fn_of[c])
+                }
+            }
+        }
+    }
+    keep
+}
+
+/// The value callee value `x` becomes in the caller: an argument for one of
+/// the callee's parameters, else past the caller's own values.
+fn renamed(x: i64, pmap: [i64], vbase: i64) -> i64 {
+    if x < 0 {
+        return x
+    }
+    if pmap[x] >= 0 {
+        return pmap[x]
+    }
+    vbase + x
+}
+
+/// One block of the function being built.
+fn open_block(inout g: MirFn) -> i64 {
+    let b = g.bi0.len()
+    g.bp0.push(g.bparams.len())
+    g.bnp.push(0)
+    g.bi0.push(g.op.len())
+    g.bni.push(0)
+    g.tk.push(-1)
+    g.tv.push(-1)
+    g.tt.push(-1)
+    g.tf.push(-1)
+    g.ta0.push(g.targs.len())
+    g.tan.push(0)
+    g.fa0.push(g.targs.len())
+    g.fan.push(0)
+    g.tspan.push(-1)
+    b
+}
+
+/// Ends block `b` (the last opened) with a jump to `t` passing `args`.
+fn end_jump(inout g: MirFn, b: i64, t: i64, args: [i64], span: i64) {
+    g.bni[b] = g.op.len() - g.bi0[b]
+    g.tk[b] = ir.M_JUMP
+    g.tt[b] = t
+    g.ta0[b] = g.targs.len()
+    for x in args {
+        g.targs.push(x)
+    }
+    g.tan[b] = args.len()
+    g.fa0[b] = g.targs.len()
+    g.fan[b] = 0
+    g.tspan[b] = span
+}
+
+/// Copies instruction `i` of `src`, its operands through `pmap`/`vbase`
+/// (`vbase` -1: the caller's own, unrenamed), its slot moved by `slot0`.
+fn copy_inst(inout g: MirFn, src: MirFn, i: i64, pmap: [i64], vbase: i64, slot0: i64) {
+    let mine = vbase < 0
+    let op = src.op[i]
+    g.op.push(op)
+    g.res.push(if mine { src.res[i] } else { renamed(src.res[i], pmap, vbase) })
+    g.a.push(if mine { src.a[i] } else { renamed(src.a[i], pmap, vbase) })
+    g.b.push(if mine { src.b[i] } else { renamed(src.b[i], pmap, vbase) })
+    g.imm.push(if op == ir.M_SLOTADDR { src.imm[i] + slot0 } else { src.imm[i] })
+    g.ca0.push(g.cargs.len())
+    for j in src.ca0[i]..(src.ca0[i] + src.can[i]) {
+        g.cargs.push(if mine { src.cargs[j] } else { renamed(src.cargs[j], pmap, vbase) })
+    }
+    g.can.push(src.can[i])
+    g.ispan.push(src.ispan[i])
+}
+
+/// `f` with each call at `sites` (instruction indices, in order) replaced
+/// by a copy of its callee's body.
+fn splice(f: MirFn, sites: [i64], fns: [MirFn], fn_of: [i64]) -> MirFn {
+    let nb = ir.nblocks(f)
+    var is_site: [bool] = []
+    for i in 0..f.op.len() {
+        is_site.push(false)
+    }
+    for i in sites {
+        is_site[i] = true
+    }
+    // The new numbering of blocks: each block's first part where the block
+    // was; after it, per inlined call, the callee's blocks and then the
+    // part that goes on after the call.
+    var first: [i64] = []
+    var next = 0
+    for b in 0..nb {
+        first.push(next)
+        next += 1
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            if is_site[i] {
+                next += ir.nblocks(fns[fn_of[f.imm[i]]]) + 1
+            }
+        }
+    }
+    var g = ir.shell(f)
+    // A call whose copy returns at one place only answers that place's
+    // value: the call's result is that value, renamed once the whole
+    // function is built, rather than a parameter of the block after it, so
+    // what the copy computed is seen as what it is (a constant, say).
+    var from: [i64] = []
+    var to: [i64] = []
+    for b in 0..nb {
+        var cur = open_block(g)
+        // The block's own parameters are its first part's.
+        for k in 0..f.bnp[b] {
+            g.bparams.push(f.bparams[f.bp0[b] + k])
+        }
+        g.bnp[cur] = f.bnp[b]
+        let none: [i64] = []
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            if not is_site[i] {
+                copy_inst(g, f, i, none, -1, 0)
+                continue
+            }
+            let callee = fns[fn_of[f.imm[i]]]
+            let vbase = g.nvals
+            // Past the caller's own slots, the copies share one region: a
+            // copy's slots live only while it runs (an argument vector, an
+            // `inout` home, a result word of its own calls), and no copy runs
+            // while another does.
+            let slot0 = f.nslots
+            g.nvals += callee.nvals
+            if f.nslots + callee.nslots > g.nslots {
+                g.nslots = f.nslots + callee.nslots
+            }
+            for x in callee.vfp {
+                g.vfp.push(x)
+            }
+            // The callee's parameters are the call's arguments.
+            var pmap: [i64] = []
+            for x in 0..callee.nvals {
+                pmap.push(-1)
+            }
+            for k in 0..callee.bnp[0] {
+                pmap[callee.bparams[callee.bp0[0] + k]] = f.cargs[f.ca0[i] + k]
+            }
+            let cb0 = cur + 1
+            let after = cb0 + ir.nblocks(callee)
+            var nret = 0
+            for cb in 0..ir.nblocks(callee) {
+                if callee.tk[cb] == ir.M_RET {
+                    nret += 1
+                }
+            }
+            let one_ret = nret == 1
+            end_jump(g, cur, cb0, [], f.ispan[i])
+            for cb in 0..ir.nblocks(callee) {
+                let nbk = open_block(g)
+                if cb > 0 {
+                    for k in 0..callee.bnp[cb] {
+                        g.bparams.push(renamed(callee.bparams[callee.bp0[cb] + k], pmap, vbase))
+                    }
+                    g.bnp[nbk] = callee.bnp[cb]
+                }
+                for ci in callee.bi0[cb]..(callee.bi0[cb] + callee.bni[cb]) {
+                    copy_inst(g, callee, ci, pmap, vbase, slot0)
+                }
+                g.bni[nbk] = g.op.len() - g.bi0[nbk]
+                let k = callee.tk[cb]
+                g.tspan[nbk] = callee.tspan[cb]
+                if k == ir.M_RET {
+                    // Back to the caller, with what it answers.
+                    var args: [i64] = []
+                    if f.res[i] >= 0 and callee.tv[cb] >= 0 {
+                        if one_ret {
+                            from.push(f.res[i])
+                            to.push(renamed(callee.tv[cb], pmap, vbase))
+                        } else {
+                            args.push(renamed(callee.tv[cb], pmap, vbase))
+                        }
+                    }
+                    end_jump(g, nbk, after, args, callee.tspan[cb])
+                    continue
+                }
+                g.tk[nbk] = k
+                g.tv[nbk] = renamed(callee.tv[cb], pmap, vbase)
+                g.tt[nbk] = if callee.tt[cb] >= 0 { cb0 + callee.tt[cb] } else { -1 }
+                g.tf[nbk] = if callee.tf[cb] >= 0 { cb0 + callee.tf[cb] } else { -1 }
+                g.ta0[nbk] = g.targs.len()
+                for j in callee.ta0[cb]..(callee.ta0[cb] + callee.tan[cb]) {
+                    g.targs.push(renamed(callee.targs[j], pmap, vbase))
+                }
+                g.tan[nbk] = callee.tan[cb]
+                g.fa0[nbk] = g.targs.len()
+                for j in callee.fa0[cb]..(callee.fa0[cb] + callee.fan[cb]) {
+                    g.targs.push(renamed(callee.targs[j], pmap, vbase))
+                }
+                g.fan[nbk] = callee.fan[cb]
+            }
+            // The rest of the block, after the call: its parameter is what
+            // the call answered.
+            cur = open_block(g)
+            if f.res[i] >= 0 and not one_ret {
+                g.bparams.push(f.res[i])
+                g.bnp[cur] = 1
+            }
+        }
+        // The block's own terminator ends its last part.
+        g.bni[cur] = g.op.len() - g.bi0[cur]
+        g.tk[cur] = f.tk[b]
+        g.tv[cur] = f.tv[b]
+        g.tt[cur] = if f.tt[b] >= 0 { first[f.tt[b]] } else { -1 }
+        g.tf[cur] = if f.tf[b] >= 0 { first[f.tf[b]] } else { -1 }
+        g.ta0[cur] = g.targs.len()
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            g.targs.push(f.targs[j])
+        }
+        g.tan[cur] = f.tan[b]
+        g.fa0[cur] = g.targs.len()
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            g.targs.push(f.targs[j])
+        }
+        g.fan[cur] = f.fan[b]
+        g.tspan[cur] = f.tspan[b]
+    }
+    if from.len() > 0 {
+        apply_aliases(g, from, to)
+    }
+    g
+}
+
+/// Every read of `from[k]` in `g` becomes a read of `to[k]` (through any
+/// chain of them: a call's result answered by another inlined call's).
+fn apply_aliases(inout g: MirFn, from: [i64], to: [i64]) {
+    var al: [i64] = []
+    for x in 0..g.nvals {
+        al.push(x)
+    }
+    for k in 0..from.len() {
+        al[from[k]] = to[k]
+    }
+    // Resolve the chains, each value once: a value's alias is defined before
+    // the value it stands for was, so following them ends.
+    for x in 0..g.nvals {
+        var y = al[x]
+        var steps = 0
+        while al[y] != y and steps < g.nvals {
+            y = al[y]
+            steps += 1
+        }
+        al[x] = y
+    }
+    for i in 0..g.op.len() {
+        if g.a[i] >= 0 {
+            g.a[i] = al[g.a[i]]
+        }
+        if g.b[i] >= 0 {
+            g.b[i] = al[g.b[i]]
+        }
+    }
+    for j in 0..g.cargs.len() {
+        g.cargs[j] = al[g.cargs[j]]
+    }
+    for b in 0..ir.nblocks(g) {
+        if g.tv[b] >= 0 {
+            g.tv[b] = al[g.tv[b]]
+        }
+    }
+    for j in 0..g.targs.len() {
+        g.targs[j] = al[g.targs[j]]
+    }
+}

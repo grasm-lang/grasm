@@ -98,6 +98,14 @@
 #                  -> encodetest (the bytes against the assembler's)
 #   addr-off       a load or store that absorbed its address's `add` reaches
 #                  one element past it -> s3subset
+#   inline-line    an inlined callee's instructions are mapped to the call's
+#                  line, the caller's -> objtest (a literal's load in a copy
+#                  maps to the wrong line)
+#   direct-env     a closure called directly is handed its environment
+#                  released rather than retained, so it is released twice
+#                  -> s3rc (programs killed by a signal)
+#   rc-cancel      an `inc` and a `dec` are cancelled across a call that takes
+#                  the reference -> s3rc (a use after free)
 #
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
@@ -329,6 +337,19 @@ control addr-off compiler/aarch64/src/isel.gr \
     $'                imms.push(c + rules.mem_bytes(f.op[i]))\n            } else if k == rules.K_ASLOT {' -- \
     scripts/s3subset.sh "MISMATCH:" -
 
+control direct-env compiler/mir/src/tidy.gr \
+    "        f.op[de] = ir.M_INC" "        f.op[de] = ir.M_DEC" -- \
+    scripts/s3rc.sh "killed by signal" -
+
+control rc-cancel compiler/mir/src/tidy.gr \
+    "                } else if gone[j] or neutral(op) {" "                } else if true {" -- \
+    scripts/s3rc.sh "use after free" -
+
+control inline-line compiler/mir/src/inline.gr \
+    "                    copy_inst(g, callee, ci, pmap, vbase, slot0)" \
+    $'                    copy_inst(g, callee, ci, pmap, vbase, slot0)\n                    g.ispan[g.ispan.len() - 1] = f.ispan[i]' -- \
+    scripts/objtest.sh "maps to line" -
+
 # The backend's copy of the runtime's layouts, with a fault in a copy of it,
 # held by `rtlayout` to compiler/rt's (which takes no backend: it reads the
 # file).
@@ -407,10 +428,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Thirty-seven gate runs over thirty-two faults, and every one must have
+# Forty gate runs over thirty-five faults, and every one must have
 # failed.
-if [ "$controls" -ne 37 ] || [ "$caught" -ne 37 ]; then
-    echo "expected 37 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 40 ] || [ "$caught" -ne 40 ]; then
+    echo "expected 40 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

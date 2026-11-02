@@ -1,6 +1,6 @@
 // `s3`: the self-hosted backend's driver (docs/self-hosting.md, stage S3).
 //
-//     s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--runtime]
+//     s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--runtime] [--inline=N]
 //     s3 --check-rules        the lowering rules' own checks
 //
 // `--runtime` compiles the runtime written in Grasm (docs/self-hosting.md
@@ -13,6 +13,9 @@
 // `thread_local` cells Mach-O thread-local variables, and the context
 // switch and the variables' getters leaves this driver writes into the
 // object (`compiler/aarch64/src/leaves.gr`).
+// `--inline=N` inlines callees of at most N MIR instructions and terminators
+// into their callers, 0 none (`compiler/mir/src/inline.gr`; the default is
+// `INLINE_LIMIT`).
 // `--ra=linear` allocates registers by linear scan, the fast allocator, in
 // place of the release one (`--ra=backtrack`, the default; docs/self-hosting.md
 // §4).
@@ -53,8 +56,12 @@ import mir.ir
 import aarch64
 import macho
 
+/// The largest callee inlined, in MIR instructions and terminators
+/// (`compiler/mir/src/inline.gr`); `--inline=N` sets another, 0 none.
+let INLINE_LIMIT = 32
+
 fn usage() {
-    eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats] [--runtime]")
+    eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats] [--runtime] [--inline=N]")
     eprint("       s3 --check-rules | --forms | --encode-test <prefix>")
     exit(2)
 }
@@ -242,7 +249,7 @@ fn add_leaves(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, i
 }
 
 /// Compiles a TIR file into an object file. Answers the exit status.
-fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool) -> i64 {
+fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool, inline_limit: i64) -> i64 {
     let src = match read_bytes(inp) {
         Ok(b) -> b
         Err(e) -> {
@@ -250,7 +257,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             return 2
         }
     }
-    let p = match mir.build(src, lib) {
+    let p = match mir.build(src, lib, inline_limit) {
         Ok(x) -> x
         Err(msg) -> {
             eprint(msg)
@@ -442,7 +449,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
         print("functions: {p.fns.len()}   checked: {p.fns.len() - ra_failed}   spill slots: {spills}   words: {obj.text.len()}   with doubles: {with_fp}")
         // The mid-end's counts on a line of their own: gates read the first
         // line by position (`scripts/ra_check.sh`).
-        print("mid-end: folded: {p.folded}")
+        print("mid-end: folded: {p.folded}   inlined: {p.inlined} calls of {p.inlinees} functions, {p.dropped} no longer called, {p.direct} closures called directly, {p.rcpairs} count pairs cancelled")
     }
     if listing != "" {
         match write_file(listing, text.to_str()) {
@@ -474,6 +481,7 @@ fn main() {
     var check = true
     var stats = false
     var lib = false
+    var inline_limit = INLINE_LIMIT
     var i = 0
     while i < a.len() {
         let x = a[i]
@@ -512,6 +520,13 @@ fn main() {
         } else if x == "--runtime" {
             lib = true
             i += 1
+        } else if x.starts_with("--inline=") {
+            inline_limit = x.substr(9, x.len() - 9).parse_int() ?? -1
+            if inline_limit < 0 {
+                usage()
+                return
+            }
+            i += 1
         } else if x.starts_with("-") or inp != "" {
             usage()
             return
@@ -524,5 +539,5 @@ fn main() {
         usage()
         return
     }
-    exit(compile(inp, out, opts, listing, check, stats, lib))
+    exit(compile(inp, out, opts, listing, check, stats, lib, inline_limit))
 }

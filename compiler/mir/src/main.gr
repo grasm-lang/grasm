@@ -6,8 +6,11 @@
 //     lower.gr  TIR to three-address code over variables; decides the subset
 //     ssa.gr    variables to SSA with block arguments
 //     fold.gr   constant folding, the mid-end's first pass
-//     ir.gr     MIR itself: opcodes, the function record, a printer
+//     inline.gr small functions inlined into their callers
+//     tidy.gr   direct calls of closures made in place, and the counts
+//               inlining leaves that cancel
 //     layout.gr the runtime's layouts the lowering reads inline
+//     ir.gr     MIR itself: opcodes, the function record, a printer
 import sexp
 import mono
 import ir
@@ -15,13 +18,16 @@ import prog
 import lower
 import ssa
 import fold
+import inline
+import tidy
 
 /// Reads a program's TIR and builds the MIR of every function `main`
 /// reaches, plus the C entry point. A program outside the subset is an
 /// error naming every construct that put it there. The runtime written in
 /// Grasm (`lib`) is every function its `export fn`s reach, with no C entry
-/// point of its own.
-pub fn build(src: bytes, lib: bool) -> MirProg ! str {
+/// point of its own. A callee of at most `inline_limit` instructions and
+/// terminators is inlined into its callers (`inline.gr`); 0 inlines none.
+pub fn build(src: bytes, lib: bool, inline_limit: i64) -> MirProg ! str {
     let t0 = try sexp.read(src)
     if not lib {
         // The runtime dialect is the runtime's ([T-RUNTIME]): a program's
@@ -86,6 +92,10 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
     }
     var q = 0
     var folded = 0
+    // Per function, the callable id it compiles (-1 for the C entry) and
+    // whether C calls it.
+    var fn_callable: [i64] = []
+    var fn_centry: [bool] = []
     // The runtime has no C entry point of its own.
     var done_own = lib
     while true {
@@ -204,10 +214,58 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
         if c >= nc and lifts.global[c - nc] {
             f.global = true
         }
+        f.centry = c == -1 or (c >= nc and lifts.kind[c - nc] == lower.LIFT_CENTRY)
+        fn_callable.push(c)
+        fn_centry.push(f.centry)
         fns.push(f)
     }
     if errors.len() > 0 {
         fail(errors.join("\n"))
+    }
+    // Small callees into their callers, then what that made constant.
+    var fn_of: [i64] = []
+    for k in 0..callee_sym.len() {
+        fn_of.push(-1)
+    }
+    for k in 0..fns.len() {
+        if fn_callable[k] >= 0 {
+            fn_of[fn_callable[k]] = k
+        }
+    }
+    // A closure written where it is called through is called directly,
+    // so it can be inlined too.
+    var direct = 0
+    if inline_limit > 0 {
+        for k in 0..fns.len() {
+            var f = fns[k]
+            let nd = tidy.direct_calls(f, rt_syms)
+            if nd > 0 {
+                direct += nd
+                fns[k] = f
+            }
+        }
+    }
+    let ist = inline.inline_all(fns, fn_of, fn_centry, inline_limit)
+    var dropped = 0
+    var rcpairs = 0
+    if ist.sites > 0 {
+        let keep = inline.referenced(fns, fn_of)
+        var kept: [MirFn] = []
+        for k in 0..fns.len() {
+            if not keep[k] {
+                dropped += 1
+                continue
+            }
+            var f = fns[k]
+            fold.merge_blocks(f)
+            rcpairs += tidy.cancel_rc(f)
+            folded += fold.fold(f)
+            if fold.fold_branches(f) > 0 {
+                fold.merge_blocks(f)
+            }
+            kept.push(f)
+        }
+        fns = kept
     }
     // The source files the spans index, for the line table.
     var files: [str] = []
@@ -265,6 +323,7 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
     MirProg{
         fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs, files: files, fbase: fbase,
         pcells: pcells, psize: psize, tcells: tcells, tsize: tsize, folded: folded,
+        inlined: ist.sites, inlinees: ist.callees, dropped: dropped, direct: direct, rcpairs: rcpairs,
     }
 }
 
