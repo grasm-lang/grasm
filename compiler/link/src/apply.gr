@@ -6,6 +6,16 @@
 // GOT: the `ldr` becomes an `add` of the address itself, as ld-prime does
 // (ld64's kindStoreARM64GOTLeaPageOff12). A call to a dylib goes through a
 // stub, which loads the GOT slot dyld binds.
+//
+// On x86-64 (docs/self-hosting.md §6.16) every code relocation is a 32-bit
+// displacement from the end of its field (and of the immediate bytes after
+// it, for `SIGNED_1/2/4`), its addend the field's own value: a call's to its
+// target or to a stub, an address's, a GOT slot's. A GOT load or a
+// thread-local descriptor's load of something defined here becomes a `leaq`
+// of it -- the `movq` opcode 8B made 8D -- as ld64 does
+// (kindStoreX86PCRel32GOTLoadNowLEA, kindStoreX86PCRel32TLVLoadNowLEA); the
+// Cranelift build's `movq` of its own data's GOT slot, which it marks
+// `X86_64_RELOC_GOT`, the same. A stub is `jmp *slot(%rip)`.
 import rd
 import state
 import objfile
@@ -52,7 +62,21 @@ fn got_slot_addr(l: Ld, got_o: i64, r: i64) -> i64 {
 }
 
 fn stub_addr(l: Ld, stubs_o: i64, g: i64) -> i64 {
-    l.o_addr[stubs_o] + 12 * l.g_stub[g]
+    l.o_addr[stubs_o] + layout.stub_size(l) * l.g_stub[g]
+}
+
+fn fits32(v: i64) -> bool {
+    v >= -2147483648 and v <= 2147483647
+}
+
+/// The `movq` before an x86-64 RIP-relative field made a `leaq`: answers
+/// "" or why it cannot be.
+fn x_lea(inout buf: bytes, at: i64) -> str {
+    if at < 2 or buf.at(at - 2) != 0x8b or buf.at(at - 1).bit_and(0xc7) != 0x05 {
+        return "a load that is not `movq sym(%rip)`"
+    }
+    rd.put8(buf, at - 2, 0x8d)
+    ""
 }
 
 fn page(x: i64) -> i64 {
@@ -120,7 +144,37 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
                 if k == state.T_NONE {
                     fail(fail_at(l, a, r, "undefined symbol {if l.r_tg[r] >= 0 { l.g_name[l.r_tg[r]] } else { "?" }}"))
                 }
-                if t == objfile.R_BRANCH26 {
+                if t == objfile.R_X_BRANCH or t == objfile.R_X_SIGNED or t == objfile.R_X_GOT_LOAD or t == objfile.R_X_GOT or t == objfile.R_X_TLV {
+                    // The field holds the addend; the displacement counts
+                    // from the end of the field and of what follows it.
+                    let c = rd.s32(d, src + field)
+                    let after = pc + 4 + (if t == objfile.R_X_SIGNED { l.r_addend[r] } else { 0 })
+                    var target = 0
+                    if t == objfile.R_X_BRANCH {
+                        target = if k == state.T_IMPORT { stub_addr(l, stubs_o, l.r_tg[r]) } else { target_addr(l, r) } + c
+                    } else if t == objfile.R_X_SIGNED {
+                        if k == state.T_IMPORT {
+                            fail(fail_at(l, a, r, "a direct reference to {l.g_name[l.r_tg[r]]}, which is in a dylib"))
+                        }
+                        target = target_addr(l, r) + c
+                    } else if (t == objfile.R_X_GOT_LOAD or t == objfile.R_X_GOT) and k == state.T_IMPORT {
+                        target = got_slot_addr(l, got_o, r) + c
+                    } else {
+                        if k != state.T_ATOM {
+                            fail(fail_at(l, a, r, "a thread-local variable from a dylib, which this linker does not take"))
+                        }
+                        let why = x_lea(buf, at)
+                        if why != "" {
+                            fail(fail_at(l, a, r, why))
+                        }
+                        target = target_addr(l, r) + c
+                    }
+                    let delta = target - after
+                    if not fits32(delta) {
+                        fail(fail_at(l, a, r, "the target is out of a 32-bit displacement's reach ({rd.hex(delta)})"))
+                    }
+                    rd.put32(buf, at, delta)
+                } else if t == objfile.R_BRANCH26 {
                     let target = if k == state.T_IMPORT { stub_addr(l, stubs_o, l.r_tg[r]) + l.r_addend[r] } else { target_addr(l, r) + l.r_addend[r] }
                     let delta = target - pc
                     if delta < -134217728 or delta >= 134217728 {
@@ -238,8 +292,19 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
             }
         }
     }
-    // The stubs: adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16.
-    if stubs_o >= 0 {
+    // The stubs: on x86-64, jmp *slot(%rip); on arm64, adrp x16, slot@PAGE;
+    // ldr x16, [x16, slot@PAGEOFF]; br x16.
+    if stubs_o >= 0 and l.x64 {
+        for i in 0..l.stub_g.len() {
+            let g = l.stub_g[i]
+            let pc = l.o_addr[stubs_o] + 6 * i
+            let slot = l.o_addr[got_o] + 8 * l.g_got[g]
+            let at = l.o_off[stubs_o] + 6 * i
+            rd.put8(buf, at, 0xff)
+            rd.put8(buf, at + 1, 0x25)
+            rd.put32(buf, at + 2, slot - (pc + 6))
+        }
+    } else if stubs_o >= 0 {
         for i in 0..l.stub_g.len() {
             let g = l.stub_g[i]
             let pc = l.o_addr[stubs_o] + 12 * i

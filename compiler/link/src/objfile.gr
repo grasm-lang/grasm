@@ -1,5 +1,8 @@
-// Reading a relocatable arm64 Mach-O object (MH_OBJECT) into the linker's
-// arrays: its sections, its symbols, and its relocations decoded.
+// Reading a relocatable arm64 or x86-64 Mach-O object (MH_OBJECT) into the
+// linker's arrays: its sections, its symbols, and its relocations decoded.
+// An x86-64 object's relocation types are mapped to the linker's own kinds
+// as they are read: `UNSIGNED` and `SUBTRACTOR` to arm64's, which mean the
+// same, and the rest to `R_X_*` (docs/self-hosting.md §6.16).
 //
 // A relocation is decoded in table order, because two kinds modify the one
 // after them: ARM64_RELOC_ADDEND carries the addend of the PAGE21,
@@ -21,10 +24,20 @@ pub let R_POINTER_TO_GOT = 7
 pub let R_TLVP_PAGE21 = 8
 pub let R_TLVP_PAGEOFF12 = 9
 pub let R_ADDEND = 10
+/// x86-64's: a 32-bit displacement from the end of the field (and of the
+/// 1, 2 or 4 immediate bytes after it, for `SIGNED_1/2/4`, kept as the
+/// record's addend), to a symbol, a call's, a GOT slot's, a thread-local
+/// descriptor's; and a 32-bit displacement to a GOT slot outside code.
+pub let R_X_SIGNED = 11
+pub let R_X_BRANCH = 12
+pub let R_X_GOT_LOAD = 13
+pub let R_X_GOT = 14
+pub let R_X_TLV = 15
 
 pub fn reloc_name(t: i64) -> str {
     let names = ["UNSIGNED", "SUBTRACTOR", "BRANCH26", "PAGE21", "PAGEOFF12", "GOT_LOAD_PAGE21", "GOT_LOAD_PAGEOFF12",
-        "POINTER_TO_GOT", "TLVP_LOAD_PAGE21", "TLVP_LOAD_PAGEOFF12", "ADDEND"]
+        "POINTER_TO_GOT", "TLVP_LOAD_PAGE21", "TLVP_LOAD_PAGEOFF12", "ADDEND", "X86_64_RELOC_SIGNED", "X86_64_RELOC_BRANCH",
+        "X86_64_RELOC_GOT_LOAD", "X86_64_RELOC_GOT", "X86_64_RELOC_TLV"]
     if t >= 0 and t < names.len() { names[t] } else { "type {t}" }
 }
 
@@ -58,13 +71,19 @@ pub fn read(inout l: Ld, path: str, d: bytes, key: i64) -> i64 ! str {
         fail("{path}: not a 64-bit Mach-O object")
     }
     let cpu = rd.u32(d, 4)
-    if cpu != 0x0100000c {
-        fail("{path}: built for cpu type {cpu}, not arm64")
+    if cpu != 0x0100000c and cpu != 0x01000007 {
+        fail("{path}: built for cpu type {cpu}, not arm64 or x86_64")
     }
+    let is_x64 = cpu == 0x01000007
+    if l.arch_known and is_x64 != l.x64 {
+        fail("{path}: built for {if is_x64 { "x86_64" } else { "arm64" }}, and the objects before it for {if l.x64 { "x86_64" } else { "arm64" }}")
+    }
+    l.x64 = is_x64
+    l.arch_known = true
     if rd.u32(d, 12) != 1 {
         fail("{path}: not a relocatable object (file type {rd.u32(d, 12)})")
     }
-    if rd.u32(d, 8).bit_and(0xffffff) == 2 {
+    if not is_x64 and rd.u32(d, 8).bit_and(0xffffff) == 2 {
         fail("{path}: built for arm64e, which this linker does not take (the native build is arm64)")
     }
     let fi = l.f_path.len()
@@ -157,6 +176,24 @@ pub fn read(inout l: Ld, path: str, d: bytes, key: i64) -> i64 ! str {
     fi
 }
 
+/// An x86-64 relocation type as the linker's kind (`R_*`); `SIGNED_1/2/4`
+/// as 106, 107, 108, for the caller to take apart.
+fn x64_kind(path: str, t: i64) -> i64 ! str {
+    match t {
+        0 -> R_UNSIGNED
+        1 -> R_X_SIGNED
+        2 -> R_X_BRANCH
+        3 -> R_X_GOT_LOAD
+        4 -> R_X_GOT
+        5 -> R_SUBTRACTOR
+        6 -> 106
+        7 -> 107
+        8 -> 108
+        9 -> R_X_TLV
+        _ -> fail("{path}: x86-64 relocation type {t}, which this linker does not know")
+    }
+}
+
 /// Decodes section `si`'s relocations into the `r_*` arrays, sorted by address.
 fn relocs(inout l: Ld, fi: i64, si: i64) -> () ! str {
     let d = l.f_data[fi]
@@ -190,8 +227,17 @@ fn relocs(inout l: Ld, fi: i64, si: i64) -> () ! str {
         let pcrel = w.ushr(24).bit_and(1) == 1
         let length = w.ushr(25).bit_and(3)
         let ext = w.ushr(27).bit_and(1) == 1
-        let t = w.ushr(28).bit_and(15)
-        if t == R_ADDEND {
+        var t = w.ushr(28).bit_and(15)
+        var bias = 0
+        if l.x64 {
+            t = try x64_kind(l.f_path[fi], t)
+            if t >= 106 {
+                // SIGNED_1/2/4: the field is followed by that many bytes.
+                bias = if t == 106 { 1 } else if t == 107 { 2 } else { 4 }
+                t = R_X_SIGNED
+            }
+        }
+        if t == R_ADDEND and not l.x64 {
             pend_addend = rd.sext(symnum, 24)
             have_addend = true
             continue
@@ -221,7 +267,7 @@ fn relocs(inout l: Ld, fi: i64, si: i64) -> () ! str {
         pcr.push(pcrel)
         sym.push(ys)
         tsec.push(ts)
-        add.push(if have_addend { pend_addend } else { 0 })
+        add.push(if have_addend { pend_addend } else { bias })
         if have_sub {
             ssym.push(pend_ssym)
             ssec.push(pend_ssec)

@@ -121,7 +121,10 @@ for k in "${!S3_SRC[@]}"; do
     cl_code=$?
     $S3_RUN arch -x86_64 "$WORK/p.x" >"$WORK/x.out" 2>"$WORK/x.err" </dev/null
     x_code=$?
-    $S3_RUN "$GRASM" run "$src" >"$WORK/i.out" 2>"$WORK/i.err" </dev/null
+    # The interpreter runs under the corpus's limit (`corpus.sh`), as in
+    # `crosstest`: a compiled program's 20 s is far too little for it (a
+    # parallel map or a password hash, interpreted, takes minutes).
+    $RUN_LIMIT "$GRASM" run "$src" >"$WORK/i.out" 2>"$WORK/i.err" </dev/null
     i_code=$?
     if [ "$cl_code" = 124 ] || [ "$x_code" = 124 ] || [ "$i_code" = 124 ]; then
         timedout=$((timedout + 1))
@@ -158,7 +161,7 @@ if [ ${#S3_NOTIR[@]} -gt 0 ]; then
 fi
 if [ ${#TIMEDOUT[@]} -gt 0 ]; then
     echo
-    echo "TIMED OUT after ${S3_RUN_SECONDS}s (not agreement):"
+    echo "TIMED OUT after ${S3_RUN_SECONDS}s compiled or ${RUN_LIMIT_SECONDS}s interpreted (not agreement):"
     printf '  %s\n' "${TIMEDOUT[@]}"
 fi
 if [ ${#FAILED[@]} -gt 0 ]; then

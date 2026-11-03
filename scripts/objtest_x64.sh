@@ -147,10 +147,13 @@ if [ -z "${DIRS:-}" ] && [ "$checked" -lt "$S3_SUBSET_FLOOR" ]; then
     echo "only $checked objects were checked; the subset's floor is $S3_SUBSET_FLOOR"
     exit 1
 fi
-# The line tables' sample, held to a floor as `objtest`'s is: far fewer than
-# arm64's 100,000 would be a check that stopped finding its sample.
-if [ -z "${DIRS:-}" ] && [ "$lines_checked" -lt 100000 ]; then
-    echo "only $lines_checked literal loads were looked up in the line tables; the floor is 100000"
+# The line tables' sample, held to a floor as `objtest`'s is. A literal's
+# address is one `leaq` on x86-64 where arm64 loads it with two instructions,
+# each looked up, so the count is half of arm64's: 68,953 against 137,906 on
+# the subset when the gate was written (2026-11-02). Far fewer would be a
+# check that stopped finding its sample.
+if [ -z "${DIRS:-}" ] && [ "$lines_checked" -lt 60000 ]; then
+    echo "only $lines_checked literal loads were looked up in the line tables; the floor is 60000"
     exit 1
 fi
 [ "$lines_checked" -gt 0 ] || { echo "no instruction was looked up in a line table"; exit 1; }

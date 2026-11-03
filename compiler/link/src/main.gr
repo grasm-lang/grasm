@@ -1,4 +1,5 @@
-// `link`: the Grasm linker for arm64 Mach-O (docs/self-hosting.md, stage S4).
+// `link`: the Grasm linker for arm64 Mach-O (docs/self-hosting.md, stage S4),
+// and for x86-64 Mach-O (§6.16, stage S7), chosen by the objects it is given.
 //
 //     link [options] <inputs> -o <output>
 //
@@ -90,9 +91,22 @@
 // ld's MD5; no tool entry in LC_BUILD_VERSION; no debug map (N_OSO stabs) --
 // the objects it would point at are in a directory deleted after the build,
 // and an N_OSO records a path and a time; and local symbols at one address
-// may be listed in another order. Not taken, and refused by name: x86_64,
-// arm64e, dylib or bundle output, common symbols, initializers
-// (`__mod_init_func`), a thread-local variable from a dylib, frameworks.
+// may be listed in another order. Not taken, and refused by name: arm64e,
+// dylib or bundle output, common symbols, initializers (`__mod_init_func`),
+// a thread-local variable from a dylib, frameworks, and objects of both
+// architectures in one link.
+//
+// x86-64 (§6.16): the objects say so, and then pages are 4 KiB, a stub is
+// `jmp *slot(%rip)` (6 bytes), and the code's relocations are x86-64's --
+// BRANCH, SIGNED (and SIGNED_1/2/4), GOT_LOAD, GOT and TLV, each a 32-bit
+// displacement from the end of its field with the field's value as addend; a
+// GOT load or a thread-local descriptor's load of something defined here
+// made a `leaq` of it, as ld64 does. Everything else -- atoms, dead
+// stripping, layout, chained fixups (`DYLD_CHAINED_PTR_64_OFFSET`, as ld
+// writes for x86-64 too), the export trie, the symbol table, the signature --
+// is the arm64 code. What it does not yet do for x86-64 is match ld's bytes:
+// `linkdiff` is arm64's; ld signs no x86-64 executable, and this linker signs
+// it as it signs arm64's.
 //
 // Exit status: 0 written; 1 the link failed (undefined or duplicate symbols,
 // an input this linker does not take); 2 bad usage.
@@ -292,7 +306,8 @@ fn run(inout l: Ld) -> () ! str {
     try deadstrip.mark(l, files)
     let undef = deadstrip.undefined(l, files)
     if undef.len() > 0 {
-        fail("Undefined symbols for architecture arm64:\n" + undef.join("\n") + "\nld: symbol(s) not found for architecture arm64")
+        let arch = if l.x64 { "x86_64" } else { "arm64" }
+        fail("Undefined symbols for architecture {arch}:\n" + undef.join("\n") + "\nld: symbol(s) not found for architecture {arch}")
     }
     try layout.sections(l, files)
     for o in l.o_order {

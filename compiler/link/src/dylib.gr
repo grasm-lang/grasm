@@ -71,7 +71,7 @@ fn flow_items(text: str) -> [str] {
 }
 
 /// Reads the documents of a TAPI v4 text stub.
-fn parse_tbd(path: str, text: str) -> [TbdDoc] ! str {
+fn parse_tbd(path: str, text: str, target: str) -> [TbdDoc] ! str {
     let lines = text.lines()
     var docs: [TbdDoc] = []
     var cur = TbdDoc{ install: "", cur: 0x10000, compat: 0x10000, reexported: [], syms: [], weak: [], tlv: [] }
@@ -136,7 +136,7 @@ fn parse_tbd(path: str, text: str) -> [TbdDoc] ! str {
             continue
         }
         if key == "targets" {
-            item_ok = flow_items(value).contains("arm64-macos")
+            item_ok = flow_items(value).contains(target)
             continue
         }
         if not item_ok {
@@ -202,7 +202,7 @@ fn add_exports(inout l: Ld, di: i64, doc: TbdDoc) {
 
 /// Adds a library read from a `.tbd`; answers its index.
 pub fn read_tbd(inout l: Ld, path: str, text: str) -> i64 ! str {
-    let docs = try parse_tbd(path, text)
+    let docs = try parse_tbd(path, text, if l.x64 { "x86_64-macos" } else { "arm64-macos" })
     let main = docs[0]
     let di = l.dl_install.len()
     l.dl_install.push(main.install)
@@ -240,22 +240,24 @@ fn be32(d: bytes, at: i64) -> i64 {
 /// Adds a Mach-O dylib; answers its index.
 pub fn read_macho(inout l: Ld, path: str, data: bytes) -> i64 ! str {
     var at = 0
+    let cpu = if l.x64 { 0x01000007 } else { 0x0100000c }
+    let arch = if l.x64 { "x86_64" } else { "arm64" }
     if data.len() >= 8 and be32(data, 0) == 0xcafebabe {
         let n = be32(data, 4)
         var found = -1
         for k in 0..n {
             let e = 8 + 20 * k
-            if be32(data, e) == 0x0100000c {
+            if be32(data, e) == cpu {
                 found = be32(data, e + 8)
             }
         }
         if found < 0 {
-            fail("{path}: a universal file with no arm64 slice")
+            fail("{path}: a universal file with no {arch} slice")
         }
         at = found
     }
-    if rd.u32(data, at) != 0xfeedfacf or rd.u32(data, at + 4) != 0x0100000c {
-        fail("{path}: not an arm64 Mach-O library")
+    if rd.u32(data, at) != 0xfeedfacf or rd.u32(data, at + 4) != cpu {
+        fail("{path}: not an {arch} Mach-O library")
     }
     if rd.u32(data, at + 12) != 6 {
         fail("{path}: not a dynamic library")

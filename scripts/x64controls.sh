@@ -41,9 +41,9 @@
 #                its reader)
 #   x-pop-order  the epilogue pops the callee-saved registers in the order
 #                the prologue pushed them -> xs3subset
-#   x-clobber    the target description says a call keeps rcx, so values are
-#                left in it across calls -- which the checker, reading the
-#                same description, cannot see -> xs3subset
+#   x-clobber    the target description hands out rcx, which a call changes,
+#                to values living across calls -> xs3subset (the allocation
+#                checker refuses every function that keeps one there)
 #   x-scratch    r11, a reload's scratch register, is also handed out to
 #                values -> ra_check_x64 (the checker, under pressure)
 #   x-reloc-off  every relocation is recorded one byte short of its field
@@ -52,6 +52,19 @@
 #                -> objtest_x64 (a literal's load maps to the wrong line)
 #   x-nondet     the driver writes the clock into every object
 #                -> objtest_x64 (two compilations differ)
+#
+# Step four's runtime and linker:
+#
+#   x-stub       a stub jumps through the GOT slot after its own
+#                -> xrtswap (calls into libSystem land in the wrong function)
+#   x-tlv-lea    a GOT or thread-local load of something defined in the
+#                image is left a `movq` rather than made a `leaq`, so it reads
+#                the target's first word as its address (the runtime's
+#                thread-local descriptors, the Cranelift objects' own data)
+#                -> xrtswap
+#   x-ctx-init   a new fiber's stack is one word lower, so its first call is
+#                made with `rsp` misaligned -> xrtswap (a concurrent program
+#                fails)
 #
 # The gates that compile the corpus stop at the first failure
 # (`S3_STOP_AT_FIRST=1`). `S3_RT_X64=` is handed to them as given.
@@ -148,8 +161,8 @@ control reloc-kind $M \
     scripts/encodetest_x64.sh "RELOC lea-rip"
 
 control coverage compiler/x86_64/src/main.gr \
-    $'        out.push(mach.form_name(m))\n    }\n    out' \
-    $'        out.push(mach.form_name(m))\n    }\n    out.push(mach.form_name(mach.P_RETURN))\n    out' -- \
+    $'            out.push(mach.form_name(m))\n        }\n    }\n    out' \
+    $'            out.push(mach.form_name(m))\n        }\n    }\n    out.push(mach.form_name(mach.P_RETURN))\n    out' -- \
     scripts/encodetest_x64.sh "with no test cases"
 
 X=compiler/x86_64/src
@@ -175,13 +188,13 @@ control x-pop-order $X/emit.gr \
     scripts/xs3subset.sh "FAILED:"
 
 control x-clobber $X/desc.gr \
-    "    r == mach.RAX or r == mach.RCX or r == mach.RDX" "    r == mach.RAX or r == mach.RDX" -- \
-    scripts/xs3subset.sh "FAILED:"
+    "    t.callee_order = [[mach.RBX, mach.R12," "    t.callee_order = [[mach.RCX, mach.RBX, mach.R12," -- \
+    scripts/xs3subset.sh "register allocation check failed"
 
 control x-scratch $X/desc.gr \
     "        [mach.RSI, mach.RDI, mach.R8, mach.R9, mach.RCX, mach.RDX, mach.RAX]," \
     "        [mach.R11, mach.RSI, mach.RDI, mach.R8, mach.R9, mach.RCX, mach.RDX, mach.RAX]," -- \
-    scripts/ra_check_x64.sh "passed the checker"
+    scripts/ra_check_x64.sh "register allocation check failed"
 
 control x-reloc-off $X/emit.gr \
     "                    p.rel_in.push(bs.len() - 4)" "                    p.rel_in.push(bs.len() - 3)" -- \
@@ -195,6 +208,22 @@ control x-nondet compiler/s3/src/main.gr \
     '    unit.producer = "grasm compiler/s3"' '    unit.producer = "grasm compiler/s3 at {now_millis()}"' -- \
     scripts/objtest_x64.sh "two compilations differ"
 
+control x-stub compiler/link/src/apply.gr \
+    "            let slot = l.o_addr[got_o] + 8 * l.g_got[g]
+            let at = l.o_off[stubs_o] + 6 * i" "            let slot = l.o_addr[got_o] + 8 * l.g_got[g] + 8
+            let at = l.o_off[stubs_o] + 6 * i" -- \
+    scripts/xrtswap.sh "FAILED:"
+
+control x-tlv-lea compiler/link/src/apply.gr \
+    "    rd.put8(buf, at - 2, 0x8d)" "    rd.put8(buf, at - 2, 0x8b)" -- \
+    scripts/xrtswap.sh "FAILED:"
+
+control x-ctx-init $X/leaves.gr \
+    "    try put(l, mach.X_STORE, mach.RAX, mach.RSI, -1, -8)
+    try put(l, mach.X_LEA, mach.RAX, mach.RSI, -1, -8)" "    try put(l, mach.X_STORE, mach.RAX, mach.RSI, -1, -16)
+    try put(l, mach.X_LEA, mach.RAX, mach.RSI, -1, -16)" -- \
+    scripts/xrtswap.sh "FAILED:"
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -203,9 +232,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Eighteen faults in nineteen gate runs, and every one must have been caught.
-if [ "$controls" -ne 19 ] || [ "$caught" -ne 19 ]; then
-    echo "expected 19 controls caught, ran $controls and caught $caught"
+# Twenty-one faults in twenty-two gate runs, and every one must have been
+# caught.
+if [ "$controls" -ne 22 ] || [ "$caught" -ne 22 ]; then
+    echo "expected 22 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

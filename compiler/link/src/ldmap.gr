@@ -37,7 +37,7 @@ fn atom_name(l: Ld, a: i64) -> str {
 
 pub fn text(l: Ld, files: [i64]) -> str {
     var s = str_builder()
-    s.push_str("# Path: {l.out}\n# Arch: arm64\n# Object files:\n[  0] linker synthesized\n")
+    s.push_str("# Path: {l.out}\n# Arch: {if l.x64 { "x86_64" } else { "arm64" }}\n# Object files:\n[  0] linker synthesized\n")
     var fidx: Map[i64, i64] = {}
     var k = 1
     for fi in files {
@@ -65,7 +65,8 @@ pub fn text(l: Ld, files: [i64]) -> str {
         } else if kind == layout.K_STUBS {
             for i in 0..l.stub_g.len() {
                 let g = l.stub_g[i]
-                s.push_str(hexaddr(l.o_addr[o] + 12 * i) + "\t" + hex8(12) + "\t" + idx(dl0 + l.g_dylib[g]) + " " + l.g_name[g] + ".stub\n")
+                let ss = layout.stub_size(l)
+                s.push_str(hexaddr(l.o_addr[o] + ss * i) + "\t" + hex8(ss) + "\t" + idx(dl0 + l.g_dylib[g]) + " " + l.g_name[g] + ".stub\n")
             }
         } else if kind == layout.K_GOT {
             for i in 0..l.got_name.len() {

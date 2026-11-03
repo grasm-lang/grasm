@@ -29,6 +29,17 @@ pub let K_UNWIND = 3
 pub let K_EHFRAME = 4
 
 pub let PAGE = 16384
+
+/// The page segments are laid out on: 16 KiB on arm64, 4 KiB on x86-64, as
+/// ld lays each out.
+pub fn page(l: Ld) -> i64 {
+    if l.x64 { 4096 } else { PAGE }
+}
+
+/// A stub's size: `adrp`, `ldr`, `br` on arm64; `jmp *slot(%rip)` on x86-64.
+pub fn stub_size(l: Ld) -> i64 {
+    if l.x64 { 6 } else { 12 }
+}
 pub let BASE = 0x100000000
 
 /// The output section an input section's atoms go to: (segment, section).
@@ -157,8 +168,8 @@ pub fn sections(inout l: Ld, files: [i64]) -> () ! str {
     if l.stub_g.len() > 0 {
         let s = new_out(l, "__TEXT", "__stubs", 0x80000408)
         l.o_kind[s] = K_STUBS
-        l.o_p2[s] = 2
-        l.o_size[s] = 12 * l.stub_g.len()
+        l.o_p2[s] = if l.x64 { 1 } else { 2 }
+        l.o_size[s] = stub_size(l) * l.stub_g.len()
         final.push(s)
     }
     for o in order_text {
@@ -218,16 +229,16 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                     }
                     if k == state.T_IMPORT {
                         let name = l.g_name[g]
-                        if t == objfile.R_BRANCH26 {
+                        if t == objfile.R_BRANCH26 or t == objfile.R_X_BRANCH {
                             stub.set(name, g)
                             got.set(name, (g, -1))
                             imp.set(name, g)
-                        } else if t == objfile.R_GOT_PAGE21 or t == objfile.R_GOT_PAGEOFF12 or t == objfile.R_POINTER_TO_GOT {
+                        } else if t == objfile.R_GOT_PAGE21 or t == objfile.R_GOT_PAGEOFF12 or t == objfile.R_POINTER_TO_GOT or t == objfile.R_X_GOT_LOAD or t == objfile.R_X_GOT {
                             got.set(name, (g, -1))
                             imp.set(name, g)
                         } else if t == objfile.R_UNSIGNED and l.r_len[r] == 3 {
                             imp.set(name, g)
-                        } else if t == objfile.R_TLVP_PAGE21 or t == objfile.R_TLVP_PAGEOFF12 {
+                        } else if t == objfile.R_TLVP_PAGE21 or t == objfile.R_TLVP_PAGEOFF12 or t == objfile.R_X_TLV {
                             fail("a thread-local variable imported from a dylib ({name}) is not supported")
                         } else {
                             fail("{l.f_path[fi]}: a {objfile.reloc_name(t)} relocation to {name}, which is in a dylib")
@@ -340,10 +351,11 @@ pub fn place(inout l: Ld, header_size: i64) -> i64 {
     }
     let total = off
     let big = 1.shl(maxp2)
-    var seg_end = rd.align_up(header_size + 32 + total, PAGE)
+    let psz = page(l)
+    var seg_end = rd.align_up(header_size + 32 + total, psz)
     var start = (seg_end - total) / big * big
     while start < header_size + 32 {
-        seg_end += PAGE
+        seg_end += psz
         start = (seg_end - total) / big * big
     }
     for o in text {
@@ -374,8 +386,8 @@ pub fn place(inout l: Ld, header_size: i64) -> i64 {
             addr += l.o_size[o]
         }
         if any {
-            let vmsize = rd.align_up(addr - seg_start, PAGE)
-            let filesize = rd.align_up(file_end - seg_start, PAGE)
+            let vmsize = rd.align_up(addr - seg_start, psz)
+            let filesize = rd.align_up(file_end - seg_start, psz)
             if seg == "__DATA_CONST" {
                 l.seg_dc = (seg_start, vmsize, fileoff, filesize)
             } else {

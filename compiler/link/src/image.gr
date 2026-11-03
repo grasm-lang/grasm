@@ -312,11 +312,12 @@ fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
         if mine.len() == 0 {
             continue
         }
-        let npages = size / layout.PAGE
+        let psz = layout.page(l)
+        let npages = size / psz
         rd.wpad(b, 8)
         seg_info[si] = b.len() - image_at
         rd.w32(b, 22 + 2 * npages)
-        rd.w16(b, layout.PAGE)
+        rd.w16(b, psz)
         rd.w16(b, 6)
         rd.w64(b, start - layout.BASE)
         rd.w32(b, 0)
@@ -328,15 +329,15 @@ fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
         for k in 0..mine.len() {
             let i = mine[k]
             let off = fx.addr[i] - start
-            let pg = off / layout.PAGE
+            let pg = off / psz
             if starts[pg] == 0xffff {
-                starts[pg] = off % layout.PAGE
+                starts[pg] = off % psz
             }
             // The next fixup on this page, in 4-byte strides.
             var next = 0
             if k + 1 < mine.len() {
                 let off2 = fx.addr[mine[k + 1]] - start
-                if off2 / layout.PAGE == pg {
+                if off2 / psz == pg {
                     next = (off2 - off) / 4
                 }
             }
@@ -765,7 +766,7 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
             rd.w32(c, l.o_flags[o])
             if l.o_kind[o] == layout.K_STUBS {
                 rd.w32(c, 0)
-                rd.w32(c, 12)
+                rd.w32(c, layout.stub_size(l))
             } else if l.o_kind[o] == layout.K_GOT {
                 rd.w32(c, l.stub_g.len())
                 rd.w32(c, 0)
@@ -776,7 +777,7 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
             rd.w32(c, 0)
         }
     }
-    wseg(c, "__LINKEDIT", l.seg_linkedit_addr, rd.align_up(file_size - le_off, layout.PAGE), le_off, file_size - le_off, 1, 0, 0)
+    wseg(c, "__LINKEDIT", l.seg_linkedit_addr, rd.align_up(file_size - le_off, layout.page(l)), le_off, file_size - le_off, 1, 0, 0)
     wlinkedit_cmd(c, 0x80000034, fixups_off, fixups.len())
     wlinkedit_cmd(c, 0x80000033, trie_off, tri.len())
     rd.w32(c, 2)
@@ -861,8 +862,9 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
     let flags = if l.tlv_any { 0xa00085 } else { 0x200085 }
     var h = byte_builder()
     rd.w32(h, 0xfeedfacf)
-    rd.w32(h, 0x0100000c)
-    rd.w32(h, 0)
+    // CPU_TYPE_ARM64, or CPU_TYPE_X86_64 with CPU_SUBTYPE_X86_64_ALL.
+    rd.w32(h, if l.x64 { 0x01000007 } else { 0x0100000c })
+    rd.w32(h, if l.x64 { 3 } else { 0 })
     rd.w32(h, 2)
     rd.w32(h, ncmds(l))
     rd.w32(h, cmds.len())

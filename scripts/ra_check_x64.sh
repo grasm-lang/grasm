@@ -58,6 +58,7 @@ class_planted=0
 class_caught=0
 with_fp=0
 fp_programs=0
+fp_in_memory=0
 declare -a FAILED=()
 
 # corrupt KIND -- plants KIND in the program `$tir`, and sets `cn` (planted)
@@ -162,9 +163,12 @@ for k in "${!S3_SRC[@]}"; do
     if [ "${prog_fp:-0}" -gt 0 ]; then
         fp_programs=$((fp_programs + 1))
         with_fp=$((with_fp + prog_fp))
+        # System V preserves no xmm register across a call, so a program
+        # whose every double lives across one keeps them all in memory, and
+        # a double given a general register cannot be planted in it: counted
+        # apart, where `ra_check` (arm64, d8..d15 preserved) requires one.
         if [ "$cn" -lt 1 ]; then
-            fail=$((fail + 1))
-            FAILED+=("$src — $prog_fp functions hold doubles, and no class error could be planted")
+            fp_in_memory=$((fp_in_memory + 1))
         fi
     elif [ "$cn" != 0 ]; then
         fail=$((fail + 1))
@@ -176,7 +180,7 @@ echo "programs: $programs   stressed runs: $runs   identical: $pass   failed: $f
 echo "functions checked: $functions   programs that spilled with no registers: $spilled"
 echo "programs with doubles: $fp_programs   functions with doubles: $with_fp"
 echo "control, doubles only: planted: $fp_planted   caught: $fp_caught"
-echo "control, a double in a general register: planted: $class_planted   caught: $class_caught"
+echo "control, a double in a general register: planted: $class_planted   caught: $class_caught   (programs where no double is given a register, so none can be planted: $fp_in_memory)"
 echo "control: planted: $planted   caught: $caught"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
@@ -205,7 +209,7 @@ if [ "$fp_planted" -lt 1 ] || [ "$fp_caught" -ne "$fp_planted" ]; then
     echo "the doubles-only control planted $fp_planted errors and the checker caught $fp_caught"
     exit 1
 fi
-if [ "$class_planted" -lt "$fp_programs" ] || [ "$class_caught" -ne "$class_planted" ] || [ "$fp_programs" -lt 1 ]; then
+if [ "$class_planted" -lt $((fp_programs - fp_in_memory)) ] || [ "$class_caught" -ne "$class_planted" ] || [ "$fp_programs" -lt 1 ] || [ "$fp_in_memory" -ge "$fp_programs" ]; then
     echo "the class control planted $class_planted errors in $fp_programs programs with doubles and the checker caught $class_caught"
     exit 1
 fi
