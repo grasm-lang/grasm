@@ -46,6 +46,10 @@ so the same program runs mostly out of spill slots. One that returns from
 `main` is run once more with `GRASM_LEAK_CHECK=1`, and must have nothing
 live at exit.
 
+`S3_TARGET=x86_64` fuzzes the x86-64 backend instead (`lib/s3engine.py`):
+each program is compiled with `--target x86_64`, linked for x86-64, and held
+to the Cranelift build for x86_64-apple-darwin, both run under Rosetta.
+
     scripts/fuzz_s3.py [--programs N] [--seed S] [--keep]
 """
 
@@ -60,8 +64,6 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
-RUNTIME = os.environ.get("S3_RT") or os.path.join(ROOT, "target", "release", "libgrasm_rt_abi.a")
-
 import importlib.util as _ilu
 
 
@@ -74,6 +76,12 @@ def _lib(name):
 
 
 build_native = _lib("inplace").build
+ENGINE = _lib("s3engine")
+X64 = ENGINE.target() == "x86_64"
+RUNTIME = ENGINE.runtime(ROOT)
+# What a binary for the target runs under, and how long it may take there.
+RUNNER = ENGINE.runner()
+LIMIT = 40 if X64 else 20
 _lib("fresh").fresh_or_stop(GRASM)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import s3_subset  # noqa: E402
@@ -1205,9 +1213,19 @@ class Part4Gen:
                 f"{{{v}.rotate_left({r.randint(0, 70)})}} {{{v}.rotate_right({r.randint(0, 70)})}} {{{v}.swap_bytes()}}\")"]
 
 
-def run(cmd, timeout=20, env=None):
+def run(cmd, timeout=None, env=None):
+    timeout = timeout or LIMIT
     try:
-        p = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+        p = subprocess.run(RUNNER + cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, b"", b"timeout"
+
+
+def run_tool(cmd):
+    """A build step, which runs on the host whatever the target."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=20, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, b"", b"timeout"
@@ -1217,18 +1235,34 @@ def link_in_place(obj, out):
     """Links `obj` into `out`, keeping `out`'s inode (`lib/inplace.py`), with
     `cc` or the linker `S3_LINKER` names (`lib/s3engine.py`)."""
     stage = out + ".stage"
-    p = subprocess.run(_lib("s3engine").link_command(obj, RUNTIME, stage), capture_output=True, text=True)
+    p = subprocess.run(ENGINE.link_command(obj, RUNTIME, stage), capture_output=True, text=True)
     if p.returncode != 0:
         return p
-    data = open(stage, "rb").read()
-    if os.path.exists(out):
-        with open(out, "r+b") as f:
-            f.truncate(0)
-            f.write(data)
-        os.remove(stage)
-    else:
-        os.replace(stage, out)
+    ENGINE.write_in_place(stage, out)
     return p
+
+
+def build_reference(src, ref):
+    """The Cranelift build of `src` into `ref`: `grasm build --native`, or
+    for x86-64 the object `--target x86_64-apple-darwin` emits, linked by
+    `cc -arch x86_64` with the x86-64 runtime. Answers (ok, why)."""
+    if not X64:
+        b = build_native(GRASM, src, ref, "--native")
+        return b.returncode == 0 and os.path.exists(ref), b.stderr or ""
+    obj = ref + ".o"
+    if os.path.exists(obj):
+        os.remove(obj)
+    b = subprocess.run([GRASM, "build", src, "--native", "--target", ENGINE.X64_TRIPLE, "-o", ref],
+                       capture_output=True, text=True)
+    if b.returncode != 0 or not os.path.exists(obj):
+        return False, b.stderr or b.stdout
+    stage = ref + ".stage"
+    p = subprocess.run(["cc", "-arch", "x86_64", obj, RUNTIME, "-o", stage, "-Wl,-dead_strip"],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return False, p.stderr
+    ENGINE.write_in_place(stage, ref)
+    return True, ""
 
 
 def main():
@@ -1242,7 +1276,10 @@ def main():
     # `S3_EXTRA` added to each compilation, as the other S3 gates take them
     # (`scripts/s3controls.sh` points them at a deliberately broken one).
     s3 = os.environ.get("S3") or os.path.join(work, "s3")
-    extra = (os.environ.get("S3_EXTRA") or "").split()
+    extra = ENGINE.driver_args() + (os.environ.get("S3_EXTRA") or "").split()
+    if not os.path.isfile(RUNTIME):
+        print(f"the runtime {RUNTIME} is missing")
+        return 1
     if not os.environ.get("S3"):
         p = subprocess.run([GRASM, "build", os.path.join(ROOT, "compiler/s3/src/main.gr"), "--native", "-o", s3],
                            capture_output=True, text=True, cwd=ROOT)
@@ -1287,9 +1324,9 @@ def main():
             failures.append((idx, "outside the subset: " + "; ".join(sorted(set(reasons)))[:300], src_text))
             continue
         ref = os.path.join(work, "ref")
-        b = build_native(GRASM, src, ref, "--native")
-        if b.returncode != 0 or not os.path.exists(ref):
-            failures.append((idx, "the Cranelift build fails: " + (b.stderr or "")[:300], src_text))
+        built, why = build_reference(src, ref)
+        if not built:
+            failures.append((idx, "the Cranelift build fails: " + why[:300], src_text))
             continue
         want = run([ref])
         if want[0] == 101:
@@ -1298,7 +1335,7 @@ def main():
         for regs in (None, 3):
             obj = os.path.join(work, "p.o")
             cmd = [s3, tir, "-o", obj] + ([] if regs is None else ["--max-regs", str(regs)]) + extra
-            c = run(cmd)
+            c = run_tool(cmd)
             if c[0] != 0:
                 failures.append((idx, f"the backend answered {c[0]} (regs {regs}): {c[2][:300]!r}", src_text))
                 ok = False
@@ -1338,7 +1375,7 @@ def main():
             print(f"  kept: {path}")
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)
-    print(f"programs: {args.programs}   compared: {made}   identical: {agree}   stressed: {stressed}   "
+    print(f"target: {'x86_64 (under Rosetta)' if X64 else 'arm64'}   programs: {args.programs}   compared: {made}   identical: {agree}   stressed: {stressed}   "
           f"leak-checked: {leak_checked}   panicked: {panicked}   failed: {len(failures)}   "
           f"not checked: {not_checked}")
     if failures:

@@ -675,10 +675,16 @@ pub fn commands_size(l: Ld) -> i64 {
     for d in l.dl_install {
         n += rd.align_up(24 + d.to_bytes().len() + 1, 8)
     }
-    // LC_FUNCTION_STARTS, LC_DATA_IN_CODE, and LC_CODE_SIGNATURE but on
-    // x86-64, where ld signs nothing and neither does this linker.
-    n += 16 + 16 + if l.x64 { 0 } else { 16 }
+    // LC_FUNCTION_STARTS, LC_DATA_IN_CODE, and LC_CODE_SIGNATURE when the
+    // image is signed.
+    n += 16 + 16 + if signs(l) { 16 } else { 0 }
     n
+}
+
+/// Whether the image is signed: on arm64. ld signs no x86-64 executable, and
+/// neither does this linker.
+fn signs(l: Ld) -> bool {
+    not l.x64
 }
 
 fn ncmds(l: Ld) -> i64 {
@@ -694,7 +700,7 @@ fn ncmds(l: Ld) -> i64 {
     if l.uuid {
         n += 1
     }
-    n += 3 + l.dl_install.len() + if l.x64 { 2 } else { 3 }
+    n += 3 + l.dl_install.len() + if signs(l) { 3 } else { 2 }
     n
 }
 
@@ -747,7 +753,7 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
     rd.wpad(le, 8)
     let stroff = le_off + le.len()
     le.push_bytes(strtab)
-    let sign = not l.x64
+    let sign = signs(l)
     if sign {
         rd.wpad(le, 16)
     }

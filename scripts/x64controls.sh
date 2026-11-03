@@ -40,7 +40,9 @@
 #                -> encodetest_x64 (no flag setter between a comparison and
 #                its reader)
 #   x-pop-order  the epilogue pops the callee-saved registers in the order
-#                the prologue pushed them -> xs3subset
+#                the prologue pushed them -> xs3subset; and fuzz_x64 (fuzz_s3
+#                and one generator on the s3 engine, S3_TARGET=x86_64), which
+#                would pass were the target switch not reaching the backend
 #   x-clobber    the target description hands out rcx, which a call changes,
 #                to values living across calls -> xs3subset (the allocation
 #                checker refuses every function that keeps one there)
@@ -60,11 +62,34 @@
 #   x-tlv-lea    a GOT or thread-local load of something defined in the
 #                image is left a `movq` rather than made a `leaq`, so it reads
 #                the target's first word as its address (the runtime's
-#                thread-local descriptors, the Cranelift objects' own data)
+#                thread-local descriptors)
 #                -> xrtswap
 #   x-ctx-switch the context switch restores `rsp` from the word after the
 #                one it saved it in -> xrtswap (a concurrent program, whose
 #                tasks run on fibers, fails)
+#
+# The linker against ld's x86-64 output (linkdiff_x64):
+#
+#   x-ld-sign    an x86-64 executable is signed, which ld does not do
+#                -> linkdiff_x64 (the load commands)
+#   x-ld-room    the room ld leaves after an x86-64 image's load commands is
+#                taken as arm64's 32 bytes, not 48 -> linkdiff_x64 (a program
+#                whose __TEXT then starts a page early)
+#   x-ld-pages   the chained fixups describe every page of a segment, not up
+#                to the last with a fixup -> linkdiff_x64
+#   x-ld-tail    the empty atom a label at its section's end makes has no
+#                function start -> linkdiff_x64 (the whole runtime)
+#   x-ld-got     X86_64_RELOC_GOT to something defined here is made a `leaq`
+#                like a GOT load -> linkdiff_x64 (the whole runtime)
+#   x-ld-dwarf   the compact encoding that defers to DWARF is taken as
+#                arm64's -> linkdiff_x64 (the whole runtime's __eh_frame)
+#   x-ld-tlvalign the thread-local template's sections keep their own
+#                alignments -> linkdiff_x64 (the tlv fixture)
+#   x-ld-lsda    an FDE's LSDA field, which x86-64's objects leave without a
+#                relocation, is rewritten 4 bytes off -> linkdiff_x64
+#   x-ld-strip   a stripped x86-64 image's __LINKEDIT is sized in its 4 KiB
+#                pages, where strip uses 16 KiB -> linkdiff_x64 (byte for
+#                byte against ld and strip)
 #
 # The gates that compile the corpus stop at the first failure
 # (`S3_STOP_AT_FIRST=1`). `S3_RT_X64=` is handed to them as given.
@@ -111,8 +136,12 @@ control() {
         [ $# -ge 1 ] && shift
         [ "$extra" = "-" ] && extra=""
         controls=$((controls + 1))
+        # A gate may start with VAR=value words, set for it alone.
+        local -a cmd
+        read -ra cmd <<<"$gate"
+        gate=${cmd[${#cmd[@]} - 1]}
         local log="$WORK/$name-$(basename "$gate" .sh).log"
-        S3="$driver" LINK="$linker" S3_EXTRA="$extra" S3_STOP_AT_FIRST=1 "$gate" >"$log" 2>&1
+        S3="$driver" LINK="$linker" S3_EXTRA="$extra" S3_STOP_AT_FIRST=1 env "${cmd[@]}" >"$log" 2>&1
         local code=$?
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
             caught=$((caught + 1))
@@ -192,7 +221,8 @@ control x-flags $X/rules.gr \
 control x-pop-order $X/emit.gr \
     "try ins(p, mach.X_POP, saved[k], -1, -1, -1, 0, -1)" \
     "try ins(p, mach.X_POP, saved[saved.len() - 1 - k], -1, -1, -1, 0, -1)" -- \
-    scripts/xs3subset.sh "FAILED:"
+    scripts/xs3subset.sh "FAILED:" - \
+    "FUZZ_X64_ONLY=^fuzz_(s3|intwidth)$ scripts/fuzz_x64.sh" "FAILED: fuzz_s3"
 
 control x-clobber $X/desc.gr \
     "    t.callee_order = [[mach.RBX, mach.R12," "    t.callee_order = [[mach.RCX, mach.RBX, mach.R12," -- \
@@ -230,6 +260,45 @@ control x-ctx-switch $X/leaves.gr \
     "    try put(l, mach.X_LOAD, mach.RSP, mach.RSI, -1, CTX_SP + 8)" -- \
     scripts/xrtswap.sh "FAILED:"
 
+L=compiler/link/src
+
+control x-ld-sign $L/image.gr \
+    $'fn signs(l: Ld) -> bool {\n    not l.x64' $'fn signs(l: Ld) -> bool {\n    true' -- \
+    scripts/linkdiff_x64.sh "otool -l differs"
+
+control x-ld-room $L/layout.gr \
+    "    let room = header_size + if l.x64 { 48 } else { 32 }" "    let room = header_size + 32" -- \
+    scripts/linkdiff_x64.sh "first difference"
+
+control x-ld-pages $L/image.gr \
+    "            let pg = (fx.addr[i] - start) / psz + 1" "            let pg = size / psz" -- \
+    scripts/linkdiff_x64.sh "differ"
+
+control x-ld-tail $L/image.gr \
+    "            if l.a_tail[a] and not l.dead_strip and l.a_addr" "            if false and l.a_tail[a] and not l.dead_strip and l.a_addr" -- \
+    scripts/linkdiff_x64.sh "the whole runtime"
+
+control x-ld-got $L/apply.gr \
+    "                    } else if t == objfile.R_X_GOT or (t == objfile.R_X_GOT_LOAD and k == state.T_IMPORT) {" \
+    "                    } else if (t == objfile.R_X_GOT or t == objfile.R_X_GOT_LOAD) and k == state.T_IMPORT {" -- \
+    scripts/linkdiff_x64.sh "the whole runtime"
+
+control x-ld-dwarf $L/deadstrip.gr \
+    "    if l.x64 { 0x04000000 } else { 0x03000000 }" "    0x03000000" -- \
+    scripts/linkdiff_x64.sh "the whole runtime"
+
+control x-ld-tlvalign $L/layout.gr \
+    "            l.o_p2[o] = tp2" "            l.o_p2[o] = l.o_p2[o]" -- \
+    scripts/linkdiff_x64.sh "fixture tlv"
+
+control x-ld-lsda $L/unwind.gr \
+    "+ l.eh_lsda_off[e] - (here + lf)" "+ l.eh_lsda_off[e] - (here + lf) + 4" -- \
+    scripts/linkdiff_x64.sh "the whole runtime"
+
+control x-ld-strip $L/image.gr \
+    "    let le_page = if l.strip { layout.PAGE } else { layout.page(l) }" "    let le_page = layout.page(l)" -- \
+    scripts/linkdiff_x64.sh "first difference"
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -238,10 +307,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Twenty-one faults in twenty-two gate runs, and every one must have been
+# Thirty faults in thirty-two gate runs, and every one must have been
 # caught.
-if [ "$controls" -ne 22 ] || [ "$caught" -ne 22 ]; then
-    echo "expected 22 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 32 ] || [ "$caught" -ne 32 ]; then
+    echo "expected 32 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

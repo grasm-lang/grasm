@@ -65,6 +65,11 @@ def _rerun_if_killed(*args, **kwargs):
         return p
     cmd = args[0] if args else kwargs.get("args")
     exe = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else None
+    if isinstance(exe, str) and os.path.basename(exe) == "arch":
+        # `arch -x86_64 <binary> ...` (`s3engine`'s S3_TARGET=x86_64): the
+        # binary is the first word after arch's own flags.
+        rest = [w for w in cmd[1:] if not (isinstance(w, str) and w.startswith("-"))]
+        exe = rest[0] if rest else None
     if not isinstance(exe, str):
         return p
     path = os.path.realpath(os.path.join(kwargs.get("cwd") or ".", exe))

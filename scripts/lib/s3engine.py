@@ -35,6 +35,17 @@ runtime to link, and `S3_LINKER=` a linker to link with instead of `cc`
 (compiler/link, docs/self-hosting.md stage S4), as `scripts/lib/s3.sh` takes
 it; `FRONT=` a frontend to make the TIR with in place of `grasm tir`
 (`compiler/front`'s `front tir`; `scripts/withstage.sh`, §6.14).
+
+`S3_TARGET=x86_64` points all of it at the x86-64 backend (docs/self-hosting.md
+§6.16, stage S7), run under Rosetta: the driver compiles with
+`--target x86_64`, links with `cc -arch x86_64` (or `S3_LINKER`) and the Rust
+runtime built for x86_64-apple-darwin (`S3_RT_X64=` another), and is held to
+a reference built here from the same source -- the Cranelift build for
+x86_64-apple-darwin with that runtime, linked by `cc -arch x86_64` -- not to
+the generator's arm64 binary, so the two sides share an architecture and its
+libm. Both run as `arch -x86_64 <binary>`, with twice the generator's time
+limit; a run killed by SIGKILL is run once more from a fresh inode, as
+`lib/inplace.py` does for arm64 (it looks through `arch`).
 """
 
 import importlib.util as _ilu
@@ -66,13 +77,59 @@ def _run(cmd, timeout, env=None, stdin=None, cwd=None):
         return 124, b"", b"timeout"
 
 
+X64_TRIPLE = "x86_64-apple-darwin"
+
+
+def target():
+    """`S3_TARGET`: "" for arm64, the host, or "x86_64"; anything else is an
+    error, raised rather than read as arm64."""
+    t = os.environ.get("S3_TARGET") or ""
+    if t not in ("", "x86_64"):
+        raise SystemExit(f"S3_TARGET={t}: the targets are x86_64 and the host (unset)")
+    return t
+
+
+def runtime(root=ROOT):
+    """The Rust runtime archive for the target."""
+    if target() == "x86_64":
+        return os.environ.get("S3_RT_X64") or os.path.join(
+            root, "target", X64_TRIPLE, "release", "libgrasm_rt_abi.a")
+    return os.environ.get("S3_RT") or os.path.join(root, "target", "release", "libgrasm_rt_abi.a")
+
+
+def driver_args():
+    """What the driver is given for the target."""
+    return ["--target", "x86_64"] if target() == "x86_64" else []
+
+
+def runner():
+    """What a binary for the target is run under: `arch -x86_64` for x86-64."""
+    return ["arch", "-x86_64"] if target() == "x86_64" else []
+
+
 def link_command(obj, rt, exe):
-    """The command that links an object with the runtime: `cc`, or the linker
-    `S3_LINKER` names, with -dead_strip either way."""
+    """The command that links an object with the runtime: `cc` (`-arch
+    x86_64` for that target), or the linker `S3_LINKER` names, which takes
+    the architecture from the object, with -dead_strip either way."""
     linker = os.environ.get("S3_LINKER")
     if linker:
         return [linker, obj, rt, "-dead_strip", "-o", exe]
-    return ["cc", obj, rt, "-o", exe, "-Wl,-dead_strip"]
+    arch = ["-arch", "x86_64"] if target() == "x86_64" else []
+    return ["cc"] + arch + [obj, rt, "-o", exe, "-Wl,-dead_strip"]
+
+
+def write_in_place(stage, out):
+    """Moves `stage` to `out`, keeping `out`'s inode when it exists."""
+    with open(stage, "rb") as f:
+        data = f.read()
+    if os.path.exists(out):
+        with open(out, "r+b") as f:
+            f.truncate(0)
+            f.write(data)
+        os.remove(stage)
+        _inplace.reused(out)
+    else:
+        os.replace(stage, out)
 
 
 def _clean(err):
@@ -92,9 +149,11 @@ class Engine:
     def __init__(self, grasm, work, root=ROOT):
         self.grasm = grasm
         self.work = work
-        self.rt = os.environ.get("S3_RT") or os.path.join(
-            root, "target", "release", "libgrasm_rt_abi.a")
-        self.extra = (os.environ.get("S3_EXTRA") or "").split()
+        self.error = None
+        self.target = target()
+        self.rt = runtime(root)
+        self.extra = driver_args() + (os.environ.get("S3_EXTRA") or "").split()
+        self.run = runner()
         self.offered = 0
         self.agreed = 0
         self.declined = 0
@@ -105,7 +164,9 @@ class Engine:
         self.exe = os.path.join(work, "s3.bin")
         self.tir = os.path.join(work, "s3.tir")
         self.obj = os.path.join(work, "s3.o")
-        self.error = None
+        # The x86-64 reference: its object and its binary.
+        self.xref = os.path.join(work, "s3.xref")
+        self.xref_obj = self.xref + ".o"
         if not os.path.isfile(self.rt):
             self.error = f"the runtime {self.rt} is missing"
         self.driver = os.environ.get("S3")
@@ -137,16 +198,28 @@ class Engine:
             if os.path.exists(stage):
                 os.remove(stage)
             return p.stdout + p.stderr
-        with open(stage, "rb") as f:
-            data = f.read()
-        if os.path.exists(self.exe):
-            with open(self.exe, "r+b") as f:
-                f.truncate(0)
-                f.write(data)
-            os.remove(stage)
-            _inplace.reused(self.exe)
-        else:
-            os.replace(stage, self.exe)
+        write_in_place(stage, self.exe)
+        return None
+
+    def _x64_reference(self, src, cwd):
+        """Builds the Cranelift x86-64 reference for `src` into `self.xref`:
+        the object from `grasm build --target`, linked by `cc -arch x86_64`
+        with the runtime. Answers None, or why it did not build."""
+        for path in (self.xref_obj,):
+            if os.path.exists(path):
+                os.remove(path)
+        b = _run([self.grasm, "build", src, "--native", "--target", X64_TRIPLE, "-o", self.xref],
+                 timeout=300, cwd=cwd)
+        if b[0] != 0 or not os.path.exists(self.xref_obj):
+            return f"`grasm build --target {X64_TRIPLE}` answered {b[0]}: {_short(b[2] + b[1])}"
+        stage = self.xref + ".stage"
+        p = subprocess.run(["cc", "-arch", "x86_64", self.xref_obj, self.rt, "-o", stage, "-Wl,-dead_strip"],
+                           capture_output=True, text=True)
+        if p.returncode != 0 or not os.path.exists(stage):
+            if os.path.exists(stage):
+                os.remove(stage)
+            return f"`cc -arch x86_64` does not link it: {_short(p.stdout + p.stderr)}"
+        write_in_place(stage, self.xref)
         return None
 
     def check(self, src, ref, label, args=(), env=None, stdin=None, cwd=None,
@@ -154,7 +227,8 @@ class Engine:
         """Builds `src` with the Grasm backend and runs it beside `ref`.
 
         `ref` is the Cranelift binary the generator built from the same
-        source; both run with `args`, `env` (the whole environment, as
+        source (for `S3_TARGET=x86_64`, one built here for x86-64 instead);
+        both run with `args`, `env` (the whole environment, as
         `subprocess` takes it), `stdin` (bytes or text) and `cwd`. `interp`,
         if given, is what `grasm run` printed, (exit, stdout), and is shown
         beside a disagreement so it says which engine moved. Answers
@@ -189,9 +263,15 @@ class Engine:
         why = self._link()
         if why is not None:
             return self._fail(label, f"the object does not link: {_short(why)}")
+        if self.target == "x86_64":
+            why = self._x64_reference(src, cwd)
+            if why is not None:
+                return self._fail(label, f"the x86-64 reference: {why}")
+            ref = self.xref
+            timeout = 2 * timeout
         cmd_tail = list(args)
-        want = _run([ref] + cmd_tail, timeout, env, stdin, cwd)
-        got = _run([self.exe] + cmd_tail, timeout, env, stdin, cwd)
+        want = _run(self.run + [ref] + cmd_tail, timeout, env, stdin, cwd)
+        got = _run(self.run + [self.exe] + cmd_tail, timeout, env, stdin, cwd)
         # Two runs stopped at the limit print the same nothing; that is not
         # agreement.
         if want == (124, b"", b"timeout") or got == (124, b"", b"timeout"):
@@ -215,12 +295,12 @@ class Engine:
         if leak and want[0] == 0:
             lenv = dict(env if env is not None else os.environ)
             lenv["GRASM_LEAK_CHECK"] = "1"
-            lk = _run([self.exe] + cmd_tail, timeout, lenv, stdin, cwd)
+            lk = _run(self.run + [self.exe] + cmd_tail, timeout, lenv, stdin, cwd)
             if not (lk[0] == 0 and _clean(lk[2])):
                 # Held to the Cranelift build's standard, not past it: when
                 # that build holds something at exit too, this is not where
                 # the difference is.
-                rk = _run([ref] + cmd_tail, timeout, lenv, stdin, cwd)
+                rk = _run(self.run + [ref] + cmd_tail, timeout, lenv, stdin, cwd)
                 if rk[0] == 0 and _clean(rk[2]):
                     return self._fail(label, f"the Grasm build holds allocations at exit "
                                              f"(exit {lk[0]}): {_short(lk[2], 200)}")
@@ -232,7 +312,8 @@ class Engine:
     # ----- the verdict --------------------------------------------------------
 
     def summary(self):
-        return (f"s3 engine: offered: {self.offered}   agreed: {self.agreed}   "
+        name = "s3 engine (x86_64, under Rosetta)" if self.target == "x86_64" else "s3 engine"
+        return (f"{name}: offered: {self.offered}   agreed: {self.agreed}   "
                 f"declined: {self.declined}   failed: {self.failed}   "
                 f"leak-checked: {self.leak_checked}")
 
@@ -260,7 +341,8 @@ class Engine:
     def cleanup(self):
         """Removes what this engine wrote, for a generator that keeps its
         directory."""
-        mine = [self.tir, self.obj, self.exe, self.exe + ".stage"]
+        mine = [self.tir, self.obj, self.exe, self.exe + ".stage", self.xref, self.xref_obj,
+                self.xref + ".stage"]
         if self.own_driver:
             mine.append(self.driver)
         for path in mine:

@@ -31,6 +31,14 @@ load.
 
 `S3=<binary>` times that driver; `S3_RT=` names the runtime; `S3_LINKER=`
 links with that linker instead of `cc` (`scripts/lib/s3engine.py`).
+
+`S3_TARGET=x86_64` times the x86-64 backend (docs/self-hosting.md §6.16)
+against the Cranelift build for x86_64-apple-darwin, both linked by `cc -arch
+x86_64` (or `S3_LINKER`) with the x86-64 runtime (`S3_RT_X64=`) and run as
+`arch -x86_64 <binary>` -- under Rosetta on this machine, which translates
+both and so measures the translation as much as either code generator: those
+figures are not to be quoted as either backend's speed. The untimed first
+run of each binary also pays Rosetta's translation.
 """
 
 import argparse
@@ -45,11 +53,15 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
-RUNTIME = os.environ.get("S3_RT") or os.path.join(ROOT, "target", "release", "libgrasm_rt_abi.a")
 PROGRAMS = ["fib", "sieve", "matmul", "wordfreq", "tree", "sort", "parmap", "parwords"]
 
 sys.path.insert(0, os.path.join(ROOT, "scripts", "lib"))
+import s3engine  # noqa: E402
 from s3engine import link_command  # noqa: E402
+
+X64 = s3engine.target() == "x86_64"
+RUNTIME = s3engine.runtime(ROOT)
+RUNNER = s3engine.runner()
 
 
 def load():
@@ -58,7 +70,7 @@ def load():
 
 def time_us(exe):
     started = time.perf_counter()
-    p = subprocess.run([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    p = subprocess.run(RUNNER + [exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     elapsed = time.perf_counter() - started
     if p.returncode != 0:
         raise SystemExit(f"{exe} exited {p.returncode} while being timed")
@@ -79,11 +91,14 @@ def main():
     variants = []
     for v in args.variant or ["s3="]:
         name, _, extra = v.partition("=")
-        variants.append((name, extra.split()))
+        variants.append((name, s3engine.driver_args() + extra.split()))
     one, cpus = load()
     if one > cpus * 0.35 and not os.environ.get("BENCH_IGNORE_LOAD"):
         print(f"refusing to benchmark: load average {one:.2f} on {cpus} cores")
         return 1
+    if X64:
+        print("target: x86_64 under Rosetta -- these figures measure the translation too; not to be quoted",
+              flush=True)
     work = tempfile.mkdtemp(prefix="s3bench_")
     try:
         s3 = os.environ.get("S3") or os.path.join(work, "s3")
@@ -99,7 +114,15 @@ def main():
             src = os.path.join(ROOT, "benchmarks", "grasm", prog + ".gr")
             tir = os.path.join(work, prog + ".tir")
             cl = os.path.join(work, prog + ".cl")
-            p = subprocess.run([GRASM, "build", src, "--native", "-o", cl], capture_output=True, text=True)
+            if X64:
+                p = subprocess.run([GRASM, "build", src, "--native", "--target", s3engine.X64_TRIPLE, "-o", cl],
+                                   capture_output=True, text=True)
+                if p.returncode == 0:
+                    p = subprocess.run(["cc", "-arch", "x86_64", cl + ".o", RUNTIME, "-o", cl, "-Wl,-dead_strip"],
+                                       capture_output=True, text=True)
+                    os.remove(cl + ".o")
+            else:
+                p = subprocess.run([GRASM, "build", src, "--native", "-o", cl], capture_output=True, text=True)
             if p.returncode != 0:
                 print(f"{prog}: the Cranelift build fails: {(p.stdout + p.stderr)[:300]}")
                 return 1
@@ -125,7 +148,7 @@ def main():
                 bins.append((name, exe))
             want = subprocess.run([GRASM, "run", src], capture_output=True, text=True).stdout
             for name, exe in bins:
-                got = subprocess.run([exe], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                got = subprocess.run(RUNNER + [exe], capture_output=True, text=True, stdin=subprocess.DEVNULL)
                 if got.returncode != 0 or got.stdout != want:
                     print(f"{prog}: {name} prints {got.stdout[:120]!r}, `grasm run` {want[:120]!r}")
                     return 1
@@ -150,7 +173,8 @@ def main():
                 os.remove(exe)
             os.remove(tir)
         print()
-        summary = [f"programs: {len(args.programs.split(','))}", f"rounds: {args.rounds}"]
+        summary = [f"target: {'x86_64 (Rosetta)' if X64 else 'arm64'}",
+                   f"programs: {len(args.programs.split(','))}", f"rounds: {args.rounds}"]
         for name, _ in variants:
             summary.append(f"{name} geomean: {geomean(ratios[name]):.3f}")
         if change:

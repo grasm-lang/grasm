@@ -127,6 +127,8 @@ run_gate xs3subset     scripts/xs3subset.sh
 run_gate objtest_x64   scripts/objtest_x64.sh
 run_gate ra_check_x64  scripts/ra_check_x64.sh
 run_gate xrtswap       scripts/xrtswap.sh
+run_gate linkdiff_x64  scripts/linkdiff_x64.sh
+run_gate fuzz_x64      scripts/fuzz_x64.sh
 run_gate objtest       scripts/objtest.sh
 run_gate ra_check      scripts/ra_check.sh
 run_gate s3rc          scripts/s3rc.sh
