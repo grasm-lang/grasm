@@ -260,6 +260,23 @@ pub let P_RETURN = 150
 /// Not an instruction: a 64-bit constant, which selection expands into the
 /// shortest of `movl`, `movq` and `movabsq`.
 pub let P_MOVIMM = 151
+// Pseudo-instructions: operations x86-64 has no one instruction for, each a
+// short sequence with branches inside it, expanded at emission (`emit.gr`).
+// The allocator and the checker see one instruction, with the registers it
+// reads and writes in its fields; its temporaries are read and written, so a
+// rule makes them first and their lives cover the operands' reads.
+/// Signed division and remainder of rdx:rax (field 0, rax; field 3, rdx) by
+/// field 2, with -1 answering `-rax` and 0 where `idiv` would fault.
+pub let P_SDIVREM = 152
+/// An unsigned word (field 2) to a double (field 0); fields 1 and 3 general
+/// temporaries.
+pub let P_UCVTF = 153
+/// A double (field 2) to a signed word (field 0), saturating, NaN 0; field 1
+/// a general temporary.
+pub let P_CVTS = 154
+/// A double (field 2) to an unsigned word (field 0), saturating, NaN 0;
+/// field 1 a general temporary, field 3 an xmm one.
+pub let P_CVTU = 155
 /// The size of a table indexed by opcode.
 pub let NMOPS = 160
 
@@ -398,7 +415,29 @@ pub fn form_name(m: i64) -> str {
         102 -> "fldcw"
         150 -> "<return>"
         151 -> "<movimm>"
+        152 -> "<sdivrem>"
+        153 -> "<ucvtf>"
+        154 -> "<cvts>"
+        155 -> "<cvtu>"
         _ -> "?"
+    }
+}
+
+/// The real instructions a pseudo-instruction becomes, for the forms the
+/// target can emit.
+pub fn expands_to(m: i64) -> [i64] {
+    if m == P_MOVIMM {
+        [X_MOVI32, X_MOVSI, X_MOVABS]
+    } else if m == P_SDIVREM {
+        [X_CMPI, X_JCC8, X_CQO, X_IDIV, X_JMP8, X_NEG, X_MOVI32]
+    } else if m == P_UCVTF {
+        [X_TEST, X_JCC8, X_CVTSI2SD, X_JMP8, X_MOV, X_SHRI, X_ANDI, X_OR, X_ADDSD]
+    } else if m == P_CVTS {
+        [X_CVTTSD2SI, X_CMPI, X_JCC8, X_UCOMISD, X_MOVI32, X_JMP8, X_MOVQ_FROMX, X_TEST, X_MOVABS]
+    } else if m == P_CVTU {
+        [X_UCOMISD, X_JCC8, X_MOVABS, X_MOVQ_TOX, X_CVTTSD2SI, X_TEST, X_MOVI32, X_JMP8, X_MOVQ_FROMX, X_SHLI, X_OR, X_MOVSI]
+    } else {
+        []
     }
 }
 
@@ -541,7 +580,11 @@ pub fn is_mem(m: i64) -> bool {
 }
 
 pub fn role_d(m: i64) -> i64 {
-    if (m >= X_ADD and m <= X_IMUL) or (m >= X_ADDI and m <= X_XORI) or (m >= X_SHL and m <= X_NOT) {
+    if m == P_MOVIMM or m == P_UCVTF or m == P_CVTS or m == P_CVTU {
+        ROLE_DEF
+    } else if m == P_SDIVREM {
+        ROLE_USEDEF
+    } else if (m >= X_ADD and m <= X_IMUL) or (m >= X_ADDI and m <= X_XORI) or (m >= X_SHL and m <= X_NOT) {
         ROLE_USEDEF
     } else if m == X_IDIV or m == X_DIV or is_atomic(m) or (m >= X_ADDSD and m <= X_DIVSD) or m == X_ANDPD or m == X_XORPD {
         ROLE_USEDEF
@@ -561,7 +604,9 @@ pub fn role_d(m: i64) -> i64 {
 }
 
 pub fn role_n(m: i64) -> i64 {
-    if m == X_CMP or m == X_TEST or m == X_CMPI or m == X_IMULI or m == X_CQO or m == X_UCOMISD {
+    if m == P_UCVTF or m == P_CVTS or m == P_CVTU {
+        ROLE_USEDEF
+    } else if m == X_CMP or m == X_TEST or m == X_CMPI or m == X_IMULI or m == X_CQO or m == X_UCOMISD {
         ROLE_USE
     } else if is_mem(m) or m == X_CALLR or m == X_PUSH {
         ROLE_USE
@@ -571,7 +616,9 @@ pub fn role_n(m: i64) -> i64 {
 }
 
 pub fn role_m(m: i64) -> i64 {
-    if (m >= X_ADD and m <= X_TEST) or (m >= X_SHL and m <= X_ROR) or m == X_IDIV or m == X_DIV {
+    if m >= P_SDIVREM and m <= P_CVTU {
+        ROLE_USE
+    } else if (m >= X_ADD and m <= X_TEST) or (m >= X_SHL and m <= X_ROR) or m == X_IDIV or m == X_DIV {
         ROLE_USE
     } else if (m >= X_MOV and m <= X_MOVZXW) or (m >= X_CMPXCHG8 and m <= X_CMPXCHG64) {
         ROLE_USE
@@ -583,13 +630,19 @@ pub fn role_m(m: i64) -> i64 {
 }
 
 pub fn role_a(m: i64) -> i64 {
-    if m == X_IDIV or m == X_DIV { ROLE_USEDEF } else { ROLE_NONE }
+    if m == X_IDIV or m == X_DIV or m == P_SDIVREM or m == P_UCVTF or m == P_CVTU { ROLE_USEDEF } else { ROLE_NONE }
 }
 
 /// Whether field `field` of opcode `m` is an xmm register; every other
 /// register field is a general one.
 pub fn fp_field(m: i64, field: i64) -> bool {
-    if (m >= X_MOVAPS and m <= X_ROUNDSD) {
+    if m == P_UCVTF {
+        field == 0
+    } else if m == P_CVTS {
+        field == 2
+    } else if m == P_CVTU {
+        field == 2 or field == 3
+    } else if (m >= X_MOVAPS and m <= X_ROUNDSD) {
         field == 0 or field == 2
     } else if m == X_UCOMISD {
         field == 1 or field == 2
@@ -607,7 +660,7 @@ pub fn fp_field(m: i64, field: i64) -> bool {
 pub fn fixed_reg(m: i64, field: i64) -> i64 {
     if m == X_CQO {
         if field == 0 { RDX } else if field == 1 { RAX } else { -1 }
-    } else if m == X_IDIV or m == X_DIV {
+    } else if m == X_IDIV or m == X_DIV or m == P_SDIVREM {
         if field == 0 { RAX } else if field == 3 { RDX } else { -1 }
     } else if m >= X_CMPXCHG8 and m <= X_CMPXCHG64 {
         if field == 0 { RAX } else { -1 }
@@ -1423,6 +1476,9 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
     }
     if m == P_MOVIMM {
         return "<movimm> ${imm}, {d}"
+    }
+    if m >= P_SDIVREM and m <= P_CVTU {
+        return "{form_name(m)} {d}, {n}, {s}, {reg_text(m, 3, ra)}"
     }
     "<?>"
 }

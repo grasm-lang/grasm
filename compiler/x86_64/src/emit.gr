@@ -1,0 +1,487 @@
+// From allocated code to bytes, for x86-64: the frame, the prologue and
+// epilogue, the pseudo-instructions, branches and their relaxation,
+// relocations (docs/self-hosting.md §6.16).
+//
+// The frame keeps the frame-pointer chain and saves the callee-saved
+// registers the body writes, then makes room for the rest, keeping `rsp`
+// 16-aligned at every call:
+//
+//     [args in] [return address] [rbp] [rbx, r12..r15 as written] [pad] [spill] [slots] [args out] <- rsp
+//
+// It is set up where the shared plan says (`frameplan.frame_plan`); a
+// return on a path that never set it up is a bare `ret`, its return address
+// never having left the stack. Arguments that arrived on the stack are at
+// `16(%rbp)` and up.
+//
+// The code is built as a list of pieces: fixed bytes, or a branch to a block
+// whose displacement is not known yet. Every branch starts short (8 bits)
+// and is made long (32) when its target is out of reach, until none is --
+// pieces only grow, so it ends. Then the pieces are written out, and each
+// relocation and line-table row placed at its byte.
+import mach
+import vcode.vcode
+import vcode.regalloc
+import vcode.frameplan
+
+type X64Code = {
+    sym: str,
+    bytes: [i64],
+    /// Relocations: byte offset of the 32-bit field, kind (`mach.REL_*`),
+    /// what it refers to (`vcode.SYM_*` and its id).
+    rel_off: [i64],
+    rel_kind: [i64],
+    rel_symk: [i64],
+    rel_sym: [i64],
+    asm: [str],
+    frame: i64,
+    nspill: i64,
+    nsaved: i64,
+    frame_at: i64,
+    /// The line table's rows: from byte `row_byte[k]` on, source offset
+    /// `row_src[k]`'s.
+    row_byte: [i64],
+    row_src: [i64],
+}
+
+/// The pieces of a function's code before branches have their sizes.
+type XPieces = {
+    /// Per piece: its bytes (a branch's are made at the end), whether it is
+    /// a block branch, and if so its opcode (`X_JMP32` or `X_JCC32`), its
+    /// condition, its target block, and whether it is long.
+    bytes: [[i64]],
+    is_br: [bool],
+    br_cc: [i64],
+    br_tgt: [i64],
+    long: [bool],
+    /// Which piece each block starts at.
+    block_at: [i64],
+    /// Relocations: piece, offset in it, kind, symbol.
+    rel_piece: [i64],
+    rel_in: [i64],
+    rel_kind: [i64],
+    rel_symk: [i64],
+    rel_sym: [i64],
+    /// Rows: piece and source offset.
+    row_piece: [i64],
+    row_src: [i64],
+    asm: [str],
+    want_asm: bool,
+}
+
+fn piece(inout p: XPieces, bs: [i64]) {
+    p.bytes.push(bs)
+    p.is_br.push(false)
+    p.br_cc.push(-1)
+    p.br_tgt.push(-1)
+    p.long.push(false)
+    ()
+}
+
+/// Code from here on is source offset `src`'s, if that is a change.
+fn at_src(inout p: XPieces, src: i64) {
+    let n = p.row_src.len()
+    if n > 0 and p.row_src[n - 1] == src {
+        return
+    }
+    if n > 0 and p.row_piece[n - 1] == p.bytes.len() {
+        p.row_src[n - 1] = src
+        if n > 1 and p.row_src[n - 2] == src {
+            p.row_src.pop()
+            p.row_piece.pop()
+        }
+        return
+    }
+    p.row_piece.push(p.bytes.len())
+    p.row_src.push(src)
+}
+
+/// One instruction, encoded now.
+fn ins(inout p: XPieces, m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, cc: i64) -> () ! str {
+    let bs = try mach.encode(m, rd, rn, rm, ra, imm, 0, cc, 0)
+    piece(p, bs)
+    if p.want_asm {
+        p.asm.push(mach.asm_text(m, rd, rn, rm, ra, imm, 0, cc, 0, ""))
+    }
+    ()
+}
+
+// ----- the pseudo-instructions ---------------------------------------------------
+//
+// Each is a short sequence with branches inside it, built as a list of steps
+// and laid out in two passes: every inner branch is 8-bit, so each step's
+// size is known from encoding it with any offset, and then the offsets.
+
+type XSeq = {
+    mop: [i64],
+    rd: [i64],
+    rn: [i64],
+    rm: [i64],
+    ra: [i64],
+    imm: [i64],
+    cc: [i64],
+    /// A branch step's target label, else -1; a label step has `mop` -1.
+    lbl: [i64],
+}
+
+fn sq(inout s: XSeq, m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, cc: i64, lbl: i64) {
+    s.mop.push(m)
+    s.rd.push(rd)
+    s.rn.push(rn)
+    s.rm.push(rm)
+    s.ra.push(ra)
+    s.imm.push(imm)
+    s.cc.push(cc)
+    s.lbl.push(lbl)
+    ()
+}
+
+fn label(inout s: XSeq, k: i64) {
+    sq(s, -1, -1, -1, -1, -1, 0, -1, k)
+}
+
+/// The sequence's bytes, its branches pointed at their labels.
+fn lay(s: XSeq, inout p: XPieces) -> () ! str {
+    // First pass: each step's offset; a label's is where the next step is.
+    var at: [i64] = []
+    var lpos: [i64] = []
+    for k in 0..8 {
+        lpos.push(-1)
+    }
+    var pos = 0
+    for k in 0..s.mop.len() {
+        at.push(pos)
+        if s.mop[k] < 0 {
+            lpos[s.lbl[k]] = pos
+            continue
+        }
+        let bs = try mach.encode(s.mop[k], s.rd[k], s.rn[k], s.rm[k], s.ra[k], s.imm[k], 0, s.cc[k], 2)
+        pos += bs.len()
+    }
+    var out: [i64] = []
+    for k in 0..s.mop.len() {
+        if s.mop[k] < 0 {
+            continue
+        }
+        let off = if s.lbl[k] >= 0 { lpos[s.lbl[k]] - at[k] } else { 0 }
+        let bs = try mach.encode(s.mop[k], s.rd[k], s.rn[k], s.rm[k], s.ra[k], s.imm[k], 0, s.cc[k], off)
+        for x in bs {
+            out.push(x)
+        }
+        if p.want_asm {
+            p.asm.push("  " + mach.asm_text(s.mop[k], s.rd[k], s.rn[k], s.rm[k], s.ra[k], s.imm[k], 0, s.cc[k], off, ""))
+        }
+    }
+    piece(p, out)
+    ()
+}
+
+fn new_seq() -> XSeq {
+    XSeq{ mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], cc: [], lbl: [] }
+}
+
+/// `sdiv`/`srem`: rdx:rax by `r`, the quotient in rax and the remainder in
+/// rdx, with -1 as a divisor answering `-rax` and 0, where `idiv` would
+/// fault on `MIN / -1` ([E-ARITH-INT]).
+fn seq_sdivrem(r: i64) -> XSeq {
+    var s = new_seq()
+    sq(s, mach.X_CMPI, -1, r, -1, -1, -1, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_E, 0)
+    sq(s, mach.X_CQO, mach.RDX, mach.RAX, -1, -1, 0, -1, -1)
+    sq(s, mach.X_IDIV, mach.RAX, -1, r, mach.RDX, 0, -1, -1)
+    sq(s, mach.X_JMP8, -1, -1, -1, -1, 0, -1, 1)
+    label(s, 0)
+    sq(s, mach.X_NEG, mach.RAX, -1, -1, -1, 0, -1, -1)
+    sq(s, mach.X_MOVI32, mach.RDX, -1, -1, -1, 0, -1, -1)
+    label(s, 1)
+    s
+}
+
+/// `ucvtf`: the unsigned word `a` to a double in `res`; a word with its top
+/// bit set is halved, its low bit kept so the rounding is the same, then
+/// converted and doubled. `t` and `t2` are scratch.
+fn seq_ucvtf(res: i64, a: i64, t: i64, t2: i64) -> XSeq {
+    var s = new_seq()
+    sq(s, mach.X_TEST, -1, a, a, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_S, 0)
+    sq(s, mach.X_CVTSI2SD, res, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_JMP8, -1, -1, -1, -1, 0, -1, 1)
+    label(s, 0)
+    sq(s, mach.X_MOV, t, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_SHRI, t, -1, -1, -1, 1, -1, -1)
+    sq(s, mach.X_MOV, t2, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_ANDI, t2, -1, -1, -1, 1, -1, -1)
+    sq(s, mach.X_OR, t, -1, t2, -1, 0, -1, -1)
+    sq(s, mach.X_CVTSI2SD, res, -1, t, -1, 0, -1, -1)
+    sq(s, mach.X_ADDSD, res, -1, res, -1, 0, -1, -1)
+    label(s, 1)
+    s
+}
+
+/// `fcvtzs`: the double `a` to a signed word in `res`, toward zero,
+/// saturating, NaN to 0 ([L-LIB-AS-I64]). `cvttsd2si` answers MIN for NaN and
+/// for what does not fit; MIN less one overflows exactly then. `t` is
+/// scratch.
+fn seq_cvts(res: i64, a: i64, t: i64) -> XSeq {
+    var s = new_seq()
+    sq(s, mach.X_CVTTSD2SI, res, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_CMPI, -1, res, -1, -1, 1, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_NO, 2)
+    sq(s, mach.X_UCOMISD, -1, a, a, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_NP, 0)
+    sq(s, mach.X_MOVI32, res, -1, -1, -1, 0, -1, -1)
+    sq(s, mach.X_JMP8, -1, -1, -1, -1, 0, -1, 2)
+    label(s, 0)
+    // Not a NaN: a negative value keeps MIN; a positive one is MAX.
+    sq(s, mach.X_MOVQ_FROMX, t, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_TEST, -1, t, t, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_S, 2)
+    sq(s, mach.X_MOVABS, res, -1, -1, -1, 9223372036854775807, -1, -1)
+    label(s, 2)
+    s
+}
+
+/// `fcvtzu`: the double `a` to an unsigned word in `res`, toward zero,
+/// saturating at 0 and at 2^64 - 1, NaN to 0. Below 2^63 `cvttsd2si`, a
+/// negative answer meaning 0; from 2^63 to 2^64 the word is the significand
+/// shifted into place with its top bit set; past that, all ones. `t` and the
+/// double `x` are scratch.
+fn seq_cvtu(res: i64, a: i64, t: i64, x: i64) -> XSeq {
+    let mn = -9223372036854775807 - 1
+    var s = new_seq()
+    sq(s, mach.X_UCOMISD, -1, a, a, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_P, 0)
+    sq(s, mach.X_MOVABS, t, -1, -1, -1, 4890909195324358656, -1, -1)
+    sq(s, mach.X_MOVQ_TOX, x, -1, t, -1, 0, -1, -1)
+    sq(s, mach.X_UCOMISD, -1, a, x, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_AE, 1)
+    sq(s, mach.X_CVTTSD2SI, res, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_TEST, -1, res, res, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_NS, 3)
+    label(s, 0)
+    sq(s, mach.X_MOVI32, res, -1, -1, -1, 0, -1, -1)
+    sq(s, mach.X_JMP8, -1, -1, -1, -1, 0, -1, 3)
+    label(s, 1)
+    sq(s, mach.X_MOVABS, t, -1, -1, -1, 4895412794951729152, -1, -1)
+    sq(s, mach.X_MOVQ_TOX, x, -1, t, -1, 0, -1, -1)
+    sq(s, mach.X_UCOMISD, -1, a, x, -1, 0, -1, -1)
+    sq(s, mach.X_JCC8, -1, -1, -1, -1, 0, mach.C_AE, 2)
+    sq(s, mach.X_MOVQ_FROMX, res, -1, a, -1, 0, -1, -1)
+    sq(s, mach.X_SHLI, res, -1, -1, -1, 11, -1, -1)
+    sq(s, mach.X_MOVABS, t, -1, -1, -1, mn, -1, -1)
+    sq(s, mach.X_OR, res, -1, t, -1, 0, -1, -1)
+    sq(s, mach.X_JMP8, -1, -1, -1, -1, 0, -1, 3)
+    label(s, 2)
+    sq(s, mach.X_MOVSI, res, -1, -1, -1, -1, -1, -1)
+    label(s, 3)
+    s
+}
+
+// ----- the function ---------------------------------------------------------------
+
+fn is_cond(m: i64) -> bool {
+    m == mach.X_JCC32 or m == mach.X_JCC8
+}
+
+/// A branch to block `tgt`, sized later.
+fn branch(inout p: XPieces, m: i64, cc: i64, tgt: i64) {
+    p.bytes.push([])
+    p.is_br.push(true)
+    p.br_cc.push(if is_cond(m) { cc } else { -1 })
+    p.br_tgt.push(tgt)
+    p.long.push(false)
+    if p.want_asm {
+        p.asm.push(if is_cond(m) { "j{mach.cond_name(cc)} Lb{tgt}" } else { "jmp Lb{tgt}" })
+    }
+    ()
+}
+
+fn br_size(p: XPieces, k: i64) -> i64 {
+    if not p.long[k] {
+        2
+    } else if p.br_cc[k] >= 0 {
+        6
+    } else {
+        5
+    }
+}
+
+/// The callee-saved registers the prologue pushes, in order.
+fn saved_regs(t: Target, al: Alloc) -> [i64] {
+    var out: [i64] = []
+    for r in [mach.RBX, mach.R12, mach.R13, mach.R14, mach.R15] {
+        if al.used_callee[r] {
+            out.push(r)
+        }
+    }
+    out
+}
+
+/// Encodes a function. `callee_sym` and `rt_names` only name things in the
+/// listing.
+pub fn emit(t: Target, al: Alloc, sym: str, want_asm: bool) -> X64Code ! str {
+    var p = XPieces{
+        bytes: [], is_br: [], br_cc: [], br_tgt: [], long: [], block_at: [],
+        rel_piece: [], rel_in: [], rel_kind: [], rel_symk: [], rel_sym: [],
+        row_piece: [], row_src: [], asm: [], want_asm: want_asm,
+    }
+    let saved = saved_regs(t, al)
+    let slots = al.nout + al.nslots + al.nspill
+    // After `push rbp` rsp is 16-aligned; the saved registers and the area
+    // below them keep it so.
+    let pushed = 8 * saved.len()
+    let area = (8 * slots + pushed + 15).bit_and(-16) - pushed
+    let plan = frameplan.frame_plan(t, al)
+    let fp_block = plan.at
+    let framed = plan.framed
+    let nb = al.bi0.len()
+    at_src(p, al.span0)
+    for b in 0..nb {
+        p.block_at.push(p.bytes.len())
+        if want_asm {
+            p.asm.push("Lb{b}:")
+        }
+        if b == fp_block {
+            at_src(p, al.span0)
+            try ins(p, mach.X_PUSH, -1, mach.RBP, -1, -1, 0, -1)
+            try ins(p, mach.X_MOV, mach.RBP, -1, mach.RSP, -1, 0, -1)
+            for r in saved {
+                try ins(p, mach.X_PUSH, -1, r, -1, -1, 0, -1)
+            }
+            if area > 0 {
+                try ins(p, mach.X_SUBI, mach.RSP, -1, -1, -1, area, -1)
+            }
+        }
+        let end = al.bi0[b] + al.bni[b]
+        var i = al.bi0[b]
+        while i < end {
+            let m = al.mop[i]
+            if (m == mach.X_MOV or m == mach.X_MOVAPS) and al.rd[i] == al.rm[i] {
+                i += 1
+                continue
+            }
+            if m == mach.X_JMP32 and al.tgt[i] == b + 1 {
+                i += 1
+                continue
+            }
+            at_src(p, al.src[i])
+            if m == mach.P_RETURN {
+                if framed[b] {
+                    if area > 0 {
+                        try ins(p, mach.X_ADDI, mach.RSP, -1, -1, -1, area, -1)
+                    }
+                    var k = saved.len() - 1
+                    while k >= 0 {
+                        try ins(p, mach.X_POP, saved[k], -1, -1, -1, 0, -1)
+                        k -= 1
+                    }
+                    try ins(p, mach.X_POP, mach.RBP, -1, -1, -1, 0, -1)
+                }
+                try ins(p, mach.X_RET, -1, -1, -1, -1, 0, -1)
+                i += 1
+                continue
+            }
+            if al.tgt[i] >= 0 {
+                var cc = al.cc[i]
+                var tgt = al.tgt[i]
+                var skip_next = false
+                if is_cond(m) and tgt == b + 1 {
+                    if i + 1 < end and al.mop[i + 1] == mach.X_JMP32 {
+                        // `jcc next; jmp other` is `j!cc other`.
+                        tgt = al.tgt[i + 1]
+                        cc = mach.cond_invert(cc)
+                        skip_next = true
+                    } else if i + 1 == end {
+                        // A conditional branch to the next block, last in
+                        // its block, does nothing. One with more branches
+                        // after it skips them, and stays.
+                        i += 1
+                        continue
+                    }
+                }
+                branch(p, m, cc, tgt)
+                i += if skip_next { 2 } else { 1 }
+                continue
+            }
+            if m == mach.P_SDIVREM {
+                try lay(seq_sdivrem(al.rm[i]), p)
+            } else if m == mach.P_UCVTF {
+                try lay(seq_ucvtf(al.rd[i], al.rm[i], al.rn[i], al.ra[i]), p)
+            } else if m == mach.P_CVTS {
+                try lay(seq_cvts(al.rd[i], al.rm[i], al.rn[i]), p)
+            } else if m == mach.P_CVTU {
+                try lay(seq_cvtu(al.rd[i], al.rm[i], al.rn[i], al.ra[i]), p)
+            } else {
+                let bs = try mach.encode(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i], al.cc[i], 0)
+                if al.symk[i] > 0 {
+                    let kind = mach.reloc_kind(m)
+                    if kind == mach.REL_NONE {
+                        fail("{sym}: {mach.form_name(m)} refers to a symbol it cannot be relocated against")
+                    }
+                    p.rel_piece.push(p.bytes.len())
+                    p.rel_in.push(bs.len() - 4)
+                    p.rel_kind.push(kind)
+                    p.rel_symk.push(al.symk[i])
+                    p.rel_sym.push(al.sym_id[i])
+                }
+                piece(p, bs)
+                if want_asm {
+                    let target = if al.symk[i] > 0 { "sym{al.symk[i]}:{al.sym_id[i]}" } else { "" }
+                    p.asm.push(mach.asm_text(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i], al.cc[i], 0, target))
+                }
+            }
+            i += 1
+        }
+    }
+    // Branch sizes: short until out of reach, then long, to a fixpoint.
+    let np = p.bytes.len()
+    var start: [i64] = []
+    for k in 0..(np + 1) {
+        start.push(0)
+    }
+    var grew = true
+    while grew {
+        grew = false
+        var pos = 0
+        for k in 0..np {
+            start[k] = pos
+            pos += if p.is_br[k] { br_size(p, k) } else { p.bytes[k].len() }
+        }
+        start[np] = pos
+        for k in 0..np {
+            if p.is_br[k] and not p.long[k] {
+                let off = start[p.block_at[p.br_tgt[k]]] - start[k]
+                if off - 2 < -128 or off - 2 > 127 {
+                    p.long[k] = true
+                    grew = true
+                }
+            }
+        }
+    }
+    var out: [i64] = []
+    for k in 0..np {
+        if p.is_br[k] {
+            let off = start[p.block_at[p.br_tgt[k]]] - start[k]
+            let m = if p.br_cc[k] >= 0 { if p.long[k] { mach.X_JCC32 } else { mach.X_JCC8 } } else { if p.long[k] { mach.X_JMP32 } else { mach.X_JMP8 } }
+            for x in try mach.encode(m, -1, -1, -1, -1, 0, 0, p.br_cc[k], off) {
+                out.push(x)
+            }
+        } else {
+            for x in p.bytes[k] {
+                out.push(x)
+            }
+        }
+    }
+    var rel_off: [i64] = []
+    for k in 0..p.rel_piece.len() {
+        rel_off.push(start[p.rel_piece[k]] + p.rel_in[k])
+    }
+    var row_byte: [i64] = []
+    for k in 0..p.row_piece.len() {
+        row_byte.push(start[p.row_piece[k]])
+    }
+    X64Code{
+        sym: sym, bytes: out, rel_off: rel_off, rel_kind: p.rel_kind, rel_symk: p.rel_symk, rel_sym: p.rel_sym,
+        asm: p.asm, frame: 8 * slots, nspill: al.nspill, nsaved: saved.len(), frame_at: fp_block,
+        row_byte: row_byte, row_src: p.row_src,
+    }
+}

@@ -1,0 +1,161 @@
+// The runtime dialect's leaves for x86-64 ([T-RUNTIME], docs/self-hosting.md
+// §5.5, §5.6 and §6.16), as `compiler/aarch64/src/leaves.gr` writes them for
+// AArch64: fixed functions the backend writes into the runtime's object when
+// its code calls them, each reached by `call` as any C function is, so the
+// calling convention decides what a call to one may change.
+//
+//     _grt.ctx_switch(from, to)   saves this context at `from`, resumes `to`
+//     _grt.ctx_init(ctx, top, entry, arg)
+//                                 a context whose first resumption calls
+//                                 `entry(arg)` on the stack below `top`
+//     _grt.ctx_start              where that first resumption lands
+//     _grt.tlv.<cell>             the address of the calling thread's copy
+//                                 of a runtime thread-local variable
+//
+// A context is what System V has a callee preserve: rbx at 0, rbp at 8,
+// r12..r15 at 16..40, rsp at 48, MXCSR at 56 and the x87 control word at 60
+// -- 64 bytes of the 176 `fiber.gr` gives each. The return address is on the
+// stack `rsp` points at, so a switch saves `rsp` and `ret`s on the other
+// stack, into whatever called the switch there. A new context's stack holds
+// `_grt.ctx_start`'s address at `top - 8` (top rounded down to 16) and its
+// `rsp` points there, so the first switch into it `ret`s into
+// `_grt.ctx_start` with `rsp` 16-aligned, as a call needs; that moves the
+// argument (r12) into rdi, calls the entry (rbx), and stops at `ud2` if it
+// returns. Its rbp is 0, so a backtrace ends there.
+import mach
+import mir.ir
+
+type X64Leaf = {
+    sym: str,
+    bytes: [i64],
+    /// Relocations: byte offset of the 32-bit field, kind (`mach.REL_*`), the
+    /// symbol.
+    rel_off: [i64],
+    rel_kind: [i64],
+    rel_name: [str],
+    asm: [str],
+}
+
+pub let CTX_SP = 48
+pub let CTX_MXCSR = 56
+pub let CTX_X87 = 60
+
+fn new_leaf(sym: str) -> X64Leaf {
+    X64Leaf{ sym: sym, bytes: [], rel_off: [], rel_kind: [], rel_name: [], asm: [] }
+}
+
+fn put(inout l: X64Leaf, m: i64, rd: i64, rn: i64, rm: i64, imm: i64) -> () ! str {
+    for x in try mach.encode(m, rd, rn, rm, -1, imm, 0, -1, 0) {
+        l.bytes.push(x)
+    }
+    l.asm.push(mach.asm_text(m, rd, rn, rm, -1, imm, 0, -1, 0, ""))
+    ()
+}
+
+/// An instruction ending in a 32-bit field the linker completes against
+/// `name`.
+fn put_rel(inout l: X64Leaf, m: i64, rd: i64, rn: i64, name: str) -> () ! str {
+    let bs = try mach.encode(m, rd, rn, -1, -1, 0, 0, -1, 0)
+    l.rel_off.push(l.bytes.len() + bs.len() - 4)
+    l.rel_kind.push(mach.reloc_kind(m))
+    l.rel_name.push(name)
+    for x in bs {
+        l.bytes.push(x)
+    }
+    l.asm.push(mach.asm_text(m, rd, rn, -1, -1, 0, 0, -1, 0, name))
+    ()
+}
+
+fn saved() -> [i64] {
+    [mach.RBX, mach.RBP, mach.R12, mach.R13, mach.R14, mach.R15]
+}
+
+/// `ctx_switch(from: rdi, to: rsi)`.
+fn switch_leaf() -> X64Leaf ! str {
+    var l = new_leaf("_grt.ctx_switch")
+    let rs = saved()
+    for k in 0..rs.len() {
+        try put(l, mach.X_STORE, rs[k], mach.RDI, -1, 8 * k)
+    }
+    try put(l, mach.X_STORE, mach.RSP, mach.RDI, -1, CTX_SP)
+    try put(l, mach.X_STMXCSR, -1, mach.RDI, -1, CTX_MXCSR)
+    try put(l, mach.X_FNSTCW, -1, mach.RDI, -1, CTX_X87)
+    for k in 0..rs.len() {
+        try put(l, mach.X_LOAD, rs[k], mach.RSI, -1, 8 * k)
+    }
+    try put(l, mach.X_LOAD, mach.RSP, mach.RSI, -1, CTX_SP)
+    try put(l, mach.X_LDMXCSR, -1, mach.RSI, -1, CTX_MXCSR)
+    try put(l, mach.X_FLDCW, -1, mach.RSI, -1, CTX_X87)
+    try put(l, mach.X_RET, -1, -1, -1, 0)
+    l
+}
+
+/// `ctx_init(ctx: rdi, top: rsi, entry: rdx, arg: rcx)`.
+fn init_leaf() -> X64Leaf ! str {
+    var l = new_leaf("_grt.ctx_init")
+    try put(l, mach.X_ANDI, mach.RSI, -1, -1, -16)
+    try put_rel(l, mach.X_LEA_RIP, mach.RAX, -1, "_grt.ctx_start")
+    try put(l, mach.X_STORE, mach.RAX, mach.RSI, -1, -8)
+    try put(l, mach.X_LEA, mach.RAX, mach.RSI, -1, -8)
+    try put(l, mach.X_STORE, mach.RAX, mach.RDI, -1, CTX_SP)
+    try put(l, mach.X_STORE, mach.RDX, mach.RDI, -1, 0)
+    try put(l, mach.X_STORE, mach.RCX, mach.RDI, -1, 16)
+    try put(l, mach.X_MOVI32, mach.RAX, -1, -1, 0)
+    for off in [8, 24, 32, 40] {
+        try put(l, mach.X_STORE, mach.RAX, mach.RDI, -1, off)
+    }
+    // The new context's control words are this one's.
+    try put(l, mach.X_STMXCSR, -1, mach.RDI, -1, CTX_MXCSR)
+    try put(l, mach.X_FNSTCW, -1, mach.RDI, -1, CTX_X87)
+    try put(l, mach.X_RET, -1, -1, -1, 0)
+    l
+}
+
+/// Where a context made by `ctx_init` first resumes.
+fn start_leaf() -> X64Leaf ! str {
+    var l = new_leaf("_grt.ctx_start")
+    try put(l, mach.X_MOV, mach.RDI, -1, mach.R12, 0)
+    try put(l, mach.X_CALLR, -1, mach.RBX, -1, 0)
+    try put(l, mach.X_UD2, -1, -1, -1, 0)
+    l
+}
+
+/// The address of the calling thread's copy of runtime thread-local
+/// variable `cell`: through the variable's descriptor, whose thunk
+/// (`__tlv_bootstrap`'s, bound by the linker) answers it in rax.
+fn tlv_get(cell: str) -> X64Leaf ! str {
+    var l = new_leaf("_" + ir.rt_tlv_getter(cell))
+    try put(l, mach.X_PUSH, -1, mach.RBP, -1, 0)
+    try put(l, mach.X_MOV, mach.RBP, -1, mach.RSP, 0)
+    try put_rel(l, mach.X_LOAD_TLV, mach.RDI, -1, ir.tlv_var_sym(cell))
+    try put(l, mach.X_CALLM, -1, mach.RDI, -1, 0)
+    try put(l, mach.X_POP, mach.RBP, -1, -1, 0)
+    try put(l, mach.X_RET, -1, -1, -1, 0)
+    l
+}
+
+/// The leaves a runtime that calls `rt_name` needs, given its thread-local
+/// cells: none when the name is not one of them.
+pub fn leaves_for(rt_name: str, cells: [str]) -> [X64Leaf] ! str {
+    if rt_name == ir.RT_CTX_SWITCH {
+        return [try switch_leaf()]
+    }
+    if rt_name == ir.RT_CTX_INIT {
+        return [try init_leaf(), try start_leaf()]
+    }
+    for c in cells {
+        if rt_name == ir.rt_tlv_getter(c) {
+            return [try tlv_get(c)]
+        }
+    }
+    []
+}
+
+/// Every form a leaf writes, for `emittable_forms`.
+pub fn leaf_mops() -> [i64] {
+    [
+        mach.X_STORE, mach.X_LOAD, mach.X_STMXCSR, mach.X_FNSTCW, mach.X_LDMXCSR, mach.X_FLDCW, mach.X_RET,
+        mach.X_ANDI, mach.X_LEA_RIP, mach.X_LEA, mach.X_MOVI32, mach.X_MOV, mach.X_CALLR, mach.X_UD2,
+        mach.X_PUSH, mach.X_LOAD_TLV, mach.X_CALLM, mach.X_POP,
+    ]
+}

@@ -7,3 +7,9 @@ entry = "src/main.gr"
 # S7): the instructions, their encodings and their assembly text, held to the
 # system assembler by `scripts/encodetest_x64.sh`. Pure computation.
 capabilities = []
+
+[dependencies.mir]
+path = "../mir"
+
+[dependencies.vcode]
+path = "../vcode"

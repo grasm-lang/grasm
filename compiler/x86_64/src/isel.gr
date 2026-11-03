@@ -1,0 +1,664 @@
+// Instruction selection for x86-64: MIR to VCode, by the rules in
+// `rules.gr`, as `compiler/aarch64/src/isel.gr` does for AArch64 -- each MIR
+// value the virtual register of the same number, the first rule whose guard
+// holds for each instruction, and an instruction whose every use was
+// absorbed into another's encoding (a constant taken as an immediate, a
+// comparison folded into its branch, an address folded into its load) not
+// emitted at all.
+//
+// The calling convention is System V's, as Apple uses it (docs/self-hosting.md
+// §6.16): integers in rdi, rsi, rdx, rcx, r8, r9 and doubles in xmm0..xmm7,
+// counted apart, the rest on the stack in argument order, eight bytes each;
+// the result in rax or xmm0. Block arguments are parallel moves at the end
+// of the jumping block (`moves.par_moves`).
+import mach
+import rules
+import mir.ir
+import vcode.vcode
+import vcode.moves
+
+type XSel = {
+    def_inst: [i64],
+    uses: [i64],
+    ruses: [i64],
+    rule_of: [i64],
+    term_rule: [i64],
+    inner: [i64],
+    absorbed: [bool],
+    abase: [i64],
+}
+
+fn const_of(f: MirFn, s: XSel, v: i64) -> (bool, i64) {
+    if v < 0 {
+        return (false, 0)
+    }
+    let i = s.def_inst[v]
+    if i >= 0 and f.op[i] == ir.M_ICONST {
+        return (true, f.imm[i])
+    }
+    (false, 0)
+}
+
+fn b_guard(g: i64, k: i64) -> bool {
+    if g == rules.G_B_SIMM32 {
+        rules.simm32(k)
+    } else if g == rules.G_B_SHIFT {
+        k >= 0 and k <= 63
+    } else if g == rules.G_B_POW2 {
+        k != 0 and k.bit_and(k - 1) == 0
+    } else {
+        false
+    }
+}
+
+/// Whether guard `g` holds for instruction `i` (or, with `i` < 0, for the
+/// terminator of a block whose candidate comparison is `j`).
+fn guard_holds(f: MirFn, s: XSel, g: i64, i: i64, j: i64) -> bool {
+    if g == rules.G_ANY {
+        return true
+    }
+    if g == rules.G_AOFF or g == rules.G_ASLOT {
+        if i < 0 or f.a[i] < 0 {
+            return false
+        }
+        let d = s.def_inst[f.a[i]]
+        if d < 0 {
+            return false
+        }
+        if g == rules.G_ASLOT {
+            return f.op[d] == ir.M_SLOTADDR
+        }
+        if f.op[d] != ir.M_ADD {
+            return false
+        }
+        let (isk, k) = const_of(f, s, f.b[d])
+        return isk and rules.simm32(k)
+    }
+    if g == rules.G_B_SIMM32 or g == rules.G_B_SHIFT or g == rules.G_B_POW2 {
+        if i < 0 or ir.nreads(f.op[i]) != 2 {
+            return false
+        }
+        let (isk, k) = const_of(f, s, f.b[i])
+        return isk and b_guard(g, k)
+    }
+    if g == rules.G_FCC_SWAP or g == rules.G_FCC_EQ or g == rules.G_FCC_NE {
+        if i < 0 or f.op[i] != ir.M_FCMP {
+            return false
+        }
+        let sh = rules.fcc_shape(f.imm[i])
+        return (g == rules.G_FCC_SWAP and sh == rules.FS_SWAP) or (g == rules.G_FCC_EQ and sh == rules.FS_EQ) or (g == rules.G_FCC_NE and sh == rules.FS_NE)
+    }
+    // The fusing guards: `j` is a comparison only this branch reads.
+    if j < 0 {
+        return false
+    }
+    if g == rules.G_FFUSE or g == rules.G_FFUSE_SWAP or g == rules.G_FFUSE_EQ or g == rules.G_FFUSE_NE {
+        if f.op[j] != ir.M_FCMP {
+            return false
+        }
+        let sh = rules.fcc_shape(f.imm[j])
+        let want = if g == rules.G_FFUSE { rules.FS_PLAIN } else if g == rules.G_FFUSE_SWAP { rules.FS_SWAP } else if g == rules.G_FFUSE_EQ { rules.FS_EQ } else { rules.FS_NE }
+        return sh == want
+    }
+    if f.op[j] != ir.M_ICMP {
+        return false
+    }
+    if g == rules.G_FUSE {
+        return true
+    }
+    if g == rules.G_FUSE_IMM {
+        let (isk, k) = const_of(f, s, f.b[j])
+        return isk and rules.simm32(k)
+    }
+    false
+}
+
+fn choose(f: MirFn, s: XSel, rs: [XRule], op: i64, i: i64, j: i64) -> i64 {
+    for k in 0..rs.len() {
+        if rs[k].op == op and guard_holds(f, s, rs[k].guard, i, j) {
+            return k
+        }
+    }
+    -1
+}
+
+fn bump(inout s: XSel, v: i64) {
+    if v >= 0 {
+        s.ruses[v] += 1
+    }
+}
+
+/// Counts the register reads a chosen rule makes.
+fn count_rule(inout s: XSel, ru: XRule, a: i64, b: i64, ia: i64, ib: i64, ab: i64) {
+    for tm in ru.emit {
+        for sel in [tm.d, tm.n, tm.m, tm.a] {
+            if sel == rules.S_A {
+                bump(s, a)
+            } else if sel == rules.S_B {
+                bump(s, b)
+            } else if sel == rules.S_IA {
+                bump(s, ia)
+            } else if sel == rules.S_IB {
+                bump(s, ib)
+            } else if sel == rules.S_AB {
+                bump(s, ab)
+            }
+        }
+    }
+}
+
+/// Operations that follow the calling convention rather than the rule table.
+fn is_call(op: i64) -> bool {
+    op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND or op == ir.M_INC or op == ir.M_DEC
+}
+
+/// Chooses a rule for every instruction and terminator, and counts what is
+/// left to read in registers.
+fn plan(f: MirFn, rs: [XRule]) -> XSel ! str {
+    let nv = f.nvals
+    var s = XSel{ def_inst: [], uses: [], ruses: [], rule_of: [], term_rule: [], inner: [], absorbed: [], abase: [] }
+    for v in 0..nv {
+        s.def_inst.push(-1)
+        s.uses.push(0)
+        s.ruses.push(0)
+    }
+    for i in 0..f.op.len() {
+        if f.res[i] >= 0 {
+            s.def_inst[f.res[i]] = i
+        }
+        let n = ir.nreads(f.op[i])
+        if n >= 1 {
+            s.uses[f.a[i]] += 1
+        }
+        if n >= 2 {
+            s.uses[f.b[i]] += 1
+        }
+        for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+            s.uses[f.cargs[j]] += 1
+        }
+        s.rule_of.push(-1)
+        s.absorbed.push(false)
+        s.abase.push(-1)
+    }
+    let nb = ir.nblocks(f)
+    for b in 0..nb {
+        if f.tv[b] >= 0 {
+            s.uses[f.tv[b]] += 1
+        }
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            s.uses[f.targs[j]] += 1
+        }
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            s.uses[f.targs[j]] += 1
+        }
+    }
+    for b in 0..nb {
+        let k = f.tk[b]
+        var tr = -1
+        var j = -1
+        if k == ir.M_BRIF {
+            let c = f.tv[b]
+            let d = s.def_inst[c]
+            if d >= f.bi0[b] and d < f.bi0[b] + f.bni[b] and (f.op[d] == ir.M_ICMP or f.op[d] == ir.M_FCMP) and s.uses[c] == 1 {
+                j = d
+            }
+            tr = choose(f, s, rs, ir.M_BRIF, -1, j)
+            if tr >= 0 and rs[tr].guard != rules.G_ANY {
+                s.absorbed[j] = true
+            } else {
+                j = -1
+            }
+        } else if k == ir.M_JUMP or k == ir.M_TRAP {
+            tr = choose(f, s, rs, k, -1, -1)
+        }
+        if (k == ir.M_BRIF or k == ir.M_JUMP or k == ir.M_TRAP) and tr < 0 {
+            fail("no rule selects `{ir.op_name(k)}`")
+        }
+        s.term_rule.push(tr)
+        s.inner.push(j)
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            let op = f.op[i]
+            if is_call(op) {
+                continue
+            }
+            let ri = choose(f, s, rs, op, i, -1)
+            if ri < 0 {
+                fail("no rule selects `{ir.op_name(op)}`")
+            }
+            s.rule_of[i] = ri
+            if rs[ri].guard == rules.G_AOFF {
+                s.abase[i] = f.a[s.def_inst[f.a[i]]]
+            }
+        }
+    }
+    for i in 0..f.op.len() {
+        if s.absorbed[i] {
+            continue
+        }
+        let op = f.op[i]
+        if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
+            if op == ir.M_CALLIND {
+                bump(s, f.a[i])
+            }
+            for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                bump(s, f.cargs[j])
+            }
+        } else if op == ir.M_INC or op == ir.M_DEC {
+            bump(s, f.a[i])
+        } else {
+            count_rule(s, rs[s.rule_of[i]], f.a[i], f.b[i], -1, -1, s.abase[i])
+            if ir.has_cargs(op) {
+                for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                    bump(s, f.cargs[j])
+                }
+            }
+        }
+    }
+    for b in 0..nb {
+        let k = f.tk[b]
+        if k == ir.M_RET {
+            bump(s, f.tv[b])
+        } else if k == ir.M_BRIF {
+            let j = s.inner[b]
+            var ia = -1
+            var ib = -1
+            if j >= 0 {
+                ia = f.a[j]
+                ib = f.b[j]
+            }
+            count_rule(s, rs[s.term_rule[b]], f.tv[b], -1, ia, ib, -1)
+        }
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            bump(s, f.targs[j])
+        }
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            bump(s, f.targs[j])
+        }
+    }
+    // A pure instruction nobody reads in a register is not emitted, and
+    // stops counting as a reader of its own operands.
+    var changed = true
+    while changed {
+        changed = false
+        var i = f.op.len() - 1
+        while i >= 0 {
+            if not s.absorbed[i] and ir.pure_op(f.op[i]) and f.res[i] >= 0 and s.ruses[f.res[i]] == 0 {
+                s.absorbed[i] = true
+                changed = true
+                let ru = rs[s.rule_of[i]]
+                for tm in ru.emit {
+                    for sel in [tm.d, tm.n, tm.m, tm.a] {
+                        if sel == rules.S_A and f.a[i] >= 0 {
+                            s.ruses[f.a[i]] -= 1
+                        } else if sel == rules.S_B and f.b[i] >= 0 {
+                            s.ruses[f.b[i]] -= 1
+                        } else if sel == rules.S_AB and s.abase[i] >= 0 {
+                            s.ruses[s.abase[i]] -= 1
+                        }
+                    }
+                }
+            }
+            i -= 1
+        }
+    }
+    s
+}
+
+fn vr(v: i64) -> i64 {
+    if v < 0 { -1 } else { mach.VR + v }
+}
+
+fn sel_reg(sel: i64, res: i64, a: i64, b: i64, t0: i64, t1: i64, ia: i64, ib: i64, c: i64, ab: i64) -> i64 {
+    match sel {
+        1 -> vr(res)
+        2 -> vr(a)
+        3 -> vr(b)
+        4 -> t0
+        5 -> t1
+        7 -> vr(ia)
+        8 -> vr(ib)
+        9 -> vr(c)
+        10 -> vr(ab)
+        11 -> mach.RAX
+        12 -> mach.RCX
+        13 -> mach.RDX
+        14 -> mach.RSP
+        _ -> -1
+    }
+}
+
+/// Expands one rule application. `i` is the instruction (-1 for a
+/// terminator), `j` the comparison a branch absorbed, `tt`/`tf` the branch
+/// targets.
+fn expand(inout vc: VCode, f: MirFn, s: XSel, ru: XRule, ccm: [i64], fccm: [i64], i: i64, j: i64, tt: i64, tf: i64, cond: i64) -> () ! str {
+    var res = -1
+    var a = -1
+    var b = -1
+    var own_imm = 0
+    if i >= 0 {
+        res = f.res[i]
+        a = f.a[i]
+        b = f.b[i]
+        own_imm = f.imm[i]
+    } else {
+        a = cond
+    }
+    var ia = -1
+    var ib = -1
+    if j >= 0 {
+        ia = f.a[j]
+        ib = f.b[j]
+    }
+    var c3 = -1
+    if i >= 0 and ir.has_cargs(f.op[i]) and f.can[i] > 0 {
+        c3 = f.cargs[f.ca0[i]]
+    }
+    // The temporaries, each of the class of the field it is first named in.
+    var t0 = -1
+    var t1 = -1
+    for tm in ru.emit {
+        let sels = [tm.d, tm.n, tm.m, tm.a]
+        for k in 0..4 {
+            let cls = if mach.fp_field(tm.mop, k) { mach.CLS_FP } else { mach.CLS_INT }
+            if t0 < 0 and sels[k] == rules.S_T0 {
+                t0 = vcode.new_vreg(vc, cls)
+            }
+            if t1 < 0 and sels[k] == rules.S_T1 {
+                t1 = vcode.new_vreg(vc, cls)
+            }
+        }
+    }
+    var ab = -1
+    var adef = -1
+    if i >= 0 and (ru.guard == rules.G_AOFF or ru.guard == rules.G_ASLOT) {
+        adef = s.def_inst[a]
+        ab = s.abase[i]
+    }
+    for tm in ru.emit {
+        let d = sel_reg(tm.d, res, a, b, t0, t1, ia, ib, c3, ab)
+        let n = sel_reg(tm.n, res, a, b, t0, t1, ia, ib, c3, ab)
+        let m = sel_reg(tm.m, res, a, b, t0, t1, ia, ib, c3, ab)
+        let ra = sel_reg(tm.a, res, a, b, t0, t1, ia, ib, c3, ab)
+        let k = tm.imm
+        var imm = 0
+        if k >= 0 {
+            imm = k
+        } else if k == rules.K_B or k == rules.K_B_LOG2 {
+            let (isk, cv) = const_of(f, s, b)
+            if not isk {
+                fail("a rule took operand b as an immediate, and it is not a constant")
+            }
+            imm = if k == rules.K_B { cv } else { log2(cv) }
+        } else if k == rules.K_IB {
+            let (isk, cv) = const_of(f, s, ib)
+            if not isk {
+                fail("a rule took the comparison's b as an immediate, and it is not a constant")
+            }
+            imm = cv
+        } else if k == rules.K_AOFF {
+            let (isk, cv) = const_of(f, s, f.b[adef])
+            if not isk {
+                fail("a load or store took its address's offset as an immediate, and it is not a constant")
+            }
+            imm = cv
+        } else if k == rules.K_ASLOT {
+            imm = (f.imm[adef] + vc.nout) * 8
+        } else if k == rules.K_IMM {
+            imm = own_imm
+        } else if k == rules.K_SLOT {
+            imm = (own_imm + vc.nout) * 8
+        } else if k == rules.K_LIT {
+            imm = tm.lit
+        } else {
+            fail("unknown immediate selector {k}")
+        }
+        if tm.mop == mach.P_MOVIMM {
+            let x = vcode.push(vc, mach.movimm_form(imm), d, -1, -1)
+            vc.imm[x] = imm
+            continue
+        }
+        let x = vcode.push(vc, tm.mop, d, n, m)
+        vc.ra[x] = ra
+        vc.imm[x] = imm
+        if tm.cc >= 0 {
+            vc.cc[x] = tm.cc
+        } else if tm.cc == rules.CC_OWN {
+            vc.cc[x] = ccm[own_imm]
+        } else if tm.cc == rules.CC_INNER {
+            vc.cc[x] = ccm[f.imm[j]]
+        } else if tm.cc == rules.CC_FOWN {
+            vc.cc[x] = fccm[own_imm]
+        } else if tm.cc == rules.CC_FINNER {
+            vc.cc[x] = fccm[f.imm[j]]
+        }
+        if tm.tgt == rules.T_THEN {
+            vc.tgt[x] = tt
+        } else if tm.tgt == rules.T_ELSE {
+            vc.tgt[x] = tf
+        }
+        if tm.sym != rules.Y_NONE {
+            vc.symk[x] = tm.sym
+            vc.sym_id[x] = own_imm
+        }
+    }
+    ()
+}
+
+/// The k with `1 << k == b`, for a power of two `b`.
+fn log2(b: i64) -> i64 {
+    var k = 0
+    while k < 63 and 1.shl(k) != b {
+        k += 1
+    }
+    k
+}
+
+/// Where System V puts each of a call's (or a function's) arguments, given
+/// which are doubles: `reg[k]` argument k's register, or -1 when it travels
+/// on the stack at slot `slot[k]`.
+type XArgPlan = {
+    reg: [i64],
+    slot: [i64],
+    nint: i64,
+    nfp: i64,
+    nstack: i64,
+}
+
+pub fn int_args() -> [i64] {
+    [mach.RDI, mach.RSI, mach.RDX, mach.RCX, mach.R8, mach.R9]
+}
+
+fn plan_args(fp: [bool]) -> XArgPlan {
+    let ia = int_args()
+    var p = XArgPlan{ reg: [], slot: [], nint: 0, nfp: 0, nstack: 0 }
+    for k in 0..fp.len() {
+        if fp[k] and p.nfp < 8 {
+            p.reg.push(mach.R_X0 + p.nfp)
+            p.slot.push(-1)
+            p.nfp += 1
+        } else if not fp[k] and p.nint < 6 {
+            p.reg.push(ia[p.nint])
+            p.slot.push(-1)
+            p.nint += 1
+        } else {
+            p.reg.push(-1)
+            p.slot.push(p.nstack)
+            p.nstack += 1
+        }
+    }
+    p
+}
+
+/// The C functions the runtime calls that C declares variadic, and how many
+/// fixed parameters each has: `open(path, flags, ...)` and `fcntl(fd, cmd,
+/// ...)` (docs/self-hosting.md §6.16, decision (1)). The runtime declares
+/// each with eight register parameters and the variadic one ninth, where
+/// AAPCS64 on Apple passes a variadic argument (`compiler/rt/src/fsys.gr`);
+/// System V passes it as the next fixed argument, so a call with those nine
+/// passes its first two and its last.
+fn variadic_fixed(name: str) -> i64 {
+    if name == "open" or name == "fcntl" { 2 } else { -1 }
+}
+
+/// Which of instruction `i`'s arguments it passes, in order: all of them,
+/// or for a variadic C function declared as the runtime declares one, the
+/// fixed ones and the last.
+fn call_args(f: MirFn, i: i64, rt_syms: [str]) -> [i64] {
+    var out: [i64] = []
+    let n = f.can[i]
+    var fixed = -1
+    if f.op[i] == ir.M_CALLRT and f.imm[i] >= 0 and f.imm[i] < rt_syms.len() and n == 9 {
+        fixed = variadic_fixed(rt_syms[f.imm[i]])
+    }
+    for k in 0..n {
+        if fixed < 0 or k < fixed or k == n - 1 {
+            out.push(f.cargs[f.ca0[i] + k])
+        }
+    }
+    out
+}
+
+/// Whether instruction `i` calls a variadic C function (`call_args`), for
+/// which al says how many xmm registers carry arguments: none.
+fn calls_variadic(f: MirFn, i: i64, rt_syms: [str]) -> bool {
+    f.op[i] == ir.M_CALLRT and f.imm[i] >= 0 and f.imm[i] < rt_syms.len() and f.can[i] == 9 and variadic_fixed(rt_syms[f.imm[i]]) >= 0
+}
+
+fn args_fp(f: MirFn, args: [i64]) -> [bool] {
+    var out: [bool] = []
+    for v in args {
+        out.push(f.vfp[v])
+    }
+    out
+}
+
+/// Selects machine instructions for a whole function.
+pub fn select(t: Target, f: MirFn, rs: [XRule], ccm: [i64], fccm: [i64], rt_syms: [str]) -> VCode ! str {
+    let s = try plan(f, rs)
+    var vc = vcode.new_vcode(f.sym)
+    vc.nvregs = f.nvals
+    for v in 0..f.nvals {
+        vc.vcls.push(if f.vfp[v] { mach.CLS_FP } else { mach.CLS_INT })
+    }
+    vc.nparams = f.nparams
+    vc.nslots = f.nslots
+    vc.span0 = f.span0
+    vc.cur_src = f.span0
+    for i in 0..f.op.len() {
+        if f.op[i] == ir.M_CALL or f.op[i] == ir.M_CALLRT or f.op[i] == ir.M_CALLIND {
+            let ap = plan_args(args_fp(f, call_args(f, i, rt_syms)))
+            if ap.nstack > vc.nout {
+                vc.nout = ap.nstack
+            }
+        }
+    }
+    var pfp: [bool] = []
+    for k in 0..f.bnp[0] {
+        pfp.push(f.vfp[f.bparams[f.bp0[0] + k]])
+    }
+    let pp = plan_args(pfp)
+    vc.nreg_int = pp.nint
+    vc.nreg_fp = pp.nfp
+    let nb = ir.nblocks(f)
+    for b in 0..nb {
+        vc.bi0.push(vc.mop.len())
+        if b == 0 {
+            // Parameters arrive in rdi.. and xmm0.., and the rest above the
+            // saved rbp and the return address.
+            for k in 0..f.bnp[0] {
+                let p = vr(f.bparams[f.bp0[0] + k])
+                if pp.reg[k] >= 0 {
+                    moves.mov(t, vc, p, pp.reg[k])
+                } else {
+                    let x = vcode.push(vc, if pfp[k] { mach.X_MOVSD_LOAD } else { mach.X_LOAD }, p, mach.RBP, -1)
+                    vc.imm[x] = 16 + 8 * pp.slot[k]
+                }
+            }
+        }
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            if s.absorbed[i] {
+                continue
+            }
+            vc.cur_src = f.ispan[i]
+            let op = f.op[i]
+            if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
+                let args = call_args(f, i, rt_syms)
+                let n = args.len()
+                let cfp = args_fp(f, args)
+                let ap = plan_args(cfp)
+                for k in 0..n {
+                    if ap.reg[k] < 0 {
+                        let x = vcode.push(vc, if cfp[k] { mach.X_MOVSD_STORE } else { mach.X_STORE }, vr(args[k]), mach.RSP, -1)
+                        vc.imm[x] = 8 * ap.slot[k]
+                    }
+                }
+                for k in 0..n {
+                    if ap.reg[k] >= 0 {
+                        moves.mov(t, vc, ap.reg[k], vr(args[k]))
+                    }
+                }
+                if calls_variadic(f, i, rt_syms) {
+                    // Last before the call: nothing between writes rax.
+                    let z = vcode.push(vc, mach.X_MOVI32, mach.RAX, -1, -1)
+                    vc.imm[z] = 0
+                }
+                // A call through a function value's code: its register's
+                // interval spans the argument moves, so they did not take it.
+                let x = if op == ir.M_CALLIND { vcode.push(vc, mach.X_CALLR, -1, vr(f.a[i]), -1) } else { vcode.push(vc, mach.X_CALL, -1, -1, -1) }
+                let res_fp = f.res[i] >= 0 and f.vfp[f.res[i]]
+                vc.imm[x] = if f.res[i] < 0 { vcode.RES_NONE } else if res_fp { vcode.RES_D0 } else { vcode.RES_X0 }
+                vc.imm2[x] = vcode.call_args_code(ap.nint, ap.nfp)
+                if op != ir.M_CALLIND {
+                    vc.symk[x] = if op == ir.M_CALL { vcode.SYM_FN } else { vcode.SYM_RT }
+                    vc.sym_id[x] = f.imm[i]
+                }
+                if f.res[i] >= 0 {
+                    moves.mov(t, vc, vr(f.res[i]), if res_fp { mach.R_X0 } else { mach.RAX })
+                }
+                continue
+            }
+            if op == ir.M_INC or op == ir.M_DEC {
+                moves.mov(t, vc, mach.RDI, vr(f.a[i]))
+                let x = vcode.push(vc, mach.X_CALL, -1, -1, -1)
+                vc.imm[x] = vcode.RES_NONE
+                vc.imm2[x] = vcode.call_args_code(1, 0)
+                vc.symk[x] = vcode.SYM_RT
+                vc.sym_id[x] = if op == ir.M_INC { ir.RT_VAL_INC } else { ir.RT_VAL_DEC }
+                continue
+            }
+            try expand(vc, f, s, rs[s.rule_of[i]], ccm, fccm, i, -1, -1, -1, -1)
+        }
+        let k = f.tk[b]
+        vc.cur_src = f.tspan[b]
+        if k == ir.M_RET {
+            var rk = vcode.RES_NONE
+            if f.tv[b] >= 0 {
+                if f.vfp[f.tv[b]] {
+                    moves.mov(t, vc, mach.R_X0, vr(f.tv[b]))
+                    rk = vcode.RES_D0
+                } else {
+                    moves.mov(t, vc, mach.RAX, vr(f.tv[b]))
+                    rk = vcode.RES_X0
+                }
+            }
+            let x = vcode.push(vc, mach.P_RETURN, -1, -1, -1)
+            vc.imm[x] = rk
+        } else {
+            if k == ir.M_JUMP {
+                let tb = f.tt[b]
+                var dsts: [i64] = []
+                var srcs: [i64] = []
+                for q in 0..f.tan[b] {
+                    dsts.push(vr(f.bparams[f.bp0[tb] + q]))
+                    srcs.push(vr(f.targs[f.ta0[b] + q]))
+                }
+                moves.par_moves(t, vc, dsts, srcs)
+            } else if k == ir.M_BRIF and (f.tan[b] > 0 or f.fan[b] > 0) {
+                fail("a conditional branch passes arguments: its edges were not split")
+            }
+            try expand(vc, f, s, rs[s.term_rule[b]], ccm, fccm, -1, s.inner[b], f.tt[b], f.tf[b], f.tv[b])
+        }
+        vc.bni.push(vc.mop.len() - vc.bi0[b])
+    }
+    vc
+}

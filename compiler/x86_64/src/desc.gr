@@ -1,0 +1,119 @@
+// x86-64 as the shared allocators, checker and frame planner see it
+// (`compiler/vcode/src/target.gr`, docs/self-hosting.md §6.16): `mach.gr`'s
+// roles and register files, and System V's registers as Apple uses them.
+import mach
+import vcode.target
+
+/// What a call may change: rax, rcx, rdx, rsi, rdi, r8..r11, and every xmm
+/// register.
+fn caller_saved(r: i64) -> bool {
+    r == mach.RAX or r == mach.RCX or r == mach.RDX or r == mach.RSI or r == mach.RDI or (r >= mach.R8 and r <= mach.R11) or mach.is_xmm(r)
+}
+
+/// What the callee preserves, and the prologue saves when the body writes
+/// it: rbx and r12..r15 (rbp is the frame pointer, never handed out).
+fn callee_saved(r: i64) -> bool {
+    r == mach.RBX or (r >= mach.R12 and r <= mach.R15)
+}
+
+fn reg_name(r: i64) -> str {
+    if mach.is_xmm(r) {
+        "xmm{r - mach.R_X0}"
+    } else if r >= 0 and r < 16 {
+        mach.reg_name(r, 64)
+    } else {
+        "?{r}"
+    }
+}
+
+/// The description, built once per compilation.
+pub fn description() -> Target {
+    var t = target.blank("x86_64")
+    var rd: [i64] = []
+    var rn: [i64] = []
+    var rm: [i64] = []
+    var ra: [i64] = []
+    var fd: [bool] = []
+    var fn_: [bool] = []
+    var fm: [bool] = []
+    var fa: [bool] = []
+    var call: [bool] = []
+    var form: [str] = []
+    for m in 0..target.NMOPS {
+        rd.push(mach.role_d(m))
+        rn.push(mach.role_n(m))
+        rm.push(mach.role_m(m))
+        ra.push(mach.role_a(m))
+        fd.push(mach.fp_field(m, 0))
+        fn_.push(mach.fp_field(m, 1))
+        fm.push(mach.fp_field(m, 2))
+        fa.push(mach.fp_field(m, 3))
+        call.push(mach.is_call(m))
+        form.push(mach.form_name(m))
+    }
+    t.role_d = rd
+    t.role_n = rn
+    t.role_m = rm
+    t.role_a = ra
+    t.fp_d = fd
+    t.fp_n = fn_
+    t.fp_m = fm
+    t.fp_a = fa
+    t.call = call
+    t.form = form
+    var notreg: [bool] = []
+    var cs: [bool] = []
+    var ce: [bool] = []
+    var nw: [bool] = []
+    var fr: [bool] = []
+    var names: [str] = []
+    for r in 0..target.NPHYS {
+        // rsp is the stack pointer, not a register a value lives in; the
+        // numbers between the sixteen general and the sixteen xmm registers
+        // and past them name nothing.
+        notreg.push(r == mach.RSP or (r >= 16 and r < mach.R_X0) or r >= mach.R_X0 + 16)
+        cs.push(caller_saved(r))
+        ce.push(callee_saved(r))
+        nw.push(r == mach.RBP)
+        fr.push(r == mach.RSP or r == mach.RBP)
+        names.push(reg_name(r))
+    }
+    t.notreg = notreg
+    t.caller_saved = cs
+    t.callee_saved = ce
+    t.no_write = nw
+    t.frame_reg = fr
+    t.reg_name = names
+    var af: [i64] = []
+    for k in 0..8 {
+        af.push(mach.R_X0 + k)
+    }
+    t.arg_int = [mach.RDI, mach.RSI, mach.RDX, mach.RCX, mach.R8, mach.R9]
+    t.arg_fp = af
+    t.res_int = mach.RAX
+    t.res_fp = mach.R_X0
+    t.entry_fixed = [mach.RBP]
+    // Handed out: the caller-saved ones, those no argument or division
+    // needs first; then rbx and r12..r15. r10 and r11 are the reload
+    // scratch registers, xmm14 and xmm15 their doubles'.
+    let x = mach.R_X0
+    t.caller_order = [
+        [mach.RSI, mach.RDI, mach.R8, mach.R9, mach.RCX, mach.RDX, mach.RAX],
+        [x + 8, x + 9, x + 10, x + 11, x + 12, x + 13, x + 7, x + 6, x + 5, x + 4, x + 3, x + 2, x + 1, x],
+    ]
+    t.callee_order = [[mach.RBX, mach.R12, mach.R13, mach.R14, mach.R15], []]
+    t.stress_order = [
+        [mach.RSI, mach.RBX, mach.RDI, mach.R12, mach.R8, mach.R13, mach.R9, mach.R14, mach.RCX, mach.R15, mach.RDX, mach.RAX],
+        [x + 8, x + 9, x + 10, x + 11, x + 12, x + 13, x + 7, x + 6, x + 5, x + 4, x + 3, x + 2, x + 1, x],
+    ]
+    t.scratch = [[mach.R11, mach.R10], [x + 15, x + 14]]
+    t.mov = [mach.X_MOV, mach.X_MOVAPS]
+    t.mov_src = [2, 2]
+    t.load = [mach.X_LOAD, mach.X_MOVSD_LOAD]
+    t.store = [mach.X_STORE, mach.X_MOVSD_STORE]
+    t.sp = mach.RSP
+    t.call_op = mach.X_CALL
+    // A 32-bit displacement reaches any frame this backend makes.
+    t.max_frame = 1073741824
+    t
+}

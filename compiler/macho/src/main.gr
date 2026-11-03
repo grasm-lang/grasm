@@ -1,4 +1,9 @@
-// `macho`: a relocatable Mach-O object for arm64 (docs/self-hosting.md, S3).
+// `macho`: a relocatable Mach-O object for arm64 (docs/self-hosting.md, S3),
+// or for x86-64 (§6.16, S7): the same layout, with the CPU type, the code as
+// bytes rather than words, `__text` aligned to 16, and x86-64's relocation
+// types (`X86_64_RELOC_BRANCH`, `SIGNED`, `GOT_LOAD`, `TLV`, each PC-relative
+// and four bytes; `UNSIGNED`, numbered 0 as arm64's is, for the data's
+// pointers and the DWARF's addresses).
 //
 // What `ld` needs from a compiler and nothing else, laid out the way clang
 // lays out its own objects:
@@ -32,7 +37,11 @@
 import dwarf
 
 type MoObj = {
-    /// The code, one 32-bit instruction word per element.
+    /// Whether the object is x86-64's; then the code is `code`, one byte per
+    /// element, and the relocations' kinds are x86-64's.
+    x64: bool,
+    code: [i64],
+    /// The code, one 32-bit instruction word per element (arm64).
     text: [i64],
     /// Functions: name (with its leading underscore), byte offset in
     /// `__text`, and whether other objects may see it.
@@ -89,7 +98,7 @@ pub let R_TLVP_PAGEOFF12 = 9
 
 pub fn new_obj() -> MoObj {
     MoObj{
-        text: [], fsym: [], foff: [], fext: [], rel_off: [], rel_kind: [], rel_sym: [], dsym: [], dbytes: [],
+        x64: false, code: [], text: [], fsym: [], foff: [], fext: [], rel_off: [], rel_kind: [], rel_sym: [], dsym: [], dbytes: [],
         wsym: [], wbytes: [], wrel_off: [], wrel_sym: [], zsym: [], zsize: [], tsym: [], tsize: [], debug: false,
         dw: dwarf.new_unit(),
     }
@@ -166,7 +175,7 @@ pub fn write(o: MoObj) -> bytes ! str {
             cstr_ix.push(k)
         }
     }
-    let text_size = 4 * o.text.len()
+    let text_size = if o.x64 { o.code.len() } else { 4 * o.text.len() }
     var cstr_size = 0
     for k in cstr_ix {
         cstr_size += o.dbytes[k].len() + 1
@@ -410,7 +419,14 @@ pub fn write(o: MoObj) -> bytes ! str {
         }
         let kind = o.rel_kind[k]
         var pcrel = 0
-        if kind == R_BRANCH26 or kind == R_PAGE21 or kind == R_GOT_PAGE21 or kind == R_TLVP_PAGE21 {
+        if o.x64 {
+            // SIGNED, BRANCH, GOT_LOAD, TLV: each a 32-bit displacement from
+            // the next instruction.
+            if not (kind == 1 or kind == 2 or kind == 3 or kind == 9) {
+                fail("x86-64 relocation kind {kind} is not one this writer knows")
+            }
+            pcrel = 1
+        } else if kind == R_BRANCH26 or kind == R_PAGE21 or kind == R_GOT_PAGE21 or kind == R_TLVP_PAGE21 {
             pcrel = 1
         } else if kind != R_PAGEOFF12 and kind != R_GOT_PAGEOFF12 and kind != R_TLVP_PAGEOFF12 {
             fail("relocation kind {kind} is not one this writer knows")
@@ -490,10 +506,11 @@ pub fn write(o: MoObj) -> bytes ! str {
     let str_off = sym_off + 16 * nsyms
 
     var b = byte_builder()
-    // mach_header_64
+    // mach_header_64: CPU_TYPE_ARM64, or CPU_TYPE_X86_64 with
+    // CPU_SUBTYPE_X86_64_ALL.
     put32(b, 0xFEEDFACF)
-    put32(b, 0x0100000C)
-    put32(b, 0)
+    put32(b, if o.x64 { 0x01000007 } else { 0x0100000C })
+    put32(b, if o.x64 { 3 } else { 0 })
     put32(b, 1)
     put32(b, 4)
     put32(b, sizeofcmds)
@@ -517,7 +534,7 @@ pub fn write(o: MoObj) -> bytes ! str {
     put64(b, text_addr)
     put64(b, text_size)
     put32(b, data_off + text_addr)
-    put32(b, 2)
+    put32(b, if o.x64 { 4 } else { 2 })
     put32(b, if o.rel_off.len() > 0 { rel_off } else { 0 })
     put32(b, o.rel_off.len())
     put32(b, 0x80000400)
@@ -667,8 +684,14 @@ pub fn write(o: MoObj) -> bytes ! str {
     }
     pad_to(b, 16)
     // Section contents.
-    for w in o.text {
-        put32(b, w)
+    if o.x64 {
+        for x in o.code {
+            put8(b, x)
+        }
+    } else {
+        for w in o.text {
+            put32(b, w)
+        }
     }
     for k in cstr_ix {
         b.push_bytes(o.dbytes[k])

@@ -1,32 +1,140 @@
 // `x86_64`: the x86-64 target of the Grasm backend (docs/self-hosting.md
-// §6.16, stage S7 part one).
+// §6.16, stage S7 part one): MIR in, x86-64 machine code out.
 //
+//     rules.gr     instruction selection, as data, and the table's checker
+//     isel.gr      MIR to VCode by those rules, plus the calling convention
+//     emit.gr      frame, pseudo-instructions, branches, relocations, bytes
 //     mach.gr      the instructions: roles, fixed registers, encodings,
 //                  assembly text
+//     desc.gr      the target description the shared code reads
+//     leaves.gr    the runtime dialect's leaves
 //     enctest.gr   the encoder's test cases
 //
-// This is step two of the part: the encoder, held to the system assembler
-// (`scripts/encodetest_x64.sh`) across every form the design's selection
-// will emit. Instruction selection, the calling convention, allocation
-// through the shared allocators and the frame come in step three; until then
-// `emittable_forms` is every form the encoder knows, and the driver compiles
-// nothing for this target.
+// VCode, both register allocators, the allocation checker, the frame's
+// placement and parallel moves are `compiler/vcode`'s, shared with AArch64.
 import mach
+import rules
+import desc
+import isel
+import emit
+import leaves
 import enctest
+import mir.ir
+import vcode.vcode
+import vcode.regalloc
+import vcode.backtrack
+import vcode.check
 
-/// Every instruction form compiled code for this target can contain. Until
-/// the rule table exists (step three) that is every form the encoder knows,
-/// each of which the design (§6.16) has a use for; the table will then name
-/// the ones it emits, as `compiler/aarch64`'s `emittable_forms` derives its
-/// list from its rules.
+type X64Opts = {
+    /// Registers the allocator may hand out; negative for all of them.
+    max_regs: i64,
+    /// A planted allocation error (`regalloc.PLANT_*`), for the checker's
+    /// control.
+    corrupt: i64,
+    want_asm: bool,
+    /// Which allocator: 0 linear scan, 1 the release one.
+    ra: i64,
+    tg: Target,
+}
+
+pub fn default_opts() -> X64Opts {
+    X64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false, ra: 1, tg: desc.description() }
+}
+
+/// What compiling one function produced.
+type X64Result = {
+    code: X64Code,
+    ra_errors: [str],
+    corrupted: i64,
+    vcode_text: str,
+}
+
+/// Selects, allocates, checks and encodes one function. `rt_syms` names the
+/// runtime and C functions its calls reach (`MirProg.rt_syms`).
+pub fn compile_fn(f: MirFn, rs: [XRule], ccm: [i64], fccm: [i64], opts: X64Opts, rt_syms: [str]) -> X64Result ! str {
+    let t = opts.tg
+    let vc = try isel.select(t, f, rs, ccm, fccm, rt_syms)
+    let al = if opts.ra == 1 { try backtrack.allocate(t, vc, opts.max_regs, opts.corrupt) } else { try regalloc.allocate(t, vc, opts.max_regs, opts.corrupt) }
+    let errs = check.check(t, al)
+    var vtext = ""
+    if opts.want_asm {
+        vtext = print_vcode(vc)
+    }
+    if errs.len() > 0 {
+        let none = X64Code{ sym: f.sym, bytes: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [], frame: 0, nspill: al.nspill, nsaved: 0, frame_at: 0, row_byte: [], row_src: [] }
+        return X64Result{ code: none, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
+    }
+    let code = try emit.emit(t, al, f.sym, opts.want_asm)
+    X64Result{ code: code, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
+}
+
+/// The function as text, for reading.
+fn print_vcode(vc: VCode) -> str {
+    var out = str_builder()
+    out.push_str("vcode {vc.sym} vregs={vc.nvregs} params={vc.nparams} slots={vc.nslots} out={vc.nout}\n")
+    for b in 0..vcode.nblocks(vc) {
+        out.push_str("  b{b}:\n")
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            var target = ""
+            if vc.tgt[i] >= 0 {
+                target = "b{vc.tgt[i]}"
+            } else if vc.symk[i] > 0 {
+                target = "sym{vc.symk[i]}:{vc.sym_id[i]}"
+            }
+            out.push_str("    " + mach.asm_text(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i], vc.cc[i], 0, target) + "\n")
+        }
+    }
+    out.to_str()
+}
+
+pub fn rule_table() -> [XRule] {
+    rules.rules()
+}
+
+pub fn cond_map() -> [i64] {
+    rules.cc_map()
+}
+
+pub fn fcond_map() -> [i64] {
+    rules.fcc_map()
+}
+
+/// Everything wrong with the rule table, or nothing.
+pub fn check_rules() -> [str] {
+    rules.check(rules.rules())
+}
+
+/// Every instruction form compiled code for this target can contain: what
+/// the rules emit (a pseudo-instruction as what it expands to), and what the
+/// calling convention, the allocator's spills and reloads, the frame,
+/// branches and the runtime's leaves add.
 pub fn emittable_forms() -> [str] {
+    var seen: [bool] = []
+    for m in 0..mach.NMOPS {
+        seen.push(false)
+    }
+    for m in rules.rule_mops(rules.rules()) {
+        seen[m] = true
+    }
+    for m in [mach.X_MOV, mach.X_MOVAPS, mach.X_CALL, mach.X_CALLR, mach.X_STORE, mach.X_LOAD, mach.X_MOVSD_STORE, mach.X_MOVSD_LOAD, mach.X_PUSH, mach.X_POP, mach.X_SUBI, mach.X_ADDI, mach.X_RET, mach.X_JMP8, mach.X_JMP32, mach.X_JCC8, mach.X_JCC32, mach.X_MOVI32] {
+        seen[m] = true
+    }
+    for m in leaves.leaf_mops() {
+        seen[m] = true
+    }
     var out: [str] = []
-    for m in mach.all_mops() {
-        out.push(mach.form_name(m))
+    for m in 0..mach.NMOPS {
+        if seen[m] {
+            out.push(mach.form_name(m))
+        }
     }
     out
 }
 
 pub fn encode_cases() -> X64Cases ! str {
     enctest.cases()
+}
+
+pub fn leaves_for(rt_name: str, cells: [str]) -> [X64Leaf] ! str {
+    leaves.leaves_for(rt_name, cells)
 }

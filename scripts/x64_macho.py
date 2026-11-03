@@ -5,6 +5,17 @@
                                              against the encoder's, case by
                                              case, and each relocation where
                                              the encoder says it must be
+    x64_macho.py relocs <obj>                objtest_x64: every relocation in
+                                             `__text` ends the instruction its
+                                             kind relocates, and every call to
+                                             a symbol and every RIP-relative
+                                             instruction has one; `__data`,
+                                             `__thread_vars` and the DWARF as
+                                             `s3_macho.py relocs` checks them
+    x64_macho.py lines <obj> <tir>           objtest_x64: each instruction
+                                             that loads a string literal's
+                                             address maps to the literal's
+                                             file and line
 
 `cases.tsv` is what `s3 --encode-test <p> --target x86_64` writes: per line
 the form, the encoder's bytes in hex, the assembly the assembler was given,
@@ -18,8 +29,14 @@ and the first case reported as different is where to look.
 It reads the file itself rather than parsing `otool` output, as
 `scripts/s3_macho.py` does for arm64 objects.
 """
+import os
+import re
 import struct
+import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import s3_macho  # noqa: E402
 
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x2
@@ -146,9 +163,159 @@ def cmd_compare(path, tsv):
     return 1 if bad or problems or total != len(code) else 0
 
 
+# The arm64 reader's checks of what the two targets lay out alike -- the
+# descriptors in `__data`, the thread-local descriptors, the DWARF's
+# relocations, the line table read through `dwarfdump` -- are used as they
+# are, reading sections through this module's reader, which takes an x86-64
+# object where theirs takes an arm64 one.
+s3_macho.sections = sections
+
+INSN = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(.*)$")
+
+
+def instructions(obj):
+    """`objdump -d`'s instructions in `__text`: (offset, length, text). The
+    disassembler is used for where each instruction starts, which the bytes
+    alone do not say on x86-64; what each relocation is checked against is
+    the bytes themselves."""
+    p = subprocess.run(["objdump", "-d", "--no-leading-headers", obj], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise SystemExit(f"objdump -d refuses {obj}: {p.stderr.strip()[:300]}")
+    out = []
+    for line in p.stdout.splitlines():
+        m = INSN.match(line)
+        if m:
+            out.append((int(m.group(1), 16), len(m.group(2).split()), m.group(3).strip()))
+    return out
+
+
+def rip_relative(code, at, n):
+    """Whether the instruction at `at` of `n` bytes is `lea` or `mov` from a
+    RIP-relative address ending the instruction: REX.W, 8D or 8B, ModRM mode
+    0 with rm 101."""
+    if n != 7:
+        return False
+    rex, op, modrm = code[at], code[at + 1], code[at + 2]
+    return rex & 0xF8 == 0x48 and op in (0x8D, 0x8B) and modrm & 0xC7 == 0x05
+
+
+def cmd_relocs(path):
+    data = open(path, "rb").read()
+    code, t = text(data)
+    syms = symbols(data)
+    problems = []
+    rel = {}
+    for k, (addr, rtype, pcrel, length, ext, sym) in enumerate(relocations(data, t)):
+        if not ext or sym >= len(syms):
+            problems.append(f"relocation {k} at {addr:#x} names no symbol")
+            continue
+        if rtype not in (1, 2, 3, 9) or pcrel != 1 or length != 2:
+            problems.append(f"relocation {k} at {addr:#x}: {RELOC_NAMES.get(rtype, rtype)}, pcrel {pcrel}, length {length}")
+        if addr in rel:
+            problems.append(f"two relocations at {addr:#x}")
+        rel[addr] = (rtype, syms[sym][0])
+    seen = set()
+    for at, n, txt in instructions(path):
+        end = at + n - 4
+        if code[at] == 0xE8 and n == 5:
+            if rel.get(end, (None,))[0] != 2:
+                problems.append(f"the call at {at:#x} has no BRANCH relocation")
+            seen.add(end)
+        elif rip_relative(code, at, n):
+            want = (1,) if code[at + 1] == 0x8D else (3, 9)
+            if rel.get(end, (None,))[0] not in want:
+                problems.append(f"the RIP-relative `{txt}` at {at:#x} has no {'SIGNED' if want == (1,) else 'GOT_LOAD or TLV'} relocation")
+            seen.add(end)
+    for addr in sorted(set(rel) - seen):
+        problems.append(f"the relocation at {addr:#x} ({RELOC_NAMES.get(rel[addr][0])}, {rel[addr][1]}) ends no call or RIP-relative instruction")
+    ndata = s3_macho.check_data_relocs(data, syms, problems)
+    ndata += s3_macho.check_tlv_relocs(data, syms, problems)
+    ndebug = s3_macho.check_debug_relocs(data, t, problems)
+    for p in problems[:20]:
+        print(p)
+    print(f"relocations: {len(rel)}   data relocations: {ndata}   debug relocations: {ndebug}   problems: {len(problems)}")
+    return 1 if problems else 0
+
+
+def cmd_lines(obj, tir):
+    """As `s3_macho.py lines`, for x86-64: a literal's address is loaded by
+    one `leaq l_.str.N(%rip)` (a SIGNED relocation against the literal's
+    symbol) per copy of the function it is in, and the instruction starts
+    three bytes before its displacement."""
+    data = open(obj, "rb").read()
+    _code, t = text(data)
+    secs, _ = sections(data)
+    syms = symbols(data)
+    files = s3_macho.tir_files(tir)
+    if not files:
+        print(f"{tir} names no source file")
+        return 1
+    tir_text = open(tir, encoding="utf-8").read()
+    seqs = s3_macho.line_table(obj)
+    nrows = sum(len(rows) for rows, _ in seqs)
+    problems = []
+    nlines = {}
+    pieces = {}
+    for path in files:
+        try:
+            src = open(path, encoding="utf-8").read()
+        except OSError as e:
+            problems.append(f"cannot read {path}: {e}")
+            continue
+        nlines[path] = src.count("\n") + 1
+        for piece, ln in s3_macho.literal_pieces(src):
+            pieces.setdefault(piece, []).append((path, ln))
+    for rows, _end in seqs:
+        for addr, name, ln in rows:
+            if name not in nlines:
+                problems.append(f"the row at {addr:#x} names {name}, which is not one of the program's files")
+            elif ln > nlines[name]:
+                problems.append(f"the row at {addr:#x} is line {ln} of {name}, which has {nlines[name]}")
+    cstr = secs.get(("__TEXT", "__cstring"))
+    sect_no = {key: 1 + k for k, key in enumerate(secs)}
+    text_of = {}
+    if cstr is not None:
+        for k, (name, _ntype, nsect, value) in enumerate(syms):
+            if name.startswith("l_.str.") and nsect == sect_no[("__TEXT", "__cstring")]:
+                off = cstr["off"] + value - cstr["addr"]
+                end = data.index(b"\0", off)
+                text_of[k] = data[off:end].decode("utf-8", "replace")
+    refs = {}
+    for addr, rtype, _pcrel, _length, ext, sym in relocations(data, t):
+        if ext and rtype == 1 and sym in text_of:
+            refs.setdefault(sym, []).append(addr - 3)
+    checked = 0
+    repeated = 0
+    for sym, addrs in sorted(refs.items()):
+        s = text_of[sym]
+        where = pieces.get(s, [])
+        if len(s) < 3 or len(where) != 1:
+            continue
+        if len(addrs) > 1 and tir_text.count('"' + s + '"') + tir_text.count('::' + s + '"') != 1:
+            continue
+        path, want = where[0]
+        for addr in addrs:
+            row = s3_macho.lookup(seqs, addr)
+            checked += 1
+            if len(addrs) > 1:
+                repeated += 1
+            if row is None:
+                problems.append(f"no line row covers {addr:#x}, which loads {s!r}")
+            elif row[1] != path or row[2] != want:
+                problems.append(f"{addr:#x}, which loads {s!r} (line {want} of {path}), maps to line {row[2]} of {row[1]}")
+    for p in problems[:12]:
+        print(p)
+    print(f"line rows: {nrows}   literal loads checked: {checked}   wrong: {len(problems)}   of literals loaded more than once: {repeated}")
+    return 1 if problems else 0
+
+
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "compare":
         return cmd_compare(sys.argv[2], sys.argv[3])
+    if len(sys.argv) == 3 and sys.argv[1] == "relocs":
+        return cmd_relocs(sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] == "lines":
+        return cmd_lines(sys.argv[2], sys.argv[3])
     print(__doc__)
     return 2
 

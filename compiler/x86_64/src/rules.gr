@@ -1,0 +1,1247 @@
+// Instruction selection for x86-64, as data (docs/self-hosting.md §4 and
+// §6.16), in the shape of `compiler/aarch64/src/rules.gr`: for a MIR opcode,
+// when a guard holds, these machine instructions. Rules for one opcode are
+// tried in order, the first whose guard holds is used, and `check` proves of
+// the table that no rule is shadowed by an earlier one, that every opcode
+// ends in a rule that always applies, that every template reads only what it
+// has and writes only what it may, that each operand is of its field's
+// register file, that no instruction which sets the flags stands between a
+// comparison and the instruction reading them, and that the condition maps
+// mean what MIR's conditions mean.
+//
+// Most of x86-64's arithmetic is two-address, so a template moves operand a
+// into the result first and then operates on the result. A register an
+// instruction reads or writes without naming it (rax and rdx for a division,
+// rcx for a shift count, rax for a compare-and-swap) is named here by a
+// selector of its own (`S_RAX`, ...), which the encoder holds to the one
+// register the form fixes.
+import mach
+import mir.ir
+
+type XTmpl = {
+    mop: i64,
+    d: i64,
+    n: i64,
+    m: i64,
+    a: i64,
+    imm: i64,
+    /// The value `K_LIT` stands for.
+    lit: i64,
+    cc: i64,
+    tgt: i64,
+    sym: i64,
+}
+
+type XRule = {
+    name: str,
+    op: i64,
+    guard: i64,
+    emit: [XTmpl],
+}
+
+// Register operands.
+pub let S_NONE = 0
+pub let S_RES = 1
+pub let S_A = 2
+pub let S_B = 3
+/// Temporaries, each of the class of the field it is first written in.
+pub let S_T0 = 4
+pub let S_T1 = 5
+/// The operands of the comparison a branch absorbed.
+pub let S_IA = 7
+pub let S_IB = 8
+/// The third operand (`ir.has_cargs`): a compare-and-swap's new value.
+pub let S_C = 9
+/// The base of the address a load or store absorbed (`G_AOFF`).
+pub let S_AB = 10
+/// Fixed physical registers.
+pub let S_RAX = 11
+pub let S_RCX = 12
+pub let S_RDX = 13
+pub let S_RSP = 14
+
+// Immediates: a literal when non-negative, else computed.
+pub let K_B = -1
+pub let K_IB = -4
+pub let K_IMM = -6
+pub let K_SLOT = -7
+pub let K_B_LOG2 = -8
+pub let K_AOFF = -9
+pub let K_ASLOT = -10
+/// The template's own `lit`, which may be negative or past 63 bits.
+pub let K_LIT = -11
+
+// Conditions: through the integer map, from the instruction itself or from
+// the comparison its branch absorbed; through the map of doubles; or a fixed
+// x86-64 condition when non-negative.
+pub let CC_NONE = -3
+pub let CC_OWN = -1
+pub let CC_INNER = -2
+pub let CC_FOWN = -4
+pub let CC_FINNER = -5
+
+// Branch targets.
+pub let T_NONE = 0
+pub let T_THEN = 1
+pub let T_ELSE = 2
+
+// Symbols, as `compiler/aarch64`'s.
+pub let Y_NONE = 0
+pub let Y_FN = 1
+pub let Y_STR = 3
+pub let Y_DATA = 4
+pub let Y_GOT = 5
+pub let Y_CELL = 6
+
+// Guards.
+pub let G_ANY = 0
+/// Operand b is a constant a sign-extended 32-bit immediate holds.
+pub let G_B_SIMM32 = 1
+/// Operand b is a constant in 0..63: a shift count.
+pub let G_B_SHIFT = 2
+/// Operand b is a constant power of two.
+pub let G_B_POW2 = 3
+/// A `brif` on an `icmp` in its block that nothing else reads ...
+pub let G_FUSE = 4
+/// ... whose b is a sign-extended 32-bit constant.
+pub let G_FUSE_IMM = 5
+/// A `brif` on an `fcmp` in its block that nothing else reads, by the
+/// comparison's shape (`fcc_shape`): `>` and `>=`; `<` and `<=`, its
+/// operands swapped; `==`; `!=`.
+pub let G_FFUSE = 6
+pub let G_FFUSE_SWAP = 7
+pub let G_FFUSE_EQ = 8
+pub let G_FFUSE_NE = 9
+/// Operand a of a load or store is an `add` of a register and a
+/// sign-extended 32-bit constant.
+pub let G_AOFF = 10
+/// Operand a of a load or store is a frame slot's address.
+pub let G_ASLOT = 11
+/// An `fcmp` by its shape, as for the fused ones.
+pub let G_FCC_SWAP = 12
+pub let G_FCC_EQ = 13
+pub let G_FCC_NE = 14
+
+pub fn guard_name(g: i64) -> str {
+    match g {
+        0 -> "any"
+        1 -> "b:simm32"
+        2 -> "b:shift"
+        3 -> "b:pow2"
+        4 -> "fuse-icmp"
+        5 -> "fuse-icmp b:simm32"
+        6 -> "fuse-fcmp"
+        7 -> "fuse-fcmp swapped"
+        8 -> "fuse-fcmp eq"
+        9 -> "fuse-fcmp ne"
+        10 -> "a:base+offset"
+        11 -> "a:slot"
+        12 -> "fcmp swapped"
+        13 -> "fcmp eq"
+        14 -> "fcmp ne"
+        _ -> "?"
+    }
+}
+
+/// Whether every instruction guard `g2` admits is one `g1` admits too.
+pub fn subsumes(g1: i64, g2: i64) -> bool {
+    if g1 == G_ANY or g1 == g2 {
+        return true
+    }
+    if g1 == G_FUSE {
+        return g2 == G_FUSE_IMM
+    }
+    false
+}
+
+/// Whether `k` is a constant a sign-extended 32-bit field holds.
+pub fn simm32(k: i64) -> bool {
+    k >= -2147483648 and k <= 2147483647
+}
+
+// ----- the conditions ------------------------------------------------------------
+
+/// MIR's integer conditions, in `CC_*` order, as x86-64 condition codes read
+/// after `cmp b, a` (the flags of a - b).
+pub fn cc_map() -> [i64] {
+    [mach.C_E, mach.C_NE, mach.C_L, mach.C_LE, mach.C_G, mach.C_GE, mach.C_B, mach.C_BE, mach.C_A, mach.C_AE]
+}
+
+/// The shapes of a comparison of doubles: after `ucomisd`, unordered sets
+/// ZF, PF and CF, less sets CF, equal sets ZF, and greater sets none. So `>`
+/// is `a` (neither CF nor ZF) and `>=` is `ae` (not CF), both false when
+/// unordered; `<` and `<=` are those with the operands swapped; `==` needs ZF
+/// and not PF, and `!=` not ZF or PF -- two conditions each.
+pub let FS_PLAIN = 0
+pub let FS_SWAP = 1
+pub let FS_EQ = 2
+pub let FS_NE = 3
+
+pub fn fcc_shape(c: i64) -> i64 {
+    if c == ir.CC_EQ {
+        FS_EQ
+    } else if c == ir.CC_NE {
+        FS_NE
+    } else if c == ir.CC_SLT or c == ir.CC_SLE {
+        FS_SWAP
+    } else {
+        FS_PLAIN
+    }
+}
+
+/// MIR's conditions on doubles, `CC_EQ` .. `CC_SGE`, as the x86-64 condition
+/// read after the shape's `ucomisd`: for `==` and `!=` the first of their two.
+pub fn fcc_map() -> [i64] {
+    [mach.C_E, mach.C_NE, mach.C_A, mach.C_AE, mach.C_A, mach.C_AE]
+}
+
+// ----- templates -----------------------------------------------------------------
+
+fn tm(mop: i64, d: i64, n: i64, m: i64) -> XTmpl {
+    XTmpl{ mop: mop, d: d, n: n, m: m, a: S_NONE, imm: 0, lit: 0, cc: CC_NONE, tgt: T_NONE, sym: Y_NONE }
+}
+
+/// `mop` with destination `d` and immediate `imm`.
+fn ti(mop: i64, d: i64, imm: i64) -> XTmpl {
+    XTmpl{ mop: mop, d: d, n: S_NONE, m: S_NONE, a: S_NONE, imm: imm, lit: 0, cc: CC_NONE, tgt: T_NONE, sym: Y_NONE }
+}
+
+/// A constant into `d` (`P_MOVIMM`) from `lit`.
+fn tlit(d: i64, lit: i64) -> XTmpl {
+    XTmpl{ mop: mach.P_MOVIMM, d: d, n: S_NONE, m: S_NONE, a: S_NONE, imm: K_LIT, lit: lit, cc: CC_NONE, tgt: T_NONE, sym: Y_NONE }
+}
+
+/// A memory access: register `d`, address `n` plus `imm`.
+fn tmem(mop: i64, d: i64, n: i64, imm: i64) -> XTmpl {
+    XTmpl{ mop: mop, d: d, n: n, m: S_NONE, a: S_NONE, imm: imm, lit: 0, cc: CC_NONE, tgt: T_NONE, sym: Y_NONE }
+}
+
+fn tcc(mop: i64, d: i64, m: i64, cc: i64) -> XTmpl {
+    XTmpl{ mop: mop, d: d, n: S_NONE, m: m, a: S_NONE, imm: 0, lit: 0, cc: cc, tgt: T_NONE, sym: Y_NONE }
+}
+
+fn tbr(mop: i64, cc: i64, tgt: i64) -> XTmpl {
+    XTmpl{ mop: mop, d: S_NONE, n: S_NONE, m: S_NONE, a: S_NONE, imm: 0, lit: 0, cc: cc, tgt: tgt, sym: Y_NONE }
+}
+
+fn tsym(mop: i64, sym: i64) -> XTmpl {
+    XTmpl{ mop: mop, d: S_RES, n: S_NONE, m: S_NONE, a: S_NONE, imm: 0, lit: 0, cc: CC_NONE, tgt: T_NONE, sym: sym }
+}
+
+fn r(name: str, op: i64, guard: i64, emit: [XTmpl]) -> XRule {
+    XRule{ name: name, op: op, guard: guard, emit: emit }
+}
+
+/// `res = a op b`, two-address: the move (`movq`, or `movaps` for doubles),
+/// then the operation, with b in a register, or as an immediate when it
+/// fits.
+fn arith(inout rs: [XRule], name: str, op: i64, rr: i64, ri: i64) {
+    let mv = if ir.res_fp(op) { mach.X_MOVAPS } else { mach.X_MOV }
+    if ri > 0 {
+        rs.push(r(name + "-imm", op, G_B_SIMM32, [tm(mv, S_RES, S_NONE, S_A), ti(ri, S_RES, K_B)]))
+    }
+    rs.push(r(name, op, G_ANY, [tm(mv, S_RES, S_NONE, S_A), tm(rr, S_RES, S_NONE, S_B)]))
+    ()
+}
+
+/// A shift: by a constant, the immediate form; else the count in rcx.
+fn shift(inout rs: [XRule], name: str, op: i64, rcl: i64, ri: i64) {
+    rs.push(r(name + "-imm", op, G_B_SHIFT, [tm(mach.X_MOV, S_RES, S_NONE, S_A), ti(ri, S_RES, K_B)]))
+    rs.push(r(name, op, G_ANY, [tm(mach.X_MOV, S_RCX, S_NONE, S_B), tm(mach.X_MOV, S_RES, S_NONE, S_A), tm(rcl, S_RES, S_NONE, S_RCX)]))
+    ()
+}
+
+/// A one-operand operation on `res` after the move.
+fn unary2(name: str, op: i64, mop: i64) -> XRule {
+    r(name, op, G_ANY, [tm(mach.X_MOV, S_RES, S_NONE, S_A), ti(mop, S_RES, 0)])
+}
+
+/// A move-shaped operation: `mop a, res`.
+fn movish(name: str, op: i64, mop: i64) -> XRule {
+    r(name, op, G_ANY, [tm(mop, S_RES, S_NONE, S_A)])
+}
+
+/// A load or store's three rules: at an absorbed `add`'s base and offset, at
+/// a frame slot (from `rsp`), and at offset 0 of the address in a register.
+/// A store's value is its operand b.
+fn mem_rules(inout rs: [XRule], name: str, op: i64, mop: i64) {
+    let v = if mem_store(op) { S_B } else { S_RES }
+    rs.push(r(name + "-off", op, G_AOFF, [tmem(mop, v, S_AB, K_AOFF)]))
+    rs.push(r(name + "-slot", op, G_ASLOT, [tmem(mop, v, S_RSP, K_ASLOT)]))
+    rs.push(r(name, op, G_ANY, [tmem(mop, v, S_A, 0)]))
+    ()
+}
+
+/// `res`'s narrow value widened as AArch64's `w` forms leave it: the upper
+/// bits clear.
+fn widen(k: i64) -> [XTmpl] {
+    if k == 0 {
+        [tm(mach.X_MOVZXB, S_RES, S_NONE, S_RES)]
+    } else if k == 1 {
+        [tm(mach.X_MOVZXW, S_RES, S_NONE, S_RES)]
+    } else if k == 2 {
+        [tm(mach.X_MOV32, S_RES, S_NONE, S_RES)]
+    } else {
+        []
+    }
+}
+
+fn cat(a: [XTmpl], b: [XTmpl]) -> [XTmpl] {
+    var out = a
+    for x in b {
+        out.push(x)
+    }
+    out
+}
+
+/// One bit-reversal step: `res = ((res >> k) & m) | ((res & m) << k)`, the
+/// mask in T1, T0 the other half.
+fn swap_step(k: i64, mask: i64) -> [XTmpl] {
+    [
+        tlit(S_T1, mask),
+        tm(mach.X_MOV, S_T0, S_NONE, S_RES),
+        ti(mach.X_SHRI, S_T0, k),
+        tm(mach.X_AND, S_T0, S_NONE, S_T1),
+        tm(mach.X_AND, S_RES, S_NONE, S_T1),
+        ti(mach.X_SHLI, S_RES, k),
+        tm(mach.X_OR, S_RES, S_NONE, S_T0),
+    ]
+}
+
+/// The table.
+pub fn rules() -> [XRule] {
+    var rs: [XRule] = []
+    rs.push(r("iconst", ir.M_ICONST, G_ANY, [ti(mach.P_MOVIMM, S_RES, K_IMM)]))
+    arith(rs, "add", ir.M_ADD, mach.X_ADD, mach.X_ADDI)
+    arith(rs, "sub", ir.M_SUB, mach.X_SUB, mach.X_SUBI)
+    // A product with `1 << k` is a left shift; with another constant the
+    // three-address `imul`.
+    rs.push(r("mul-pow2", ir.M_MUL, G_B_POW2, [tm(mach.X_MOV, S_RES, S_NONE, S_A), ti(mach.X_SHLI, S_RES, K_B_LOG2)]))
+    var imuli = tm(mach.X_IMULI, S_RES, S_A, S_NONE)
+    imuli.imm = K_B
+    rs.push(r("mul-imm", ir.M_MUL, G_B_SIMM32, [imuli]))
+    arith(rs, "mul", ir.M_MUL, mach.X_IMUL, 0)
+    // Signed division and remainder: `idiv` faults on `MIN / -1`, which
+    // [E-ARITH-INT] answers MIN (and the remainder 0), so the division is a
+    // pseudo-instruction that tests for -1 first (`emit.gr`).
+    var sdr = tm(mach.P_SDIVREM, S_RAX, S_NONE, S_B)
+    sdr.a = S_RDX
+    // rdx is made first (`cqo` will overwrite it), so that nothing the
+    // division reads is given rdx.
+    rs.push(r("sdiv", ir.M_SDIV, G_ANY, [tm(mach.X_MOV, S_RAX, S_NONE, S_A), tlit(S_RDX, 0), sdr, tm(mach.X_MOV, S_RES, S_NONE, S_RAX)]))
+    rs.push(r("srem", ir.M_SREM, G_ANY, [tm(mach.X_MOV, S_RAX, S_NONE, S_A), tlit(S_RDX, 0), sdr, tm(mach.X_MOV, S_RES, S_NONE, S_RDX)]))
+    // Unsigned: rdx cleared, then `div`; by a power of two a right shift.
+    var udv = tm(mach.X_DIV, S_RAX, S_NONE, S_B)
+    udv.a = S_RDX
+    rs.push(r("udiv-pow2", ir.M_UDIV, G_B_POW2, [tm(mach.X_MOV, S_RES, S_NONE, S_A), ti(mach.X_SHRI, S_RES, K_B_LOG2)]))
+    rs.push(r("udiv", ir.M_UDIV, G_ANY, [tm(mach.X_MOV, S_RAX, S_NONE, S_A), tlit(S_RDX, 0), udv, tm(mach.X_MOV, S_RES, S_NONE, S_RAX)]))
+    rs.push(r("urem", ir.M_UREM, G_ANY, [tm(mach.X_MOV, S_RAX, S_NONE, S_A), tlit(S_RDX, 0), udv, tm(mach.X_MOV, S_RES, S_NONE, S_RDX)]))
+    arith(rs, "and", ir.M_AND, mach.X_AND, mach.X_ANDI)
+    arith(rs, "or", ir.M_OR, mach.X_OR, mach.X_ORI)
+    arith(rs, "xor", ir.M_XOR, mach.X_XOR, mach.X_XORI)
+    shift(rs, "shl", ir.M_SHL, mach.X_SHL, mach.X_SHLI)
+    shift(rs, "sshr", ir.M_SSHR, mach.X_SAR, mach.X_SARI)
+    shift(rs, "ushr", ir.M_USHR, mach.X_SHR, mach.X_SHRI)
+    rs.push(unary2("neg", ir.M_NEG, mach.X_NEG))
+    rs.push(unary2("not", ir.M_NOT, mach.X_NOT))
+    rs.push(movish("sext8", ir.M_SEXT8, mach.X_MOVSXB))
+    rs.push(movish("sext16", ir.M_SEXT16, mach.X_MOVSXW))
+    rs.push(movish("sext32", ir.M_SEXT32, mach.X_MOVSXD))
+    rs.push(movish("uext8", ir.M_UEXT8, mach.X_MOVZXB))
+    rs.push(movish("uext16", ir.M_UEXT16, mach.X_MOVZXW))
+    rs.push(movish("uext32", ir.M_UEXT32, mach.X_MOV32))
+    // A comparison: the flags, the low byte set from them, widened.
+    let set_own = [tcc(mach.X_SETCC, S_RES, S_NONE, CC_OWN), tm(mach.X_MOVZXB, S_RES, S_NONE, S_RES)]
+    var cmpi = tmem(mach.X_CMPI, S_NONE, S_A, K_B)
+    rs.push(r("icmp-imm", ir.M_ICMP, G_B_SIMM32, cat([cmpi], set_own)))
+    rs.push(r("icmp", ir.M_ICMP, G_ANY, cat([tm(mach.X_CMP, S_NONE, S_A, S_B)], set_own)))
+    rs.push(r("straddr", ir.M_STRADDR, G_ANY, [tsym(mach.X_LEA_RIP, Y_STR)]))
+    rs.push(r("dataaddr", ir.M_DATAADDR, G_ANY, [tsym(mach.X_LEA_RIP, Y_DATA)]))
+    rs.push(r("fnaddr", ir.M_FNADDR, G_ANY, [tsym(mach.X_LEA_RIP, Y_FN)]))
+    rs.push(r("gotaddr", ir.M_GOTADDR, G_ANY, [tsym(mach.X_LOAD_GOT, Y_GOT)]))
+    rs.push(r("celladdr", ir.M_CELLADDR, G_ANY, [tsym(mach.X_LEA_RIP, Y_CELL)]))
+    rs.push(r("getsp", ir.M_GETSP, G_ANY, [tm(mach.X_MOV, S_RES, S_NONE, S_RSP)]))
+    rs.push(r("slotaddr", ir.M_SLOTADDR, G_ANY, [tmem(mach.X_LEA, S_RES, S_RSP, K_SLOT)]))
+    mem_rules(rs, "load", ir.M_LOAD, mach.X_LOAD)
+    mem_rules(rs, "store", ir.M_STORE, mach.X_STORE)
+    // Doubles. A constant is its bits made in a general register and moved
+    // across; `fneg` and `fabs` flip and clear the sign bit with a mask made
+    // the same way.
+    rs.push(r("fconst", ir.M_FCONST, G_ANY, [ti(mach.P_MOVIMM, S_T0, K_IMM), tm(mach.X_MOVQ_TOX, S_RES, S_NONE, S_T0)]))
+    arith(rs, "fadd", ir.M_FADD, mach.X_ADDSD, 0)
+    arith(rs, "fsub", ir.M_FSUB, mach.X_SUBSD, 0)
+    arith(rs, "fmul", ir.M_FMUL, mach.X_MULSD, 0)
+    arith(rs, "fdiv", ir.M_FDIV, mach.X_DIVSD, 0)
+    let mn = -9223372036854775807 - 1
+    rs.push(r("fneg", ir.M_FNEG, G_ANY, [tlit(S_T0, mn), tm(mach.X_MOVQ_TOX, S_T1, S_NONE, S_T0), tm(mach.X_MOVAPS, S_RES, S_NONE, S_A), tm(mach.X_XORPD, S_RES, S_NONE, S_T1)]))
+    rs.push(r("fabs", ir.M_FABS, G_ANY, [tlit(S_T0, 9223372036854775807), tm(mach.X_MOVQ_TOX, S_T1, S_NONE, S_T0), tm(mach.X_MOVAPS, S_RES, S_NONE, S_A), tm(mach.X_ANDPD, S_RES, S_NONE, S_T1)]))
+    rs.push(movish("fsqrt", ir.M_FSQRT, mach.X_SQRTSD))
+    var floor = tm(mach.X_ROUNDSD, S_RES, S_NONE, S_A)
+    floor.imm = 9
+    var ceil = tm(mach.X_ROUNDSD, S_RES, S_NONE, S_A)
+    ceil.imm = 10
+    rs.push(r("ffloor", ir.M_FFLOOR, G_ANY, [floor]))
+    rs.push(r("fceil", ir.M_FCEIL, G_ANY, [ceil]))
+    // Comparisons of doubles by shape (`fcc_shape`).
+    let fz = [tm(mach.X_MOVZXB, S_RES, S_NONE, S_RES), tm(mach.X_MOVZXB, S_T0, S_NONE, S_T0)]
+    rs.push(r("fcmp-eq", ir.M_FCMP, G_FCC_EQ, cat(cat([tm(mach.X_UCOMISD, S_NONE, S_A, S_B), tcc(mach.X_SETCC, S_RES, S_NONE, mach.C_E), tcc(mach.X_SETCC, S_T0, S_NONE, mach.C_NP)], fz), [tm(mach.X_AND, S_RES, S_NONE, S_T0)])))
+    rs.push(r("fcmp-ne", ir.M_FCMP, G_FCC_NE, cat(cat([tm(mach.X_UCOMISD, S_NONE, S_A, S_B), tcc(mach.X_SETCC, S_RES, S_NONE, mach.C_NE), tcc(mach.X_SETCC, S_T0, S_NONE, mach.C_P)], fz), [tm(mach.X_OR, S_RES, S_NONE, S_T0)])))
+    let fset = [tcc(mach.X_SETCC, S_RES, S_NONE, CC_FOWN), tm(mach.X_MOVZXB, S_RES, S_NONE, S_RES)]
+    rs.push(r("fcmp-swap", ir.M_FCMP, G_FCC_SWAP, cat([tm(mach.X_UCOMISD, S_NONE, S_B, S_A)], fset)))
+    rs.push(r("fcmp", ir.M_FCMP, G_ANY, cat([tm(mach.X_UCOMISD, S_NONE, S_A, S_B)], fset)))
+    rs.push(movish("scvtf", ir.M_SCVTF, mach.X_CVTSI2SD))
+    // The conversions x86-64 has no one instruction for are
+    // pseudo-instructions with branches inside (`emit.gr`); their
+    // temporaries are made first, by a constant, so that each lives across
+    // the operands' reads rather than being handed the register of one.
+    var ucv = tm(mach.P_UCVTF, S_RES, S_T0, S_A)
+    ucv.a = S_T1
+    rs.push(r("ucvtf", ir.M_UCVTF, G_ANY, [tlit(S_T0, 0), tlit(S_T1, 0), ucv]))
+    rs.push(r("fcvtzs", ir.M_FCVTZS, G_ANY, [tlit(S_T0, 0), tm(mach.P_CVTS, S_RES, S_T0, S_A)]))
+    var cvu = tm(mach.P_CVTU, S_RES, S_T0, S_A)
+    cvu.a = S_T1
+    rs.push(r("fcvtzu", ir.M_FCVTZU, G_ANY, [tlit(S_T0, 0), tm(mach.X_MOVQ_TOX, S_T1, S_NONE, S_T0), cvu]))
+    rs.push(movish("fbits", ir.M_FBITS, mach.X_MOVQ_FROMX))
+    rs.push(movish("ffrombits", ir.M_FFROMBITS, mach.X_MOVQ_TOX))
+    // Bits. Leading zeros: `bsr` gives the highest set bit's index and
+    // leaves the destination as it was for 0, which `cmovz` then makes -1;
+    // 63 less that is the count, 64 for 0.
+    rs.push(r("clz", ir.M_CLZ, G_ANY, [tlit(S_T0, -1), tm(mach.X_BSR, S_RES, S_NONE, S_A), tcc(mach.X_CMOV, S_RES, S_T0, mach.C_E), ti(mach.X_NEG, S_RES, 0), ti(mach.X_ADDI, S_RES, 63)]))
+    // A bit reversal: the bytes reversed, then nibbles, pairs and bits
+    // swapped within each byte.
+    var rb = [tm(mach.X_MOV, S_RES, S_NONE, S_A), ti(mach.X_BSWAP, S_RES, 0)]
+    rb = cat(rb, swap_step(4, 1085102592571150095))
+    rb = cat(rb, swap_step(2, 3689348814741910323))
+    rb = cat(rb, swap_step(1, 6148914691236517205))
+    rs.push(r("rbit", ir.M_RBIT, G_ANY, rb))
+    rs.push(unary2("bswap64", ir.M_BSWAP64, mach.X_BSWAP))
+    rs.push(r("bswap16", ir.M_BSWAP16, G_ANY, [tm(mach.X_MOV, S_RES, S_NONE, S_A), ti(mach.X_ROLW8, S_RES, 0), tm(mach.X_MOVZXW, S_RES, S_NONE, S_RES)]))
+    rs.push(unary2("bswap32", ir.M_BSWAP32, mach.X_BSWAP32))
+    shift(rs, "rotr", ir.M_ROTR, mach.X_ROR, mach.X_RORI)
+    // Raw memory ([L-LIB-MEM]).
+    mem_rules(rs, "load8u", ir.M_LOAD8U, mach.X_LOAD8U)
+    mem_rules(rs, "load8s", ir.M_LOAD8S, mach.X_LOAD8S)
+    mem_rules(rs, "load16u", ir.M_LOAD16U, mach.X_LOAD16U)
+    mem_rules(rs, "load16s", ir.M_LOAD16S, mach.X_LOAD16S)
+    mem_rules(rs, "load32u", ir.M_LOAD32U, mach.X_LOAD32U)
+    mem_rules(rs, "load32s", ir.M_LOAD32S, mach.X_LOAD32S)
+    mem_rules(rs, "store8", ir.M_STORE8, mach.X_STORE8)
+    mem_rules(rs, "store16", ir.M_STORE16, mach.X_STORE16)
+    mem_rules(rs, "store32", ir.M_STORE32, mach.X_STORE32)
+    // Atomics ([L-LIB-ATOMIC]), sequentially consistent: a load is the plain
+    // load, zero-extended; a store `xchg`; a fetch-add `lock xadd`; a
+    // compare-and-swap `lock cmpxchg` through rax; the answers widened.
+    let widths = ["8", "16", "32", "64"]
+    let loads = [mach.X_LOAD8U, mach.X_LOAD16U, mach.X_LOAD32U, mach.X_LOAD]
+    for k in 0..4 {
+        rs.push(r("aload" + widths[k], ir.M_ALOAD8 + k, G_ANY, [tmem(loads[k], S_RES, S_A, 0)]))
+        rs.push(r("astore" + widths[k], ir.M_ASTORE8 + k, G_ANY, [tm(mach.X_MOV, S_T0, S_NONE, S_B), tmem(mach.X_XCHG8 + k, S_T0, S_A, 0)]))
+        rs.push(r("aadd" + widths[k], ir.M_AADD8 + k, G_ANY, cat([tm(mach.X_MOV, S_RES, S_NONE, S_B), tmem(mach.X_XADD8 + k, S_RES, S_A, 0)], widen(k))))
+        var cx = tmem(mach.X_CMPXCHG8 + k, S_RAX, S_A, 0)
+        cx.m = S_C
+        rs.push(r("acas" + widths[k], ir.M_ACAS8 + k, G_ANY, cat([tm(mach.X_MOV, S_RAX, S_NONE, S_B), cx, tm(mach.X_MOV, S_RES, S_NONE, S_RAX)], widen(k))))
+    }
+    mem_rules(rs, "fload", ir.M_FLOAD, mach.X_MOVSD_LOAD)
+    mem_rules(rs, "fstore", ir.M_FSTORE, mach.X_MOVSD_STORE)
+    // Branches, a conditional one to the `then` block and a jump to the
+    // `else` (emission drops a jump to the next block and inverts a
+    // condition to make one).
+    let b_else = tbr(mach.X_JMP32, CC_NONE, T_ELSE)
+    rs.push(r("brif-fcmp-eq", ir.M_BRIF, G_FFUSE_EQ, [tm(mach.X_UCOMISD, S_NONE, S_IA, S_IB), tbr(mach.X_JCC32, mach.C_P, T_ELSE), tbr(mach.X_JCC32, mach.C_E, T_THEN), b_else]))
+    rs.push(r("brif-fcmp-ne", ir.M_BRIF, G_FFUSE_NE, [tm(mach.X_UCOMISD, S_NONE, S_IA, S_IB), tbr(mach.X_JCC32, mach.C_P, T_THEN), tbr(mach.X_JCC32, mach.C_NE, T_THEN), b_else]))
+    rs.push(r("brif-fcmp-swap", ir.M_BRIF, G_FFUSE_SWAP, [tm(mach.X_UCOMISD, S_NONE, S_IB, S_IA), tbr(mach.X_JCC32, CC_FINNER, T_THEN), b_else]))
+    rs.push(r("brif-fcmp", ir.M_BRIF, G_FFUSE, [tm(mach.X_UCOMISD, S_NONE, S_IA, S_IB), tbr(mach.X_JCC32, CC_FINNER, T_THEN), b_else]))
+    var bcmpi = tmem(mach.X_CMPI, S_NONE, S_IA, K_IB)
+    rs.push(r("brif-cmp-imm", ir.M_BRIF, G_FUSE_IMM, [bcmpi, tbr(mach.X_JCC32, CC_INNER, T_THEN), b_else]))
+    rs.push(r("brif-cmp", ir.M_BRIF, G_FUSE, [tm(mach.X_CMP, S_NONE, S_IA, S_IB), tbr(mach.X_JCC32, CC_INNER, T_THEN), b_else]))
+    rs.push(r("brif", ir.M_BRIF, G_ANY, [tm(mach.X_TEST, S_NONE, S_A, S_A), tbr(mach.X_JCC32, mach.C_NE, T_THEN), b_else]))
+    rs.push(r("jump", ir.M_JUMP, G_ANY, [tbr(mach.X_JMP32, CC_NONE, T_THEN)]))
+    rs.push(r("trap", ir.M_TRAP, G_ANY, [ti(mach.X_UD2, S_NONE, 0)]))
+    rs
+}
+
+/// The MIR loads and stores with an offset form: the bytes each moves, or 0.
+pub fn mem_bytes(op: i64) -> i64 {
+    if op == ir.M_LOAD or op == ir.M_STORE or op == ir.M_FLOAD or op == ir.M_FSTORE {
+        8
+    } else if op == ir.M_LOAD8U or op == ir.M_LOAD8S or op == ir.M_STORE8 {
+        1
+    } else if op == ir.M_LOAD16U or op == ir.M_LOAD16S or op == ir.M_STORE16 {
+        2
+    } else if op == ir.M_LOAD32U or op == ir.M_LOAD32S or op == ir.M_STORE32 {
+        4
+    } else {
+        0
+    }
+}
+
+fn mem_store(op: i64) -> bool {
+    op == ir.M_STORE or op == ir.M_FSTORE or (op >= ir.M_STORE8 and op <= ir.M_STORE32)
+}
+
+/// The MIR opcodes selection goes through the table for.
+pub fn ruled_ops() -> [i64] {
+    [
+        ir.M_ICONST, ir.M_ADD, ir.M_SUB, ir.M_MUL, ir.M_SDIV, ir.M_UDIV, ir.M_SREM, ir.M_UREM,
+        ir.M_AND, ir.M_OR, ir.M_XOR, ir.M_SHL, ir.M_SSHR, ir.M_USHR, ir.M_NEG, ir.M_NOT,
+        ir.M_SEXT8, ir.M_SEXT16, ir.M_SEXT32, ir.M_UEXT8, ir.M_UEXT16, ir.M_UEXT32,
+        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_FNADDR, ir.M_GOTADDR, ir.M_CELLADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
+        ir.M_FCONST, ir.M_FADD, ir.M_FSUB, ir.M_FMUL, ir.M_FDIV, ir.M_FNEG, ir.M_FABS, ir.M_FSQRT,
+        ir.M_FFLOOR, ir.M_FCEIL, ir.M_FCMP, ir.M_SCVTF, ir.M_UCVTF, ir.M_FCVTZS, ir.M_FCVTZU,
+        ir.M_FBITS, ir.M_FFROMBITS, ir.M_FLOAD, ir.M_FSTORE,
+        ir.M_CLZ, ir.M_RBIT, ir.M_BSWAP64, ir.M_BSWAP16, ir.M_BSWAP32, ir.M_ROTR,
+        ir.M_LOAD8U, ir.M_LOAD8S, ir.M_LOAD16U, ir.M_LOAD16S, ir.M_LOAD32U, ir.M_LOAD32S,
+        ir.M_STORE8, ir.M_STORE16, ir.M_STORE32,
+        ir.M_ALOAD8, ir.M_ALOAD8 + 1, ir.M_ALOAD8 + 2, ir.M_ALOAD64,
+        ir.M_ASTORE8, ir.M_ASTORE8 + 1, ir.M_ASTORE8 + 2, ir.M_ASTORE64,
+        ir.M_AADD8, ir.M_AADD8 + 1, ir.M_AADD8 + 2, ir.M_AADD64,
+        ir.M_ACAS8, ir.M_ACAS8 + 1, ir.M_ACAS8 + 2, ir.M_ACAS64,
+        ir.M_BRIF, ir.M_JUMP, ir.M_TRAP,
+    ]
+}
+
+fn no_result(op: i64) -> bool {
+    op == ir.M_STORE or op == ir.M_FSTORE or (op >= ir.M_STORE8 and op <= ir.M_STORE32) or (op >= ir.M_ASTORE8 and op <= ir.M_ASTORE64) or op == ir.M_BRIF or op == ir.M_JUMP or op == ir.M_TRAP
+}
+
+fn binary_op(op: i64) -> bool {
+    ir.nreads(op) == 2 and not ir.is_terminator(op)
+}
+
+fn guard_reads_b(g: i64) -> bool {
+    g == G_B_SIMM32 or g == G_B_SHIFT or g == G_B_POW2
+}
+
+pub fn guard_fuses(g: i64) -> bool {
+    g == G_FUSE or g == G_FUSE_IMM
+}
+
+pub fn guard_ffuses(g: i64) -> bool {
+    g >= G_FFUSE and g <= G_FFUSE_NE
+}
+
+/// The physical register a fixed selector names, or -1.
+fn sel_phys(s: i64) -> i64 {
+    if s == S_RAX {
+        mach.RAX
+    } else if s == S_RCX {
+        mach.RCX
+    } else if s == S_RDX {
+        mach.RDX
+    } else if s == S_RSP {
+        mach.RSP
+    } else {
+        -1
+    }
+}
+
+/// The class a selector names in a rule for MIR `op` under guard `g`: 1 a
+/// double, 0 an integer, -1 nothing a class can be asked of (a temporary).
+fn sel_class(op: i64, g: i64, s: i64) -> i64 {
+    if s == S_RES {
+        return if ir.res_fp(op) { 1 } else { 0 }
+    }
+    if s == S_A {
+        return if op != ir.M_BRIF and ir.arg_fp(op, 0) { 1 } else { 0 }
+    }
+    if s == S_B {
+        return if ir.arg_fp(op, 1) { 1 } else { 0 }
+    }
+    if s == S_IA or s == S_IB {
+        return if guard_ffuses(g) { 1 } else { 0 }
+    }
+    if s == S_C or s == S_AB or sel_phys(s) >= 0 {
+        return 0
+    }
+    -1
+}
+
+/// Whether instruction `m` changes the flags.
+fn sets_flags(m: i64) -> bool {
+    (m >= mach.X_ADD and m <= mach.X_DIV) or m == mach.X_UCOMISD or m == mach.X_BSR or (m >= mach.X_XADD8 and m <= mach.X_CMPXCHG64) or m == mach.X_ROLW8 or m == mach.P_SDIVREM or (m >= mach.P_UCVTF and m <= mach.P_CVTU)
+}
+
+/// Whether instruction `m` reads the flags.
+fn reads_flags(m: i64) -> bool {
+    m == mach.X_SETCC or m == mach.X_CMOV or m == mach.X_JCC32 or m == mach.X_JCC8
+}
+
+/// Whether instruction `m` is a comparison a flag reader may read: what it
+/// sets is meant to be read.
+fn compares(m: i64) -> bool {
+    m == mach.X_CMP or m == mach.X_CMPI or m == mach.X_TEST or m == mach.X_UCOMISD or m == mach.X_BSR
+}
+
+fn cc_inverse(c: i64) -> i64 {
+    match c {
+        0 -> 1
+        1 -> 0
+        2 -> 5
+        5 -> 2
+        3 -> 4
+        4 -> 3
+        6 -> 9
+        9 -> 6
+        7 -> 8
+        8 -> 7
+        _ -> -1
+    }
+}
+
+/// Everything wrong with the table, or nothing.
+pub fn check(rs: [XRule]) -> [str] {
+    var problems: [str] = []
+    for op in ruled_ops() {
+        var last = -1
+        for i in 0..rs.len() {
+            if rs[i].op == op {
+                last = i
+            }
+        }
+        if last < 0 {
+            problems.push("no rule for MIR `{ir.op_name(op)}`")
+        } else if rs[last].guard != G_ANY {
+            problems.push("the last rule for `{ir.op_name(op)}` ({rs[last].name}) has a guard, so some instructions match nothing")
+        }
+    }
+    for i in 0..rs.len() {
+        let ri = rs[i]
+        var known = false
+        for op in ruled_ops() {
+            if op == ri.op {
+                known = true
+            }
+        }
+        if not known {
+            problems.push("rule {ri.name} is for `{ir.op_name(ri.op)}`, which selection does not route through the table")
+        }
+        for j in (i + 1)..rs.len() {
+            let rj = rs[j]
+            if rj.op == ri.op and subsumes(ri.guard, rj.guard) {
+                problems.push("rule {rj.name} ({guard_name(rj.guard)}) is shadowed by the earlier rule {ri.name} ({guard_name(ri.guard)})")
+            }
+        }
+        if guard_reads_b(ri.guard) and not binary_op(ri.op) {
+            problems.push("rule {ri.name}: guard {guard_name(ri.guard)} on an operation with no operand b")
+        }
+        if (guard_fuses(ri.guard) or guard_ffuses(ri.guard)) and ri.op != ir.M_BRIF {
+            problems.push("rule {ri.name}: only a branch can absorb a comparison")
+        }
+        if ri.guard >= G_FCC_SWAP and ri.guard <= G_FCC_NE and ri.op != ir.M_FCMP {
+            problems.push("rule {ri.name}: a comparison's shape is a guard of `fcmp` only")
+        }
+        if (ri.guard == G_AOFF or ri.guard == G_ASLOT) and (mem_bytes(ri.op) == 0 or ri.emit.len() != 1 or mach.access_size(ri.emit[0].mop) != mem_bytes(ri.op)) {
+            problems.push("rule {ri.name}: only a load or store of the bytes its instruction moves can absorb its address")
+        }
+        if ri.emit.is_empty() {
+            problems.push("rule {ri.name} emits nothing")
+        }
+        var defined_res = false
+        var defined_t0 = false
+        var defined_t1 = false
+        var t0_class = -1
+        var t1_class = -1
+        // The flags: whether some instruction before has set them, and
+        // whether the last to set them is a comparison.
+        var flags_set = false
+        var flags_compare = false
+        for tm in ri.emit {
+            let m = tm.mop
+            if m != mach.P_MOVIMM and mach.form_name(m) == "?" {
+                problems.push("rule {ri.name}: opcode {m} is not an instruction this backend encodes")
+            }
+            let fields = [tm.d, tm.n, tm.m, tm.a]
+            let roles = [mach.role_d(m), mach.role_n(m), mach.role_m(m), mach.role_a(m)]
+            // Reads first, as the instruction does them.
+            for k in 0..4 {
+                let s = fields[k]
+                let role = roles[k]
+                if role == mach.ROLE_NONE and s != S_NONE {
+                    problems.push("rule {ri.name}: {mach.form_name(m)} has no operand {k} to fill")
+                }
+                let fixed = mach.fixed_reg(m, k)
+                if fixed >= 0 and role != mach.ROLE_NONE and sel_phys(s) != fixed {
+                    problems.push("rule {ri.name}: operand {k} of {mach.form_name(m)} must be %{mach.reg_name(fixed, 64)}")
+                }
+                if s != S_NONE and role != mach.ROLE_NONE {
+                    let want = if mach.fp_field(m, k) { 1 } else { 0 }
+                    var have = sel_class(ri.op, ri.guard, s)
+                    if s == S_T0 {
+                        if t0_class < 0 {
+                            t0_class = want
+                        }
+                        have = t0_class
+                    }
+                    if s == S_T1 {
+                        if t1_class < 0 {
+                            t1_class = want
+                        }
+                        have = t1_class
+                    }
+                    if have >= 0 and have != want {
+                        let fw = if want == 1 { "an xmm" } else { "a general" }
+                        problems.push("rule {ri.name}: operand {k} of {mach.form_name(m)} is {fw} register, and what fills it is not")
+                    }
+                }
+                if role == mach.ROLE_DEF and not (s == S_RES or s == S_T0 or s == S_T1 or sel_phys(s) >= 0) {
+                    problems.push("rule {ri.name}: {mach.form_name(m)} writes operand {k}, which must be the result, a temporary or a fixed register")
+                }
+                if role == mach.ROLE_USEDEF and not (s == S_RES or s == S_T0 or s == S_T1 or sel_phys(s) >= 0) {
+                    problems.push("rule {ri.name}: {mach.form_name(m)} changes operand {k}, which must be the result, a temporary or a fixed register")
+                }
+                if role == mach.ROLE_USE or role == mach.ROLE_USEDEF {
+                    if s == S_NONE {
+                        problems.push("rule {ri.name}: {mach.form_name(m)} reads operand {k}, which is not given")
+                    }
+                    if s == S_RES and not defined_res {
+                        problems.push("rule {ri.name}: reads the result before writing it")
+                    }
+                    if (s == S_T0 and not defined_t0) or (s == S_T1 and not defined_t1) {
+                        problems.push("rule {ri.name}: reads a temporary before writing it")
+                    }
+                    if s == S_B and guard_reads_b(ri.guard) {
+                        problems.push("rule {ri.name}: reads b as a register though its guard took it as an immediate")
+                    }
+                    if s == S_C and not ir.has_cargs(ri.op) {
+                        problems.push("rule {ri.name}: reads a third operand its operation does not have")
+                    }
+                    if s == S_AB and ri.guard != G_AOFF {
+                        problems.push("rule {ri.name}: reads the base of an address it has not absorbed")
+                    }
+                    if s == S_A and (ri.guard == G_AOFF or ri.guard == G_ASLOT) {
+                        problems.push("rule {ri.name}: reads the address in a register though its guard absorbed it")
+                    }
+                    if (s == S_IA or s == S_IB) and not (guard_fuses(ri.guard) or guard_ffuses(ri.guard)) {
+                        problems.push("rule {ri.name}: reads an absorbed comparison it has not absorbed")
+                    }
+                    if s == S_IB and ri.guard == G_FUSE_IMM {
+                        problems.push("rule {ri.name}: reads the comparison's b as a register though its guard took it as an immediate")
+                    }
+                }
+            }
+            for k in 0..4 {
+                if roles[k] == mach.ROLE_DEF or roles[k] == mach.ROLE_USEDEF {
+                    if fields[k] == S_RES {
+                        defined_res = true
+                    } else if fields[k] == S_T0 {
+                        defined_t0 = true
+                    } else if fields[k] == S_T1 {
+                        defined_t1 = true
+                    }
+                }
+            }
+            if m == mach.P_MOVIMM {
+                if tm.d == S_RES {
+                    defined_res = true
+                } else if tm.d == S_T0 {
+                    defined_t0 = true
+                    if t0_class < 0 {
+                        t0_class = 0
+                    }
+                } else if tm.d == S_T1 {
+                    defined_t1 = true
+                    if t1_class < 0 {
+                        t1_class = 0
+                    }
+                } else if sel_phys(tm.d) < 0 {
+                    problems.push("rule {ri.name}: a constant is made into something that is not a register it may write")
+                }
+                if tm.imm != K_IMM and tm.imm != K_LIT {
+                    problems.push("rule {ri.name}: a constant is the instruction's own or the template's")
+                }
+            }
+            // Immediates.
+            let k = tm.imm
+            if k == K_B and not (ri.guard == G_B_SIMM32 or ri.guard == G_B_SHIFT) {
+                problems.push("rule {ri.name}: K_B needs the b:simm32 or b:shift guard")
+            }
+            if k == K_B and ri.guard == G_B_SHIFT and not (m >= mach.X_SHLI and m <= mach.X_RORI) {
+                problems.push("rule {ri.name}: a shift count is the immediate of a shift")
+            }
+            if k == K_B_LOG2 and ri.guard != G_B_POW2 {
+                problems.push("rule {ri.name}: K_B_LOG2 needs the b:pow2 guard")
+            }
+            if k == K_AOFF and ri.guard != G_AOFF {
+                problems.push("rule {ri.name}: K_AOFF needs the a:base+offset guard")
+            }
+            if k == K_ASLOT and ri.guard != G_ASLOT {
+                problems.push("rule {ri.name}: K_ASLOT needs the a:slot guard")
+            }
+            if k == K_IB and ri.guard != G_FUSE_IMM {
+                problems.push("rule {ri.name}: K_IB needs the fuse-icmp b:simm32 guard")
+            }
+            if k == K_LIT and m != mach.P_MOVIMM {
+                problems.push("rule {ri.name}: K_LIT is a constant's")
+            }
+            // Conditions.
+            if tm.cc == CC_INNER and not guard_fuses(ri.guard) {
+                problems.push("rule {ri.name}: takes the condition of a comparison it has not absorbed")
+            }
+            if tm.cc == CC_FINNER and not (ri.guard == G_FFUSE or ri.guard == G_FFUSE_SWAP) {
+                problems.push("rule {ri.name}: takes the condition of a comparison of doubles it has not absorbed, or one of two")
+            }
+            if tm.cc == CC_OWN and ri.op != ir.M_ICMP {
+                problems.push("rule {ri.name}: only an integer comparison reads the integer condition map")
+            }
+            if tm.cc == CC_FOWN and not (ri.op == ir.M_FCMP and (ri.guard == G_ANY or ri.guard == G_FCC_SWAP)) {
+                problems.push("rule {ri.name}: only a comparison of doubles of one condition reads the map of doubles")
+            }
+            if reads_flags(m) and tm.cc == CC_NONE {
+                problems.push("rule {ri.name}: {mach.form_name(m)} needs a condition")
+            }
+            // The flags: a reader must read what a comparison set, with
+            // nothing that sets them in between.
+            if reads_flags(m) and not (flags_set and flags_compare) {
+                problems.push("rule {ri.name}: {mach.form_name(m)} reads flags no comparison just before it set")
+            }
+            if sets_flags(m) {
+                flags_set = true
+                flags_compare = compares(m)
+            }
+            let branch = m == mach.X_JMP32 or m == mach.X_JCC32
+            if branch != (tm.tgt != T_NONE) {
+                problems.push("rule {ri.name}: {mach.form_name(m)} and its branch target disagree")
+            }
+            if (m == mach.X_LEA_RIP or m == mach.X_LOAD_GOT) != (tm.sym != Y_NONE) {
+                problems.push("rule {ri.name}: {mach.form_name(m)} and its symbol disagree")
+            }
+        }
+        if not no_result(ri.op) and not defined_res {
+            problems.push("rule {ri.name} never writes its result")
+        }
+    }
+    for p in check_ccs() {
+        problems.push(p)
+    }
+    for p in check_fccs(rs) {
+        problems.push(p)
+    }
+    for p in check_imm_forms(rs) {
+        problems.push(p)
+    }
+    problems
+}
+
+// ----- the conditions, against what they mean --------------------------------------
+
+/// `a <u b`, on the bits.
+fn ult(a: i64, b: i64) -> bool {
+    let mn = -9223372036854775807 - 1
+    a.bit_xor(mn) < b.bit_xor(mn)
+}
+
+fn mir_holds(c: i64, a: i64, b: i64) -> bool {
+    match c {
+        0 -> a == b
+        1 -> a != b
+        2 -> a < b
+        3 -> a <= b
+        4 -> a > b
+        5 -> a >= b
+        6 -> ult(a, b)
+        7 -> not ult(b, a)
+        8 -> ult(b, a)
+        9 -> not ult(a, b)
+        _ -> false
+    }
+}
+
+/// Whether x86-64 condition `cc` holds of flags CF, ZF, SF, OF and PF
+/// (Intel SDM, "Jcc").
+fn flags_hold(cc: i64, cf: bool, zf: bool, sf: bool, of: bool, pf: bool) -> bool {
+    match cc {
+        0 -> of
+        1 -> not of
+        2 -> cf
+        3 -> not cf
+        4 -> zf
+        5 -> not zf
+        6 -> cf or zf
+        7 -> not cf and not zf
+        8 -> sf
+        9 -> not sf
+        10 -> pf
+        11 -> not pf
+        12 -> sf != of
+        13 -> sf == of
+        14 -> zf or sf != of
+        _ -> not zf and sf == of
+    }
+}
+
+/// Whether condition `cc` holds after `cmp b, a`: the flags of `a - b`.
+fn cmp_holds(cc: i64, a: i64, b: i64) -> bool {
+    let r = a - b
+    let of = (a < 0) != (b < 0) and (r < 0) != (a < 0)
+    flags_hold(cc, ult(a, b), r == 0, r < 0, of, false)
+}
+
+/// The integer map, checked against what each condition means on words at
+/// the edges of both orders, and against its inverse.
+fn check_ccs() -> [str] {
+    var problems: [str] = []
+    let cm = cc_map()
+    if cm.len() != 10 {
+        problems.push("the condition map has {cm.len()} entries for 10 conditions")
+        return problems
+    }
+    let mn = -9223372036854775807 - 1
+    let mx = 9223372036854775807
+    let vals = [0, 1, -1, 2, -2, 100, -100, mn, mx, mn + 1, mx - 1]
+    for c in 0..10 {
+        var wrong = 0
+        var example = ""
+        for a in vals {
+            for b in vals {
+                if cmp_holds(cm[c], a, b) != mir_holds(c, a, b) {
+                    if wrong == 0 {
+                        example = "{a} vs {b}"
+                    }
+                    wrong += 1
+                }
+            }
+        }
+        if wrong > 0 {
+            problems.push("{ir.cc_name(c)} maps to {mach.cond_name(cm[c])}, which disagrees on {wrong} pairs, first {example}")
+        }
+        let inv = cc_inverse(c)
+        if mach.cond_invert(cm[c]) != cm[inv] {
+            problems.push("{ir.cc_name(c)} maps to {mach.cond_name(cm[c])}, whose inverse is not what {ir.cc_name(inv)} maps to ({mach.cond_name(cm[inv])})")
+        }
+    }
+    problems
+}
+
+/// Whether condition `cc` holds after `ucomisd` of `x` with `y` (Intel SDM,
+/// UCOMISD): unordered sets ZF, PF and CF; less CF; equal ZF; greater none.
+fn ucom_holds(cc: i64, x: f64, y: f64) -> bool {
+    if x.is_nan() or y.is_nan() {
+        return flags_hold(cc, true, true, false, false, true)
+    }
+    if x == y {
+        return flags_hold(cc, false, true, false, false, false)
+    }
+    if x < y {
+        return flags_hold(cc, true, false, false, false, false)
+    }
+    flags_hold(cc, false, false, false, false, false)
+}
+
+fn fmir_holds(c: i64, a: f64, b: f64) -> bool {
+    match c {
+        0 -> a == b
+        1 -> a != b
+        2 -> a < b
+        3 -> a <= b
+        4 -> a > b
+        5 -> a >= b
+        _ -> false
+    }
+}
+
+/// The comparisons of doubles, as the table makes them: for each condition
+/// the rule `fcmp` takes and the one a fused branch takes, read off the
+/// table itself -- the `ucomisd` operands' order and the conditions of the
+/// `setcc`s and `jcc`s and how they combine -- and evaluated by IEEE 754 on
+/// both zeros, the infinities, the largest and smallest values and a NaN,
+/// against Grasm's own `f64` comparisons.
+fn check_fccs(rs: [XRule]) -> [str] {
+    var problems: [str] = []
+    let fm = fcc_map()
+    if fm.len() != 6 {
+        problems.push("the map of doubles has {fm.len()} entries for 6 conditions")
+        return problems
+    }
+    let zero = 0.0
+    let nan = zero / zero
+    let inf = 1.0 / zero
+    let big = 0x7FEFFFFFFFFFFFFF.from_bits()
+    let tiny = 1.from_bits()
+    let vals = [0.0, -zero, 1.0, -1.0, 2.5, -2.5, inf, -inf, nan, big, -big, tiny, -tiny]
+    var checked = 0
+    for c in 0..6 {
+        let sh = fcc_shape(c)
+        let g = if sh == FS_EQ { G_FCC_EQ } else if sh == FS_NE { G_FCC_NE } else if sh == FS_SWAP { G_FCC_SWAP } else { G_ANY }
+        let gb = if sh == FS_EQ { G_FFUSE_EQ } else if sh == FS_NE { G_FFUSE_NE } else if sh == FS_SWAP { G_FFUSE_SWAP } else { G_FFUSE }
+        for which in 0..2 {
+            var rule = -1
+            for k in 0..rs.len() {
+                if rule < 0 and ((which == 0 and rs[k].op == ir.M_FCMP and rs[k].guard == g) or (which == 1 and rs[k].op == ir.M_BRIF and rs[k].guard == gb)) {
+                    rule = k
+                }
+            }
+            if rule < 0 {
+                problems.push("no rule compares doubles for {ir.cc_name(c)}")
+                continue
+            }
+            var wrong = 0
+            var example = ""
+            for a in vals {
+                for b in vals {
+                    let got = if which == 0 { fset_value(rs[rule], c, a, b) } else { fbranch_value(rs[rule], c, a, b) }
+                    checked += 1
+                    if got != fmir_holds(c, a, b) {
+                        if wrong == 0 {
+                            example = "{a} vs {b}"
+                        }
+                        wrong += 1
+                    }
+                }
+            }
+            if wrong > 0 {
+                problems.push("on doubles, {ir.cc_name(c)} by rule {rs[rule].name} disagrees on {wrong} pairs, first {example}")
+            }
+        }
+    }
+    if checked == 0 {
+        problems.push("no comparison of doubles was checked")
+    }
+    problems
+}
+
+/// What `ucomisd` in a rule compares: (a, b) or, swapped, (b, a).
+fn ucom_order(ru: XRule, a: f64, b: f64) -> (f64, f64) {
+    for tm in ru.emit {
+        if tm.mop == mach.X_UCOMISD {
+            let x = if tm.n == S_A or tm.n == S_IA { a } else { b }
+            let y = if tm.m == S_A or tm.m == S_IA { a } else { b }
+            return (x, y)
+        }
+    }
+    (a, b)
+}
+
+fn tm_cc(tm: XTmpl, fm: [i64], c: i64) -> i64 {
+    if tm.cc >= 0 { tm.cc } else { fm[c] }
+}
+
+/// The result an `fcmp` rule leaves: its `setcc`s, combined by the `and` or
+/// `or` that follows (one `setcc` stands alone).
+fn fset_value(ru: XRule, c: i64, a: f64, b: f64) -> bool {
+    let (x, y) = ucom_order(ru, a, b)
+    let fm = fcc_map()
+    var vals: [bool] = []
+    var comb = 0
+    for tm in ru.emit {
+        if tm.mop == mach.X_SETCC {
+            vals.push(ucom_holds(tm_cc(tm, fm, c), x, y))
+        }
+        if tm.mop == mach.X_AND {
+            comb = 1
+        }
+        if tm.mop == mach.X_OR {
+            comb = 2
+        }
+    }
+    if vals.len() == 1 {
+        return vals[0]
+    }
+    if vals.len() == 2 and comb == 1 {
+        return vals[0] and vals[1]
+    }
+    if vals.len() == 2 and comb == 2 {
+        return vals[0] or vals[1]
+    }
+    false
+}
+
+/// Whether a fused branch's rule goes to its `then` block: its `jcc`s in
+/// order, the first that holds deciding, else the final jump.
+fn fbranch_value(ru: XRule, c: i64, a: f64, b: f64) -> bool {
+    let (x, y) = ucom_order(ru, a, b)
+    let fm = fcc_map()
+    for tm in ru.emit {
+        if tm.mop == mach.X_JCC32 and ucom_holds(tm_cc(tm, fm, c), x, y) {
+            return tm.tgt == T_THEN
+        }
+        if tm.mop == mach.X_JMP32 {
+            return tm.tgt == T_THEN
+        }
+    }
+    false
+}
+
+// ----- the immediate forms, against the operations ------------------------------------
+
+pub fn log2(b: i64) -> i64 {
+    var k = 0
+    while k < 63 and 1.shl(k) != b {
+        k += 1
+    }
+    k
+}
+
+fn udiv(x: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0
+    }
+    var q = 0
+    var r = 0
+    var i = 63
+    while i >= 0 {
+        r = r.shl(1).bit_or(x.ushr(i).bit_and(1))
+        if not ult(r, b) {
+            r = r - b
+            q = q.bit_or(1.shl(i))
+        }
+        i -= 1
+    }
+    q
+}
+
+fn op_value(op: i64, x: i64, b: i64) -> i64 {
+    if op == ir.M_ADD {
+        x + b
+    } else if op == ir.M_SUB {
+        x - b
+    } else if op == ir.M_AND {
+        x.bit_and(b)
+    } else if op == ir.M_OR {
+        x.bit_or(b)
+    } else if op == ir.M_XOR {
+        x.bit_xor(b)
+    } else if op == ir.M_SHL {
+        x.shl(b.bit_and(63))
+    } else if op == ir.M_SSHR {
+        x.shr(b.bit_and(63))
+    } else if op == ir.M_USHR {
+        x.ushr(b.bit_and(63))
+    } else if op == ir.M_ROTR {
+        let s = b.bit_and(63)
+        if s == 0 { x } else { x.ushr(s).bit_or(x.shl(64 - s)) }
+    } else if op == ir.M_MUL {
+        x * b
+    } else if op == ir.M_UDIV {
+        udiv(x, b)
+    } else {
+        -12345
+    }
+}
+
+/// What instruction `m` computes of `x` with immediate `k`, as the Intel SDM
+/// defines it: a 32-bit immediate sign-extended, a shift count masked to six
+/// bits.
+fn mop_value(m: i64, x: i64, k: i64) -> i64 {
+    let s = k.bit_and(63)
+    if m == mach.X_ADDI {
+        x + k
+    } else if m == mach.X_SUBI {
+        x - k
+    } else if m == mach.X_ANDI {
+        x.bit_and(k)
+    } else if m == mach.X_ORI {
+        x.bit_or(k)
+    } else if m == mach.X_XORI {
+        x.bit_xor(k)
+    } else if m == mach.X_IMULI {
+        x * k
+    } else if m == mach.X_SHLI {
+        x.shl(s)
+    } else if m == mach.X_SHRI {
+        x.ushr(s)
+    } else if m == mach.X_SARI {
+        x.shr(s)
+    } else if m == mach.X_RORI {
+        if s == 0 { x } else { x.ushr(s).bit_or(x.shl(64 - s)) }
+    } else {
+        -54321
+    }
+}
+
+/// Every rule taking b as an immediate computes, with the immediate it would
+/// take from b, what the operation does with b in a register, for words at
+/// the edges and between: a guard and its immediate that disagree are found
+/// before any program is compiled.
+fn check_imm_forms(rs: [XRule]) -> [str] {
+    var problems: [str] = []
+    let mn = -9223372036854775807 - 1
+    let xs = [0, 1, -1, 2, 3, 255, -256, 4096, 81985529216486895, mn, mn + 1, 9223372036854775807, 6148914691236517205, -6148914691236517206]
+    var bs: [i64] = []
+    for k in 0..64 {
+        bs.push(k)
+        bs.push(1.shl(k))
+        bs.push(1.shl(k) - 1)
+        bs.push(0 - 1.shl(k))
+    }
+    for x in [255, 65535, 4294967295, 2147483647, -2147483648, 2147483648, -2147483649, 64, 100, 12345] {
+        bs.push(x)
+    }
+    var checked = 0
+    for ru in rs {
+        // A comparison's immediate is checked with the condition map
+        // (`check_ccs`), against the same words.
+        if not guard_reads_b(ru.guard) or ru.op == ir.M_ICMP {
+            continue
+        }
+        // The instruction that takes the immediate, and whether the
+        // template moves a into the result first (two-address) or reads it
+        // itself (`imul $k, a, res`).
+        var im = -1
+        for tm in ru.emit {
+            if tm.imm == K_B or tm.imm == K_B_LOG2 {
+                im = tm.mop
+            }
+        }
+        if im < 0 {
+            problems.push("rule {ru.name}: its guard takes b as an immediate, and nothing reads it")
+            continue
+        }
+        var wrong = 0
+        var example = ""
+        for b in bs {
+            let ok = if ru.guard == G_B_SIMM32 { simm32(b) } else if ru.guard == G_B_SHIFT { b >= 0 and b <= 63 } else { b != 0 and b.bit_and(b - 1) == 0 }
+            if not ok {
+                continue
+            }
+            var k = b
+            for tm in ru.emit {
+                if tm.imm == K_B_LOG2 {
+                    k = log2(b)
+                }
+            }
+            for x in xs {
+                checked += 1
+                if mop_value(im, x, k) != op_value(ru.op, x, b) {
+                    if wrong == 0 {
+                        example = "{x} with b = {b}"
+                    }
+                    wrong += 1
+                }
+            }
+        }
+        if wrong > 0 {
+            problems.push("rule {ru.name}: {mach.form_name(im)} disagrees with `{ir.op_name(ru.op)}` on {wrong} cases, first {example}")
+        }
+    }
+    if checked == 0 {
+        problems.push("no immediate rule was checked against its operation")
+    }
+    problems
+}
+
+/// Every opcode a rule can emit, `P_MOVIMM` as the three it becomes and the
+/// pseudo-instructions as what `emit.gr` expands them to.
+pub fn rule_mops(rs: [XRule]) -> [i64] {
+    var seen: [bool] = []
+    for m in 0..mach.NMOPS {
+        seen.push(false)
+    }
+    for ru in rs {
+        for tm in ru.emit {
+            if tm.mop < mach.X_LAST {
+                seen[tm.mop] = true
+            } else {
+                for x in mach.expands_to(tm.mop) {
+                    seen[x] = true
+                }
+            }
+        }
+    }
+    var out: [i64] = []
+    for m in 0..mach.NMOPS {
+        if seen[m] {
+            out.push(m)
+        }
+    }
+    out
+}
