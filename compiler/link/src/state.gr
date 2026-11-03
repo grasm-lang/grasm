@@ -135,6 +135,11 @@ type Ld = {
     a_fde: [i64],
     a_cold: [bool],
     a_named: [bool],
+    /// A symbol sits at the atom's end, the end of its section (the
+    /// `.Lfunc_end` label LLVM's assembler leaves): ld makes it an atom of
+    /// its own, empty, which has a function start and which -dead_strip
+    /// removes, symbol and all.
+    a_tail: [bool],
     // ----- relocations, decoded; a SUBTRACTOR is folded into the UNSIGNED after it
     r_sec: [i64],
     r_off: [i64],
@@ -171,6 +176,16 @@ type Ld = {
     eh_of: [i64],
     eh_func: [i64],
     eh_lsda: [i64],
+    /// An FDE's LSDA when its field carries no relocation and was read from
+    /// the record (x86-64's LLVM writes them so): the offset in the LSDA's
+    /// atom, and the field's offset in the record (-1: not so); and the
+    /// width of a pointer field and whether the function's field carries no
+    /// relocation, which `unwind.eh_bytes` then rewrites.
+    eh_lsda_off: [i64],
+    eh_lsda_field: [i64],
+    eh_lsda_size: [i64],
+    eh_psize: [i64],
+    eh_func_bare: [bool],
     /// A CIE's personality: global symbol or -1.
     eh_pers_g: [i64],
     eh_pers_atom: [i64],
@@ -243,11 +258,11 @@ pub fn new_ld() -> Ld {
         s_flags: [], s_role: [], s_atom0: [], s_natom: [], s_rel0: [], s_nrel: [], s_out: [],
         y_file: [], y_name: [], y_type: [], y_sect: [], y_desc: [], y_value: [], y_atom: [], y_g: [],
         a_sec: [], a_off: [], a_size: [], a_p2: [], a_mod: [], a_live: [], a_addr: [], a_sym: [], a_canon: [],
-        a_rel0: [], a_nrel: [], a_cu: [], a_fde: [], a_cold: [], a_named: [],
+        a_rel0: [], a_nrel: [], a_cu: [], a_fde: [], a_cold: [], a_named: [], a_tail: [],
         r_sec: [], r_off: [], r_type: [], r_len: [], r_pcrel: [], r_sym: [], r_tsec: [], r_addend: [], r_subsym: [],
         r_subsec: [], r_atom: [], r_tkind: [], r_tatom: [], r_toff: [], r_tg: [], r_satom: [], r_soff: [],
         cu_atom: [], cu_len: [], cu_enc: [], cu_pers_g: [], cu_pers_atom: [], cu_lsda: [], cu_lsda_off: [],
-        eh_atom: [], eh_cie: [], eh_of: [], eh_func: [], eh_lsda: [], eh_pers_g: [], eh_pers_atom: [],
+        eh_atom: [], eh_cie: [], eh_of: [], eh_func: [], eh_lsda: [], eh_lsda_off: [], eh_lsda_field: [], eh_lsda_size: [], eh_psize: [], eh_func_bare: [], eh_pers_g: [], eh_pers_atom: [],
         g_map: {}, g_name: [], g_kind: [], g_def: [], g_dylib: [], g_weak: [], g_pext: [], g_tlv: [],
         g_got: [], g_stub: [], g_import: [], g_weakref: [],
         o_seg: [], o_name: [], o_flags: [], o_p2: [], o_addr: [], o_size: [], o_off: [], o_atoms: [], o_kind: [], o_order: [],

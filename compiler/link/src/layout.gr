@@ -224,7 +224,7 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                     let t = l.r_type[r]
                     let k = l.r_tkind[r]
                     let g = l.r_tg[r]
-                    if eh and t != objfile.R_POINTER_TO_GOT {
+                    if eh and t != objfile.R_POINTER_TO_GOT and t != objfile.R_X_GOT {
                         continue
                     }
                     if k == state.T_IMPORT {
@@ -243,7 +243,7 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                         } else {
                             fail("{l.f_path[fi]}: a {objfile.reloc_name(t)} relocation to {name}, which is in a dylib")
                         }
-                    } else if k == state.T_ATOM and t == objfile.R_POINTER_TO_GOT {
+                    } else if k == state.T_ATOM and (t == objfile.R_POINTER_TO_GOT or t == objfile.R_X_GOT) {
                         let ta = l.a_canon[l.r_tatom[r]]
                         let name = if g >= 0 { l.g_name[g] } else { target_name(l, 0, ta, -1) }
                         got.set(local_key(name, ta), (-1, ta))
@@ -352,9 +352,13 @@ pub fn place(inout l: Ld, header_size: i64) -> i64 {
     let total = off
     let big = 1.shl(maxp2)
     let psz = page(l)
-    var seg_end = rd.align_up(header_size + 32 + total, psz)
+    // ld leaves 32 bytes after the load commands, and on x86-64, where it
+    // writes no LC_CODE_SIGNATURE, room for that command's 16 bytes too
+    // (measured: an x86-64 link never has less than 48).
+    let room = header_size + if l.x64 { 48 } else { 32 }
+    var seg_end = rd.align_up(room + total, psz)
     var start = (seg_end - total) / big * big
-    while start < header_size + 32 {
+    while start < room {
         seg_end += psz
         start = (seg_end - total) / big * big
     }
@@ -363,6 +367,21 @@ pub fn place(inout l: Ld, header_size: i64) -> i64 {
         l.o_off[o] = l.o_addr[o] - BASE
     }
     l.seg_text_size = seg_end
+    // The thread-local template's sections all take the largest alignment
+    // among them, as ld gives them: the template is copied whole.
+    var tp2 = 0
+    for o in l.o_order {
+        let ty = l.o_flags[o].bit_and(255)
+        if (ty == 0x11 or ty == 0x12) and l.o_p2[o] > tp2 {
+            tp2 = l.o_p2[o]
+        }
+    }
+    for o in l.o_order {
+        let ty = l.o_flags[o].bit_and(255)
+        if ty == 0x11 or ty == 0x12 {
+            l.o_p2[o] = tp2
+        }
+    }
     // __DATA_CONST, then __DATA: forwards from a page boundary each.
     var addr = BASE + seg_end
     var fileoff = seg_end

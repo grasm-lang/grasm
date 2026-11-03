@@ -66,8 +66,9 @@ link_args() {
 # The C fixtures (`scripts/fixtures/link/`): what neither backend emits but a
 # Mach-O linker must get right. Each is `name|sources|exported symbols`, a
 # source ending in `.py` being a program that writes the C (`pages.py`,
-# too large to keep); `link_fixture_build NAME` compiles one with `cc -c`
-# (-O1) into $WORK/fx/NAME/,
+# too large to keep); `link_fixture_build NAME [ARCH]` compiles one with `cc -c`
+# (-O1, and `-arch ARCH` when given: `scripts/linkdiff_x64.sh` asks for
+# x86_64) into $WORK/fx/NAME/,
 # links the reference there with cc (`ref`), and sets FX_OBJS and FX_FLAGS to
 # the objects and the flags compiler/link takes for the same link.
 LINK_FIXTURES=(
@@ -78,6 +79,8 @@ LINK_FIXTURES=(
 
 link_fixture_build() {
     local want=$1 entry name srcs exports s
+    local arch=()
+    [ -n "${2:-}" ] && arch=(-arch "$2")
     for entry in "${LINK_FIXTURES[@]}"; do
         IFS='|' read -r name srcs exports <<<"$entry"
         [ "$name" = "$want" ] || continue
@@ -94,14 +97,14 @@ link_fixture_build() {
                 python3 "scripts/fixtures/link/$s" >"$c" || return 1
             fi
             local o="$dir/$(basename "${c%.c}").o"
-            cc -O1 -c "$c" -o "$o" || return 1
+            cc ${arch[@]+"${arch[@]}"} -O1 -c "$c" -o "$o" || return 1
             FX_OBJS+=("$o")
         done
         for s in $exports; do
             FX_FLAGS+=(-exported_symbol "$s")
             ccflags+=("-Wl,-exported_symbol,$s")
         done
-        cc "${FX_OBJS[@]}" -o "$dir/ref" "${ccflags[@]}"
+        cc ${arch[@]+"${arch[@]}"} "${FX_OBJS[@]}" -o "$dir/ref" "${ccflags[@]}"
         return $?
     done
     echo "no fixture named $want"

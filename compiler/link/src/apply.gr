@@ -147,7 +147,9 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
                 if t == objfile.R_X_BRANCH or t == objfile.R_X_SIGNED or t == objfile.R_X_GOT_LOAD or t == objfile.R_X_GOT or t == objfile.R_X_TLV {
                     // The field holds the addend; the displacement counts
                     // from the end of the field and of what follows it.
-                    let c = rd.s32(d, src + field)
+                    // A section-relative reference's field held the input
+                    // displacement, which its resolved target replaces.
+                    let c = if l.r_sym[r] >= 0 { rd.s32(d, src + field) } else { 0 }
                     let after = pc + 4 + (if t == objfile.R_X_SIGNED { l.r_addend[r] } else { 0 })
                     var target = 0
                     if t == objfile.R_X_BRANCH {
@@ -157,8 +159,15 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
                             fail(fail_at(l, a, r, "a direct reference to {l.g_name[l.r_tg[r]]}, which is in a dylib"))
                         }
                         target = target_addr(l, r) + c
-                    } else if (t == objfile.R_X_GOT_LOAD or t == objfile.R_X_GOT) and k == state.T_IMPORT {
-                        target = got_slot_addr(l, got_o, r) + c
+                    } else if t == objfile.R_X_GOT or (t == objfile.R_X_GOT_LOAD and k == state.T_IMPORT) {
+                        // X86_64_RELOC_GOT is not a `movq` ld may make a
+                        // `leaq`: it reaches a local target through a GOT
+                        // slot too, as ld does.
+                        let slot = got_slot_addr(l, got_o, r)
+                        if slot < 0 {
+                            fail(fail_at(l, a, r, "a GOT reference without a GOT slot"))
+                        }
+                        target = slot + c
                     } else {
                         if k != state.T_ATOM {
                             fail(fail_at(l, a, r, "a thread-local variable from a dylib, which this linker does not take"))

@@ -78,6 +78,12 @@ pub fn exported(l: Ld, g: i64) -> bool {
     true
 }
 
+/// Whether symbol `y` sits at the very end of its section.
+fn is_tail(l: Ld, y: i64) -> bool {
+    let si = l.y_sect[y]
+    l.y_value[y] - l.s_addr[si] == l.s_size[si] and l.s_size[si] > 0
+}
+
 fn sym_addr(l: Ld, y: i64) -> i64 {
     let a = l.y_atom[y]
     l.a_addr[l.a_canon[a]] + (l.y_value[y] - l.s_addr[l.y_sect[y]] - l.a_off[a])
@@ -106,6 +112,10 @@ fn symbols(l: Ld, files: [i64]) -> (Syms, i64, i64, i64) {
             }
             let name = l.y_name[y]
             if name.starts_with("l") or name.starts_with("L") {
+                continue
+            }
+            if l.dead_strip and is_tail(l, y) {
+                // ld's empty atom for it is dead.
                 continue
             }
             var pext = false
@@ -313,7 +323,15 @@ fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
             continue
         }
         let psz = layout.page(l)
-        let npages = size / psz
+        // Pages up to the last one with a fixup, as ld counts them; the
+        // rest of the segment needs no entry.
+        var npages = 0
+        for i in mine {
+            let pg = (fx.addr[i] - start) / psz + 1
+            if pg > npages {
+                npages = pg
+            }
+        }
         rd.wpad(b, 8)
         seg_info[si] = b.len() - image_at
         rd.w32(b, 22 + 2 * npages)
@@ -413,6 +431,12 @@ fn function_starts(l: Ld) -> bytes {
             if d != 0 {
                 rd.wuleb(b, d)
                 last = l.a_addr[a]
+            }
+            // ld's empty atom for a label at its section's end, unless
+            // -dead_strip removed it or it ends __text.
+            if l.a_tail[a] and not l.dead_strip and l.a_addr[a] + l.a_size[a] < l.o_addr[o] + l.o_size[o] {
+                rd.wuleb(b, l.a_size[a])
+                last = l.a_addr[a] + l.a_size[a]
             }
         }
     }
@@ -651,7 +675,9 @@ pub fn commands_size(l: Ld) -> i64 {
     for d in l.dl_install {
         n += rd.align_up(24 + d.to_bytes().len() + 1, 8)
     }
-    n += 16 + 16 + 16
+    // LC_FUNCTION_STARTS, LC_DATA_IN_CODE, and LC_CODE_SIGNATURE but on
+    // x86-64, where ld signs nothing and neither does this linker.
+    n += 16 + 16 + if l.x64 { 0 } else { 16 }
     n
 }
 
@@ -668,7 +694,7 @@ fn ncmds(l: Ld) -> i64 {
     if l.uuid {
         n += 1
     }
-    n += 3 + l.dl_install.len() + 3
+    n += 3 + l.dl_install.len() + if l.x64 { 2 } else { 3 }
     n
 }
 
@@ -721,13 +747,16 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
     rd.wpad(le, 8)
     let stroff = le_off + le.len()
     le.push_bytes(strtab)
-    rd.wpad(le, 16)
+    let sign = not l.x64
+    if sign {
+        rd.wpad(le, 16)
+    }
     let sig_off = le_off + le.len()
     let ident = if l.ident != "" { l.ident } else { basename(l.out) }
     let pages = (sig_off + 4095) / 4096
     // The SuperBlob and its one CodeDirectory, zero-padded to 8 bytes as ld
     // (and strip) size the space.
-    let sig_size = rd.align_up(12 + 8 + 88 + ident.to_bytes().len() + 1 + 32 * pages, 8)
+    let sig_size = if sign { rd.align_up(12 + 8 + 88 + ident.to_bytes().len() + 1 + 32 * pages, 8) } else { 0 }
     for _k in 0..sig_size {
         le.push_byte(0)
     }
@@ -777,7 +806,11 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
             rd.w32(c, 0)
         }
     }
-    wseg(c, "__LINKEDIT", l.seg_linkedit_addr, rd.align_up(file_size - le_off, layout.page(l)), le_off, file_size - le_off, 1, 0, 0)
+    // `strip` sizes the __LINKEDIT it writes in 16 KiB pages whatever the
+    // architecture -- an x86-64 file's included, which ld itself sizes in
+    // 4 KiB ones.
+    let le_page = if l.strip { layout.PAGE } else { layout.page(l) }
+    wseg(c, "__LINKEDIT", l.seg_linkedit_addr, rd.align_up(file_size - le_off, le_page), le_off, file_size - le_off, 1, 0, 0)
     wlinkedit_cmd(c, 0x80000034, fixups_off, fixups.len())
     wlinkedit_cmd(c, 0x80000033, trie_off, tri.len())
     rd.w32(c, 2)
@@ -852,7 +885,9 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
     }
     wlinkedit_cmd(c, 0x26, starts_off, starts.len())
     wlinkedit_cmd(c, 0x29, dic_off, 0)
-    wlinkedit_cmd(c, 0x1d, sig_off, sig_size)
+    if sign {
+        wlinkedit_cmd(c, 0x1d, sig_off, sig_size)
+    }
     let cmds = c.to_bytes()
     if 32 + cmds.len() > l.o_addr[l.o_order[0]] - layout.BASE {
         fail("the load commands do not fit before the first section")
@@ -885,6 +920,9 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
             }
             file.set(uuid_at + 8 + k, v)
         }
+    }
+    if not sign {
+        return file
     }
     // ld-prime's executable segment limit is the size of __text; strip's,
     // re-signing, the size of the __TEXT segment.

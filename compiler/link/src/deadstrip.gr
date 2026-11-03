@@ -12,13 +12,19 @@
 import state
 import objfile
 
+/// The compact encoding's mode that says "see the FDE":
+/// `UNWIND_ARM64_MODE_DWARF`, or on x86-64 `UNWIND_X86_64_MODE_DWARF`.
+pub fn mode_dwarf(l: Ld) -> i64 {
+    if l.x64 { 0x04000000 } else { 0x03000000 }
+}
+
 /// Whether function atom `a`'s unwind information has to come from its FDE.
 pub fn needs_fde(l: Ld, a: i64) -> bool {
     if l.a_fde[a] < 0 {
         return false
     }
     let c = l.a_cu[a]
-    c < 0 or l.cu_enc[c].bit_and(0x0f000000) == 0x03000000
+    c < 0 or l.cu_enc[c].bit_and(0x0f000000) == mode_dwarf(l)
 }
 
 fn push(inout l: Ld, inout work: [i64], a: i64) {

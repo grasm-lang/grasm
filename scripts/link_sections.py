@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two arm64 executables, section by section and blob by blob.
+"""Two arm64 (or two x86-64) executables, section by section and blob by blob.
 
     scripts/link_sections.py <ld's> <ours> [--symbols]
 

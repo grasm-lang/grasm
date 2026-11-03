@@ -18,6 +18,7 @@
 // generated C with 2,000 to 6,000 functions (2 to 6 pages) checked the rest.
 import rd
 import state
+import objfile
 import deadstrip
 import layout
 
@@ -121,8 +122,8 @@ fn entries(l: Ld, text: i64, delta: i64, got_base: i64) -> UEntries {
         var pers = -1
         if deadstrip.needs_fde(l, a) {
             let e = l.a_fde[a]
-            enc = MODE_DWARF.bit_or(l.eh_out_off.get(e) ?? 0)
-            lsda = img(l, l.eh_lsda[e], 0, delta)
+            enc = deadstrip.mode_dwarf(l).bit_or(l.eh_out_off.get(e) ?? 0)
+            lsda = img(l, l.eh_lsda[e], l.eh_lsda_off[e], delta)
             let cie = l.eh_of[e]
             pers = got_addr_of(l, l.eh_pers_g[cie], l.eh_pers_atom[cie], got_base)
         } else if l.a_cu[a] >= 0 {
@@ -140,12 +141,24 @@ fn entries(l: Ld, text: i64, delta: i64, got_base: i64) -> UEntries {
         u.enc.push(enc)
         u.lsda.push(lsda)
         u.pers.push(pers)
+        // ld's empty atom for a label at an input section's end is a
+        // function without unwind information, unless -dead_strip removed
+        // it or it is the end of __text.
+        let end = l.a_addr[a] + l.a_size[a]
+        if l.a_tail[a] and not l.dead_strip and end < l.o_addr[text] + l.o_size[text] {
+            u.func.push(a)
+            u.addr.push(end + delta)
+            u.size.push(0)
+            u.enc.push(0)
+            u.lsda.push(-1)
+            u.pers.push(-1)
+        }
     }
     u
 }
 
-fn is_dwarf(enc: i64) -> bool {
-    enc.bit_and(0x0f000000) == MODE_DWARF
+fn is_dwarf(l: Ld, enc: i64) -> bool {
+    enc.bit_and(0x0f000000) == deadstrip.mode_dwarf(l)
 }
 
 /// The `__unwind_info` section's bytes. Before layout, `delta` is 0 and the
@@ -163,7 +176,7 @@ pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
     for i in 0..all.func.len() {
         let enc = all.enc[i]
         let has_lsda = all.lsda[i] >= 0
-        if is_dwarf(enc) or enc != last_enc or all.pers[i] != last_pers or has_lsda or last_lsda {
+        if is_dwarf(l, enc) or enc != last_enc or all.pers[i] != last_pers or has_lsda or last_lsda {
             u.func.push(all.func[i])
             u.addr.push(all.addr[i])
             u.size.push(all.size[i])
@@ -195,7 +208,7 @@ pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
     var most = 0
     for i in 0..u.func.len() {
         let enc = u.enc[i]
-        if is_dwarf(enc) {
+        if is_dwarf(l, enc) {
             continue
         }
         let c = (count.get(enc) ?? 0) + 1
@@ -241,9 +254,9 @@ pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
             let enc = u.enc[j]
             var ei = -1
             var new_spec = false
-            if not is_dwarf(enc) and common.has(enc) {
+            if not is_dwarf(l, enc) and common.has(enc) {
                 ei = common.get(enc) ?? 0
-            } else if not is_dwarf(enc) and specific.has(enc) {
+            } else if not is_dwarf(l, enc) and specific.has(enc) {
                 ei = specific.get(enc) ?? 0
             } else {
                 ei = common_list.len() + spec_list.len()
@@ -261,7 +274,7 @@ pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
             }
             if new_spec {
                 spec_list.push(enc)
-                if not is_dwarf(enc) {
+                if not is_dwarf(l, enc) {
                     specific.set(enc, ei)
                 }
             }
@@ -364,12 +377,42 @@ pub fn eh_bytes(l: Ld, o: i64) -> bytes ! str {
         if not l.eh_cie[e] {
             let cie_at = l.eh_out_off.get(l.eh_of[e]) ?? 0
             rd.put32(buf, at + 4, at + 4 - cie_at)
+            // Fields the input left without a relocation (x86-64's LLVM
+            // writes the function's and the LSDA's address relative to the
+            // field): rewritten for where both now are.
+            let ps = l.eh_psize[e]
+            if l.eh_func_bare[e] and l.eh_func[e] >= 0 {
+                let v = l.a_addr[l.a_canon[l.eh_func[e]]] - (here + 8)
+                if ps == 4 {
+                    rd.put32(buf, at + 8, v)
+                } else {
+                    rd.put64(buf, at + 8, v)
+                }
+            }
+            let lf = l.eh_lsda_field[e]
+            if lf >= 0 {
+                let v = l.a_addr[l.a_canon[l.eh_lsda[e]]] + l.eh_lsda_off[e] - (here + lf)
+                if l.eh_lsda_size[e] == 4 {
+                    rd.put32(buf, at + lf, v)
+                } else {
+                    rd.put64(buf, at + lf, v)
+                }
+            }
         }
         for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
             let field = l.r_off[r] - l.a_off[a]
             let t = l.r_type[r]
             let where = here + field
-            if t == 7 {
+            if t == objfile.R_X_GOT {
+                // x86-64's personality: a 32-bit displacement to its GOT
+                // slot from the end of the field, the field's value the
+                // addend.
+                let slot = got_addr_of(l, l.r_tg[r], l.r_tatom[r], l.o_addr[got_o])
+                if slot < 0 {
+                    fail("an eh_frame personality without a GOT slot")
+                }
+                rd.put32(buf, at + field, slot - (where + 4) + rd.s32(d, src + field))
+            } else if t == 7 {
                 // POINTER_TO_GOT: 32 bits, from the field to the slot.
                 let slot = got_addr_of(l, if l.r_tkind[r] == state.T_IMPORT { l.r_tg[r] } else { l.r_tg[r] }, l.r_tatom[r], l.o_addr[got_o])
                 if slot < 0 {

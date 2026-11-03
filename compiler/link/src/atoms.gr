@@ -133,6 +133,7 @@ pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
             l.a_fde.push(-1)
             l.a_cold.push(false)
             l.a_named.push(false)
+            l.a_tail.push(false)
         }
         l.s_natom[si] = uniq.len()
         // Each symbol into the atom that holds it; the atom's name is the
@@ -146,6 +147,9 @@ pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
                 continue
             }
             l.y_atom[y] = a
+            if o == size and size > 0 {
+                l.a_tail[a] = true
+            }
             if l.a_off[a] == o {
                 let cur = l.a_sym[a]
                 if cur < 0 or (l.y_type[cur].bit_and(1) == 0 and l.y_type[y].bit_and(1) != 0) {
@@ -286,16 +290,22 @@ pub fn resolve_relocs(inout l: Ld, fi: i64) -> () ! str {
                 l.r_tg[r] = g
             } else {
                 // Section-relative: an absolute pointer's place holds the
-                // target's input address; elsewhere the target is the
-                // section's own address plus nothing we can read, which
-                // arm64 objects never ask for.
+                // target's input address; an x86-64 PC-relative one's holds
+                // the displacement to it from the end of the field (and of
+                // the bytes after it, for SIGNED_1/2/4); elsewhere the
+                // target is the section's own address plus nothing we can
+                // read, which arm64 objects never ask for.
                 let ts = l.r_tsec[r]
-                if t != objfile.R_UNSIGNED {
+                var taddr = content(l, r)
+                if t == objfile.R_X_SIGNED or t == objfile.R_X_BRANCH {
+                    let bias = if t == objfile.R_X_SIGNED { l.r_addend[r] } else { 0 }
+                    taddr = l.s_addr[si] + l.r_off[r] + 4 + bias + content(l, r)
+                } else if t != objfile.R_UNSIGNED {
                     fail("{l.f_path[fi]}: a section-relative {objfile.reloc_name(t)} relocation in {l.s_seg[si]},{l.s_name[si]}")
                 }
-                let (a, o) = at_address(l, ts, content(l, r))
+                let (a, o) = at_address(l, ts, taddr)
                 if a < 0 {
-                    fail("{l.f_path[fi]}: a pointer to {rd.hex(content(l, r))}, outside {l.s_seg[ts]},{l.s_name[ts]}")
+                    fail("{l.f_path[fi]}: a reference to {rd.hex(taddr)}, outside {l.s_seg[ts]},{l.s_name[ts]}")
                 }
                 l.r_tkind[r] = state.T_ATOM
                 l.r_tatom[r] = a
@@ -406,6 +416,11 @@ pub fn read_eh_frame(inout l: Ld, fi: i64) -> () ! str {
             l.eh_of.push(-1)
             l.eh_func.push(-1)
             l.eh_lsda.push(-1)
+            l.eh_lsda_off.push(0)
+            l.eh_lsda_field.push(-1)
+            l.eh_lsda_size.push(0)
+            l.eh_psize.push(8)
+            l.eh_func_bare.push(false)
             l.eh_pers_g.push(-1)
             l.eh_pers_atom.push(-1)
         }
@@ -416,7 +431,7 @@ pub fn read_eh_frame(inout l: Ld, fi: i64) -> () ! str {
             if l.eh_cie[e] {
                 // The personality is the one pointer a CIE carries.
                 for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
-                    if l.r_type[r] == objfile.R_POINTER_TO_GOT or l.r_type[r] == objfile.R_UNSIGNED {
+                    if l.r_type[r] == objfile.R_POINTER_TO_GOT or l.r_type[r] == objfile.R_X_GOT or l.r_type[r] == objfile.R_UNSIGNED {
                         l.eh_pers_g[e] = l.r_tg[r]
                         l.eh_pers_atom[e] = if l.r_tkind[r] == state.T_ATOM { l.r_tatom[r] } else { -1 }
                     }
@@ -429,26 +444,126 @@ pub fn read_eh_frame(inout l: Ld, fi: i64) -> () ! str {
                 fail("{l.f_path[fi]}: an FDE whose CIE is not a record")
             }
             l.eh_of[e] = base_eh + (ca - a0)
+            // The CIE says how wide the FDE's pointers are and whether it
+            // has an LSDA field (its augmentation, "zPLR").
+            let (psize, lsize) = cie_layout(d, l.s_off[si] + l.a_off[ca])
+            l.eh_psize[e] = psize
+            var func_rel = false
+            var lsda_rel = false
             for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
                 let field = l.r_off[r] - l.a_off[a]
                 if field == 8 {
                     l.eh_func[e] = l.r_tatom[r]
+                    func_rel = true
                 } else if field > 8 {
                     l.eh_lsda[e] = l.r_tatom[r]
+                    lsda_rel = true
                 }
             }
             if l.eh_func[e] < 0 {
                 // No relocation: the field holds the function's address
                 // relative to itself.
-                let fa = l.s_addr[si] + l.a_off[a] + 8 + rd.u64(d, off + 8)
+                let fa = l.s_addr[si] + l.a_off[a] + 8 + pcrel_value(d, off + 8, psize)
                 let text = find_text_atom(l, fi, fa)
                 l.eh_func[e] = text
+                l.eh_func_bare[e] = not func_rel
+            }
+            if not lsda_rel and lsize > 0 {
+                // An LSDA field with no relocation: after the pointers and
+                // the augmentation's length, its target relative to itself.
+                let at = 8 + 2 * psize + uleb_size(d, off + 8 + 2 * psize)
+                let v = pcrel_value(d, off + at, lsize)
+                if v != 0 {
+                    let la = l.s_addr[si] + l.a_off[a] + at + v
+                    let (lt, lo) = find_data_atom(l, fi, la)
+                    if lt < 0 {
+                        fail("{l.f_path[fi]}: an FDE's LSDA at {rd.hex(la)} is in no section")
+                    }
+                    l.eh_lsda[e] = lt
+                    l.eh_lsda_off[e] = lo
+                    l.eh_lsda_field[e] = at
+                    l.eh_lsda_size[e] = lsize
+                }
             }
             if l.eh_func[e] >= 0 and l.a_fde[l.eh_func[e]] < 0 {
                 l.a_fde[l.eh_func[e]] = e
             }
         }
     }
+}
+
+/// A signed `size`-byte value (4 or 8) at `at`.
+fn pcrel_value(d: bytes, at: i64, size: i64) -> i64 {
+    if size == 4 { rd.s32(d, at) } else { rd.u64(d, at) }
+}
+
+/// How many bytes the ULEB128 at `at` takes.
+fn uleb_size(d: bytes, at: i64) -> i64 {
+    var n = 1
+    while d.at(at + n - 1).bit_and(128) != 0 {
+        n += 1
+    }
+    n
+}
+
+/// The width of a DWARF pointer encoding's value: 4 for `sdata4`/`udata4`,
+/// else 8.
+fn enc_size(enc: i64) -> i64 {
+    let f = enc.bit_and(15)
+    if f == 3 or f == 11 { 4 } else { 8 }
+}
+
+/// A CIE's pointer widths: its FDEs' address fields (`R`) and their LSDA
+/// field (`L`, 0 when the augmentation has none). Read from the CIE at `off`:
+/// length, id, version, the augmentation string, the alignments and the
+/// return register, then the augmentation data.
+fn cie_layout(d: bytes, off: i64) -> (i64, i64) {
+    var at = off + 8
+    let version = d.at(at)
+    at += 1
+    var aug = ""
+    while d.at(at) != 0 {
+        aug = aug + "{d.at(at)}" + ","
+        at += 1
+    }
+    at += 1
+    at += uleb_size(d, at)
+    at += uleb_size(d, at)
+    at += if version == 1 { 1 } else { uleb_size(d, at) }
+    var psize = 8
+    var lsize = 0
+    // The augmentation's letters, as their byte values: z 122, P 80, L 76,
+    // R 82.
+    let letters = aug.split(",")
+    if letters.len() > 0 and letters[0] == "122" {
+        at += uleb_size(d, at)
+        for k in 1..letters.len() {
+            let c = letters[k]
+            if c == "80" {
+                let pe = d.at(at)
+                at += 1 + enc_size(pe)
+            } else if c == "76" {
+                lsize = enc_size(d.at(at))
+                at += 1
+            } else if c == "82" {
+                psize = enc_size(d.at(at))
+                at += 1
+            }
+        }
+    }
+    (psize, lsize)
+}
+
+/// The atom of file `fi` holding address `addr`, in any section that is
+/// linked, and the offset in it; (-1, 0) when none does.
+fn find_data_atom(l: Ld, fi: i64, addr: i64) -> (i64, i64) {
+    let sec0 = l.f_sec0[fi]
+    for si in sec0..(sec0 + l.f_nsec[fi]) {
+        if addr >= l.s_addr[si] and addr < l.s_addr[si] + l.s_size[si] and l.s_role[si] == state.ROLE_NORMAL {
+            return at_address(l, si, addr)
+        }
+    }
+    (-1, 0)
 }
 
 fn find_text_atom(l: Ld, fi: i64, addr: i64) -> i64 {
