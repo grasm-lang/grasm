@@ -3680,7 +3680,20 @@ load of 2 to 5):
   double is given a register, counted apart).
 - `encodetest_x64`: 133 rules, no problems; 102 forms, 5,558 encodings as
   the assembler's, 51 relocations as its.
-- X64CONTROLS_LINE
+- `x64controls`: "controls: 22   caught: 22   missed: 0" -- the encoder's
+  nine; the rule table's integer condition map (caught by its check, and with
+  the check skipped by `xs3subset`'s output), the operands of `<` on doubles
+  not swapped, a flag setter between `bsr` and its `cmov`; the epilogue's pops
+  in the pushes' order, rcx handed to values living across calls, a reload's
+  scratch register handed out (the allocation checker); a relocation a byte
+  short, the line table a byte late, the clock in every object
+  (`objtest_x64`); a stub through the wrong GOT slot, a GOT or thread-local
+  load not made a `leaq`, and the context switch restoring `rsp` from the
+  wrong word (`xrtswap`). Each control builds the driver and the linker from
+  its own mutated copy. Two of the first run's were found vacuous and
+  replaced: removing rcx from what a call changes is no fault, since no value
+  that crosses a call is ever offered it, and a new fiber's stack one word
+  lower runs correctly under Rosetta.
 - Unchanged for arm64: `linkdiff` 168 of 168 byte-identical to the shipped
   build, tools and sections agreeing, the 3 C fixtures and the whole runtime;
   `linktest` 651 Cranelift and 648 Grasm-backend programs, 2,604 links each
