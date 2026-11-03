@@ -263,8 +263,8 @@ control fp-cc compiler/aarch64/src/rules.gr \
     scripts/encodetest.sh "on doubles, slt maps to lt" - \
     scripts/fuzz_s3.py "FAILED program" --no-rule-check
 
-control fp-class compiler/aarch64/src/isel.gr \
-    "    if vcode.cls_of(vc, d) == mach.CLS_FP {" "    if false {" -- \
+control fp-class compiler/vcode/src/moves.gr \
+    "    let cls = vcode.cls_of(vc, d)" "    let cls = 0" -- \
     scripts/s3subset.sh "register allocation check failed" -
 
 control capture-rc compiler/mir/src/lower.gr \
