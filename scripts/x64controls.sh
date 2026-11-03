@@ -27,6 +27,34 @@
 #                relocation -> encodetest_x64 (the relocation check)
 #   coverage     the target says it can emit a form the encoder has no cases
 #                for -> encodetest_x64 (the coverage check)
+#
+# Step three's selection, allocation, frame and object (§6.16):
+#
+#   x-cc-map     the integer condition `slt` maps to `le`
+#                -> encodetest_x64 (the rule table's check of the map)
+#                -> xs3subset, with the table's checks skipped, by the output
+#   x-fcc-swap   `<` and `<=` on doubles compare without swapping the
+#                operands, so they read as `>` and `>=`
+#                -> encodetest_x64 (the comparisons evaluated by IEEE 754)
+#   x-flags      a `not` between `bsr` and the `cmov` reading its flags
+#                -> encodetest_x64 (no flag setter between a comparison and
+#                its reader)
+#   x-pop-order  the epilogue pops the callee-saved registers in the order
+#                the prologue pushed them -> xs3subset
+#   x-clobber    the target description says a call keeps rcx, so values are
+#                left in it across calls -- which the checker, reading the
+#                same description, cannot see -> xs3subset
+#   x-scratch    r11, a reload's scratch register, is also handed out to
+#                values -> ra_check_x64 (the checker, under pressure)
+#   x-reloc-off  every relocation is recorded one byte short of its field
+#                -> objtest_x64 (relocations against the instructions)
+#   x-line       every line-table row starts a byte after its instruction
+#                -> objtest_x64 (a literal's load maps to the wrong line)
+#   x-nondet     the driver writes the clock into every object
+#                -> objtest_x64 (two compilations differ)
+#
+# The gates that compile the corpus stop at the first failure
+# (`S3_STOP_AT_FIRST=1`). `S3_RT_X64=` is handed to them as given.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -40,10 +68,10 @@ controls=0
 caught=0
 declare -a MISSED=()
 
-# control NAME FILE OLD NEW -- GATE SYMPTOM
+# control NAME FILE OLD NEW -- GATE SYMPTOM [EXTRA] [GATE SYMPTOM EXTRA] ...
 control() {
-    local name=$1 file=$2 old=$3 new=$4 gate=$6 symptom=$7
-    controls=$((controls + 1))
+    local name=$1 file=$2 old=$3 new=$4
+    shift 5
     rm -rf "$WORK/src"
     mkdir -p "$WORK/src"
     cp -R compiler "$WORK/src/"
@@ -57,18 +85,28 @@ control() {
         sed 's/^/    /' "$WORK/build-$name.log" | head -5
         return
     fi
-    local log="$WORK/$name.log"
-    S3="$driver" "$gate" >"$log" 2>&1
-    local code=$?
-    if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
-        caught=$((caught + 1))
-        echo "caught: $name by $(basename "$gate" .sh) (exit $code; \"$symptom\")"
-    elif [ "$code" != 0 ]; then
-        MISSED+=("$name: $(basename "$gate" .sh) failed (exit $code) but not with \"$symptom\"; see its last lines below")
-        tail -5 "$log" | sed 's/^/    /'
-    else
-        MISSED+=("$name: $(basename "$gate" .sh) passed with the fault in place")
-    fi
+    while [ $# -ge 2 ]; do
+        local gate=$1 symptom=$2 extra=${3:--}
+        shift 2
+        [ $# -ge 1 ] && shift
+        [ "$extra" = "-" ] && extra=""
+        controls=$((controls + 1))
+        local log="$WORK/$name-$(basename "$gate" .sh).log"
+        S3="$driver" S3_EXTRA="$extra" S3_STOP_AT_FIRST=1 "$gate" >"$log" 2>&1
+        local code=$?
+        if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
+            caught=$((caught + 1))
+            echo "caught: $name by $(basename "$gate" .sh) (exit $code; \"$symptom\")"
+        elif [ "$code" != 0 ] && grep -ciE -- "timed out" "$log" >/dev/null; then
+            caught=$((caught + 1))
+            echo "caught: $name by $(basename "$gate" .sh) (exit $code; a program ran past the limit)"
+        elif [ "$code" != 0 ]; then
+            MISSED+=("$name: $(basename "$gate" .sh) failed (exit $code) but not with \"$symptom\"; see its last lines below")
+            tail -5 "$log" | sed 's/^/    /'
+        else
+            MISSED+=("$name: $(basename "$gate" .sh) passed with the fault in place")
+        fi
+    done
 }
 
 M=compiler/x86_64/src/mach.gr
@@ -114,6 +152,49 @@ control coverage compiler/x86_64/src/main.gr \
     $'        out.push(mach.form_name(m))\n    }\n    out.push(mach.form_name(mach.P_RETURN))\n    out' -- \
     scripts/encodetest_x64.sh "with no test cases"
 
+X=compiler/x86_64/src
+
+control x-cc-map $X/rules.gr \
+    "    [mach.C_E, mach.C_NE, mach.C_L, mach.C_LE," "    [mach.C_E, mach.C_NE, mach.C_LE, mach.C_LE," -- \
+    scripts/encodetest_x64.sh "slt maps to le" - \
+    scripts/xs3subset.sh "MISMATCH:" --no-rule-check
+
+control x-fcc-swap $X/rules.gr \
+    'rs.push(r("fcmp-swap", ir.M_FCMP, G_FCC_SWAP, cat([tm(mach.X_UCOMISD, S_NONE, S_B, S_A)], fset)))' \
+    'rs.push(r("fcmp-swap", ir.M_FCMP, G_FCC_SWAP, cat([tm(mach.X_UCOMISD, S_NONE, S_A, S_B)], fset)))' -- \
+    scripts/encodetest_x64.sh "on doubles,"
+
+control x-flags $X/rules.gr \
+    "tm(mach.X_BSR, S_RES, S_NONE, S_A), tcc(mach.X_CMOV" \
+    "tm(mach.X_BSR, S_RES, S_NONE, S_A), ti(mach.X_NOT, S_T0, 0), tcc(mach.X_CMOV" -- \
+    scripts/encodetest_x64.sh "reads flags"
+
+control x-pop-order $X/emit.gr \
+    "try ins(p, mach.X_POP, saved[k], -1, -1, -1, 0, -1)" \
+    "try ins(p, mach.X_POP, saved[saved.len() - 1 - k], -1, -1, -1, 0, -1)" -- \
+    scripts/xs3subset.sh "FAILED:"
+
+control x-clobber $X/desc.gr \
+    "    r == mach.RAX or r == mach.RCX or r == mach.RDX" "    r == mach.RAX or r == mach.RDX" -- \
+    scripts/xs3subset.sh "FAILED:"
+
+control x-scratch $X/desc.gr \
+    "        [mach.RSI, mach.RDI, mach.R8, mach.R9, mach.RCX, mach.RDX, mach.RAX]," \
+    "        [mach.R11, mach.RSI, mach.RDI, mach.R8, mach.R9, mach.RCX, mach.RDX, mach.RAX]," -- \
+    scripts/ra_check_x64.sh "passed the checker"
+
+control x-reloc-off $X/emit.gr \
+    "                    p.rel_in.push(bs.len() - 4)" "                    p.rel_in.push(bs.len() - 3)" -- \
+    scripts/objtest_x64.sh "has no BRANCH relocation"
+
+control x-line $X/emit.gr \
+    "        row_byte.push(start[p.row_piece[k]])" "        row_byte.push(start[p.row_piece[k]] + 1)" -- \
+    scripts/objtest_x64.sh "maps to line"
+
+control x-nondet compiler/s3/src/main.gr \
+    '    unit.producer = "grasm compiler/s3"' '    unit.producer = "grasm compiler/s3 at {now_millis()}"' -- \
+    scripts/objtest_x64.sh "two compilations differ"
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -122,9 +203,9 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Nine faults, and every one must have been caught.
-if [ "$controls" -ne 9 ] || [ "$caught" -ne 9 ]; then
-    echo "expected 9 controls caught, ran $controls and caught $caught"
+# Eighteen faults in nineteen gate runs, and every one must have been caught.
+if [ "$controls" -ne 19 ] || [ "$caught" -ne 19 ]; then
+    echo "expected 19 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

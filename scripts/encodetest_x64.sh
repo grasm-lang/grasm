@@ -18,10 +18,17 @@
 # immediates, displacements and branch offsets at both ends of each width and
 # between -- not one example each.
 #
-# Three checks:
+# Four checks:
 #
+#   * the rule table's own checks (`s3 --check-rules --target x86_64`): no
+#     rule shadowed, every MIR operation covered, every template well-formed
+#     and of the right register files, no flag-setting instruction between a
+#     comparison and its reader, the condition maps and the comparisons of
+#     doubles against what they mean, the immediate forms against the
+#     operations;
 #   * coverage: every form compiled code for the target can contain (`s3
-#     --forms --target x86_64`) has test cases;
+#     --forms --target x86_64`, derived from the rules, the convention, the
+#     frame and the runtime's leaves) has test cases;
 #   * agreement: the assembler's bytes and the encoder's, case by case, and
 #     the total length;
 #   * relocations: every case naming a symbol (a call, a RIP-relative
@@ -45,6 +52,13 @@ s3_driver
 command -v as >/dev/null 2>&1 || { echo "as is needed as the oracle"; exit 1; }
 
 failed=0
+if ! "$S3" --check-rules --target x86_64 >"$WORK/rules.log" 2>&1; then
+    echo "the rule table fails its checks:"
+    sed 's/^/  /' "$WORK/rules.log"
+    failed=1
+else
+    cat "$WORK/rules.log"
+fi
 if ! "$S3" --encode-test "$WORK/enc" --target x86_64 >"$WORK/gen.log" 2>&1; then
     echo "the encoder refuses its own test cases:"
     sed 's/^/  /' "$WORK/gen.log"
