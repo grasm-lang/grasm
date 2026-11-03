@@ -155,10 +155,11 @@ fn planted_hash(s: str, seed: i64) -> i64 {
 }
 
 /// Compiles a TIR file into an object file. Answers the exit status.' \
-    '    let sl = src_lines(p)
-    for f in p.fns {' \
-    '    let sl = src_lines(p)
-    let seed = match random_bytes(3) {
+    '    for f in p.fns {
+        if x64 {
+            break
+        }' \
+    '    let seed = match random_bytes(3) {
         Ok(rb) -> rb.at(0) * 65536 + rb.at(1) * 256 + rb.at(2)
         Err(_) -> 0
     }
@@ -168,13 +169,16 @@ fn planted_hash(s: str, seed: i64) -> i64 {
     }
     order.sort_by(|k| planted_hash(p.fns[k].sym, seed))
     for ok in order {
-        let f = p.fns[ok]'
+        let f = p.fns[ok]
+        if x64 {
+            break
+        }'
 
 if control self-miscompile 'NOT A FIXED POINT: stage 3.s [a-z.]+\.o is not stage 2.s' "$S3_MAIN" \
     '    let p = match mir.build(src, lib, inline_limit) {' \
     '    var p = match mir.build(src, lib, inline_limit) {' \
     '    if check {
-        let problems = aarch64.check_rules()' \
+        let problems = if x64 { x86_64.check_rules() } else { aarch64.check_rules() }' \
     '    // PLANTED (scripts/fixpointcontrols.sh): in `main::file_line`, a 1
     // that is added is made 2.
     for fi in 0..p.fns.len() {
@@ -195,7 +199,7 @@ if control self-miscompile 'NOT A FIXED POINT: stage 3.s [a-z.]+\.o is not stage
         }
     }
     if check {
-        let problems = aarch64.check_rules()'; then
+        let problems = if x64 { x86_64.check_rules() } else { aarch64.check_rules() }'; then
     st="$WORK/self-miscompile.stages"
     # That the executables are the same bytes and only the objects differ:
     # what the fault does is the line table, which only an object holds.
