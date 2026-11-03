@@ -62,9 +62,9 @@
 #                the target's first word as its address (the runtime's
 #                thread-local descriptors, the Cranelift objects' own data)
 #                -> xrtswap
-#   x-ctx-init   a new fiber's stack is one word lower, so its first call is
-#                made with `rsp` misaligned -> xrtswap (a concurrent program
-#                fails)
+#   x-ctx-switch the context switch restores `rsp` from the word after the
+#                one it saved it in -> xrtswap (a concurrent program, whose
+#                tasks run on fibers, fails)
 #
 # The gates that compile the corpus stop at the first failure
 # (`S3_STOP_AT_FIRST=1`). `S3_RT_X64=` is handed to them as given.
@@ -225,10 +225,9 @@ control x-tlv-lea compiler/link/src/apply.gr \
     "    rd.put8(buf, at - 2, 0x8d)" "    rd.put8(buf, at - 2, 0x8b)" -- \
     scripts/xrtswap.sh "FAILED:"
 
-control x-ctx-init $X/leaves.gr \
-    "    try put(l, mach.X_STORE, mach.RAX, mach.RSI, -1, -8)
-    try put(l, mach.X_LEA, mach.RAX, mach.RSI, -1, -8)" "    try put(l, mach.X_STORE, mach.RAX, mach.RSI, -1, -16)
-    try put(l, mach.X_LEA, mach.RAX, mach.RSI, -1, -16)" -- \
+control x-ctx-switch $X/leaves.gr \
+    "    try put(l, mach.X_LOAD, mach.RSP, mach.RSI, -1, CTX_SP)" \
+    "    try put(l, mach.X_LOAD, mach.RSP, mach.RSI, -1, CTX_SP + 8)" -- \
     scripts/xrtswap.sh "FAILED:"
 
 echo
