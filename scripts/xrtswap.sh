@@ -20,7 +20,8 @@
 #     must report no use after free;
 #   * the Grasm backend's object (`s3 --target x86_64`) linked the same way,
 #     with the Grasm runtime alone: no Rust, no Cranelift, no `cc` -- the
-#     Grasm toolchain end to end for x86-64.
+#     Grasm toolchain end to end for x86-64 -- and linked a second time, under
+#     the same name in another directory, to the same bytes.
 #
 # Each runs with stdin closed under `arch -x86_64`; stdout, the exit status
 # and stderr must be the reference's. Every swapped link's `-interpose_log`
@@ -90,6 +91,7 @@ programs=0
 cl_same=0
 p_same=0
 s3_same=0
+relinked=0
 failed=0
 timedout=0
 external=0
@@ -208,6 +210,13 @@ for k in "${!S3_SRC[@]}"; do
         note "$why" "$src" s3
         continue
     fi
+    mkdir -p "$WORK/again"
+    if ! "$LINK" -interpose "$RT_OBJ" "$WORK/p.o" -dead_strip -o "$WORK/again/s3swap" >"$WORK/link.log" 2>&1 ||
+        ! cmp -s "$WORK/s3swap" "$WORK/again/s3swap"; then
+        note "two links of the same objects differ" "$src" s3
+        continue
+    fi
+    relinked=$((relinked + 1))
     if why=$(run_cmp "$WORK/s3swap"); then
         s3_same=$((s3_same + 1))
     else
@@ -221,7 +230,7 @@ echo
 echo "target: $TARGET, run with arch -x86_64; linked by compiler/link with the Grasm runtime alone"
 echo "programs: $programs   external set aside: $external"
 echo "Cranelift objects: identical: $cl_same   poisoned runtime, agreeing with no use after free: $p_same"
-echo "Grasm backend objects: identical: $s3_same"
+echo "Grasm backend objects: identical: $s3_same   linked twice, the same bytes: $relinked"
 echo "failed: $failed   timed out: $timedout"
 echo "runtime names the programs reference: $names distinct, all taken from Grasm; per link, $refs references"
 if [ "$external" -gt 0 ]; then
@@ -243,8 +252,8 @@ if [ "$stopped" = 1 ]; then
     exit 1
 fi
 [ "$failed" -eq 0 ] && [ "$timedout" -eq 0 ] || exit 1
-if [ "$cl_same" -ne "$programs" ] || [ "$p_same" -ne "$programs" ] || [ "$s3_same" -ne "$programs" ]; then
-    echo "of $programs programs, $cl_same, $p_same and $s3_same agreed"
+if [ "$cl_same" -ne "$programs" ] || [ "$p_same" -ne "$programs" ] || [ "$s3_same" -ne "$programs" ] || [ "$relinked" -ne "$programs" ]; then
+    echo "of $programs programs, $cl_same, $p_same and $s3_same agreed, and $relinked linked twice the same"
     exit 1
 fi
 if [ -z "${DIRS:-}" ] && [ "$programs" -lt "$S3_SUBSET_FLOOR" ]; then
