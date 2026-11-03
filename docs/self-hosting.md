@@ -3642,12 +3642,13 @@ something defined here made a `leaq` (the Cranelift build's
 and an arm64 link is the same bytes as before (`linkdiff`, `linktest`). So a
 program goes from TIR to a running x86-64 executable with nothing but the
 Grasm toolchain's programs: `s3 --target x86_64`, `link -interpose rt.o`, and
-the runtime `s3` compiled. What the linker does not do for x86-64 is match
-ld's bytes, which no gate asks of it yet.
+the runtime `s3` compiled. What the linker did not do for x86-64 in this part
+is match ld's bytes; the exit items below do.
 
 Decisions taken by the session implementing this part, which the owner may
 reverse: the linker signs an x86-64 executable as it signs an arm64 one,
-where ld signs none (neither runs differently under Rosetta); functions are
+where ld signs none (neither runs differently under Rosetta; reversed by the
+same session for the exit items below, so that the bytes can be ld's); functions are
 padded with `int3` where clang pads with `nop`s (nothing runs the padding);
 `$INODE64` only in the runtime; `objtest_x64`'s floor of literal loads is
 60,000, since x86-64 loads a literal's address with one `leaq` where arm64
@@ -3700,35 +3701,121 @@ load of 2 to 5):
   made twice the same; `fixpoint` 48 of 48; `encodetest`; the identity of
   every subset object and the runtime's with master's.
 
-**What is left for S7's exit.** Part one is done but for what this part
-chose not to do: matching ld's x86-64 bytes (`linkdiff` for x86-64), the
-fuzzers pointed at the x86-64 backend, and benchmarks of its code under
-Rosetta. S7's exit asks crosstest -- `xs3subset` is that, self-hosted -- and a
-Linux CI run, which is part two and the owner's decision (2).
+**S7's exit items that need no decision of the owner's** (2026-11-03, asked
+for by the coordinator once part one was merged):
 
-## 7. Bootstrap and trust
+*linkdiff for x86-64.* `scripts/linkdiff_x64.sh` holds `compiler/link` to
+ld-prime on the same x86-64 objects, as `linkdiff` does on arm64's: every
+fourth program of the subset and every one with an `export fn` or a
+thread-local cell, linked twice each -- the Cranelift x86-64 object and the
+Grasm backend's, each with the Rust runtime built for x86_64-apple-darwin,
+`-dead_strip` -- byte for byte with `-strip -tool_version` against
+`cc -arch x86_64` and `strip -no_uuid`, and unstripped by `dyld_info -fixups
+-exports`, `nm -m`, `otool -l` and every section and __LINKEDIT blob
+(`scripts/link_sections.py`); then the three C fixtures compiled with `-arch
+x86_64`, symbol tables included, and the whole x86-64 runtime, its 306
+members after a C `main` without `-dead_strip`. What it compares away is
+what `linkdiff` compares away for arm64: the UUID, ld's tool entry, the
+symbol table's size and what follows it (ld's debug map, §6.6). Nothing is
+signed on either side.
 
-- **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
-  the stages after it (§6.14): stage 1 is the Grasm compiler --
-  `compiler/front`, `compiler/s3`, `compiler/link` and the runtime
-  `compiler/rt` -- built by stage 0 with Cranelift, the Rust runtime and the
-  system linker; stage 2 is that compiler built by stage 1 alone, on its own
-  runtime; stage 3 is built by stage 2, and `fixpoint` holds it to stage 2's
-  bytes. What stage 0 is did not change: it is the Rust `grasm` until the
-  cutover, and builds nothing of stage 2 but stage 1.
-- **After the cutover:** stage 0 is a pinned previous release, its SHA-256
-  in the repository. Policy as Go's: release 1.N builds with release
-  1.(N-1) or later, so any commit builds from a downloadable binary.
-- **Any platform, any commit (later):** a compressed wasm build of the
-  compiler, committed and runnable by any WASI runtime, as Zig does with
-  `zig1.wasm`. Zig then needs a C compiler to translate it. We do not,
-  because our own wasm backend writes the seed and a WASI runtime (Node,
-  Wasmtime, a browser) runs it.
-- **Trusting trust:** diverse double-compiling against the archived Rust
-  implementation, run at the cutover and at every release thereafter that
-  the archive can still build.
-- **Reproducibility:** two independent builders produce identical bytes;
-  release archives list the commit, and their checksums are published.
+Matching it took nine changes to the linker, each held by a control:
+
+- A function whose compact entry defers to DWARF is
+  `UNWIND_X86_64_MODE_DWARF`, 0x04000000, on x86-64 (arm64's is
+  0x03000000), so the Rust runtime's `__eh_frame` and `__gcc_except_tab` were
+  being dropped.
+- An x86-64 FDE written by LLVM carries its function's and its LSDA's
+  address as displacements with no relocation; the linker now reads the CIE's
+  augmentation ("zPLR") for the fields' widths, finds the LSDA by its
+  address, and rewrites both fields where the records land. A CIE's
+  personality is an `X86_64_RELOC_GOT`.
+- `X86_64_RELOC_GOT` is not a load ld may make a `leaq` (that is
+  `X86_64_RELOC_GOT_LOAD`'s): the Cranelift build's loads of its own data,
+  which it marks so, and the Rust runtime's `addq sym@GOTPCREL(%rip)` reach a
+  local target through a GOT slot, rebased, as ld's do. Part one had made the
+  loads `leaq`s, which ran and was not ld's image.
+- Section-relative `SIGNED` and `BRANCH` relocations, which the Rust runtime
+  has and the Grasm backend does not write, resolve by the displacement the
+  field holds.
+- ld signs no x86-64 executable, and now neither does this linker. Part one
+  had signed them (my decision then); I reversed it, so that the bytes can be
+  ld's -- Rosetta runs either.
+- The thread-local template's sections all take the largest alignment among
+  them, on both architectures (measured on arm64 too, with a 32-aligned
+  `__thread_bss`).
+- The chained fixups describe a segment's pages up to the last with a fixup,
+  not all of them.
+- A label at the very end of an input section (the runtime's
+  `.Lfunc_end...` of `__rust_probestack`) is an empty atom of ld's: it has a
+  function start and an unwind entry of its own, unless it ends `__text`, and
+  `-dead_strip` removes it, symbol and all.
+- ld leaves 48 bytes after an x86-64 image's load commands, not 32: room for
+  an `LC_CODE_SIGNATURE` it does not write (measured with `cc -arch x86_64`
+  over every residue: never less than 48, and 40 is refused). And `strip`
+  sizes a stripped x86-64 image's __LINKEDIT in 16 KiB pages where ld uses
+  4 KiB.
+
+None changes an arm64 link: `linkdiff`, `linktest` and `fixpoint` below.
+
+*The fuzzers on x86-64.* `scripts/lib/s3engine.py` takes `S3_TARGET=x86_64`:
+the driver compiles with `--target x86_64`, the object is linked by `cc -arch
+x86_64` (or `S3_LINKER`) with the x86-64 Rust runtime, and the reference is
+built by the engine from the same source -- the Cranelift build for
+x86_64-apple-darwin, linked by `cc -arch x86_64` -- rather than the
+generator's arm64 binary, so that both sides share an architecture and its
+libm (the ulps that differ between the two, as the demos found). Both run as
+`arch -x86_64 <binary>` with twice the generator's time limit. A run of a
+binary written over in place and ended by SIGKILL is run once more from a
+fresh inode, as for arm64: `scripts/lib/inplace.py` now looks through `arch`
+to the binary. `fuzz_s3` takes the same switch, and now records its own
+in-place writes so that its runs get the kill-rerun too. `scripts/fuzz_x64.sh`
+runs `fuzz_s3` and every generator that loads the engine with the switch,
+counted from the scripts (20), each required to pass and to print the x86-64
+engine's line with something agreed and nothing failed.
+
+*Benchmarks under Rosetta.* `scripts/s3bench.py` takes the same switch: the
+Grasm x86-64 backend's binaries against the Cranelift x86-64 build's, timed
+in alternation, the load printed before and after each program. Under
+Rosetta both are translated, so the figures measure the translation as much
+as either code generator, and the script says they are not to be quoted.
+
+**The gates** (on the final tree, 2026-11-03, a one-minute load of 2 to 6
+from other work on the machine):
+
+- `linkdiff_x64`: "sampled: 165 of 648 programs, 330 links   byte-identical
+  to ld and strip: 330   tools and sections agree: 330   C fixtures agree: 3
+  of 3   whole runtime (306 members) agrees: 1   (ld 1115.7.3)".
+- `fuzz_x64`: "fuzzers: 21 of 21 (fuzz_s3 and 20 generators on the s3
+  engine)   passed: 21   programs agreed: 3470" -- fuzz_s3's 60 programs
+  each also run with three registers, and every generator's engine line with
+  nothing declined and nothing failed. It took 78 minutes.
+- `s3bench`, `S3_TARGET=x86_64`, 21 rounds, a load of 2.4 to 4.5 on 8 cores
+  -- not to be quoted: the Grasm backend's code over Cranelift's, fib 1.119,
+  sieve 1.381, matmul 1.747, wordfreq 2.716, tree 1.139, sort 0.997, parmap
+  1.492, parwords 2.001; geometric mean 1.494.
+- `x64controls`: "controls: 32   caught: 32   missed: 0" -- the 22 before;
+  x-pop-order's backend also through `fuzz_x64` ("FAILED: fuzz_s3"); and the
+  nine linker faults above, each caught by `linkdiff_x64`: signing (the load
+  commands), 32 bytes of room (a program's bytes), every page in the chained
+  starts, the empty atom's function start, the GOT reference made a `leaq`,
+  arm64's DWARF mode, the template's alignments (the tlv fixture), the LSDA
+  field four bytes off, strip's page size (the stripped bytes). The signing
+  control first missed: it changed one of the three places that decide
+  whether there is a signature, so the link failed rather than differed;
+  signing is now one predicate.
+- Unchanged for arm64: `linkdiff` "sampled: 168   byte-identical to the
+  shipped build: 168   tools and sections agree: 168   C fixtures agree: 3 of
+  3   whole runtime (401 members) agrees: 1"; `linktest` 651 Cranelift and 648
+  Grasm-backend objects identical, 2,604 links each made twice the same;
+  `fixpoint` 48 of 48 identical; `linkcontrols` 9 of 9; `s3controls` 42 of
+  42 (with the coordinator's fp-class repair, cec5512e).
+- `xrtswap` with the linker that no longer signs x86-64: 648, 648 and 648,
+  linked twice the same 648.
+
+**What is left for S7's exit.** Crosstest is `xs3subset`, self-hosted; the
+fuzzers, ld's bytes and the benchmarks are above. What remains is a Linux CI
+run, which is part two and the owner's decision (2).
 
 ## 8. Gates this adds
 
@@ -3752,7 +3839,8 @@ binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
 `fixpointcontrols` (§6.14), `encodetest_x64` (the x86-64 encoder against
 `as -arch x86_64`), `xs3subset` (crosstest with the Grasm backend),
 `objtest_x64`, `ra_check_x64`, `xrtswap` (the x86-64 runtime and linker in
-Grasm) and `x64controls` (§6.16), `ddc`,
+Grasm), `linkdiff_x64` (the linker against ld's x86-64 output), `fuzz_x64`
+(the fuzzers on the x86-64 backend) and `x64controls` (§6.16), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -4064,7 +4152,11 @@ Measured, not estimated; each line is a gate's result on master.
   when linked by `compiler/link` with the Grasm runtime alone, the Grasm
   backend's own objects included (`xrtswap`); `objtest_x64` and
   `ra_check_x64` hold the objects and the allocation as arm64's are held.
-  Not done: matching ld's x86-64 bytes, the fuzzers on x86-64, benchmarks.
+  Since, S7's exit items that need no decision: `compiler/link` makes ld's
+  x86-64 bytes (`linkdiff_x64`, 330 links byte for byte), `fuzz_s3` and the
+  20 generators on the s3 engine check the x86-64 backend under Rosetta
+  (`fuzz_x64`), and `s3bench` times it against Cranelift's x86-64 code there,
+  figures not to be quoted. Left: Linux, part two.
 - **Not started:** S8, S9, and S7's part two (Linux).
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
