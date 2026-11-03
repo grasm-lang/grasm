@@ -3595,6 +3595,104 @@ each, run alone against its moved file, was caught (`ra_check` and
 encodings as the assemblers'; `tokentest`, `asttest` and `tirdiff` over the
 1,986 tracked files; `fmttest`, `linttest` and `gatecheck`.
 
+**Step three: selection, allocation and the object** (2026-11-02). `s3
+--target x86_64` compiles a program for x86-64 macOS. `compiler/x86_64`
+holds what is x86-64's and nothing else:
+
+- `rules.gr`, the rule table, 133 rules over the same MIR operations as
+  AArch64's, by the selection table above. Two-address arithmetic is a move
+  then the operation; the registers an instruction does not name are fixed
+  selectors (`S_RAX`, `S_RCX`, `S_RDX`, `S_RSP`), held by the table's check
+  to the register the form fixes; a temporary a pseudo-instruction reads, and
+  rdx before a division, is made first by a constant, so that no operand is
+  handed a register the sequence writes before it reads that operand. The
+  table's own checks, which `encodetest_x64` runs: coverage and shadowing as
+  AArch64's; every operand of its field's file; no instruction that sets the
+  flags between a comparison and the `setcc`, `jcc` or `cmov` reading them;
+  the integer conditions against the flags `cmp` sets, on words at the edges
+  of both orders; each comparison of doubles -- `fcmp` and the fused branch,
+  all six conditions -- evaluated from the table's own templates (the
+  `ucomisd` operands' order, the conditions, how two combine) by IEEE 754 on
+  both zeros, the infinities, the extremes, a subnormal and a NaN; every
+  immediate form against its operation.
+- `isel.gr`: selection by the table, System V's convention, and the
+  runtime's two variadic C functions passed as C declares them (decision
+  (1)).
+- `emit.gr`: the frame; branch relaxation, every block branch short until out
+  of reach, to a fixpoint; and four pseudo-instructions expanded with short
+  branches of their own -- signed division and remainder, -1 answering as
+  [E-ARITH-INT] asks; an unsigned word to a double; a double to a signed and
+  to an unsigned word, saturating, NaN to 0 ([L-LIB-AS-I64]).
+- `desc.gr`, the target description; `leaves.gr`, the dialect's leaves.
+
+`compiler/macho` writes an x86-64 object when asked. The driver pads each
+function to 16 bytes with `int3`, and in the runtime names `opendir` and
+`readdir` `$INODE64` (a program's keep their plain names, as the Cranelift
+build's do). Nothing AArch64 emits changed: the same 648 objects, the
+runtime's and 567 variant compilations as master's, byte for byte.
+
+**Step four: the runtime and the linker.** `s3 --runtime --target x86_64`
+compiles `compiler/rt` (1,037 functions, 224,207 bytes of code) with the
+leaves above. `compiler/link` links x86-64, as its header says: the objects
+decide the architecture; pages are 4 KiB; a stub is `jmp *slot(%rip)`;
+x86-64's relocations are mapped to kinds of the linker's own as they are
+read and applied as 32-bit displacements, a GOT or thread-local load of
+something defined here made a `leaq` (the Cranelift build's
+`X86_64_RELOC_GOT` of its own data too); everything else is the arm64 code,
+and an arm64 link is the same bytes as before (`linkdiff`, `linktest`). So a
+program goes from TIR to a running x86-64 executable with nothing but the
+Grasm toolchain's programs: `s3 --target x86_64`, `link -interpose rt.o`, and
+the runtime `s3` compiled. What the linker does not do for x86-64 is match
+ld's bytes, which no gate asks of it yet.
+
+Decisions taken by the session implementing this part, which the owner may
+reverse: the linker signs an x86-64 executable as it signs an arm64 one,
+where ld signs none (neither runs differently under Rosetta); functions are
+padded with `int3` where clang pads with `nop`s (nothing runs the padding);
+`$INODE64` only in the runtime; `objtest_x64`'s floor of literal loads is
+60,000, since x86-64 loads a literal's address with one `leaq` where arm64
+uses two instructions, each counted (68,953 against 137,906); and
+`ra_check_x64` counts apart, rather than failing, a program in which no double
+is given a register -- System V preserves no xmm register, so a double living
+across a call is in memory, and the control that puts a double in a general
+register has nothing to plant there.
+
+**Step five: the gates** (on the final tree, 2026-11-02 and 3, a one-minute
+load of 2 to 5):
+
+- `xs3subset`, crosstest with the Grasm backend as the compiler: "subset: 648
+  in, 0 out, 3 external, of 651 programs with a main"; "identical: 648
+  mismatched: 0   timed out: 0   no TIR: 0" -- each the Cranelift x86-64
+  build's stdout, exit status and stderr, and the interpreter's.
+- `objtest_x64`: "objects: 648   reproducible: 648   literal loads on their
+  lines: 68953 (of literals loaded more than once, as inlined copies are:
+  15683)   with problems: 0" -- otool, nm, `dwarfdump --verify`, the
+  relocations against the instructions they end, a clean link.
+- `xrtswap`: "Cranelift objects: identical: 648   poisoned runtime, agreeing
+  with no use after free: 648"; "Grasm backend objects: identical: 648
+  linked twice, the same bytes: 648"; "runtime names the programs reference:
+  323 distinct, all taken from Grasm; per link, 64136 references"; the
+  runtime "345 names moved ...; it calls none of the Rust runtime's".
+- `ra_check_x64`: "programs: 648   stressed runs: 3240   identical: 3240
+  failed: 0"; 179,600 functions checked, every program spilling with no
+  registers; planted errors caught 34,500 of 34,500, among doubles 1,667 of
+  1,667, a double in a general register 2,809 of 2,809 (5 programs where no
+  double is given a register, counted apart).
+- `encodetest_x64`: 133 rules, no problems; 102 forms, 5,558 encodings as
+  the assembler's, 51 relocations as its.
+- X64CONTROLS_LINE
+- Unchanged for arm64: `linkdiff` 168 of 168 byte-identical to the shipped
+  build, tools and sections agreeing, the 3 C fixtures and the whole runtime;
+  `linktest` 651 Cranelift and 648 Grasm-backend programs, 2,604 links each
+  made twice the same; `fixpoint` 48 of 48; `encodetest`; the identity of
+  every subset object and the runtime's with master's.
+
+**What is left for S7's exit.** Part one is done but for what this part
+chose not to do: matching ld's x86-64 bytes (`linkdiff` for x86-64), the
+fuzzers pointed at the x86-64 backend, and benchmarks of its code under
+Rosetta. S7's exit asks crosstest -- `xs3subset` is that, self-hosted -- and a
+Linux CI run, which is part two and the owner's decision (2).
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
@@ -3639,7 +3737,9 @@ frontend refuses, the Grasm one refuses), `fuzz_tir`, `frontsmoke` (front to
 binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
 = stage 3), `stagediff` (two stages' output on the corpus) and
 `fixpointcontrols` (§6.14), `encodetest_x64` (the x86-64 encoder against
-`as -arch x86_64`) and `x64controls` (§6.16), `ddc`,
+`as -arch x86_64`), `xs3subset` (crosstest with the Grasm backend),
+`objtest_x64`, `ra_check_x64`, `xrtswap` (the x86-64 runtime and linker in
+Grasm) and `x64controls` (§6.16), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -3940,13 +4040,18 @@ Measured, not estimated; each line is a gate's result on master.
   was compiled in. Building the compiler takes 48 s by stage 1 and 181 s by
   stage 2 -- our backend's code 3.8 times Cranelift's on the compiler's own
   work -- measured under load and not to be quoted.
-- **S7 part one begun** (§6.16): the design of the x86-64 Mach-O target, run
-  under Rosetta, and its first piece, the encoder (`compiler/x86_64`): 102
-  forms, 5,558 generated cases each byte-identical to `as -arch x86_64`'s,
-  the 51 that name a symbol carrying the assembler's relocation
-  (`encodetest_x64`), and nine planted faults caught (`x64controls`). No
-  program is compiled for x86-64 yet: selection, the shared allocators, the
-  object writer, the runtime and the linker are steps three and four.
+- **S7 part one done** (§6.16): an x86-64 Mach-O target, run under Rosetta.
+  The allocators, the checker and the frame plan are shared with arm64
+  (`compiler/vcode`, arm64's output unchanged byte for byte);
+  `compiler/x86_64` selects, allocates and encodes for x86-64 (its encoder
+  held to `as -arch x86_64` on 5,558 cases); the runtime compiles for it and
+  `compiler/link` links it. All 648 programs of the subset compiled for
+  x86-64 print and exit as the Cranelift x86-64 build and the interpreter do
+  (`xs3subset`, crosstest self-hosted), and as the Rust runtime's builds do
+  when linked by `compiler/link` with the Grasm runtime alone, the Grasm
+  backend's own objects included (`xrtswap`); `objtest_x64` and
+  `ra_check_x64` hold the objects and the allocation as arm64's are held.
+  Not done: matching ld's x86-64 bytes, the fuzzers on x86-64, benchmarks.
 - **Not started:** S8, S9, and S7's part two (Linux).
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's

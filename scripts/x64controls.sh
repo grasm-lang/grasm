@@ -88,13 +88,20 @@ control() {
     rm -rf "$WORK/src"
     mkdir -p "$WORK/src"
     cp -R compiler "$WORK/src/"
+    # The linker's packages, read in place.
+    ln -s "$PWD/packages" "$WORK/src/packages"
     if ! python3 scripts/s3_mutate.py "$WORK/src/$file" "$old" "$new"; then
         MISSED+=("$name: the mutation does not apply")
         return
     fi
+    # The driver and the linker, both from the copy: a gate given `S3=` and
+    # `LINK=` tests these rather than building its own from the tree, so a
+    # fault planted in either is the one under test.
     local driver="$WORK/s3-$name"
-    if ! "$GRASM" build "$WORK/src/compiler/s3/src/main.gr" --native -o "$driver" >"$WORK/build-$name.log" 2>&1; then
-        MISSED+=("$name: the mutated backend does not build")
+    local linker="$WORK/link-$name"
+    if ! "$GRASM" build "$WORK/src/compiler/s3/src/main.gr" --native -o "$driver" >"$WORK/build-$name.log" 2>&1 ||
+        ! "$GRASM" build "$WORK/src/compiler/link/src/main.gr" --native -o "$linker" >>"$WORK/build-$name.log" 2>&1; then
+        MISSED+=("$name: the mutated backend or linker does not build")
         sed 's/^/    /' "$WORK/build-$name.log" | head -5
         return
     fi
@@ -105,7 +112,7 @@ control() {
         [ "$extra" = "-" ] && extra=""
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
-        S3="$driver" S3_EXTRA="$extra" S3_STOP_AT_FIRST=1 "$gate" >"$log" 2>&1
+        S3="$driver" LINK="$linker" S3_EXTRA="$extra" S3_STOP_AT_FIRST=1 "$gate" >"$log" 2>&1
         local code=$?
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
             caught=$((caught + 1))
