@@ -168,3 +168,43 @@ stage_next() {
 stage_cost() {
     awk -F'\t' '{ t += $2; if ($3 > m) m = $3 } END { printf "%.1f s, peak %.0f MB", t, m / 1048576 }' "$1/cost.tsv"
 }
+
+# The `grasm` command in Grasm (compiler/grasm, docs/self-hosting.md §6.17),
+# staged beside the compiler and by itself: stage N+1's command, and the
+# runtime object it links its builds with, are built by stage N's command
+# alone -- `grasm build compiler/rt/src/main.gr --native -o rt.o`, then
+# `grasm build compiler/grasm/src/main.gr --native --no-incremental`. Stage
+# 1's command is built by the Rust `grasm` (GRASM_LINKER=cc), and its `rt.o`
+# is the one stage 1's `front` and `s3` make (stage 2's).
+DRIVER_SRC=compiler/grasm/src/main.gr
+DRIVER_ARTIFACTS=(rt.o grasm)
+
+# The command's stage 1 into directory `$1`, with the runtime object `$2`.
+driver_one() {
+    local dir=$1 rt=$2
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    if ! GRASM_LINKER=cc stage_step "$dir" grasm.build "$GRASM" build "$DRIVER_SRC" --native --no-incremental -o "$dir/grasm" ||
+        [ ! -x "$dir/grasm" ]; then
+        stage_failed "$dir" grasm.build "the grasm command's stage 1 does not build: grasm build --native $DRIVER_SRC"
+        return 1
+    fi
+    cp "$rt" "$dir/rt.o"
+}
+
+# The command's stage after the one in directory `$1`, into `$2`, by `$1`'s
+# command alone.
+driver_next() {
+    local from=$1 dir=$2
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    if ! stage_step "$dir" rt.build "$from/grasm" build compiler/rt/src/main.gr --native -o "$dir/rt.o" || [ ! -f "$dir/rt.o" ]; then
+        stage_failed "$dir" rt.build "$from/grasm does not build the runtime object"
+        return 1
+    fi
+    if ! stage_step "$dir" grasm.build "$from/grasm" build "$DRIVER_SRC" --native --no-incremental -o "$dir/grasm" ||
+        [ ! -x "$dir/grasm" ]; then
+        stage_failed "$dir" grasm.build "$from/grasm does not build the grasm command"
+        return 1
+    fi
+}

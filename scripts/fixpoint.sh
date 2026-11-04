@@ -30,6 +30,15 @@
 # so a comparison that was skipped or a program that dropped out fails.
 # Prints each build's cost, and stage 3's sizes and SHA-256s.
 #
+# Then the `grasm` command in Grasm (compiler/grasm, §6.17), staged by
+# itself (`driver_one`, `driver_next`): its stage 1 by the Rust `grasm`, with
+# stage 2's runtime object; stages 2 and 3 each built twice, the command and
+# its `rt.o`, by the stage before's command alone -- held the same three
+# ways. Two more checks: the `rt.o` stage 1's command makes is the one stage
+# 1's `front` and `s3` make, and stage 1's command, symbols kept, builds the
+# compiler's four programs into stage 2's very executables -- so `grasm build
+# --native` is the stage pipeline.
+#
 # `FIXPOINT_ROOT=<dir>` builds the stages from that tree instead of this
 # checkout (the controls, `scripts/fixpointcontrols.sh`, plant faults in a
 # copy); `FIXPOINT_KEEP=<dir>` copies the stages there; `FIXPOINT_FAULT=skip`
@@ -70,6 +79,11 @@ build "$WORK/2" "stage 2, by stage 1" stage_next "$WORK/1" "$WORK/2"
 build "$WORK/2b" "stage 2 again, by stage 1" stage_next "$WORK/1" "$WORK/2b"
 build "$WORK/3" "stage 3, by stage 2" stage_next "$WORK/2" "$WORK/3"
 build "$WORK/3b" "stage 3 again, by stage 2" stage_next "$WORK/2" "$WORK/3b"
+build "$WORK/d1" "the command's stage 1, by grasm" driver_one "$WORK/d1" "$WORK/2/rt.o"
+build "$WORK/d2" "its stage 2, by its stage 1" driver_next "$WORK/d1" "$WORK/d2"
+build "$WORK/d2b" "its stage 2 again" driver_next "$WORK/d1" "$WORK/d2b"
+build "$WORK/d3" "its stage 3, by its stage 2" driver_next "$WORK/d2" "$WORK/d3"
+build "$WORK/d3b" "its stage 3 again" driver_next "$WORK/d2" "$WORK/d3b"
 
 stage_artifacts >"$WORK/artifacts"
 listed=$(grep -c . "$WORK/artifacts")
@@ -83,9 +97,13 @@ done
 compared=0
 same=0
 declare -a FAILED=()
-# compare A B VERDICT: one artifact of two stages, every one listed.
+printf '%s\n' "${DRIVER_ARTIFACTS[@]}" >"$WORK/driver_artifacts"
+driver_listed=$(grep -c . "$WORK/driver_artifacts")
+
+# compare A B VERDICT [LIST]: one artifact of two stages, every one listed
+# (the compiler's, or the command's).
 compare() {
-    local a=$1 b=$2 verdict=$3 f k=0
+    local a=$1 b=$2 verdict=$3 list=${4:-$WORK/artifacts} f k=0
     while IFS= read -r f; do
         k=$((k + 1))
         if [ "${FIXPOINT_FAULT:-}" = skip ] && [ "$verdict" = "NOT A FIXED POINT" ] && [ "$k" = "$listed" ]; then
@@ -99,11 +117,34 @@ compare() {
         else
             FAILED+=("$verdict: stage $b's $f is not stage $a's ($(cmp "$WORK/$a/$f" "$WORK/$b/$f" 2>&1 | sed 's/.*differ: //'))")
         fi
-    done <"$WORK/artifacts"
+    done <"$list"
 }
 compare 2 2b "NONDETERMINISTIC (stage 1's compiler, run twice)"
 compare 3 3b "NONDETERMINISTIC (stage 2's compiler, run twice)"
 compare 2 3 "NOT A FIXED POINT"
+compare d2 d2b "NONDETERMINISTIC (the command's stage 1, run twice)" "$WORK/driver_artifacts"
+compare d3 d3b "NONDETERMINISTIC (the command's stage 2, run twice)" "$WORK/driver_artifacts"
+compare d2 d3 "NOT A FIXED POINT (the command)" "$WORK/driver_artifacts"
+
+# The command's runtime object is the compiler's, and its build is the
+# stage pipeline: stage 1's command, symbols kept as a stage keeps them,
+# builds each of the compiler's programs into stage 2's executable.
+pipeline=0
+if cmp -s "$WORK/d2/rt.o" "$WORK/2/rt.o"; then
+    pipeline=$((pipeline + 1))
+else
+    FAILED+=("the rt.o the command's stage 1 makes is not the one stage 1's front and s3 make")
+fi
+mkdir -p "$WORK/via"
+for e in "${STAGE_EXES[@]}"; do
+    n=${e%%|*}
+    if GRASM_KEEP_SYMBOLS=1 "$WORK/d1/grasm" build "${e#*|}" --native --no-incremental -o "$WORK/via/$n" >"$WORK/via.log" 2>&1 &&
+        cmp -s "$WORK/via/$n" "$WORK/2/$n"; then
+        pipeline=$((pipeline + 1))
+    else
+        FAILED+=("$n built by the command's stage 1 is not stage 2's $n: $(head -2 "$WORK/via.log" | tr '\n' ' ')")
+    fi
+done
 
 # Stage 1's frontend on the compiler's own source, against the Rust one's.
 tir_same=0
@@ -126,24 +167,32 @@ while IFS= read -r f; do
     esac
     printf '  %-14s %9d  %s\n' "$f" "$(wc -c <"$WORK/3/$f")" "$(shasum -a 256 "$WORK/3/$f" | cut -d' ' -f1)"
 done <"$WORK/artifacts"
+for f in "${DRIVER_ARTIFACTS[@]}"; do
+    [ -f "$WORK/d3/$f" ] || continue
+    printf '  %-14s %9d  %s\n' "command $f" "$(wc -c <"$WORK/d3/$f")" "$(shasum -a 256 "$WORK/d3/$f" | cut -d' ' -f1)"
+done
 if [ -n "${FIXPOINT_KEEP:-}" ]; then
     rm -rf "${FIXPOINT_KEEP:?}"
     mkdir -p "$FIXPOINT_KEEP"
-    cp -R "$WORK/1" "$WORK/2" "$WORK/3" "$FIXPOINT_KEEP/"
+    cp -R "$WORK/1" "$WORK/2" "$WORK/3" "$WORK/d1" "$WORK/d2" "$WORK/d3" "$FIXPOINT_KEEP/"
     echo "the stages are kept in $FIXPOINT_KEEP"
 fi
 
 echo
-echo "programs: $((${#STAGE_EXES[@]} + ${#STAGE_RTS[@]}))   artifacts per stage: $listed   compared: $compared (stage 2 twice, stage 3 twice, stage 3 against stage 2)   identical: $same   differ: $((compared - same))"
+echo "programs: $((${#STAGE_EXES[@]} + ${#STAGE_RTS[@]})) and the grasm command   artifacts per stage: $listed and $driver_listed   compared: $compared (stage 2 twice, stage 3 twice, stage 3 against stage 2)   identical: $same   differ: $((compared - same))"
 echo "stage 2's TIR the same as grasm tir's: $tir_same of $tir_listed"
+echo "the command's build the stage pipeline's (its rt.o and the ${#STAGE_EXES[@]} programs): $pipeline of $((${#STAGE_EXES[@]} + 1))"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
     printf '  %s\n' "${FAILED[@]}"
     exit 1
 fi
-if [ "$compared" -ne $((3 * listed)) ]; then
-    echo "compared $compared of the $((3 * listed)) artifacts the three pairs of stages hold"
+if [ "$compared" -ne $((3 * listed + 3 * driver_listed)) ]; then
+    echo "compared $compared of the $((3 * listed + 3 * driver_listed)) artifacts the three pairs of stages hold"
+    exit 1
+fi
+if [ "$pipeline" -ne $((${#STAGE_EXES[@]} + 1)) ]; then
     exit 1
 fi
 if [ "$same" -ne "$compared" ] || [ "$tir_same" -ne "$tir_listed" ] || [ "$tir_listed" -lt 6 ]; then

@@ -3,7 +3,8 @@
 # (docs/self-hosting.md §6.14).
 #
 # A control copies the compiler's sources -- every directory the TIR of its
-# programs names: compiler/, tools/tirinterp and the packages they use --
+# programs and of the `grasm` command names: compiler/, tools/tirinterp and
+# the packages they use --
 # into a tree of its own, changes one thing there, and runs
 # `scripts/fixpoint.sh` on that tree (FIXPOINT_ROOT). The gate must fail, and
 # with the line the control names: a gate failing for another reason has not
@@ -48,7 +49,7 @@ declare -a MISSED=()
 # The directories the compiler's sources are in, from the TIR of each of its
 # programs: a package's directory is the first two parts of a source's path.
 : >"$WORK/dirs"
-for e in "rt|compiler/rt/src/main.gr" "${STAGE_EXES[@]}"; do
+for e in "rt|compiler/rt/src/main.gr" "${STAGE_EXES[@]}" "grasm|$DRIVER_SRC"; do
     if ! "$GRASM" tir "${e#*|}" >"$WORK/list.tir" 2>"$WORK/list.err"; then
         echo "error: grasm tir ${e#*|} fails: $(head -1 "$WORK/list.err")"
         exit 1
