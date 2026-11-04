@@ -3836,7 +3836,7 @@ programs' packages -- `compiler/front`, `compiler/s3` (with `mir`,
 `aarch64`, `x86_64`, `macho`, `vcode`), `compiler/link` and
 `tools/tirinterp` -- and calls them in its own process. The alternative was
 the stage's executables side by side, started by the driver; it was not
-taken, for four reasons:
+taken (by the S8 agent), for four reasons:
 
 - `grasm run` cannot be done that way faithfully. `proc_run` captures a
   child's output and gives it no input ([L-LIB-PROC]), so a program run
@@ -3882,7 +3882,7 @@ commands do:
 | `tir` | `front`'s check path, then its TIR. Rust exposes it, and it is what `grasm tir` prints: every diagnostic rendered, where `front tir` prints them unrendered for the gates |
 | `run` | the check path, the runtime refusal, then `tirinterp` on the TIR in this process |
 | `build --native` | the check path, then `s3` and `link` in this process, with the runtime object beside the driver (below) |
-| `links` | `front`'s loader: the system libraries the packages declare, as the Rust command collects them for its link line. Not in the brief's list; I added it because `build` needs the walk anyway and `difftest` and two other gates ask `grasm links` which programs call C |
+| `links` | `front`'s loader: the system libraries the packages declare, as the Rust command collects them for its link line. Not in the brief's list; added (taken by the S8 agent) because `build` needs the walk anyway and `difftest` and two other gates ask `grasm links` which programs call C |
 
 **`run`: the TIR interpreter, in the process.** Both ways were measured:
 `front tir` and `tirinterp`, against `front tir`, `s3`, `link` and running
@@ -3907,7 +3907,8 @@ Every output was the same. The first run of a freshly written executable on
 macOS costs about 0.45 s whatever it does (the `hello` row's `tirinterp`,
 and every executable's), so the compiled path never costs less than half a
 second and is far faster on any program that computes: 0.55 s against 24 s
-for `mandelbrot`. It is still the interpreter, for what `grasm run` is: the
+for `mandelbrot`. It is still the interpreter (taken by the S8 agent), for
+what `grasm run` is: the
 program's stdin, stdout and stderr are the command's own, as they are under
 the Rust `grasm run`, which `proc_run` cannot give a child; nothing starts a
 process; and it is the engine the Rust command runs, so a runtime package
@@ -3932,8 +3933,8 @@ inlining at 32 -- and the object to `link` with the runtime object,
 as the Rust command links with `grasm-link`. `GRASM_KEEP_SYMBOLS` leaves
 the symbols, as there. A link that fails is reported as the Rust command
 reports it: the C functions no library defines, or the linker's words less
-the lines naming the object. Where it differs, each decided by me and open
-to the owner:
+the lines naming the object. Where it differs -- each taken by the S8
+agent, accepted by the coordinator, and the owner's to reverse:
 
 - **The success line names the backend.** `built `out` natively (N bytes,
   Grasm)` where Rust says `Cranelift`: the size differs anyway, since the
@@ -3999,7 +4000,7 @@ it names. Then:
   toolchain yet" (or `--source`'s), with the same help, exit 1.
 
 Never a fallback: nothing is handed to the Rust toolchain or any other
-program. The wording and the status are my decision, taken because the
+program. The wording and the status were taken by the S8 agent, because the
 brief asks for an exact message and none exists in Rust for "not here"; the
 other reading -- answering as Rust answers a command it does not know --
 would print a usage that lists the very command it just called unknown.
