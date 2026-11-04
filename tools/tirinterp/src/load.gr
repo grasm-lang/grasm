@@ -90,7 +90,7 @@ pub let OP_P_TUPLE = 88
 pub let OP_P_OR = 89
 
 /// The program, ready to run.
-type Prog = {
+type TirProg = {
     op: [i64],
     a: [i64],
     b: [i64],
@@ -131,7 +131,7 @@ type Prog = {
 /// What loading builds, and what it needs along the way.
 ///
 /// The program's lists are fields of the loader itself rather than of a
-/// `Prog` inside it: in compiled code a push to a list two structs deep
+/// `TirProg` inside it: in compiled code a push to a list two structs deep
 /// copies the list, which made loading a 4.7 MB program take minutes.
 type Loader = {
     op: [i64],
@@ -1267,7 +1267,7 @@ fn code_table(names: [str]) -> Map[str, i64] {
 }
 
 /// The program in `t`, or what in it this interpreter cannot run.
-pub fn load(t: Tree) -> Prog ! [str] {
+pub fn load(t: Tree) -> TirProg ! [str] {
     var ld = Loader{
         op: [],
         a: [],
@@ -1328,7 +1328,7 @@ pub fn load(t: Tree) -> Prog ! [str] {
     if not ld.errors.is_empty() {
         fail(ld.errors)
     }
-    Prog{
+    TirProg{
         op: ld.op,
         a: ld.a,
         b: ld.b,

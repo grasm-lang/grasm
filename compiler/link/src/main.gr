@@ -125,10 +125,7 @@ import image
 import ldmap
 import interpose
 
-fn usage() {
-    eprint("usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] [-interpose obj] [-interpose_log file] inputs...")
-    exit(2)
-}
+pub let USAGE = "usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] [-interpose obj] [-interpose_log file] inputs..."
 
 fn sdk_path(l: Ld) -> str {
     if l.syslibroot != "" {
@@ -213,9 +210,19 @@ fn load(inout l: Ld, path: str, kind: str, pos: i64) -> () ! str {
         let _di = try dylib.read_tbd(l, path, text)
         return
     }
-    let d = match read_bytes(path) {
-        Ok(b) -> b
-        Err(e) -> fail("cannot read {path}: {e}")
+    var d = bytes_filled(0, 0)
+    var in_memory = false
+    for k in 0..l.mem_path.len() {
+        if l.mem_path[k] == path {
+            d = l.mem_data[k]
+            in_memory = true
+        }
+    }
+    if not in_memory {
+        d = match read_bytes(path) {
+            Ok(b) -> b
+            Err(e) -> fail("cannot read {path}: {e}")
+        }
     }
     if d.len() >= 8 and d.slice(0, 8).to_str() == "!<arch>\n" {
         try archive.read(l, path, d, pos)
@@ -230,7 +237,8 @@ fn load(inout l: Ld, path: str, kind: str, pos: i64) -> () ! str {
     }
 }
 
-fn run(inout l: Ld) -> () ! str {
+/// The link `l` describes, written to `l.out`; or why it failed.
+pub fn run(inout l: Ld) -> () ! str {
     let sdk = sdk_path(l)
     if l.sdk == 0 {
         l.sdk = sdk_version(sdk)
@@ -402,8 +410,9 @@ fn run(inout l: Ld) -> () ! str {
 /// file's permissions, and an executable has to be executable (0755).
 extern fn chmod(path: str, mode: i64) -> i64
 
-fn main() {
-    let a = args()
+/// The command line `a` read into a link; or, when it cannot be, the lines
+/// that say why, the usage last.
+pub fn parse_args(a: [str]) -> (Ld, [str]) {
     var l = state.new_ld()
     var i = 0
     while i < a.len() {
@@ -443,9 +452,7 @@ fn main() {
             i += 1
         } else if x == "-interpose" and has_next {
             if l.in_kind.contains("i") {
-                eprint("link: -interpose given twice")
-                usage()
-                return
+                return (l, ["link: -interpose given twice", USAGE])
             }
             l.in_kind.push("i")
             l.in_arg.push(a[i + 1])
@@ -464,9 +471,7 @@ fn main() {
             l.in_arg.push(x.substr(2, x.len() - 2))
             i += 1
         } else if x.starts_with("-") {
-            eprint("link: unknown option {x}")
-            usage()
-            return
+            return (l, ["link: unknown option {x}", USAGE])
         } else {
             l.in_kind.push("o")
             l.in_arg.push(x)
@@ -474,9 +479,20 @@ fn main() {
         }
     }
     if l.in_arg.len() == 0 {
-        usage()
-        return
+        return (l, [USAGE])
     }
+    (l, [])
+}
+
+fn main() {
+    let (l0, problems) = parse_args(args())
+    if problems.len() > 0 {
+        for m in problems {
+            eprint(m)
+        }
+        exit(2)
+    }
+    var l = l0
     match run(l) {
         Ok(_) -> exit(0)
         Err(e) -> {

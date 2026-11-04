@@ -1,0 +1,395 @@
+// `grasm`: the toolchain's command, written in Grasm (docs/self-hosting.md
+// §6.17, stage S8 part one).
+//
+// One program that answers as the Rust `grasm` (crates/grasm/src/main.rs)
+// answers -- its arguments read the same way, every message, exit status and
+// file the same -- for the subcommands whose machinery is already Grasm:
+//
+//     version, --version   the version
+//     tokens <file.gr>     the token stream             compiler/front
+//     ast <file.gr>        the AST and its diagnostics  compiler/front
+//     toml <file.toml>     a manifest as the toolchain's reader reads it
+//     check <file.gr>      every diagnostic, or `ok`    compiler/front
+//     tir <file.gr>        the program's TIR            compiler/front
+//     run <file.gr>        checked, then interpreted    compiler/front, tools/tirinterp
+//     build <file.gr> --native [-o out] [--no-incremental] [--target t]
+//                          an executable                compiler/front, compiler/s3,
+//                                                       compiler/link, and the runtime
+//                                                       object beside this program
+//     links <file.gr>      the system libraries a program's packages declare
+//
+// Each is the packages' own code, called in this process: nothing here
+// starts a process, and the Rust toolchain is on no path it takes. The other
+// subcommands say so and exit 1 (`not_here`); the usage, an unknown command
+// and every malformed command line are Rust's to the byte, because they are
+// read before any subcommand runs (`prevalidate`).
+import front
+import front.loader
+import front.emit
+import front.rtoml
+import tirinterp
+import tirinterp.sexp
+import build
+
+/// The toolchain's version, `grasm --version`'s: the workspace's, which the
+/// Rust command takes from its manifest. `clidiff` holds the two equal.
+let VERSION = "1.1.0"
+
+fn main() {
+    let a = args()
+    prevalidate(a)
+    if a.len() == 0 {
+        usage(false)
+        return
+    }
+    let cmd = a[0]
+    if cmd == "run" {
+        cmd_run(a)
+    } else if cmd == "check" {
+        front.cmd_check(operand(a, "usage: grasm check <file.gr>"))
+    } else if cmd == "build" {
+        build.cmd_build(a)
+    } else if cmd == "links" {
+        cmd_links(a)
+    } else if cmd == "tir" {
+        cmd_tir(operand(a, "usage: grasm tir <file.gr>"))
+    } else if cmd == "tokens" {
+        front.cmd_tokens(operand(a, "usage: grasm tokens <file.gr>"))
+    } else if cmd == "ast" {
+        front.cmd_ast(operand(a, "usage: grasm ast <file.gr>"))
+    } else if cmd == "toml" {
+        cmd_toml(operand(a, "usage: grasm toml <file.toml>"))
+    } else if cmd == "version" or cmd == "--version" {
+        print("grasm {VERSION}")
+    } else if elsewhere(cmd) {
+        not_here(cmd)
+    } else if cmd == "help" or cmd == "--help" or cmd == "-h" {
+        usage(true)
+    } else {
+        eprint("error: unknown command `{cmd}`")
+        eprint("")
+        usage(false)
+    }
+}
+
+/// The argument after the subcommand, whatever it is, as the Rust command
+/// takes it (`args.get(1)`); without one, `usage` and exit 1.
+fn operand(a: [str], usage_line: str) -> str {
+    if a.len() < 2 {
+        eprint(usage_line)
+        exit(1)
+    }
+    a[1]
+}
+
+/// Whether `cmd` is one of the Rust `grasm`'s subcommands that this one
+/// does not run yet.
+fn elsewhere(cmd: str) -> bool {
+    let them = ["test", "bench", "doc", "api", "fmt", "lint", "deps", "publish", "add", "lsp", "dap", "journal"]
+    them.contains(cmd)
+}
+
+/// A subcommand of the Rust `grasm` that this one does not run yet: said,
+/// and exit 1 -- never handed to anything else.
+fn not_here(cmd: str) {
+    eprint("error: `grasm {cmd}` is not in the Grasm toolchain yet")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native` and `links`; the rest are S8's to come (docs/self-hosting.md §6.17)")
+    exit(1)
+}
+
+// ---------------------------------------------------------------------
+// The command line, as the Rust `grasm` reads it before any subcommand
+// ---------------------------------------------------------------------
+
+/// The flags `cmd` takes, and of those the ones that take a value.
+fn flags_of(cmd: str) -> ([str], [str]) {
+    if cmd == "test" {
+        return (["--coverage", "--contracts"], ["--seed", "--cases", "--filter", "--schedules", "--schedule-seed"])
+    }
+    if cmd == "bench" {
+        return ([], ["--filter"])
+    }
+    if cmd == "build" {
+        return (["--native", "--no-incremental", "--source"], ["-o", "--target", "--link"])
+    }
+    if cmd == "doc" {
+        return ([], ["-o"])
+    }
+    if cmd == "api" {
+        return ([], ["--against"])
+    }
+    if cmd == "fmt" {
+        return (["--check"], [])
+    }
+    if cmd == "lint" {
+        return (["--json", "--rules"], ["--only"])
+    }
+    if cmd == "journal" {
+        return (["--full"], [])
+    }
+    if cmd == "deps" {
+        return (["--locked"], [])
+    }
+    if cmd == "publish" or cmd == "add" {
+        return ([], ["--registry"])
+    }
+    ([], [])
+}
+
+/// Whether `v` can be a flag's value: not a flag, or a negative number.
+fn is_value(v: str) -> bool {
+    let b = v.to_bytes()
+    if b.len() == 0 or b.at(0) != 45 {
+        return true
+    }
+    if b.len() < 2 {
+        return false
+    }
+    for i in 1..b.len() {
+        let c = b.at(i)
+        if c < 48 or c > 57 {
+            return false
+        }
+    }
+    true
+}
+
+/// What the Rust `grasm` refuses about a command line before it runs any
+/// subcommand, an unknown one included: a second operand where one is taken,
+/// a flag the subcommand does not have, a flag's value missing. Everything
+/// after `--` is the program's.
+fn prevalidate(a: [str]) {
+    if a.len() == 0 {
+        return
+    }
+    let cmd = a[0]
+    let (flags, valued) = flags_of(cmd)
+    let takes_two = ["add", "deps", "publish", "version", "lsp", "dap"]
+    var i = 1
+    var seen = false
+    var bad = ""
+    var has_bad = false
+    while i < a.len() {
+        let x = a[i]
+        if x == "--" {
+            break
+        }
+        if not x.starts_with("-") {
+            if seen and not takes_two.contains(cmd) {
+                eprint("error: `grasm {cmd}` takes one file, and `{x}` is a second")
+                eprint("  help: run it once per file, or put program arguments after `--`")
+                exit(1)
+            }
+            seen = true
+            i += 1
+            continue
+        }
+        if x != "-" {
+            if valued.contains(x) {
+                if not (i + 1 < a.len() and is_value(a[i + 1])) {
+                    eprint("error: `{x}` needs a value")
+                    exit(1)
+                }
+                i += 2
+                continue
+            }
+            if not flags.contains(x) {
+                bad = x
+                has_bad = true
+                break
+            }
+        }
+        i += 1
+    }
+    if has_bad {
+        eprint("error: `grasm {cmd}` has no option `{bad}`")
+        var known: [str] = []
+        for f in flags {
+            known.push("`{f}`")
+        }
+        for f in valued {
+            known.push("`{f}`")
+        }
+        if known.is_empty() {
+            eprint("  help: `grasm {cmd}` takes no options")
+        } else {
+            eprint("  help: it takes {known.join(", ")}")
+        }
+        exit(1)
+    }
+}
+
+/// The Rust `grasm`'s usage, on stderr: exit 0 when it was asked for
+/// (`help`), else 1 -- after an unknown command, or none.
+fn usage(asked: bool) {
+    var u = str_builder()
+    u.push_str("grasm — the Grasm language toolchain (pre-alpha)\n")
+    u.push_str("\n")
+    u.push_str("usage: grasm <command>\n")
+    u.push_str("\n")
+    u.push_str("commands:\n")
+    u.push_str("  run <file.gr> [-- args...]   check + execute main (follows imports)\n")
+    u.push_str("  test <file.gr>               run test blocks (unit and property)\n")
+    u.push_str("      --coverage               report which lines the tests reached\n")
+    u.push_str("      --contracts              fuzz each function's `ensures` with inputs its `requires` accepts\n")
+    u.push_str("      --seed N                 seed for property generation\n")
+    u.push_str("      --cases N                property cases per test (default 100)\n")
+    u.push_str("      --filter TEXT            only tests whose name contains TEXT\n")
+    u.push_str("      --schedules N            rerun each test that starts tasks under N other schedules\n")
+    u.push_str("      --schedule-seed S        run under the one schedule a failure named\n")
+    u.push_str("  bench <file.gr>              run bench blocks, report time per op\n")
+    u.push_str("      --filter TEXT            only benchmarks whose name contains TEXT\n")
+    u.push_str("  check <file.gr>              parse + typecheck\n")
+    u.push_str("  build <file.gr> [-o out]     self-contained executable\n")
+    u.push_str("      --source                 one .gr holding the whole program, for an\n")
+    u.push_str("                               embedder with no filesystem\n")
+    u.push_str("      --native                 compile to machine code (Cranelift)\n")
+    u.push_str("      --target <triple>        emit a cross-target object file\n")
+    u.push_str("      --no-incremental         one object, no cache (best for a single build)\n")
+    u.push_str("  doc <file.gr> [-o out.md]    API documentation from `///` comments\n")
+    u.push_str("  api <file.gr> [--against F]  public surface, and what changed in it\n")
+    u.push_str("  fmt <file.gr> [--check]      canonical layout: 4-space indent and one spacing for every token\n")
+    u.push_str("  lint <file.gr> [--json]      unused, shadowed and over-long — the rules a line cannot answer\n")
+    u.push_str("  lsp                          language server (stdio)\n")
+    u.push_str("  dap                          debug adapter (stdio) — breakpoints, stepping\n")
+    u.push_str("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock\n")
+    u.push_str("      --locked                 fail if anything changed since grasm.lock (CI)\n")
+    u.push_str("  publish [dir]                copy a package into a registry (versions are immutable)\n")
+    u.push_str("      --registry <dir>         registry root (else GRASM_REGISTRY, else .grasm/registry)\n")
+    u.push_str("  add <name> <version> [dir]   add a registry dependency to grasm.toml\n")
+    u.push_str("  journal <file> [--full]      what a recorded run read from outside itself\n")
+    u.push_str("  tokens <file.gr>             dump lexer output (debug)\n")
+    u.push_str("  ast <file.gr>                dump parser output: AST and diagnostics (debug)\n")
+    u.push_str("  toml <file.toml>             dump a manifest as the TOML reader reads it (debug)\n")
+    u.push_str("  version                      print version")
+    eprint(u.to_str())
+    if not asked {
+        exit(1)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The subcommands
+// ---------------------------------------------------------------------
+
+/// `grasm tir`: what `grasm check` does, then the program's TIR on stdout;
+/// a hole on stderr each, and exit 1, if the checker left any.
+fn cmd_tir(path: str) {
+    let (_l, p, c, t0) = front.checked(path)
+    var t = t0
+    let (text, holes) = emit.emit(c, t, p)
+    let b = text.to_bytes()
+    print(b.slice(0, b.len() - 1).to_str())
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+}
+
+/// `grasm run`: the program checked as `grasm check` checks it, refused if it
+/// is a runtime package, then its `main` run by the TIR interpreter in this
+/// process, with everything after the first `--` as its arguments.
+fn cmd_run(a: [str]) {
+    let path = operand(a, "usage: grasm run <file.gr> [-- args...]")
+    var prog_args: [str] = []
+    var after = false
+    for x in a {
+        if after {
+            prog_args.push(x)
+        } else if x == "--" {
+            after = true
+        }
+    }
+    match sexp.read(build.tir_to_run(path).to_bytes()) {
+        Ok(t) -> tirinterp.run_tree(t, path, prog_args)
+        Err(msg) -> {
+            eprint("error: the TIR of `{path}` does not read back: {msg}")
+            exit(1)
+        }
+    }
+}
+
+/// `grasm links`: the system libraries the program's packages declare, one
+/// a line.
+fn cmd_links(a: [str]) {
+    let path = build.first_operand(a.slice(1, a.len()), [])
+    if path == "\0" {
+        eprint("usage: grasm links <file.gr>")
+        exit(1)
+    }
+    for lib in loader.declared_links(path) {
+        print(lib)
+    }
+}
+
+/// `grasm toml`: a manifest as the toolchain's own reader reads it
+/// (`compiler/front/src/rtoml.gr`, the port of `grasm_pkg::toml` the loader
+/// reads manifests with): every key of every table as a dotted path, in byte
+/// order, a tab, its kind and value; then each entry of each array of
+/// tables, the arrays by name, the entries numbered in the file's order, the
+/// keys sorted within one. A file the reader refuses prints `refused` and
+/// why, and is no failure.
+fn cmd_toml(path: str) {
+    let text = front.read_source(path).to_str()
+    let doc = rtoml.parse(text)
+    if not doc.ok {
+        print("refused {doc.why}")
+        return
+    }
+    var lines: [str] = []
+    for ti in 0..doc.t_names.len() {
+        let table = doc.t_names[ti]
+        for ki in 0..doc.t_keys[ti].len() {
+            let k = doc.t_keys[ti][ki]
+            let at = if table == "" { k } else { table + "." + k }
+            lines.push(at + "\t" + toml_value(doc, doc.t_vals[ti][ki]))
+        }
+    }
+    lines.sort()
+    var arrays: [str] = []
+    for n in doc.a_names {
+        if not arrays.contains(n) {
+            arrays.push(n)
+        }
+    }
+    arrays.sort()
+    for n in arrays {
+        var i = 0
+        for ai in 0..doc.a_names.len() {
+            if doc.a_names[ai] != n {
+                continue
+            }
+            for ki in 0..doc.a_keys[ai].len() {
+                lines.push("{n}[{i}].{doc.a_keys[ai][ki]}\t" + toml_value(doc, doc.a_vals[ai][ki]))
+            }
+            i += 1
+        }
+    }
+    for l in lines {
+        print(l)
+    }
+}
+
+/// One value as `grasm toml` prints it: `str` and the string quoted as TIR
+/// quotes it, `int N`, `bool true`, `array [...]`.
+fn toml_value(doc: RDoc, v: i64) -> str {
+    let k = doc.v_kind[v]
+    if k == rtoml.V_STR {
+        return "str " + loader.quote(doc.v_str[v])
+    }
+    if k == rtoml.V_INT {
+        let n = doc.v_str[v].parse_int() ?? 0
+        return "int {n}"
+    }
+    if k == rtoml.V_BOOL {
+        return "bool " + doc.v_str[v]
+    }
+    var parts: [str] = []
+    for item in doc.v_items[v] {
+        parts.push(toml_value(doc, item))
+    }
+    "array [" + parts.join(", ") + "]"
+}

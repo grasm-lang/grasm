@@ -107,11 +107,11 @@ pub fn bytes_of_value(v: Value) -> bytes {
     }
 }
 
-pub fn none_v(p: Prog) -> Value {
+pub fn none_v(p: TirProg) -> Value {
     VVariant(p.option_ty, p.none_idx, [])
 }
 
-pub fn some_v(p: Prog, v: Value) -> Value {
+pub fn some_v(p: TirProg, v: Value) -> Value {
     VVariant(p.option_ty, p.some_idx, [v])
 }
 
@@ -122,7 +122,7 @@ pub fn empty_map() -> Value {
 // ----- printing ------------------------------------------------------------
 
 /// `print`'s text for a value.
-pub fn show(p: Prog, v: Value) -> str {
+pub fn show(p: TirProg, v: Value) -> str {
     match v {
         VStr(s) -> s
         VInt(n) -> "{n}"
@@ -136,7 +136,7 @@ pub fn show(p: Prog, v: Value) -> str {
     }
 }
 
-fn show_seq(p: Prog, items: [Value], inout out: [str]) {
+fn show_seq(p: TirProg, items: [Value], inout out: [str]) {
     var first = true
     for x in items {
         if not first {
@@ -147,7 +147,7 @@ fn show_seq(p: Prog, items: [Value], inout out: [str]) {
     }
 }
 
-fn show_into(p: Prog, v: Value, inout out: [str]) {
+fn show_into(p: TirProg, v: Value, inout out: [str]) {
     match v {
         VStr(s) -> out.push(s)
         VInt(n) -> out.push("{n}")
@@ -229,7 +229,7 @@ fn show_hex(b: bytes, inout out: [str]) {
 }
 
 /// `{k: v, ...}` in key order; a map holds keys of one type only.
-fn show_map(p: Prog, m: Value, inout out: [str]) {
+fn show_map(p: TirProg, m: Value, inout out: [str]) {
     out.push("\{")
     let keys = map_keys(m)
     let vals = map_values(m)

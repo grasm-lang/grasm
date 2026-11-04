@@ -635,10 +635,13 @@ type Manifest = {
     has_caps: bool,
     caps: [str],
     entry: str,
+    /// The system libraries `links` names, in byte order and once each, as
+    /// the Rust manifest's `BTreeSet` holds them.
+    links: [str],
 }
 
 fn bad_manifest(why: str) -> Manifest {
-    Manifest{ ok: false, why: why, name: "", version: "", dep_names: [], dep_paths: [], dep_reqs: [], has_caps: false, caps: [], entry: "" }
+    Manifest{ ok: false, why: why, name: "", version: "", dep_names: [], dep_paths: [], dep_reqs: [], has_caps: false, caps: [], entry: "", links: [] }
 }
 
 /// `Version::parse`: three parts, each a `u64` as Rust parses one (an
@@ -851,6 +854,7 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
         caps = rtoml.str_array(doc, cv)
     }
     let lv = rtoml.get(doc, pkg, "links")
+    var links: [str] = []
     if lv >= 0 {
         if not rtoml.is_str_array(doc, lv) {
             return (false, "`links` must be an array of strings", none)
@@ -859,7 +863,11 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
             if not link_name_ok(lib) {
                 return (false, "`links` entry `{lib}` is not a library name — letters, digits, `_`, `-`, `.` and `+`, and it must start with a letter, a digit or `_`", none)
             }
+            if not links.contains(lib) {
+                links.push(lib)
+            }
         }
+        links.sort()
     }
     var entry = rtoml.as_str(doc, rtoml.get(doc, pkg, "entry"))
     if entry == "\0" {
@@ -935,7 +943,7 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
     if not is_identifier(name) {
         return (false, "`{name}` is not a usable package name: a consumer writes `import {name}`, so it has to be a Grasm identifier — letters, digits and `_`, not starting with a digit, and not a keyword", none)
     }
-    (true, "", Manifest{ ok: true, why: "", name: name, version: version, dep_names: dep_names, dep_paths: paths, dep_reqs: reqs, has_caps: has_caps, caps: caps, entry: entry })
+    (true, "", Manifest{ ok: true, why: "", name: name, version: version, dep_names: dep_names, dep_paths: paths, dep_reqs: reqs, has_caps: has_caps, caps: caps, entry: entry, links: links })
 }
 
 /// A library name a link line may take: letters, digits, `_`, `-`, `.` and
@@ -1304,6 +1312,44 @@ fn visit(dir: str, required_by: str, reg: str, sel: Map[str, str], inout r: Reso
     r.names.push(m.name)
     r.dirs.push(dir)
     r.mfs.push(m)
+}
+
+/// `declared_links` (crates/grasm/src/main.rs): every system library the
+/// packages in the graph of the package holding `path` declare, in byte
+/// order and once each -- or, when that graph does not resolve, the
+/// package's own (the build reports the failure itself) -- or none, when
+/// `path` is in no package.
+pub fn declared_links(path: str) -> [str] {
+    var here = parent(path)
+    var pkg_dir = "\0"
+    while here != "\0" {
+        if is_file(join(here, "grasm.toml")) {
+            pkg_dir = here
+            break
+        }
+        here = parent(here)
+    }
+    if pkg_dir == "\0" {
+        return []
+    }
+    let res = resolve_graph(pkg_dir)
+    if not res.ok {
+        let m = load_manifest(pkg_dir)
+        if m.ok {
+            return m.links
+        }
+        return []
+    }
+    var all: [str] = []
+    for m in res.mfs {
+        for lib in m.links {
+            if not all.contains(lib) {
+                all.push(lib)
+            }
+        }
+    }
+    all.sort()
+    all
 }
 
 /// `registry_packages`: every package in the entry package's graph but the

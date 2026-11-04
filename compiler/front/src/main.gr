@@ -94,7 +94,7 @@ fn utf8_valid(b: bytes) -> bool {
 }
 
 /// Reads a source file as the Rust frontend does, or says why it cannot.
-fn read_source(path: str) -> bytes {
+pub fn read_source(path: str) -> bytes {
     match read_bytes(path) {
         Ok(b) -> {
             if not utf8_valid(b) {
@@ -104,7 +104,7 @@ fn read_source(path: str) -> bytes {
             b
         }
         Err(e) -> {
-            eprint("error: cannot read `{path}`: {e}")
+            eprint("error: cannot read `{path}`: {loader.io_error_text(e)}")
             exit(1)
             bytes_of([])
         }
@@ -178,7 +178,7 @@ fn push_token_debug(inout out: ByteBuilder, esc: EscTable, lx: Lexed, i: i64) {
 
 /// `grasm tokens`: each token's line, column and kind on stdout, each
 /// lexical error on stderr; exit 1 when there was one.
-fn cmd_tokens(path: str) {
+pub fn cmd_tokens(path: str) {
     let src = read_source(path)
     let esc = rdebug.new_esc_table()
     let lx = lex.lex(src, false)
@@ -204,7 +204,7 @@ fn cmd_tokens(path: str) {
 
 /// Writes what was built, which ends in a newline, as `print` would write
 /// it without that last newline.
-fn write_stdout(b: ByteBuilder) {
+pub fn write_stdout(b: ByteBuilder) {
     let n = b.len()
     if n == 0 {
         return
@@ -215,7 +215,7 @@ fn write_stdout(b: ByteBuilder) {
 
 /// `grasm ast`: `{:?}` of the module on one line, then each diagnostic on
 /// one; exit 1 when there was one.
-fn cmd_ast(path: str) {
+pub fn cmd_ast(path: str) {
     let src = read_source(path)
     let esc = rdebug.new_esc_table()
     let lx = lex.lex(src, true)
@@ -566,7 +566,7 @@ fn render_all(paths: [str], srcs: [bytes], bases: [i64], ds: [i64], de: [i64], d
 
 /// What was built, which ends in a newline, on stderr as `eprint` would
 /// write it without that last newline.
-fn write_stderr(b: ByteBuilder) {
+pub fn write_stderr(b: ByteBuilder) {
     let n = b.len()
     if n == 0 {
         return
@@ -578,7 +578,16 @@ fn write_stderr(b: ByteBuilder) {
 /// `grasm check`: every diagnostic of the loader and the parser, or else of
 /// the checker and the effect pass, rendered; then the capability ceilings;
 /// or `ok`.
-fn cmd_check(path: str) {
+pub fn cmd_check(path: str) {
+    let (_l, _p, _c, _t) = checked(path)
+    print("ok: `{path}` has no errors")
+}
+
+/// What `grasm check` does before it says `ok` -- `load_and_check`, the path
+/// `check`, `tir`, `run` and `build` all take: the program loaded and
+/// checked, its dependencies held to their ceilings; or every diagnostic
+/// rendered on stderr and exit 1.
+pub fn checked(path: str) -> (Loaded, Prog, Ck, Tys) {
     let l = loader.load(path)
     if l.fatal != "" {
         eprint("error: {l.fatal}")
@@ -607,7 +616,7 @@ fn cmd_check(path: str) {
         write_stderr(out)
         exit(1)
     }
-    print("ok: `{path}` has no errors")
+    (l, p, c, t)
 }
 
 /// What `grasm` says of `check`'s arguments before it reads any: it takes

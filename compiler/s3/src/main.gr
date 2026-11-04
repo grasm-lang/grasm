@@ -476,14 +476,33 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             return 2
         }
     }
+    let (st, _object) = compile_tir(src, out, opts, listing, check, stats, lib, inline_limit, x64)
+    st
+}
+
+/// What `s3 <program.tir> -o <out.o>` makes of a program's TIR and nothing
+/// else -- the options a stage's build gives it (docs/self-hosting.md §6.14):
+/// for `grasm build --native` (compiler/grasm, §6.17). The exit status, and
+/// the object when it is 0.
+pub fn compile_program(src: bytes, lib: bool, x64: bool) -> (i64, bytes) {
+    compile_tir(src, "", aarch64.default_opts(), "", true, false, lib, INLINE_LIMIT, x64)
+}
+
+fn no_object() -> bytes {
+    bytes_filled(0, 0)
+}
+
+/// Compiles TIR into an object: the exit status, and the object's bytes when
+/// it is 0, also written to `out` unless that is "".
+fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool, inline_limit: i64, x64: bool) -> (i64, bytes) {
     let p = match mir.build(src, lib, inline_limit) {
         Ok(x) -> x
         Err(msg) -> {
             eprint(msg)
             if msg.contains("outside the subset") {
-                return 3
+                return (3, no_object())
             }
-            return 1
+            return (1, no_object())
         }
     }
     if check {
@@ -492,7 +511,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             for q in problems {
                 eprint("s3: rule table: {q}")
             }
-            return 1
+            return (1, no_object())
         }
     }
     let rs = aarch64.rule_table()
@@ -523,7 +542,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
         xo.ra = opts.ra
         let st = codegen_x64(p, lib, xo, obj, unit, listing, text, sl, xcounts)
         if st >= 0 {
-            return st
+            return (st, no_object())
         }
         ra_failed = xcounts[0]
         corrupted = xcounts[1]
@@ -602,22 +621,22 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             }
             Err(msg) -> {
                 eprint("s3: {f.sym} ({f.name}): {msg}")
-                return 1
+                return (1, no_object())
             }
         }
     }
     if opts.corrupt != 0 {
         print("ra-corrupt: corrupted {corrupted} of {p.fns.len()} functions, the checker caught {caught}")
-        return if caught > 0 { 4 } else { 0 }
+        return (if caught > 0 { 4 } else { 0 }, no_object())
     }
     if ra_failed > 0 {
-        return 4
+        return (4, no_object())
     }
     match if x64 { add_leaves_x64(p, obj, unit, listing != "", text) } else { add_leaves(p, obj, unit, listing != "", text) } {
         Ok(_) -> ()
         Err(msg) -> {
             eprint("s3: a leaf of the runtime dialect: {msg}")
-            return 1
+            return (1, no_object())
         }
     }
     // The runtime's process cells and its own thread-local variables.
@@ -671,14 +690,16 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
         Ok(b) -> b
         Err(msg) -> {
             eprint("s3: writing the object: {msg}")
-            return 1
+            return (1, no_object())
         }
     }
-    match write_bytes(out, bytes) {
-        Ok(_) -> ()
-        Err(e) -> {
-            eprint("s3: cannot write {out}: {e}")
-            return 2
+    if out != "" {
+        match write_bytes(out, bytes) {
+            Ok(_) -> ()
+            Err(e) -> {
+                eprint("s3: cannot write {out}: {e}")
+                return (2, no_object())
+            }
         }
     }
     if stats {
@@ -708,11 +729,11 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             Ok(_) -> ()
             Err(e) -> {
                 eprint("s3: cannot write {listing}: {e}")
-                return 2
+                return (2, no_object())
             }
         }
     }
-    0
+    (0, bytes)
 }
 
 fn main() {

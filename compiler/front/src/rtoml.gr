@@ -29,10 +29,17 @@ type RDoc = {
     v_kind: [i64],
     v_str: [str],
     v_items: [[i64]],
+    // The entries of the arrays of tables, in the file's order: each one's
+    // array name, and its keys in byte order with their values, a key set
+    // twice keeping the later value, as the Rust reader's `BTreeMap::insert`
+    // does. Nothing the loader checks reads them; `grasm toml` prints them.
+    a_names: [str],
+    a_keys: [[str]],
+    a_vals: [[i64]],
 }
 
 fn refused(why: str) -> RDoc {
-    RDoc{ ok: false, why: why, t_names: [], t_keys: [], t_vals: [], v_kind: [], v_str: [], v_items: [] }
+    RDoc{ ok: false, why: why, t_names: [], t_keys: [], t_vals: [], v_kind: [], v_str: [], v_items: [], a_names: [], a_keys: [], a_vals: [] }
 }
 
 /// `toml::parse`.
@@ -45,8 +52,11 @@ pub fn parse(src: str) -> RDoc {
     var v_kind: [i64] = []
     var v_str: [str] = []
     var v_items: [[i64]] = []
-    // Where `key = value` lines go: a table's index, or -1 for an entry of
-    // an array of tables, whose keys nothing reads back.
+    var a_names: [str] = []
+    var a_keys: [[str]] = []
+    var a_vals: [[i64]] = []
+    // Where `key = value` lines go: a table's index, or -1 for the last
+    // entry of an array of tables.
     var current = 0
     var lineno = 0
     for raw0 in rust_lines(src) {
@@ -66,6 +76,9 @@ pub fn parse(src: str) -> RDoc {
                 return refused("{at}: empty table name")
             }
             current = -1
+            a_names.push(name)
+            a_keys.push([])
+            a_vals.push([])
             continue
         }
         if line.starts_with("[") {
@@ -110,7 +123,40 @@ pub fn parse(src: str) -> RDoc {
             vals.push(vid)
             t_keys[current] = keys
             t_vals[current] = vals
+        } else {
+            let ai = a_names.len() - 1
+            var keys = a_keys[ai]
+            var vals = a_vals[ai]
+            var at_key = -1
+            for j in 0..keys.len() {
+                if keys[j] == key {
+                    at_key = j
+                }
+            }
+            if at_key >= 0 {
+                vals[at_key] = vid
+            } else {
+                keys.push(key)
+                vals.push(vid)
+            }
+            a_keys[ai] = keys
+            a_vals[ai] = vals
         }
+    }
+    // Each entry's keys in byte order.
+    for ai in 0..a_names.len() {
+        var ks = a_keys[ai]
+        ks.sort()
+        var vs: [i64] = []
+        for k in ks {
+            for j in 0..a_keys[ai].len() {
+                if a_keys[ai][j] == k {
+                    vs.push(a_vals[ai][j])
+                }
+            }
+        }
+        a_keys[ai] = ks
+        a_vals[ai] = vs
     }
     // In byte order, as the Rust reader's maps hold them.
     var order: [str] = t_names
@@ -134,7 +180,7 @@ pub fn parse(src: str) -> RDoc {
         keys_out.push(ks)
         vals_out.push(vs)
     }
-    RDoc{ ok: true, why: "", t_names: names, t_keys: keys_out, t_vals: vals_out, v_kind: v_kind, v_str: v_str, v_items: v_items }
+    RDoc{ ok: true, why: "", t_names: names, t_keys: keys_out, t_vals: vals_out, v_kind: v_kind, v_str: v_str, v_items: v_items, a_names: a_names, a_keys: a_keys, a_vals: a_vals }
 }
 
 /// `str::lines`: split at `\n`, a `\r` before it dropped, no last empty line.

@@ -48,7 +48,7 @@ type Cx = {
     k0: [i64],
     nk: [i64],
     kids: [i64],
-    p: Prog,
+    p: TirProg,
     fr: [Value],
     ctl: i64,
     carry: Value,
@@ -91,7 +91,7 @@ type Cx = {
     cell_at: Map[i64, bool],
 }
 
-pub fn new_cx(p: Prog, args: [str]) -> Cx {
+pub fn new_cx(p: TirProg, args: [str]) -> Cx {
     var consts: [Value] = []
     var built: [bool] = []
     for _ in 0..p.const_name.len() {
@@ -534,7 +534,7 @@ fn binary(inout cx: Cx, e: i64) -> Value {
 }
 
 /// Whether `and`, `or` or `??` needs its right side, given its left.
-fn runs_right(p: Prog, op: i64, l: Value) -> bool {
+fn runs_right(p: TirProg, op: i64, l: Value) -> bool {
     match l {
         VBool(b) -> if op == 13 { b } else if op == 14 { not b } else { false }
         VVariant(ty, idx, _) -> ty == p.option_ty and idx == p.none_idx
@@ -545,7 +545,7 @@ fn runs_right(p: Prog, op: i64, l: Value) -> bool {
 
 /// What a short-circuited `and`, `or` or `??` answers: the left side, or
 /// what `Some` or `Ok` carry.
-fn short_value(p: Prog, l: Value) -> Value {
+fn short_value(p: TirProg, l: Value) -> Value {
     match l {
         VVariant(ty, idx, fs) -> if ty == p.option_ty and idx == p.some_idx { fs[0] } else { l }
         VOk(x) -> x
@@ -635,7 +635,7 @@ fn float_op(op: i64, x: f64, y: f64) -> Value {
 }
 
 /// `apply_binary`: the operator on two evaluated operands.
-pub fn apply_binary(p: Prog, op: i64, l: Value, r: Value) -> Value {
+pub fn apply_binary(p: TirProg, op: i64, l: Value, r: Value) -> Value {
     match l {
         VInt(x) -> match r {
             VInt(y) -> return int_op(op, x, y)
@@ -916,7 +916,7 @@ fn map_lit(inout cx: Cx, e: i64) -> Value {
 }
 
 /// `m.set(k, v)` on a map held uniquely by `m`.
-pub fn map_set(p: Prog, inout m: Value, k: Value, v: Value) {
+pub fn map_set(p: TirProg, inout m: Value, k: Value, v: Value) {
     var whole = value.take(m)
     match k {
         VStr(s) -> {
@@ -1268,7 +1268,7 @@ fn place_path(inout cx: Cx, e: i64) -> Path {
     path
 }
 
-fn index_value(p: Prog, ix: Value) -> i64 {
+fn index_value(p: TirProg, ix: Value) -> i64 {
     match ix {
         VInt(n) -> {
             if n < 0 {
@@ -1799,7 +1799,7 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
 }
 
 /// The name an `impl` is keyed by for a value's runtime type.
-fn impl_key(p: Prog, v: Value) -> str {
+fn impl_key(p: TirProg, v: Value) -> str {
     match v {
         VInt(_) -> "i64"
         VStr(_) -> "str"

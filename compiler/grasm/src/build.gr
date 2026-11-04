@@ -1,0 +1,479 @@
+// `grasm build`, and the front end `run` shares with it (docs/self-hosting.md
+// §6.17).
+//
+// `build --native` is the stage pipeline of §6.14 in one process: the
+// program checked and its TIR made by compiler/front, compiled by
+// compiler/s3, and linked by compiler/link with the runtime in Grasm alone --
+// the object `s3 --runtime` makes of compiler/rt, which lives beside this
+// program as `rt.o` -- as `link -interpose rt.o P.o -dead_strip` links a
+// stage's programs, with `-strip` as the shipped build strips. The command
+// line, every check before the compile, and every message are the Rust
+// `build`'s (crates/grasm/src/main.rs); what differs is said where it is.
+import front
+import front.loader
+import front.sema
+import front.emit
+import s3
+import link
+
+/// A program checked as `grasm check` checks it, with what the commands
+/// after the check ask of it: the runtime package it belongs to ("" for
+/// none) and whether its entry is one, its `export fn`s' names, and whether
+/// its entry module has a `main`.
+type Checked = {
+    p: Prog,
+    c: Ck,
+    t: Tys,
+    runtime: str,
+    entry_is_runtime: bool,
+    exports: [str],
+    has_main: bool,
+}
+
+/// What `grasm check` does; or every diagnostic and exit 1.
+pub fn checked(path: str) -> Checked {
+    let (l, p, c, t) = front.checked(path)
+    var runtime = ""
+    for k in l.runtime.keys() {
+        if runtime == "" {
+            runtime = l.runtime.get(k) ?? ""
+        }
+    }
+    var exports: [str] = []
+    for k in c.export_names.keys() {
+        exports.push(k)
+    }
+    exports.sort()
+    Checked{ p: p, c: c, t: t, runtime: runtime, entry_is_runtime: l.runtime.has("main"), exports: exports, has_main: sema.fn_of(c, "main::main") >= 0 }
+}
+
+/// The checked program's TIR. A hole the checker left is said on stderr,
+/// and exit 1, as `grasm tir` says it.
+pub fn tir_of(ch: Checked) -> str {
+    var t = ch.t
+    let (text, holes) = emit.emit(ch.c, t, ch.p)
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+    text
+}
+
+/// What `grasm run` runs: the program checked, refused if it is a runtime
+/// package, which the interpreter does not take ([T-RUNTIME]); its TIR.
+pub fn tir_to_run(path: str) -> str {
+    let ch = checked(path)
+    if ch.runtime != "" {
+        refuse_runtime(ch.runtime, "the interpreter")
+    }
+    tir_of(ch)
+}
+
+/// `Program::runtime_refusal`.
+fn refuse_runtime(pkg: str, engine: str) {
+    eprint("error: package `{pkg}` is a runtime package (`runtime = true` in its grasm.toml), so {engine} does not take it: the runtime written in Grasm is compiled only by the Grasm backend, `s3 --runtime` ([T-RUNTIME])")
+    exit(1)
+}
+
+/// The first operand among `args`, flags and the values of those in
+/// `valued` skipped; "\0" for none, or when `--` comes first.
+pub fn first_operand(args: [str], valued: [str]) -> str {
+    var i = 0
+    while i < args.len() {
+        let a = args[i]
+        if a == "--" {
+            return "\0"
+        }
+        if a.starts_with("-") and a.to_bytes().len() > 1 {
+            i += if valued.contains(a) { 2 } else { 1 }
+            continue
+        }
+        return a
+    }
+    "\0"
+}
+
+/// The value after the first `flag` anywhere on the line, or "\0".
+fn value_after(a: [str], flag: str) -> str {
+    for i in 0..a.len() {
+        if a[i] == flag {
+            if i + 1 < a.len() {
+                return a[i + 1]
+            }
+            return "\0"
+        }
+    }
+    "\0"
+}
+
+// ---------------------------------------------------------------------
+// The file system, as `std::fs::metadata` and `Path` answer
+// ---------------------------------------------------------------------
+
+/// stat(2): the file's type bits, or -1 when it cannot be asked.
+extern fn stat(path: str, buf: bytes) -> i64
+
+/// What kind of file `p` is, following symbolic links: 1 a regular file, 2
+/// a directory, 3 anything else, 0 nothing there.
+fn file_kind(p: str) -> i64 {
+    if p.contains("\0") {
+        return 0
+    }
+    // `struct stat` on arm64 macOS is 144 bytes; `st_mode` is the 16 bits
+    // at offset 4.
+    let buf = bytes_filled(144, 0)
+    let rc = unsafe { stat(p, buf) }
+    if rc != 0 {
+        return 0
+    }
+    let fmt = (buf.at(4) + 256 * buf.at(5)).bit_and(61440)
+    if fmt == 32768 {
+        1
+    } else if fmt == 16384 {
+        2
+    } else {
+        3
+    }
+}
+
+/// `Path::file_stem`: the last component's name before its last `.`, unless
+/// that `.` is its first character; "\0" when there is no last component.
+fn file_stem(p: str) -> str {
+    var b = p.to_bytes()
+    var n = b.len()
+    while n > 1 and b.at(n - 1) == 47 {
+        n -= 1
+    }
+    var s = n
+    while s > 0 and b.at(s - 1) != 47 {
+        s -= 1
+    }
+    let name = b.slice(s, n)
+    if name.len() == 0 or (name.len() == 1 and name.at(0) == 46) or (name.len() == 2 and name.at(0) == 46 and name.at(1) == 46) {
+        return "\0"
+    }
+    var dot = name.len() - 1
+    while dot > 0 and name.at(dot) != 46 {
+        dot -= 1
+    }
+    if dot <= 0 {
+        return name.to_str()
+    }
+    name.slice(0, dot).to_str()
+}
+
+/// `_NSGetExecutablePath(3)`: this program's own path.
+extern fn _NSGetExecutablePath(buf: bytes, size: bytes) -> i64
+
+/// The directory this program runs from, its links resolved; "" when it
+/// cannot be found.
+fn own_dir() -> str {
+    let buf = bytes_filled(4096, 0)
+    let size = bytes_of([0, 16, 0, 0])
+    let rc = unsafe { _NSGetExecutablePath(buf, size) }
+    if rc != 0 {
+        return ""
+    }
+    var n = 0
+    while n < buf.len() and buf.at(n) != 0 {
+        n += 1
+    }
+    let exe = buf.slice(0, n).to_str()
+    let real = loader.canonicalize(exe)
+    let d = loader.parent(if real == "\0" { exe } else { real })
+    if d == "\0" { "" } else { d }
+}
+
+/// The runtime in Grasm, as the object `s3 --runtime` makes of compiler/rt:
+/// `rt.o` beside this program, as a stage of the self-built compiler holds
+/// it (scripts/lib/stages.sh), or in ../lib/grasm. Where the Rust `grasm`
+/// finds `libgrasm_rt_abi.a`.
+fn find_runtime() -> str {
+    let dir = own_dir()
+    for c in [loader.join(dir, "rt.o"), loader.join(dir, "../lib/grasm/rt.o")] {
+        if file_kind(c) == 1 {
+            return c
+        }
+    }
+    eprint("error: cannot find the Grasm runtime (rt.o).\n\nLooked next to `{dir}` and in ../lib/grasm.\n\nIt is the object `s3 --runtime` makes of compiler/rt, which a stage of the\nself-built compiler keeps beside `grasm` (docs/self-hosting.md §6.17).")
+    exit(1)
+    ""
+}
+
+// ---------------------------------------------------------------------
+// `grasm build`
+// ---------------------------------------------------------------------
+
+/// `grasm build`, every check in the Rust command's order.
+pub fn cmd_build(a: [str]) {
+    // The first argument that is not a flag, if it is the first argument or
+    // names a `.gr` file.
+    var path = ""
+    var found = false
+    var taken = false
+    for i in 1..a.len() {
+        if not found and not a[i].starts_with("-") {
+            found = true
+            let x = a[i]
+            var first = -1
+            for j in 0..a.len() {
+                if first < 0 and a[j] == x {
+                    first = j
+                }
+            }
+            if first == 1 or x.ends_with(".gr") {
+                path = x
+                taken = true
+            }
+        }
+    }
+    if not taken {
+        eprint("usage: grasm build <file.gr> [-o output]")
+        exit(1)
+    }
+    // `--link`'s values first, then what the packages declare, each once.
+    var links: [str] = []
+    for i in 0..a.len() {
+        if a[i] == "--link" and i + 1 < a.len() {
+            links.push(a[i + 1])
+        }
+    }
+    for lib in loader.declared_links(path) {
+        if not links.contains(lib) {
+            links.push(lib)
+        }
+    }
+    var out = value_after(a, "-o")
+    if out == "\0" {
+        let stem = file_stem(path)
+        out = if stem == "\0" { "app" } else { stem }
+    }
+    let kind = file_kind(out)
+    if kind != 0 and kind != 1 {
+        eprint("error: `{out}` is not a regular file, so it cannot be an executable")
+        exit(1)
+    }
+    let dir = loader.parent(out)
+    if dir != "\0" and dir != "" and file_kind(dir) != 2 {
+        eprint("error: cannot write `{out}`: `{dir}` is not a directory")
+        exit(1)
+    }
+    if loader.same_dir(out, path) {
+        eprint("error: `{out}` is the source file — the build would overwrite it")
+        eprint("  help: name the output something else, or drop `-o` to use the file's stem")
+        exit(1)
+    }
+    let want_source = a.contains("--source")
+    if out.ends_with(".gr") and not want_source {
+        eprint("error: `{out}` ends in `.gr`, and a build writes an executable there")
+        eprint("  help: name the output without the `.gr` suffix")
+        exit(1)
+    }
+    let native = a.contains("--native")
+    if a.contains("--target") and not native {
+        eprint("error: `--target` needs `--native` — a bundled build carries the interpreter, which is this machine's")
+        eprint("  help: add `--native`, or drop `--target` to build for this machine")
+        exit(1)
+    }
+    let target = value_after(a, "--target")
+    let engine = if native { "the Cranelift build" } else { "the interpreter" }
+    let f = checked(path)
+    // A runtime package, which has no `main`, built `--native`: its object,
+    // as `s3 --runtime` makes it -- the one way a toolchain without the
+    // stage scripts makes the `rt.o` it links. The Rust command refuses
+    // here (no `main`); the Grasm backend is what the refusal names.
+    if native and f.entry_is_runtime {
+        build_runtime(f, out, target)
+        return
+    }
+    if not f.has_main {
+        eprint("error: no `main` function")
+        exit(1)
+    }
+    if f.runtime != "" {
+        refuse_runtime(f.runtime, engine)
+    }
+    if want_source {
+        eprint("error: `grasm build --source` is not in the Grasm toolchain yet")
+        eprint("  help: it builds with `--native`; the rest of `build` is S8's to come (docs/self-hosting.md §6.17)")
+        exit(1)
+    }
+    if not native {
+        eprint("error: `grasm build` without `--native` is not in the Grasm toolchain yet")
+        eprint("  help: it builds with `--native`; the rest of `build` is S8's to come (docs/self-hosting.md §6.17)")
+        exit(1)
+    }
+    if target != "\0" {
+        let x64 = target_is_x64(target)
+        let obj = if out.ends_with(".o") { out } else { out + ".o" }
+        let bytes = compile(tir_of(f), path, false, x64)
+        match write_bytes(obj, bytes) {
+            Ok(_) -> ()
+            Err(e) -> {
+                eprint("error: {loader.io_error_text(e)}")
+                exit(1)
+            }
+        }
+        print("emitted `{obj}` for {target} (link it with a {target} toolchain + libgrasm_rt_abi.a)")
+        return
+    }
+    let bytes = compile(tir_of(f), path, false, false)
+    let size = link_executable(bytes, out, links, f.exports)
+    if size == 0 {
+        eprint("error: linking produced an empty file at `{out}` — it is not an executable")
+        exit(1)
+    }
+    print("built `{out}` natively ({size} bytes, Grasm)")
+}
+
+/// Whether `--target`'s triple is x86-64 macOS, the one cross target the
+/// Grasm backend writes (docs/self-hosting.md §6.16); arm64 macOS is this
+/// machine's. Any other is refused: the Rust command emits an object for
+/// every target Cranelift knows, ELF ones included, which this backend
+/// does not write.
+fn target_is_x64(t: str) -> bool {
+    let parts = t.split("-")
+    let apple = parts.len() >= 3 and parts[1] == "apple" and (parts[2].starts_with("darwin") or parts[2].starts_with("macos"))
+    if apple and parts[0] == "x86_64" {
+        return true
+    }
+    if apple and (parts[0] == "aarch64" or parts[0] == "arm64") {
+        return false
+    }
+    eprint("error: unsupported target `{t}`: the Grasm backend writes Mach-O objects for x86_64 and aarch64 macOS only")
+    exit(1)
+    false
+}
+
+/// The program's object, by compiler/s3 as a stage's `s3` makes it.
+fn compile(tir: str, path: str, lib: bool, x64: bool) -> bytes {
+    let (st, bytes) = s3.compile_program(tir.to_bytes(), lib, x64)
+    if st != 0 {
+        eprint("error: the Grasm backend does not compile `{path}` (s3 exit status {st})")
+        exit(1)
+    }
+    bytes
+}
+
+/// The runtime package's object (`grasm build compiler/rt/src/main.gr
+/// --native -o rt.o`): an object, not an executable, so `-o out.o` names it
+/// and any other `-o` gets `.o` added, as for `--target`.
+fn build_runtime(f: Checked, out: str, target: str) {
+    let x64 = if target != "\0" { target_is_x64(target) } else { false }
+    let obj = if out.ends_with(".o") { out } else { out + ".o" }
+    let bytes = compile(tir_of(f), obj, true, x64)
+    match write_bytes(obj, bytes) {
+        Ok(_) -> ()
+        Err(e) -> {
+            eprint("error: {loader.io_error_text(e)}")
+            exit(1)
+        }
+    }
+    print("built `{obj}`, the runtime `{f.runtime}` ({bytes.len()} bytes, Grasm)")
+}
+
+/// The name the program's object goes by in the link -- it is never
+/// written -- and the mark of a line of the linker's that names it, which the
+/// Rust command drops as it drops the lines naming its scratch directory.
+let OBJECT_MARK = "grasm_native/"
+
+/// Links the program's object with the runtime in Grasm into `out`, as the
+/// Rust command links with `grasm-link`: the libraries `--link` and the
+/// packages name, `-dead_strip`, every `export fn` kept, and stripped unless
+/// `GRASM_KEEP_SYMBOLS` says otherwise. Answers the executable's size.
+fn link_executable(object: bytes, out: str, links: [str], exports: [str]) -> i64 {
+    let rt = find_runtime()
+    let obj_name = OBJECT_MARK + "out.o"
+    var argv = ["-interpose", rt, obj_name]
+    for lib in links {
+        if lib.starts_with("-") or lib.starts_with("/") {
+            argv.push(lib)
+        } else {
+            argv.push("-l" + lib)
+        }
+    }
+    argv.push("-dead_strip")
+    for e in exports {
+        argv.push("-exported_symbol")
+        argv.push("_" + e)
+    }
+    let keep = match env("GRASM_KEEP_SYMBOLS") {
+        Some(v) -> v != "0"
+        None -> false
+    }
+    if not keep {
+        argv.push("-strip")
+    }
+    argv.push("-o")
+    argv.push(out)
+    let (l0, problems) = link.parse_args(argv)
+    if problems.len() > 0 {
+        link_failed(out, problems.join("\n"))
+    }
+    var l = l0
+    l.mem_path.push(obj_name)
+    l.mem_data.push(object)
+    match link.run(l) {
+        Ok(_) -> ()
+        Err(e) -> link_failed(out, e)
+    }
+    match file_size(out) {
+        Ok(n) -> n
+        Err(e) -> {
+            eprint("error: {loader.io_error_text(e)}")
+            exit(1)
+            0
+        }
+    }
+}
+
+/// A link that failed, said as the Rust command says it: the C functions no
+/// library on the line defines, when that is what failed; else the linker's
+/// own words, less the lines naming the program's object.
+fn link_failed(out: str, text: str) {
+    var missing: [str] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if not line.starts_with("\"") {
+            continue
+        }
+        let rest = line.substr(1, line.len() - 1)
+        var name = match rest.index_of("\"") {
+            Some(q) -> rest.substr(0, q)
+            None -> rest
+        }
+        while name.starts_with("_") {
+            name = name.substr(1, name.len() - 1)
+        }
+        if name != "" and not name.starts_with("g_") and not name.starts_with("gc_") and not name.starts_with("gh_") {
+            if not missing.contains(name) {
+                missing.push(name)
+            }
+        }
+    }
+    if missing.len() > 0 {
+        missing.sort()
+        var quoted: [str] = []
+        for n in missing {
+            quoted.push("`{n}`")
+        }
+        eprint("error: cannot find the C function(s) {quoted.join(", ")} — an `extern fn` is resolved by the linker, so the library defining it has to be on the link line")
+        exit(1)
+    }
+    var kept: [str] = []
+    for line in text.split("\n") {
+        if not line.contains(OBJECT_MARK) {
+            kept.push(line)
+        }
+    }
+    let detail = kept.join("\n").trim()
+    if detail == "" {
+        eprint("error: linking `{out}` failed")
+    } else {
+        eprint("error: linking `{out}` failed:\n{detail}")
+    }
+    exit(1)
+}

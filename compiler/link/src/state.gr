@@ -63,6 +63,11 @@ type Ld = {
     /// writes what it bound, or "".
     ip_file: i64,
     ip_log: str,
+    /// Inputs already in memory, by the path they are named by: what
+    /// `grasm build --native` compiled (compiler/grasm), which it hands over
+    /// without writing it to a file first.
+    mem_path: [str],
+    mem_data: [bytes],
     // ----- object files, archive members included once loaded
     f_path: [str],
     f_data: [bytes],
@@ -250,7 +255,7 @@ type Ld = {
 pub fn new_ld() -> Ld {
     Ld{
         out: "a.out", entry: "_main", dead_strip: false, exp_list: [], exp_set: {}, strip: false, uuid: true,
-        map_path: "", syslibroot: "", lib_dirs: [], in_kind: [], in_arg: [], minos: 0, sdk: 0, ident: "", nostdlib: false, tool_version: 0, direct: [], ip_file: -1, ip_log: "",
+        map_path: "", syslibroot: "", lib_dirs: [], in_kind: [], in_arg: [], minos: 0, sdk: 0, ident: "", nostdlib: false, tool_version: 0, direct: [], ip_file: -1, ip_log: "", mem_path: [], mem_data: [],
         f_path: [], f_data: [], f_key: [], f_subsec: [], f_sec0: [], f_nsec: [], f_sym0: [], f_nsym: [],
         ar_path: [], ar_data: [], ar_pos: [], ar_toc: [], ar_index: [], ar_loaded: {},
         dl_install: [], dl_cur: [], dl_compat: [], dy_sym: {}, dy_weak: {}, dy_tlv: {},

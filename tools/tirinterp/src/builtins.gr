@@ -245,7 +245,7 @@ fn float_of(v: Value) -> f64 {
     }
 }
 
-fn str_of(p: Prog, v: Value) -> str {
+fn str_of(p: TirProg, v: Value) -> str {
     match v {
         VStr(s) -> s
         _ -> value.show(p, v)
@@ -260,7 +260,7 @@ fn ints_of(v: Value) -> [i64] {
     out
 }
 
-fn strs_of(p: Prog, v: Value) -> [str] {
+fn strs_of(p: TirProg, v: Value) -> [str] {
     var out: [str] = []
     for x in value.list_of(v) {
         out.push(str_of(p, x))
@@ -285,7 +285,7 @@ fn int_list(xs: [i64]) -> Value {
 }
 
 /// The host's `IoError`, as the program's own.
-fn io_err(p: Prog, e: IoError) -> Value {
+fn io_err(p: TirProg, e: IoError) -> Value {
     match e {
         NotFound(path) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "NotFound"), [VStr(path)]))
         IoFailed(msg) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "IoFailed"), [VStr(msg)]))
@@ -293,7 +293,7 @@ fn io_err(p: Prog, e: IoError) -> Value {
 }
 
 /// The index of variant `name` of sum type `ty`, as the program declares it.
-fn variant_named(p: Prog, ty: i64, name: str) -> i64 {
+fn variant_named(p: TirProg, ty: i64, name: str) -> i64 {
     let names = p.ty_variants[ty]
     for i in 0..names.len() {
         if names[i] == name {
@@ -310,7 +310,7 @@ fn byte_or_panic(n: i64, op: str) -> i64 {
     n
 }
 
-fn opt(p: Prog, o: Option[Value]) -> Value {
+fn opt(p: TirProg, o: Option[Value]) -> Value {
     match o {
         Some(v) -> value.some_v(p, v)
         None -> value.none_v(p)
@@ -520,7 +520,7 @@ fn run_net_workers(inout cx: Cx, inout args: [Value]) -> Value {
 
 /// The built-ins that reach the filesystem, the clock, the environment and
 /// other programs: each is the host's own.
-fn files(p: Prog, code: i64, args: [Value], name: str) -> Value {
+fn files(p: TirProg, code: i64, args: [Value], name: str) -> Value {
     match code {
         // read_bytes
         8 -> match read_bytes(str_of(p, args[0])) {
@@ -601,7 +601,7 @@ fn files(p: Prog, code: i64, args: [Value], name: str) -> Value {
 }
 
 /// The `net` built-ins: handles are the host's own.
-fn network(p: Prog, code: i64, args: [Value], name: str) -> Value {
+fn network(p: TirProg, code: i64, args: [Value], name: str) -> Value {
     match code {
         // net_close
         15 -> {
@@ -676,21 +676,21 @@ fn euler() -> f64 {
     2.718281828459045
 }
 
-fn unit_result(p: Prog, r: () ! IoError) -> Value {
+fn unit_result(p: TirProg, r: () ! IoError) -> Value {
     match r {
         Ok(_) -> VOk(VUnit)
         Err(x) -> io_err(p, x)
     }
 }
 
-fn int_result(p: Prog, r: i64 ! IoError) -> Value {
+fn int_result(p: TirProg, r: i64 ! IoError) -> Value {
     match r {
         Ok(n) -> VOk(VInt(n))
         Err(x) -> io_err(p, x)
     }
 }
 
-fn proc_answer(p: Prog, r: (i64, str, str) ! IoError) -> Value {
+fn proc_answer(p: TirProg, r: (i64, str, str) ! IoError) -> Value {
     match r {
         Ok(t) -> {
             let (code, out, err) = t
@@ -947,7 +947,7 @@ fn byte_builder_mutation(code: i64, inout b: ByteBuilder, inout args: [Value]) {
     }
 }
 
-fn map_delete(p: Prog, inout m: Value, k: Value) -> bool {
+fn map_delete(p: TirProg, inout m: Value, k: Value) -> bool {
     var whole = value.take(m)
     match k {
         VStr(s) -> {
@@ -984,7 +984,7 @@ fn map_delete(p: Prog, inout m: Value, k: Value) -> bool {
     }
 }
 
-fn map_get(p: Prog, m: Value, k: Value) -> Option[Value] {
+fn map_get(p: TirProg, m: Value, k: Value) -> Option[Value] {
     match m {
         VMap(kb, ki, ks, ku, kt) -> match k {
             VTuple(_) -> match kt.get(value.key_text(k)) {
@@ -1528,7 +1528,7 @@ fn u64_method(inout cx: Cx, code: i64, u: u64, inout args: [Value]) -> Value {
     }
 }
 
-fn opt_u64(p: Prog, o: Option[u64]) -> Value {
+fn opt_u64(p: TirProg, o: Option[u64]) -> Value {
     match o {
         Some(u) -> value.some_v(p, VU64(u))
         None -> value.none_v(p)
@@ -1844,7 +1844,7 @@ fn list_filter(inout cx: Cx, xs: [Value], f: Value) -> Value {
     VList(out)
 }
 
-fn list_best(p: Prog, xs: [Value], want_max: bool) -> Value {
+fn list_best(p: TirProg, xs: [Value], want_max: bool) -> Value {
     if xs.is_empty() {
         return value.none_v(p)
     }
@@ -1861,7 +1861,7 @@ fn list_best(p: Prog, xs: [Value], want_max: bool) -> Value {
 /// `sum`: integers wrap; floats fold from the first element, so `-0.0`
 /// survives; an empty list is the zero the checker says the sum is
 /// ([L-LIB-SUM]).
-fn list_sum(p: Prog, xs: [Value], float_sum: bool) -> Value {
+fn list_sum(p: TirProg, xs: [Value], float_sum: bool) -> Value {
     var int_sum = 0
     var fsum = 0.0
     var have_float = false

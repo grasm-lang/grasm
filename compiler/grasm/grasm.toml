@@ -1,0 +1,27 @@
+[package]
+name = "grasm"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The `grasm` command in Grasm (docs/self-hosting.md §6.17, stage S8 part
+# one). It reads sources and manifests, writes objects and executables and
+# asks the file system what a path is (`stat(2)`) and where this program is
+# (`_NSGetExecutablePath(3)`): `io` and `unsafe`. The rest is `grasm run`'s:
+# the TIR interpreter performs, for the program it runs, every effect that
+# program may -- the network, other processes, raw memory, tasks -- as the
+# Rust `grasm run` does. The command itself starts no process: nothing in
+# this package calls `proc_run` or `proc_pipeline` (`scripts/clidiff.sh`
+# holds it to that).
+capabilities = ["io", "unsafe", "async", "mem", "net", "proc"]
+
+[dependencies.front]
+path = "../front"
+
+[dependencies.s3]
+path = "../s3"
+
+[dependencies.link]
+path = "../link"
+
+[dependencies.tirinterp]
+path = "../../tools/tirinterp"

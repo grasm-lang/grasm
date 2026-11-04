@@ -3817,6 +3817,214 @@ from other work on the machine):
 fuzzers, ld's bytes and the benchmarks are above. What remains is a Linux CI
 run, which is part two and the owner's decision (2).
 
+### 6.17 S8 part one: a `grasm` driver in Grasm, for what Grasm can already do
+
+Written 2026-11-03, with the driver's argument handling, before its gate
+(`clidiff`) and before it is built by itself -- as the design to build to.
+S8 is "every `grasm` subcommand, the LSP, DAP, packages, journal and
+replay, `doc` and `api`, and the wasm32 backend". Part one is the
+subcommands whose machinery is already Grasm, put behind one command that
+answers as the Rust `grasm` answers: the same reading of its arguments, the
+same messages on the same streams, the same exit statuses and files. The
+Rust toolchain stays stage 0 and the oracle; nothing in it changed.
+
+**One program, `compiler/grasm`.** The package is named for the command it
+is, and sits beside `front`, `s3` and `link` because it is the compiler's
+driver, the thing §6.14 left to a shell function (`scripts/lib/stages.sh`)
+"where `grasm build` will be". It is one executable that imports the four
+programs' packages -- `compiler/front`, `compiler/s3` (with `mir`,
+`aarch64`, `x86_64`, `macho`, `vcode`), `compiler/link` and
+`tools/tirinterp` -- and calls them in its own process. The alternative was
+the stage's executables side by side, started by the driver; it was not
+taken, for four reasons:
+
+- `grasm run` cannot be done that way faithfully. `proc_run` captures a
+  child's output and gives it no input ([L-LIB-PROC]), so a program run
+  through it could not read stdin and would print nothing until it ended.
+- Nothing has to start a process. The S6 programs import no `exec`, `fork`,
+  `spawn`, `system` or `popen`; a driver that starts them would be the one
+  part of the compiler that can, and the one that could start the Rust
+  `grasm`. In one program the TIR and the object pass in memory: no
+  temporary files, no `$TMPDIR`, no process identifiers.
+- A release ships one file and its runtime, as the Rust one ships `grasm`
+  beside `libgrasm_rt_abi.a`.
+- The stages stay what §6.14 made them: four programs and a runtime, each
+  built and compared as now, and the driver one more program built and
+  compared the same way.
+
+What it costs: the four share one namespace of types ([T-MODULE-NS]), and
+one name clashed -- `Prog` in `compiler/front` and in `tools/tirinterp` --
+so the interpreter's is now `TirProg`. The executable is 4.0 MB (stage 2);
+§6.14's stage-2 `front`, `s3`, `link` and `tirinterp` were 3.5 MB together. Building it is
+one large compilation: 50 s and 521 MB at peak by stage 1, 82 s and 589 MB
+by stage 2 (once each, 2026-11-03, at a one-minute load of 2 to 7 from other
+work; not to be quoted) -- the Rust compiler takes 50 s for it too, where
+it takes 10 s for the four apart.
+
+What the packages gave the driver, none of it changing what their own
+commands do:
+
+| package | change |
+|---|---|
+| `compiler/front` | `cmd_check`, `cmd_tokens`, `cmd_ast`, `read_source` and the writers public; `checked`, `load_and_check`'s path that `check`, `tir`, `run` and `build` share, split out of `cmd_check`; `read_source` words a failure as Rust's `io::Error` (`io_error_text`), where it printed the runtime's `NotFound(...)` -- `tokentest` and `asttest` read only files that exist, so no gate saw it; the manifest's `links` kept, and `declared_links`, the Rust command's walk of the package graph for them; `rtoml` keeps the entries of an array of tables, which the loader never reads and `grasm toml` prints |
+| `compiler/s3` | `compile_program`: the object `s3 P.tir -o P.o` makes, as bytes; `compile` reads the file and calls it |
+| `compiler/link` | `parse_args` and `run` public; an input may be handed over in memory (`mem_path`, `mem_data`) |
+| `tools/tirinterp` | `Prog` renamed `TirProg`; `run_tree`, `run` on TIR already read |
+
+**The subcommands of part one**, and whose code each runs:
+
+| subcommand | what runs it |
+|---|---|
+| `version`, `--version` | the driver: `grasm 1.1.0`, the workspace's version as a constant `clidiff` holds to Rust's |
+| `tokens`, `ast` | `front`'s `cmd_tokens` and `cmd_ast`, which `tokentest` and `asttest` hold to Rust's |
+| `toml` | `rtoml`, the port of the Rust reader the loader reads manifests with, printed as `grasm toml` prints -- not `packages/toml`, which reads TOML itself and answers otherwise on a float, an inline table or an array across lines (§6.13); one reader is S8's to leave, not part one's |
+| `check` | `front`'s `cmd_check`, which `diagdiff` holds to Rust's |
+| `tir` | `front`'s check path, then its TIR. Rust exposes it, and it is what `grasm tir` prints: every diagnostic rendered, where `front tir` prints them unrendered for the gates |
+| `run` | the check path, the runtime refusal, then `tirinterp` on the TIR in this process |
+| `build --native` | the check path, then `s3` and `link` in this process, with the runtime object beside the driver (below) |
+| `links` | `front`'s loader: the system libraries the packages declare, as the Rust command collects them for its link line. Not in the brief's list; I added it because `build` needs the walk anyway and `difftest` and two other gates ask `grasm links` which programs call C |
+
+**`run`: the TIR interpreter, in the process.** Both ways were measured:
+`front tir` and `tirinterp`, against `front tir`, `s3`, `link` and running
+the executable, stage 1's binaries, on `examples/hello.gr` and the nine
+`benchmarks/grasm` programs, each once, 2026-11-03 at 11:12, a one-minute
+load of 1.8 to 3.8 (not to be quoted):
+
+| program | `front tir` | `tirinterp` | `s3` + `link` | the executable | Rust `grasm run` |
+|---|---:|---:|---:|---:|---:|
+| hello | 0.01 s | 0.46 s | 0.52 s | 0.45 s | 0.03 s |
+| fib | 0.01 s | 1.46 s | 0.05 s | 0.95 s | 1.73 s |
+| sort | 0.01 s | 1.21 s | 0.05 s | 0.47 s | 0.41 s |
+| wordfreq | 0.01 s | 0.90 s | 0.06 s | 0.56 s | 0.52 s |
+| tree | 0.01 s | 1.94 s | 0.05 s | 0.53 s | 1.54 s |
+| parwords | 0.01 s | 2.71 s | 0.06 s | 0.56 s | 1.96 s |
+| sieve | 0.01 s | 4.22 s | 0.05 s | 0.49 s | 2.82 s |
+| matmul | 0.02 s | 7.23 s | 0.06 s | 0.57 s | 6.00 s |
+| mandelbrot | 0.01 s | 24.19 s | 0.06 s | 0.49 s | 12.74 s |
+| parmap | 0.03 s | 112.31 s | 0.06 s | 0.89 s | 53.80 s |
+
+Every output was the same. The first run of a freshly written executable on
+macOS costs about 0.45 s whatever it does (the `hello` row's `tirinterp`,
+and every executable's), so the compiled path never costs less than half a
+second and is far faster on any program that computes: 0.55 s against 24 s
+for `mandelbrot`. It is still the interpreter, for what `grasm run` is: the
+program's stdin, stdout and stderr are the command's own, as they are under
+the Rust `grasm run`, which `proc_run` cannot give a child; nothing starts a
+process; and it is the engine the Rust command runs, so a runtime package
+is refused in the same words, "the interpreter" -- the TIR interpreter
+cannot run the runtime dialect either. The TIR interpreter takes 0.8 to 2.9
+times the Rust interpreter's time on the nine benchmarks (2.1 times on
+`parmap`). The
+panic's stack trace is the one difference [E-PANIC-TRACE] allows between
+engines, and the TIR interpreter, a native build, prints none; `clidiff`
+strips it as `tirinterp.sh` does.
+
+**`build --native`.** The Rust command's checks, in its order and words:
+the operand (the first argument not a flag, if it is the first or ends in
+`.gr`), `--link`'s values then the packages' `links`, the output (`-o`, or
+the source's stem), not a regular file, its directory missing, the source
+itself, a `.gr` name, `--target` without `--native`; then the check path,
+no `main`, a runtime package. Then the program's TIR to `s3`'s
+`compile_program` -- the object a stage's `s3` makes, release allocator,
+inlining at 32 -- and the object to `link` with the runtime object,
+`-interpose rt.o <object> <libraries> -dead_strip -exported_symbol _<e>...
+-strip -o <out>`, as a stage links its programs (§6.14) and with `-strip`
+as the Rust command links with `grasm-link`. `GRASM_KEEP_SYMBOLS` leaves
+the symbols, as there. A link that fails is reported as the Rust command
+reports it: the C functions no library defines, or the linker's words less
+the lines naming the object. Where it differs, each decided by me and open
+to the owner:
+
+- **The success line names the backend.** `built `out` natively (N bytes,
+  Grasm)` where Rust says `Cranelift`: the size differs anyway, since the
+  code is another compiler's, and the line would otherwise say something
+  false about what built the file. The usage keeps "compile to machine code
+  (Cranelift)" to the byte, because the brief holds `--help` byte for byte;
+  it becomes false the day the Grasm driver ships, and is the owner's to
+  reword in both.
+- **`--no-incremental` is accepted and changes nothing.** The Grasm backend
+  compiles a whole program into one object; there is no module cache. So
+  without the flag the Rust command writes `.grasm-cache/` beside the
+  output for a program of more than one module and this one writes
+  nothing: a file the Rust command writes that this one does not.
+- **`--target` takes x86-64 and arm64 macOS only** (`x86_64-apple-darwin`,
+  `aarch64-` or `arm64-apple-darwin`, `-macos...`), and writes the object
+  `s3 --target x86_64` writes, under the Rust command's name and message
+  (`-o x.o`, else `<out>.o`; "emitted ... (link it with a ... toolchain +
+  libgrasm_rt_abi.a)" -- true of the Grasm backend's objects too, which
+  `xs3subset` links with that archive). Any other triple, which Cranelift
+  takes for ELF, is "error: unsupported target `t`: the Grasm backend writes
+  Mach-O objects for x86_64 and aarch64 macOS only", exit 1, where the
+  Rust command emits an object; Linux is S7 part two.
+- **The runtime object is `rt.o` beside the driver**, or in `../lib/grasm/`,
+  as the Rust command looks for `libgrasm_rt_abi.a` beside itself and in
+  `../lib`; `rt.o` because that is its name in a stage's directory. It
+  reads neither `GRASM_RUNTIME` nor `GRASM_LINKER`, which name the Rust
+  runtime's archive and `cc`. Missing, it says where it looked, exit 1.
+- **The runtime is built by the driver**: `grasm build compiler/rt/src/main.gr
+  --native -o rt.o` writes the object `s3 --runtime` writes (`.o` added
+  to any other `-o`, as for `--target`), and says "built `rt.o`, the
+  runtime `rt` (N bytes, Grasm)". The Rust command refuses that line ("no
+  `main` function"), and its refusal of a runtime package names the Grasm
+  backend as the one that takes it. Without this a driver could not make
+  the runtime its own builds link, and stage 2 could not be built by stage
+  1's driver alone; with it, it is a line the two commands answer
+  differently, and `clidiff` names it as one.
+
+**How it finds its parts.** Everything but the runtime is compiled into it;
+the runtime object is found beside the executable, whose path it asks of
+`_NSGetExecutablePath(3)` (what Rust's `current_exe` asks) and resolves
+with `realpath(3)`. It never looks for the Rust `grasm`, `grasm-link`, `cc`
+or any other program, and its package calls neither `proc_run` nor
+`proc_pipeline`: the capabilities `net`, `proc`, `mem` and `async` in its
+manifest are the interpreter's, performed for the program `run` runs, as
+the Rust `grasm run` performs them.
+
+**Every other subcommand.** The command line is read first, for every
+subcommand, known or not, exactly as the Rust command reads it -- a second
+operand where one is taken, a flag the subcommand lacks, a value missing,
+`--` ending it -- so a malformed line is refused in Rust's words whatever
+it names. Then:
+
+- no subcommand: the usage on stderr, exit 1; `help`, `--help`, `-h`: the
+  usage, exit 0; an unknown one: "error: unknown command `x`", a blank
+  line, the usage, exit 1 -- all Rust's, byte for byte;
+- `test`, `bench`, `doc`, `api`, `fmt`, `lint`, `deps`, `publish`, `add`,
+  `lsp`, `dap` and `journal` -- the subcommands part one does not cover:
+  "error: `grasm <cmd>` is not in the Grasm toolchain yet" and a help line
+  naming the ones it runs and this section, on stderr, exit 1 (the status
+  the Rust command gives a command it does not know);
+- `build` without `--native`, and `build --source`: after every check
+  above, "error: `grasm build` without `--native` is not in the Grasm
+  toolchain yet" (or `--source`'s), with the same help, exit 1.
+
+Never a fallback: nothing is handed to the Rust toolchain or any other
+program. The wording and the status are my decision, taken because the
+brief asks for an exact message and none exists in Rust for "not here"; the
+other reading -- answering as Rust answers a command it does not know --
+would print a usage that lists the very command it just called unknown.
+
+**The gate, `clidiff`** (step three): every part-one subcommand through
+both commands from one directory -- the corpus and the conformance
+negatives for `check`, `tir`, `tokens`, `ast` and `run`; the manifests for
+`toml`; argument lines for every subcommand, the unknown and the
+not-covered ones included -- with stdout, stderr and the exit status the
+same bytes, normalised only in the success line of `build` and the stack
+trace `run` may leave out. `build --native` is compared by what its
+executables do, as `rtswap` and `linktest` compare, and by building twice
+for the same bytes. Counts asserted. Controls: a message reworded, an exit
+status changed, a flag misread, a subcommand routed elsewhere.
+
+**Self-hosting the driver** (step four): stage 1 is the driver built by
+the Rust `grasm`, with the `rt.o` stage 1's `front` and `s3` make; stage 2
+is the driver and `rt.o` built by stage 1's driver alone (`grasm build
+compiler/grasm/src/main.gr --native --no-incremental` and the runtime line
+above); stage 3 the same by stage 2. A first try, 2026-11-03, before the
+gate: stage 2 built at the first attempt, and stage 3 is stage 2 to the
+byte, the driver (4,025,208 bytes) and `rt.o` (555,152 bytes) alike; the
+`rt.o` stage 1's driver makes is the one stage 1's `front` and `s3` make.
+`fixpoint` is extended to it, and `clidiff` run with stage 2's driver.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against

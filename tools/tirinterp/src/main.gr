@@ -50,7 +50,14 @@ fn reprint(inp: str, outp: str) {
 /// reported and exits 1 ([E-MAIN-ERR]); a panic has already ended the run
 /// with 101.
 fn run(path: str, prog_args: [str]) {
-    let t = read_tree(path)
+    run_tree(read_tree(path), path, prog_args)
+}
+
+/// Runs the `main` of the program whose TIR is `t` -- read from `path`,
+/// which names it in what the run says when the TIR is not a program it can
+/// load -- as `run` does: what `grasm run` does after its checks
+/// (compiler/grasm, docs/self-hosting.md §6.17).
+pub fn run_tree(t: Tree, path: str, prog_args: [str]) {
     match load.load(t) {
         Ok(p) -> {
             var cx = eval.new_cx(p, prog_args)
