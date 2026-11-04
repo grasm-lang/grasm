@@ -175,6 +175,8 @@ run_gate diagcontrols  scripts/diagcontrols.sh
 run_gate fixpoint      scripts/fixpoint.sh
 run_gate stagediff     scripts/stagediff.sh
 run_gate fixpointcontrols scripts/fixpointcontrols.sh
+run_gate clidiff       scripts/clidiff.sh
+run_gate clicontrols   scripts/clicontrols.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate inctest       python3 scripts/inctest.py
 run_gate brokertest    scripts/broker_test.sh

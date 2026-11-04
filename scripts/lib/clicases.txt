@@ -1,0 +1,184 @@
+# Command lines for `scripts/clidiff.sh`: each run by the Rust `grasm` and by
+# the one in Grasm (compiler/grasm), each in an empty directory of its own
+# that links to every entry at the checkout's root, so a relative path reads
+# the checkout and a file a command writes lands in that directory.
+#
+# A line is the arguments as a shell would split them. A leading word says
+# what the two must do:
+#
+#   (none)      the same stdout, stderr, exit status and files written; a
+#               `build --native` success line may differ only in the size and
+#               in naming the backend (Cranelift, Grasm)
+#   elsewhere   a subcommand part one does not cover: the Grasm command says
+#               it is not here, on stderr, and exits 1 (docs/self-hosting.md
+#               §6.17); the Rust one does whatever it does
+#   runtime     a runtime package built `--native`: the Grasm command writes
+#               the runtime's object; the Rust one says there is no `main`
+#   target      a `--target` the Grasm backend does not write: refused in its
+#               words, where the Rust command emits an ELF or other object or
+#               refuses in Cranelift's
+#
+# Lines starting with `#` and blank lines are not cases.
+
+# No subcommand, help, version, an unknown one.
+(no arguments)
+--help
+-h
+help
+help x
+help x y
+help --x
+version
+--version
+version a b
+--version --x
+version -- --x
+bogus
+bogus --x
+bogus a b
+bogus -- a b
+bogus --
+""
+-
+--
+-x
+--x a
+
+# check
+check
+check examples/hello.gr
+check ./examples/hello.gr
+check examples/hello.gr extra
+check examples/hello.gr --x
+check --x examples/hello.gr
+check -- examples/hello.gr
+check examples/hello.gr --
+check -
+check /nonexistent.gr
+check examples
+check compiler/rt/src/main.gr
+check compiler/front/src/main.gr
+check spec/conformance/E-PANIC-TRACE.gr
+
+# tokens, ast, tir, toml
+tokens examples/hello.gr
+tokens
+tokens /nonexistent.gr
+tokens examples
+tokens a b
+tokens --x
+tokens Cargo.toml
+ast examples/hello.gr
+ast
+ast /nonexistent.gr
+ast examples
+ast examples/hello.gr --x
+tir examples/hello.gr
+tir
+tir /nonexistent.gr
+tir compiler/rt/src/main.gr
+tir examples/hello.gr x
+toml compiler/front/grasm.toml
+toml scripts/lib/tomlcases/arrays.toml
+toml scripts/lib/tomlcases/many.toml
+toml Cargo.toml
+toml examples/hello.gr
+toml /nonexistent.toml
+toml examples
+toml
+toml a b
+
+# run
+run examples/hello.gr
+run
+run examples/hello.gr --x
+run examples/hello.gr -- --x
+run examples/hello.gr -- a b -- c
+run examples/hello.gr extra
+run -- examples/hello.gr
+run /nonexistent.gr
+run compiler/rt/src/main.gr
+run examples
+
+# links
+links examples/hello.gr
+links packages/sdl/src/main.gr
+links
+links -- examples/hello.gr
+links --x
+links /nonexistent.gr
+
+# build: the operand
+build
+build --native
+build -o x examples/hello.gr
+build x y
+build build
+build examples/hello.gr examples/hello.gr
+build --native examples/hello.gr -o h
+build x.gr --native
+# build: values and flags
+build examples/hello.gr -o
+build examples/hello.gr --target
+build examples/hello.gr --link
+build examples/hello.gr --link -lm --native -o h
+build examples/hello.gr --cases 5
+build examples/hello.gr --native --x
+build examples/hello.gr -o -5 --native
+# build: the output
+build examples/hello.gr --native
+build examples/hello.gr --native -o h
+build examples/hello.gr --native -o h --no-incremental
+build examples/hello.gr --native -o sub/h
+build examples/hello.gr -o examples/hello.gr
+build examples/hello.gr -o out.gr --native
+elsewhere build examples/hello.gr -o out.gr --native --source
+build examples/hello.gr -o /dev/null --native
+build examples/hello.gr -o examples --native
+build examples/hello.gr -o /nonexistent/dir/x --native
+build examples/hello.gr --target x86_64-apple-darwin
+# build: the program
+build /nonexistent.gr --native -o h
+build spec/conformance/E-PANIC-TRACE.gr --native -o p
+build compiler/rt/src/main.gr -o r
+runtime build compiler/rt/src/main.gr --native -o rt.o
+# build: --target
+build examples/hello.gr --native --target x86_64-apple-darwin
+build examples/hello.gr --native --target x86_64-apple-darwin -o h.o
+build examples/hello.gr --native --target aarch64-apple-darwin -o h
+build examples/hello.gr --native --target arm64-apple-darwin
+target build examples/hello.gr --native --target x86_64-unknown-linux-gnu
+target build examples/hello.gr --native --target wasm32-unknown-unknown
+target build examples/hello.gr --native --target bogus
+
+# The subcommands part one does not cover: what the command line says of
+# them is the same; past it, they are not here.
+elsewhere test examples/hello.gr
+test examples/hello.gr extra
+elsewhere test --cases -1 x.gr
+test --cases --x x.gr
+test --seed
+test --bogus
+elsewhere bench examples/hello.gr
+bench --filter
+elsewhere doc examples/hello.gr
+doc -o
+elsewhere api examples/hello.gr
+api x.gr --against
+elsewhere fmt examples/hello.gr --check
+fmt --check --x
+elsewhere lint --rules
+lint --only
+elsewhere deps
+deps --locked --x
+elsewhere publish --registry r
+publish --registry
+elsewhere add a b c d
+add a --x
+elsewhere lsp
+lsp --x
+elsewhere dap a b c
+elsewhere journal x
+journal --full --x
+elsewhere build examples/hello.gr -o h
+elsewhere build examples/hello.gr --source -o h.bundle.gr
