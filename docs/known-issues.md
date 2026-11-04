@@ -5,7 +5,8 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one, a `^` chain of 100,000 terms aborting `grasm check`; one
+**Open S1: two, a `^` chain of 100,000 terms aborting `grasm check` and an
+`IoFailed` that `grasm run` and a native binary word differently; one
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
 two, a block whose value is a map literal and a statement `if` whose
@@ -18,6 +19,36 @@ refusal without its reason, and a `match`'s names unbound after an error;
 and one in `compiler/s3`, which no release ships yet, an object naming the
 directory it was compiled in. Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches.**
+
+## Found on 2026-11-03 by S8 part one (the `grasm` command in Grasm)
+
+**An `IoFailed` reads differently under `grasm run` and in a native binary
+-- *open, S1*.** The interpreter fills `IoFailed` with Rust's `io::Error` as
+it displays, the system's message and its number; the runtime, Rust's and
+the one in Grasm alike, with the system's message alone. A program that
+prints the error prints two different lines:
+
+```
+fn main() {
+    match read_bytes("/") {
+        Ok(_) -> print("read")
+        Err(e) -> print("{e}")
+    }
+}
+```
+
+`grasm run` prints `IoFailed(Is a directory (os error 21))`; `grasm build
+--native` and the executable print `IoFailed(Is a directory)`. Every
+system error does it -- `Permission denied (os error 13)` against
+`Permission denied`, `No such file or directory (os error 2)` against the
+plain words where a write's directory is missing -- while `NotFound(path)`
+reads the same in both. It is a disagreement between the engines that
+[E-PANIC-TRACE] does not license, so S1; `difftest` has not reported it, so
+no corpus program it compares prints one. The TIR interpreter, a native
+program, prints the runtime's text, so the Grasm `grasm run` (§6.17) answers
+as the native build does and not as the Rust `grasm run`. Not fixed: which
+text is right is the specification's to say first ([L-LIB-IO] names the
+variants, not their text).
 
 ## Found on 2026-11-02 by S7 part one (the x86-64 encoder)
 
