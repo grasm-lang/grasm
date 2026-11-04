@@ -4026,6 +4026,65 @@ byte, the driver (4,025,208 bytes) and `rt.o` (555,152 bytes) alike; the
 `rt.o` stage 1's driver makes is the one stage 1's `front` and `s3` make.
 `fixpoint` is extended to it, and `clidiff` run with stage 2's driver.
 
+**What the gates found** (2026-11-03 and 04, this branch on `0fed9ffd`, the
+main checkout's compiler, a one-minute load of 2 to 6 from other work):
+
+- `clidiff`, with the command stage 1 is (built by the Rust `grasm`) and,
+  run again, with stage 2's (`fixpoint`'s kept stage, built by stage 1's
+  command alone), both passing with the same lines:
+  "lines: 144   the same: 124   not here, as §6.17 says: 16   the runtime
+  built: 1   a target refused: 3"; "corpus: 1737 programs, 8685 commands
+  (tokens, ast, check, tir, links)   the same: 8685, 138 of them
+  refusals"; "toml: 1473 files   the same: 1473, 19 of them refused by
+  both"; "run: 651 programs with a main   the same: 651   timed out: 0";
+  "build: 648 programs with a main (3 link a system library)   the same
+  output: 648, 0 of them refusals   run alike: 648   built twice the same:
+  648"; "target: 65 programs for x86_64-apple-darwin   the same output, an
+  x86-64 object made twice the same: 65"; "the Grasm command's package
+  calls proc_run or proc_pipeline: 0 time(s)". About 1 hour 40 minutes a
+  run. The first run failed on its own floor (200 refusals, where the corpus
+  has 138 -- the S8 agent's guess, now 120) with nothing differing; the trial before it
+  found four command lines tagged wrongly in the cases file (`build
+  --native --source`, `test --cases -1`, two targets Cranelift refuses in
+  its own words), each now tagged for what the Grasm command says. No line
+  of the corpus met the `IoFailed` wording the engines disagree on
+  (docs/known-issues.md).
+- `clicontrols`: "controls: 7   caught: 7   missed: 0" -- "takes one file"
+  reworded, the usage after an unknown command exiting 2, `--link` read as
+  a flag, `check` handed to the Rust `grasm` by `proc_run` (caught by the
+  count; and, with the count skipped, by the sandbox, where the routed
+  output would otherwise have been the same bytes), the success line naming
+  Cranelift, `build` compiling for x86-64.
+- `fixpoint`, extended: "programs: 6 and the grasm command   artifacts per
+  stage: 16 and 2   compared: 54 ...   identical: 54   differ: 0"; "the
+  command's build the stage pipeline's (its rt.o and the 4 programs): 5 of
+  5". The command's stage 3 is its stage 2: `grasm` 4,025,208 bytes,
+  SHA-256 `8272e454f6c85013b32d9c7ff677e538d197324505b69db6a81d49da1123e483`,
+  and `rt.o` 555,152 bytes, the compiler's stage-3 `rt.o` to the byte. Its
+  stage 2 took 58.7 s and 550 MB at peak, its stage 3 100.8 s and 577 MB
+  (not to be quoted: one run, loads of 2 to 4). `fixpointcontrols`, its
+  copies now holding the command's sources: "controls: 6   caught: 6
+  missed: 0", 61 minutes.
+- Over the packages the command changed (`front`, `s3`, `link`,
+  `tirinterp`): `tokentest` 1,993 of 1,993 files identical, `asttest` 1,993
+  CSTs printed back, `tirdiff` 1,926 the same TIR and 67 refused by both of
+  1,993, `tirrefuse` 582 and 313 of 895, `diagdiff` 1,437 refused alike and
+  2,826 accepted, none differing, `s3subset` 648 of 648, `objtest` 648
+  objects and 2 runtimes reproducible, `linktest` 651 and 648 and the 3
+  fixtures, 2,604 links, `linkdiff` 168 of 168 byte-identical, `rtswap` 648
+  on each path with 323 of 323 names from Grasm, `tirinterp` 651 of 651 and
+  25 panics, `stagediff` 758 executables the same of stage 1 and stage 2;
+  `tomldiff` 1,448 of 1,448 and `frontsmoke` 47 of 47.
+
+**What is left for S8.** Part one covers nine subcommands. The rest -- `test`,
+`bench`, `doc`, `api`, `fmt`, `lint`, `deps`, `publish`, `add`, `lsp`,
+`dap`, `journal`, `build` without `--native` and `--source` -- with the LSP
+on the query engine, DAP, packages, journal and replay, the wasm32 backend,
+one TOML reader, and the decisions above that the owner reverses. The
+gates that run through the `grasm` command (§6.14's last list) can now
+take the Grasm command for the subcommands it has; none was pointed at it
+here.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
@@ -4049,7 +4108,9 @@ binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
 `as -arch x86_64`), `xs3subset` (crosstest with the Grasm backend),
 `objtest_x64`, `ra_check_x64`, `xrtswap` (the x86-64 runtime and linker in
 Grasm), `linkdiff_x64` (the linker against ld's x86-64 output), `fuzz_x64`
-(the fuzzers on the x86-64 backend) and `x64controls` (§6.16), `ddc`,
+(the fuzzers on the x86-64 backend) and `x64controls` (§6.16), `clidiff`
+(the `grasm` command in Grasm against the Rust one) and `clicontrols`
+(§6.17), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -4366,7 +4427,18 @@ Measured, not estimated; each line is a gate's result on master.
   20 generators on the s3 engine check the x86-64 backend under Rosetta
   (`fuzz_x64`), and `s3bench` times it against Cranelift's x86-64 code there,
   figures not to be quoted. Left: Linux, part two.
-- **Not started:** S8, S9, and S7's part two (Linux).
+- **S8 part one done** (§6.17): `compiler/grasm`, the `grasm` command in
+  Grasm for `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run` (the
+  TIR interpreter in the process), `build --native` (front, s3 and link in
+  the process, with the runtime object beside it) and `links`, its command
+  line read as the Rust one reads it and every other subcommand saying it is
+  not here. `clidiff`: 144 command lines, 8,685 corpus commands, 1,473 TOML
+  files, 651 runs, 648 native builds run alike and reproducible, 65 x86-64
+  objects -- the same as the Rust command's, with stage 1's command and with
+  stage 2's, the command executing nothing but itself; `clicontrols` 7 of
+  7. Built by itself, its stage 3 is its stage 2 (`fixpoint`, 54 of 54), and
+  its build of the compiler's programs is the stage pipeline's to the byte.
+- **Not started:** the rest of S8, S9, and S7's part two (Linux).
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
 subcommands in Grasm, so that the gates which build, run, check and test
