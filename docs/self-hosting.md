@@ -4429,6 +4429,147 @@ may reverse any of them.
 9. A gate that needs the machine and cannot reach it exits 77, and
    `allgates.sh` counts it as not run.
 
+**Step two: the object** (2026-11-04). `compiler/elf` writes the backend's
+object description as a relocatable ELF64, as above, and `s3 --target
+aarch64-linux` or `--target x86_64-linux` selects it. `compiler/macho/src/
+dwarf.gr` gained `sections_elf`, which shares its line program with the
+Mach-O writer (`line_table`), so that Mach-O's debug sections stay the bytes
+they were. The writer maps every relocation kind the backend has; of
+these, the low-twelve-bits types for loads and the GOT pair on arm64, and
+`GOTPCREL` without a REX prefix on x86-64, are in no object of the corpus or
+the runtime: every page-offset relocation the arm64 backend writes is on an
+`add`, and nothing in the subset takes a C function's address through the
+GOT. `scripts/elf_obj.py` reads the objects as `s3_macho.py` reads Mach-O:
+the layout, every relocation against the instruction it patches (x86-64's
+instruction starts from `llvm-objdump -d`), the struct descriptors' pointers,
+every DWARF address a function's and every offset into another debug section
+relocated (decoded from the abbreviations), no `retab` or `pacibsp` in a
+Linux arm64 object, and the line table decoded with its relocations -- every
+function's sequence starts at its own section's address 0, so a tool's
+listing cannot say which function a row is in.
+
+**Step three: the backend and the runtime** (2026-11-04). `s3 --target
+aarch64-linux`, `x86_64-linux`, and `--runtime` with either:
+
+- the arm64 frame signs with `paciasp` and returns with `autiasp; ret`
+  (two encoder forms, `mrs xd, tpidr_el0` a third, each held to clang by
+  `encodetest`); x86-64's frame is macOS's;
+- the runtime's thread-local getters are the local-exec sequences above
+  (x86-64 gained `movq %fs:0` and `leaq disp32(%r)`, held to the assembler by
+  `encodetest_x64`), relocated `R_AARCH64_TLSLE_ADD_TPREL_HI12`/`_LO12_NC`
+  and `R_X86_64_TPOFF32`;
+- `open` and `fcntl` go through the variadic table on arm64 Linux too
+  (`compiler/aarch64/src/isel.gr`, empty on macOS), and `__error` is
+  `__errno_location`.
+
+`compiler/rt/src/os.gr` holds Darwin's numbers and its three calls that
+differ (`kq_new`, `kq_event`, `name_thread`); `compiler/rt/os/linux.gr` is
+Linux's. Two more changes to the shared source: `pthread_key_create`'s slot
+is zeroed (a key is 64 bits on macOS and 32 on Linux, and is read as a word),
+and `par.gr`'s literal 6 and `fiber.gr`'s 4098 are `os` constants. Darwin's
+runtime object from the branch's source is master's but for three
+instructions in 53,693: the zeroing's `mov x1, #1`, and two `mov xN, #0`
+two places later, where the `kevent` call now goes through `os.kq_event`
+and is inlined with its arguments made in another order; with the line rows
+of the moved constants. `linux_rt_build` (`scripts/lib/linux.sh`) builds the
+Linux runtime from a copy of the package with `os/linux.gr` in place.
+
+Until the linker links ELF (step four), the Linux gates link the Grasm
+backend's programs with GNU ld 2.45: `compiler/link`'s `_start` (`link
+-start-object`), the program, the Grasm runtime, glibc's `libm.so.6` and
+`libc.so.6`, `-pie -z now -z relro --hash-style=gnu --gc-sections
+--build-id=none`, and a `--defsym` binding each `grasm_<name>` to the
+runtime's `grt_<name>`, as `link -interpose` binds them. Every program runs in
+the machine with a /tmp of its own (`scripts/lib/isolate.py`: a user and
+mount namespace mapping the machine's user to itself, the gate's directory
+mounted on /tmp): fifteen of the subset's programs name paths under /tmp,
+and the machine's /tmp is the owner's. The first full run of `elfsubset`,
+before that, left 48 files and directories of those programs in the
+machine's /tmp, and ran two programs' copies at once on one directory:
+`packages/lsm-demo` differed on both triples for that reason alone, and
+agreed once each run had its own /tmp.
+
+What the Linux runs found: `spec/conformance/T-EXTERN-POINTER.gr` declares
+`memcmp`, whose C result is an `int`, as returning `i64`, and so reads the
+half of the register C leaves unspecified -- glibc leaves it zero under a
+negative result, Apple's libSystem sign-extends -- so on Linux both builds
+print `memcmp orders: false true` where the interpreter on the Mac prints
+`true true`. It is the program's assumption, not a backend's: it is listed
+in `scripts/elfsubset_known.txt` for both triples.
+
+**The gates** (2026-11-04, the branch's final tree, a one-minute load on the
+Mac of 3 to 5 from other work, 15 to 18 GB of swap in use of 16 to 19.5 GB, the
+disk 8.6 to 12 GB free):
+
+- `objtest_elf`: "aarch64-linux: objects: 648   reproducible:
+  648   linked by ld: 648   relocations: 3322951   literal loads on their
+  lines: 137906 (of literals loaded more than once: 31366)", "the runtime:
+  built twice the same, read, relocated and linked (ld -r) without a
+  problem: 1 of 1   relocations: 6386"; "x86_64-linux: objects: 648
+  reproducible: 648   linked by ld: 648   relocations: 3083326   literal
+  loads on their lines: 68953 (of literals loaded more than once: 15683)",
+  the runtime 1 of 1, 5355 relocations; "with problems: 0" (LLVM 21.1.8's
+  readers, GNU readelf and ld 2.45). The literal loads are the Mach-O
+  gates' counts to the literal. 25 minutes.
+- `elfsubset`: "aarch64-linux: subset: 648 in, 0 out, 3 external, of 651
+  programs with a main", "identical: 647 mismatched: 0 timed out: 0
+  agreeing with the Cranelift build and not the interpreter, as listed: 1",
+  and the same for x86_64-linux; GNU ld 2.45, glibc 2.42. 36 minutes.
+- `elfrtswap`: "the Grasm runtime for aarch64-linux x86_64-linux: 345
+  names moved, exported as families.txt lists; it calls none of the Rust
+  runtime's"; for each triple "programs with a main: 648   external set
+  aside: 3", "Cranelift objects: identical: 648   poisoned runtime, agreeing
+  with no use after free: 648", "Grasm backend objects: in the subset: 648
+  identical: 648", "runtime names the programs reference: 342 distinct, all
+  taken from Grasm; per program, 221616 references bound to Grasm" (a
+  Cranelift ELF object names every runtime function it may call, used or
+  not, so these count names, not the bindings `-interpose_log` counts on
+  macOS). 20 minutes.
+- `elfcontrols`: "controls: 17   caught: 17   missed: 0" -- the object's ten
+  (an addend off by four, a function's section without SHF_ALLOC, `main`
+  local, the locals' boundary one off, an `add` relocated as a load, the TLS
+  high half relocated as the low, `.debug_abbrev`'s offset unrelocated, the
+  line sequences four bytes late, no `.note.GNU-stack`, the clock in the
+  object; each by `objtest_elf`) and step three's seven: `retab` in a Linux
+  frame (`objtest_elf`: this machine's processor runs it, so no run shows
+  it), `__error` kept (no link), the TLS getter from 0, the variadic table
+  off on arm64 (`fcntl` reads 0, no descriptor is closed on `exec`, and
+  `L-LIB-PROC` runs past the limit), Darwin's `O_CREAT` (each by
+  `elfsubset`), Darwin's `dirent` and `SOL_SOCKET` (by `elfrtswap`, the
+  Cranelift build with each runtime). The first `elf-ldst`, a load's
+  relocation scaled wrongly, was vacuous -- no object relocates a load's low
+  bits -- and was replaced by an `add` relocated as a load; the first
+  `elf-variadic` aimed at `open`'s mode, which no gate here can see: the
+  programs' /tmp is on the Mac's disk, and OrbStack's mount of it does not
+  hold a file's owner to the file's mode.
+- Darwin unchanged: from the same TIR in the same directory, master's
+  driver and the branch's made the same bytes for all 1,302 objects of the
+  corpus both compile for `aarch64` and `x86_64` (651 programs) and for the
+  runtime on both; `encodetest` 115 forms, 7,025 encodings as clang's
+  (`paciasp`, `autiasp`, `mrs-tpidr` new); `encodetest_x64` 104 forms, 5,638
+  as the assembler's (`load-fs0`, `lea-tpoff` new); `rtswap` on macOS with
+  the branch's runtime "Cranelift objects: identical: 648 failed: 0", "323
+  distinct, 323 taken from Grasm", "poisoned runtime: agreeing with no use
+  after free: 648", "Grasm backend objects: in the subset: 648 identical:
+  648", as before; `fixpoint` "compared: 54 ... identical: 54 differ: 0",
+  "stage 2's TIR the same as grasm tir's: 6 of 6" (the new `compiler/elf`,
+  `os.gr` and `elfstart.gr` among what stage 1's frontend read), stage 3's
+  `rt.o` 555,224 bytes; `fmttest`, `linttest` and `gatecheck` pass.
+
+Not run on this tree: the rest of the suite -- among them `tokentest`,
+`asttest`, `tirdiff` and `diagdiff` over the new files (`os/linux.gr`, which
+no stage reads, among them), `clidiff` (the `grasm` command's one change is
+passing `false` for Linux), `linktest` and `linkdiff` (the linker's one
+change is `-start-object`), `xrtswap` (the x86-64 macOS runtime, whose source
+changed as the arm64 one did), `rtcontrols`, `s3controls`, `x64controls` and
+the fuzzers.
+
+**What is left for S7's exit.** Step four: `compiler/link` linking ELF,
+dynamic against glibc, held to GNU ld by `linkdiff_elf`, and the Linux gates
+switched from GNU ld to it; step five's `clidiff` lines for the Linux
+triples. Then the Linux gates, run in the machine by `allgates.sh`, are
+S7's "Linux CI run".
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
@@ -4785,8 +4926,10 @@ Measured, not estimated; each line is a gate's result on master.
   stage 2's, the command executing nothing but itself; `clicontrols` 7 of
   7. Built by itself, its stage 3 is its stage 2 (`fixpoint`, 54 of 54), and
   its build of the compiler's programs is the stage pipeline's to the byte.
-- **S7 part two** (Linux ELF, §6.18): the design, with the owner's decisions
-  of where Linux runs (OrbStack on the Mac) and of its two toolchain questions.
+- **S7 part two** (Linux ELF, §6.18): the design, with the owner's decisions;
+  the ELF object writer and the backend and runtime for arm64 and x86-64
+  Linux, the corpus agreeing with the Cranelift build for each triple and
+  with the interpreter, linked by GNU ld until `compiler/link` links ELF.
 - **Not started:** the rest of S8, and S9.
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
