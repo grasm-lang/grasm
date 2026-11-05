@@ -4564,11 +4564,227 @@ change is `-start-object`), `xrtswap` (the x86-64 macOS runtime, whose source
 changed as the arm64 one did), `rtcontrols`, `s3controls`, `x64controls` and
 the fuzzers.
 
-**What is left for S7's exit.** Step four: `compiler/link` linking ELF,
-dynamic against glibc, held to GNU ld by `linkdiff_elf`, and the Linux gates
-switched from GNU ld to it; step five's `clidiff` lines for the Linux
-triples. Then the Linux gates, run in the machine by `allgates.sh`, are
-S7's "Linux CI run".
+**Step four: the linker** (2026-11-04). `compiler/link` links ELF when its
+first object is ELF: `elfmain.gr` reads the command line (`-o`, `-e`,
+`-dead_strip`, `-strip`, `-sysroot`, `-L`, `-l`, `-nostdlib`, `-nostart`,
+`-interpose`), `elfin.gr` the inputs (relocatable objects, GNU archives,
+shared libraries' dynamic symbols, versions, `DT_SONAME` and `DT_NEEDED`),
+`elfresolve.gr` resolves symbols in command-line order (archive members
+loaded pass after pass, `-interpose`'s binding of each undefined
+`grasm_<name>` to the runtime's `grt_<name>`, imports bound to the default
+version glibc's `.gnu.version_d` gives) and marks what `--gc-sections`
+keeps, `elfmerge.gr` merges string sections as ld does (`bfd/merge.c`:
+first-met order, tails merged), and `elflink.gr` lays out and writes the
+executable. The inputs are its own `_start` (`elfstart.gr`), the
+command line's, then `libm.so.6` and `libc.so.6` from the system root
+(`-sysroot`): for arm64 the machine's own root, read on the Mac through
+OrbStack's mount of it (`~/OrbStack/<machine>`, `GRASM_A64_ROOT` in the
+gates); for x86-64 `GRASM_X64_ROOT`.
+
+For every program of the subset, from either backend's object, with the
+Grasm runtime, its output is GNU ld 2.45's byte for byte, ld given `-pie -z
+now -z relro --hash-style=gnu --gc-sections --build-id=none -s` and the
+same files. That took ld's own algorithms, read from its source, where a simpler rule would
+have made a working executable with other bytes:
+
+- the dynamic symbols' order is the order of ld's symbol hash table
+  (`bfd_hash_hash` of `name@@VERSION`, the table's size grown from 4051 as
+  ld grows it from the count of names it has entered: each object's globals,
+  each `--defsym`, each library's versioned spellings), later-entered first
+  within a bucket; the PLT's and GOT's order is that traversal's;
+- `.gnu.version_r` lists each library's versions newest-first as ld
+  prepends them, `.dynstr` the names in binding order, then the libraries'
+  and the versions', with ld's suffix merging (`elf-strtab.c`);
+- `.dynamic`'s tags in ld's order, with its five spare entries
+  (`DT_RELACOUNT` in the first);
+- the RELRO layout of `lang_size_relro_segment_1` (the segment ends on a
+  maximum-page boundary: 64 KiB on arm64, 4 KiB on x86-64), x86-64's
+  separate-code pages for text and read-only data, its empty `.eh_frame`
+  when there is a PLT, its multi-byte nops between sections;
+- a merged section keeps `SHF_MERGE` only when every input had the same
+  flags and entity size (`ldlang.c`); a section symbol's addend into one is
+  mapped through the merge;
+- on arm64 a section symbol for `.text` and one for `.data` (or the first
+  writable section) in `.dynsym` when `.rela.dyn` is not empty, as
+  `elfNN_aarch64_size_dynamic_sections` adds them;
+- the GOT's local slots per object in symbol order, then the globals' in
+  traversal order, their `RELATIVE` relocations first and counted; on
+  x86-64, `GOTPCREL` loads of a symbol defined here relaxed to `lea`, and an
+  import both called and loaded called through `.plt.got` (ld's non-lazy
+  PLT) and hashed in `.gnu.hash`;
+- the thread-local offsets of each architecture's variant: arm64's
+  `TPREL` from the thread pointer past its 16-byte block (aligned to the
+  segment), x86-64's `TPOFF` below it.
+
+Relocations taken: arm64's `ABS64` (a `RELATIVE` in loaded data), `ABS32`,
+`PREL32`, the page and low-twelve-bit pairs (`ADR_PREL_PG_HI21` with `ADD`
+and every load size, `ADR_GOT_PAGE` with `LD64_GOT_LO12_NC`), `CALL26` and
+`JUMP26` (through the PLT for an import), `TLSLE_ADD_TPREL_HI12` and
+`_LO12_NC`; x86-64's `64`, `32`, `32S`, `PC32`, `PLT32`, the `GOTPCREL`
+family and `TPOFF32`. Any other is refused by name, as is a 64-bit pointer
+to an imported symbol (a copy relocation's case) and a branch out of range.
+
+What it does not link yet, and refuses rather than write wrong: an
+executable with a symbol table or debug sections (`-strip` is required: ld's
+unstripped `.symtab` order and the debug sections' relocations, tombstones
+for discarded code included, are left); unwind tables (`.eh_frame`,
+`.gcc_except_table`) and section groups (COMDAT) -- which is the Rust
+runtime's archive, so the Cranelift build's reference links stay gcc's and
+the cross ld's; and exported symbols (`-exported_symbol`). Neither backend
+writes unwind tables or groups, and `grasm build --native` strips.
+
+**The glibc floor, measured.** The floor above is wrong for 16 of the 648
+programs: glibc 2.42's libm gives `fmod` a default version of 2.38 and
+`hypot` one of 2.35, and ld binds a call to the default. The Grasm runtime's
+float `%` calls `fmod`, so a program that takes a float's remainder (13 of
+them) needs glibc 2.38; one that calls `hypot` and not `fmod` (3; 5 call
+`hypot`) needs 2.35; the runtime and every other program need 2.34. The
+reference, gcc's link of the Cranelift object with the Rust runtime, needs
+2.35 for `hypot` as well, and 2.34 for the others: its `%` does not call
+`fmod` (checked on `packages/numeric2-demo` and `packages/timezone-demo`,
+arm64). `scripts/glibc_floor.txt` lists the two functions with their
+versions and why, and the floor check (`linux_glibc_floor` in
+`scripts/lib/linux.sh`, run on every link `linkdiff_elf` and `elfsubset`
+make) fails on any import above 2.34 not listed with its version, and, on a
+whole `elfsubset` run, on a listed function no link needed.
+
+**Step five: the `grasm` command** (2026-11-04). `build --native --target`
+takes `aarch64-linux-gnu`, `x86_64-linux-gnu` and their `-unknown-`
+spellings and writes the object `s3 --target <arch>-linux` writes, under the
+Rust command's message; any other Linux triple (musl, no ABI) is refused in
+the Grasm command's words, as other targets are. A runtime package built for
+a Linux triple is refused: its Linux object is compiled from a copy with
+`os/linux.gr` as `src/os.gr` (`linux_rt_build`), which the loader does not
+make. `clidiff`'s lines gain the four spellings (each the Rust command's
+output) and the two refusals, and its `target` section builds every tenth
+program for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` as
+well as `x86_64-apple-darwin`, each object checked for its format and
+machine and made twice the same; `clicontrols` gains `linux-refused` (the
+Linux triples refused as before) and `linux-macho` (a Linux target given a
+Mach-O object).
+
+**Decisions in steps four and five** (2026-11-04), taken by the agent
+implementing this part; the coordinator or the owner may reverse any of
+them:
+
+10. The floor is 2.34 but for the functions `scripts/glibc_floor.txt`
+    lists (`fmod`, 2.38; `hypot`, 2.35), bound as ld binds them. Keeping
+    2.34 for every program would take binding those two to their older
+    versions -- the backend naming the import `fmod@GLIBC_2.17` (x86-64:
+    `@GLIBC_2.2.5`) as a `.symver` does, which ld honours and this linker
+    would have to -- or a float remainder that does not call `fmod`, or
+    linking against an older glibc.
+11. Only a stripped executable is written (`-strip` required; `grasm build
+    --native` strips): ld's unstripped symbol table order and the debug
+    sections' relocations, tombstones for discarded code among them, are
+    left.
+12. The Rust runtime's archive is refused (unwind tables, section groups),
+    so the references stay linked by gcc and the cross ld; `linkdiff_elf`
+    checks the refusal, where §6.18's plan had it link that archive too.
+13. `-exported_symbol` is refused for ELF; no program here exports one on
+    Linux.
+14. `linkdiff_elf` holds the linker to ld's bytes; equal bytes make the
+    plan's `readelf -a`, `objdump -d` and per-section comparisons the same,
+    so they run only on a difference (`scripts/elfcmp.py` names it part by
+    part).
+15. The arm64 C library is the machine's own, read on the Mac through
+    OrbStack's mount of its root, so the linker and ld read the same files;
+    a gate that cannot read it does not run (exit 77).
+16. The Linux gates link the Grasm backend's programs with `-strip`; what a
+    program prints does not depend on its symbol table.
+
+**The gates, steps four and five** (2026-11-04 and 5, on the branch's tree
+as committed -- `linkdiff_elf`'s second link of each and the comments of
+`scripts/glibc_floor.txt` came after `clidiff` and the regression gates ran,
+which read neither; a one-minute load on the Mac of 3 to 5 from other work,
+15.5 to 18 GB of swap in use until it fell to 5.5 GB near midnight, the disk
+6.6 to 22 GB free):
+- `linkdiff_elf`: for each triple "programs: 162 (every fourth of the
+  subset) linked by compiler/link: 324 twice the same: 324 GNU ld's bytes:
+  324 different: 0 newest glibc required: 2.38 (floor 2.34; above it, as
+  listed: fmod 2.38 in 8 links, hypot 2.35 in 4 links) refused as not linked
+  yet: 2 of 2", against GNU ld 2.45 on arm64 and the x86-64 cross ld 2.45. 6
+  minutes. Before it, a run over every program of the subset, both triples,
+  from each backend's objects (1,296 links each), found one link not ld's:
+  the Grasm backend's x86-64 object of `spec/conformance/L-LIB-CALL-C.gr`,
+  whose `strlen` is both called and loaded -- such an import belongs in
+  `.plt.got` and `.gnu.hash`, and `.rela.dyn`'s GOT relocations go by place.
+  With that fixed, all 2,592, run again, were ld's bytes (a run of a scratch
+  harness, not a gate).
+- `elfsubset`, linked by `compiler/link`: for each triple "subset: 648 in, 0
+  out, 3 external, of 651 programs with a main", "identical: 647 mismatched:
+  0 timed out: 0 agreeing with the Cranelift build and not the interpreter,
+  as listed: 1", "linked by compiler/link; the newest glibc a link requires:
+  2.38 (floor 2.34; above it, as listed: fmod 2.38 in 13 links, hypot 2.35
+  in 5 links)"; the references by GNU ld 2.45, run on glibc 2.42. 36
+  minutes. Its first run with the switch, before the list, agreed on every
+  program as before and failed the floor on those 16.
+- `elfrtswap`, linked by `compiler/link`: for each triple "programs with a
+  main: 648 external set aside: 3", "Cranelift objects: identical: 648
+  poisoned runtime, agreeing with no use after free: 648", "Grasm backend
+  objects: in the subset: 648 identical: 648", "runtime names the programs
+  reference: 342 distinct, all taken from Grasm". 20 minutes.
+- `elfcontrols`: "controls: 24 caught: 24 missed: 0" -- step two's and
+  three's seventeen as before (`elf-errno` caught now by `compiler/link`'s
+  "undefined reference to"), the linker's six, each by `linkdiff_elf`
+  against ld's bytes (`link-call26` and `link-tls` in `.text`, `link-slot`
+  in `.rela.plt`, `link-version` in `.gnu.version`, `link-relative` in
+  `.rela.dyn`, `link-relro` in `PT_GNU_RELRO`), and `floor-list`. The first
+  `link-relative` was vacuous on `hello`, whose link has no pointer in
+  loaded data; it runs on `examples/ranges.gr`. 3 minutes.
+- `clidiff`: "lines: 149 the same: 128 not here, as §6.17 says: 16 the
+  runtime built: 1 a target refused: 4", "corpus: 1737 programs, 8685
+  commands ... the same: 8685, 138 of them refusals", "toml: 1474 files the
+  same: 1474", "run: 651 programs with a main the same: 651", "build: 648
+  programs with a main (3 link a system library) the same output: 648 ...
+  run alike: 648 built twice the same: 648", "target: 65 programs, each for
+  x86_64-apple-darwin, x86_64-unknown-linux-gnu and
+  aarch64-unknown-linux-gnu the same output, the triple's object made twice
+  the same: 195 of 195"; no `proc_run`. 101 minutes.
+- `clicontrols`: "controls: 9 caught: 9 missed: 0", `linux-refused` and
+  `linux-macho` among them. 26 minutes.
+- The regression gates step three left unrun, one at a time under `nice`:
+  `tokentest` "files: 2003 identical: 2003 mismatched: 0"; `asttest` "files:
+  2003 AST identical: 2003 AST mismatched: 0", "CST printed back: 2003 not:
+  0"; `tirdiff` "files: 2003 TIR identical: 1936 both refuse: 67 disagree: 0
+  holes: 0", "emitted twice: 193 unstable: 0"; `diagdiff` "programs: 4273
+  ... refused with the same output: 1437 ... accepted by both: 2836 differ:
+  0 Rust panics: 0"; `linktest` "Cranelift objects: identical: 651 failed:
+  0", "Grasm backend objects: in the subset: 648 identical: 648 failed: 0",
+  "C fixtures: identical: 3 of 3", "links by compiler/link (each made twice,
+  compared): 2604"; `linkdiff` "sampled: 168 byte-identical to the shipped
+  build: 168 tools and sections agree: 168 C fixtures agree: 3 of 3 whole
+  runtime (401 members) agrees: 1"; `xrtswap` "programs: 648", "Cranelift
+  objects: identical: 648 poisoned runtime, agreeing with no use after free:
+  648", "Grasm backend objects: identical: 648 linked twice, the same bytes:
+  648", "failed: 0 timed out: 0" (123 minutes); `rtcontrols` "checks of
+  planted faults: 80 caught: 80 missed: 0"; `s3controls` "controls: 42
+  caught: 42 missed: 0" (97 minutes); `x64controls` "controls: 32 caught: 32
+  missed: 0" (53 minutes).
+- `fmttest` "formatted: 1997 unformatted: 0", `linttest` "linted: 1998 ...
+  broke: 0" and `gatecheck` pass.
+
+Not run on this tree: `objtest_elf` (the ELF writer is step three's,
+unchanged), `fixpoint` (the `grasm` command and the linker changed, and
+`clidiff` held the command built by the Rust one), `linkcontrols` and
+`linkdiff_x64` (the Mach-O linker's source is unchanged; `main.gr` sends an
+ELF input to the ELF linker before it reads its arguments as Mach-O's, and
+`linktest`, `linkdiff` and `x64controls` ran through it), `rtswap`,
+`rtlayout`, `s3subset`, `xs3subset`, the fuzzers and the rest of the suite;
+no whole `allgates.sh`. The runs of the gates above that run corpus
+programs left a `target/` in the worktree (programs' `target/demo-out`, the
+conformance programs' directories, and a poisoned runtime one of
+`s3controls`' gates builds into `target/s3rc-poison`), removed after.
+
+**What is left for S7's exit.** The Linux gates -- `objtest_elf`,
+`elfsubset`, `elfrtswap`, `linkdiff_elf` and `elfcontrols` -- run in the
+machine by a whole `allgates.sh`, S7's "Linux CI run". Of this part's plan:
+the floor decision (10) to confirm or reverse; `elfrtlayout` and `elfrepro`
+of §8 are not gates of their own (`objtest_elf` makes each object twice,
+`linkdiff_elf` each link); and the linker's unstripped output, unwind
+tables, section groups and exports (decisions 11 to 13), which the Rust
+runtime's archive would need. A runtime package's Linux object from `grasm
+build`, and a `grasm` command that runs on Linux, are S8's.
 
 ## 8. Gates this adds
 
