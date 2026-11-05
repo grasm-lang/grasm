@@ -1,0 +1,317 @@
+// The ELF linker's command line and order of work (docs/self-hosting.md
+// §6.18): what `link` does when its inputs are ELF.
+//
+//     link [options] <inputs> -o <output>
+//
+//     -o <file>               the executable (default a.out)
+//     -e <symbol>             the entry point (default _start)
+//     -dead_strip             drop what the entry and the exports do not
+//                             reach (ld's --gc-sections)
+//     -strip                  no symbol table and no debug sections (ld's -s);
+//                             required: only a stripped executable is
+//                             written yet
+//     -sysroot <dir>          where the C library is: <dir>/lib/<multiarch>
+//                             and <dir>/usr/lib/<multiarch> (default /)
+//     -L<dir>                 another place to look for libraries, first
+//     -l<name>                lib<name>.so.6, else lib<name>.so
+//     -nostdlib               no libm.so.6 and libc.so.6 after the inputs
+//     -nostart                no `_start` of this linker's before them
+//     -interpose <obj>        link <obj>, a runtime written in Grasm, where
+//                             it stands, binding the other objects'
+//                             undefined `grasm_<name>` to its `grt_<name>`
+//     -exported_symbol <sym>  export it from the executable (repeatable);
+//                             refused for ELF yet
+//
+// Inputs are relocatable objects, GNU archives and shared libraries, in
+// order; the linker's `_start` (`elfstart.gr`) goes first, and libm and libc
+// last, as the Linux gates give GNU ld the same files.
+import rd
+import elfstate
+import elfin
+import elfresolve
+import elflink
+import elfstart
+
+fn multiarch(x64: bool) -> str {
+    if x64 { "x86_64-linux-gnu" } else { "aarch64-linux-gnu" }
+}
+
+fn find_lib(l: El, file: str) -> str {
+    var dirs: [str] = []
+    for d in l.lib_dirs {
+        dirs.push(d)
+    }
+    let root = if l.sysroot.ends_with("/") { l.sysroot.substr(0, l.sysroot.len() - 1) } else { l.sysroot }
+    dirs.push(root + "/lib/" + multiarch(l.x64))
+    dirs.push(root + "/usr/lib/" + multiarch(l.x64))
+    dirs.push(root + "/usr/" + multiarch(l.x64) + "/lib")
+    for d in dirs {
+        if file_exists(d + "/" + file) {
+            return d + "/" + file
+        }
+    }
+    ""
+}
+
+/// The command line `a` read; or the lines that say why it cannot be.
+pub fn parse(a: [str]) -> (El, bool, [str]) {
+    var l = elfstate.new_el()
+    var start = true
+    var i = 0
+    while i < a.len() {
+        let x = a[i]
+        let more = i + 1 < a.len()
+        if x == "-o" and more {
+            l.out = a[i + 1]
+            i += 2
+        } else if x == "-e" and more {
+            l.entry = a[i + 1]
+            i += 2
+        } else if x == "-dead_strip" or x == "--gc-sections" {
+            l.gc = true
+            i += 1
+        } else if x == "-strip" {
+            l.strip = true
+            i += 1
+        } else if x == "-sysroot" and more {
+            l.sysroot = a[i + 1]
+            i += 2
+        } else if x == "-L" and more {
+            l.lib_dirs.push(a[i + 1])
+            i += 2
+        } else if x.starts_with("-L") {
+            l.lib_dirs.push(x.substr(2, x.len() - 2))
+            i += 1
+        } else if x.starts_with("-l") and x.len() > 2 {
+            l.in_kind.push("l")
+            l.in_arg.push(x.substr(2, x.len() - 2))
+            i += 1
+        } else if x == "-nostdlib" {
+            l.nostdlib = true
+            i += 1
+        } else if x == "-nostart" {
+            start = false
+            i += 1
+        } else if x == "-interpose" and more {
+            l.in_kind.push("i")
+            l.in_arg.push(a[i + 1])
+            i += 2
+        } else if x == "-exported_symbol" and more {
+            // Kept for the command line's sake: the ELF writer has no
+            // exported symbols yet, so a link that names one is refused.
+            l.exports.push(a[i + 1])
+            i += 2
+        } else if x.starts_with("-") {
+            return (l, start, ["link: unknown option {x}"])
+        } else {
+            l.in_kind.push("o")
+            l.in_arg.push(x)
+            i += 1
+        }
+    }
+    (l, start, [])
+}
+
+fn read_file_bytes(path: str) -> bytes ! str {
+    match read_bytes(path) {
+        Ok(b) -> b
+        Err(e) -> fail("cannot read {path}: {e}")
+    }
+}
+
+/// The link the command line describes, written; or why not.
+pub fn run(inout l: El, start: bool, first: bytes) -> () ! str {
+    // Only a stripped executable is written: its symbol table, in GNU ld's
+    // order, and the debug sections with their relocations applied are not
+    // written yet (docs/self-hosting.md §6.18).
+    if not l.strip {
+        fail("an ELF executable is written stripped only (-strip): no symbol table or debug sections yet")
+    }
+    if l.exports.len() > 0 {
+        fail("an ELF executable exports no symbol yet (-exported_symbol {l.exports[0]})")
+    }
+    l.x64 = elfin.machine(first) == elfstate.EM_X86_64
+    // Inputs in order, the start first and the C library last.
+    var kinds: [str] = []
+    var args: [str] = []
+    if start {
+        kinds.push("s")
+        args.push("")
+    }
+    for k in 0..l.in_kind.len() {
+        kinds.push(l.in_kind[k])
+        args.push(l.in_arg[k])
+    }
+    if not l.nostdlib {
+        kinds.push("so")
+        args.push("libm.so.6")
+        kinds.push("so")
+        args.push("libc.so.6")
+    }
+    // Read every object, so the interposition knows the runtime's names.
+    var datas: [bytes] = []
+    var paths: [str] = []
+    for k in 0..kinds.len() {
+        var path = args[k]
+        var d = bytes_filled(0, 0)
+        if kinds[k] == "s" {
+            path = "<_start>"
+            d = try elfstart.start_object(l.x64)
+        } else if kinds[k] == "l" {
+            var p = find_lib(l, "lib" + args[k] + ".so.6")
+            if p == "" {
+                p = find_lib(l, "lib" + args[k] + ".so")
+            }
+            if p == "" {
+                fail("cannot find -l{args[k]}")
+            }
+            path = p
+            kinds[k] = "so"
+            d = try read_file_bytes(p)
+        } else if kinds[k] == "so" {
+            let p = find_lib(l, args[k])
+            if p == "" {
+                fail("cannot find {args[k]}")
+            }
+            path = p
+            d = try read_file_bytes(p)
+        } else {
+            d = try read_file_bytes(path)
+            if d.len() >= 8 and d.slice(0, 8).to_str() == "!<arch>\n" {
+                kinds[k] = "a"
+            } else if elfin.is_elf(d) and rd.u16(d, 16) == 3 {
+                kinds[k] = "so"
+            }
+        }
+        paths.push(path)
+        datas.push(d)
+    }
+    var objs: [i64] = []
+    for k in 0..kinds.len() {
+        let kd = kinds[k]
+        if kd == "s" or kd == "o" or kd == "i" {
+            objs.push(try elfin.read_object(l, paths[k], datas[k], kd == "i"))
+        } else {
+            objs.push(-1)
+        }
+    }
+    let aliases = elfresolve.interpose(l)
+    // Resolution in command-line order.
+    var disc = 0
+    var libs: [i64] = []
+    for k in 0..kinds.len() {
+        let kd = kinds[k]
+        if objs[k] >= 0 {
+            try elfresolve.add_object(l, objs[k])
+        } else if kd == "a" {
+            try load_archive(l, paths[k], datas[k])
+        } else if kd == "so" {
+            let fi = try elfin.read_shared(l, paths[k], datas[k])
+            l.dt_needed.push(fi)
+            libs.push(fi)
+            elfresolve.add_shared(l, fi, disc)
+        }
+    }
+    // The libraries' own DT_NEEDED ones, which ld reads too.
+    var have: Map[str, bool] = {}
+    for fi in libs {
+        have.set(l.f_soname[fi], true)
+    }
+    var q = 0
+    while q < libs.len() {
+        let fi = libs[q]
+        q += 1
+        for n in l.needed.slice(l.f_needed0[fi], l.f_needed0[fi] + l.f_nneeded[fi]) {
+            if have.has(n) {
+                continue
+            }
+            have.set(n, true)
+            let p = find_lib(l, n)
+            if p == "" {
+                continue
+            }
+            let d = try read_file_bytes(p)
+            let nf = try elfin.read_shared(l, p, d)
+            libs.push(nf)
+            elfresolve.add_shared(l, nf, disc)
+        }
+    }
+    try refuse_unsupported(l)
+    try elfresolve.mark(l)
+    let file = try elflink.link(l, aliases)
+    let tmp = l.out + ".link-tmp"
+    match write_bytes(tmp, file) {
+        Ok(_) -> ()
+        Err(e) -> fail("cannot write {l.out}: {e}")
+    }
+    let rc = unsafe { chmod(tmp, 493) }
+    if rc != 0 {
+        let _gone: () ! IoError = remove_file(tmp)
+        fail("cannot make {l.out} executable")
+    }
+    match rename_file(tmp, l.out) {
+        Ok(_) -> ()
+        Err(e) -> fail("cannot write {l.out}: {e}")
+    }
+}
+
+extern fn chmod(path: str, mode: i64) -> i64
+
+/// Refuses what the linker would otherwise drop or get wrong: unwind tables
+/// (`.eh_frame`, which ld edits and indexes in `.eh_frame_hdr`, and the
+/// `.gcc_except_table` they point into) and section groups (COMDAT, which
+/// ld keeps one of). Neither backend writes them; the Rust runtime's archive
+/// has both, and is not linked by this linker yet (docs/self-hosting.md
+/// §6.18).
+fn refuse_unsupported(l: El) -> () ! str {
+    for s in 0..l.s_file.len() {
+        let fi = l.s_file[s]
+        if l.f_kind[fi] != 0 {
+            continue
+        }
+        let n = l.s_name[s]
+        if (n.starts_with(".eh_frame") or n.starts_with(".gcc_except_table")) and l.s_size[s] > 0 {
+            fail("{l.f_path[fi]}: unwind tables ({n}) are not linked yet")
+        }
+        if l.s_type[s] == elfstate.SHT_GROUP {
+            fail("{l.f_path[fi]}: section groups (COMDAT) are not linked yet")
+        }
+    }
+    ()
+}
+
+/// An archive's members loaded while one defines a symbol still undefined,
+/// pass after pass over its symbol table, as ld loads them.
+fn load_archive(inout l: El, path: str, d: bytes) -> () ! str {
+    let m = try elfin.ar_map(d, path)
+    var loaded: Map[i64, bool] = {}
+    var changed = true
+    while changed {
+        changed = false
+        for k in 0..m.names.len() {
+            let off = m.offs[k]
+            if loaded.has(off) {
+                continue
+            }
+            match l.g_map.get(m.names[k]) {
+                Some(g) -> {
+                    if l.g_kind[g] == elfstate.G_UNDEF and not weak_only(l, g) {
+                        loaded.set(off, true)
+                        let mem = try elfin.ar_member(d, off)
+                        let fi = try elfin.read_object(l, path + "(" + mem.0 + ")", mem.1, false)
+                        try elfresolve.add_object(l, fi)
+                        changed = true
+                    }
+                }
+                None -> ()
+            }
+        }
+    }
+    ()
+}
+
+/// Whether every reference to `g` so far is weak (a weak reference loads no
+/// archive member).
+fn weak_only(l: El, g: i64) -> bool {
+    not l.g_sref[g]
+}

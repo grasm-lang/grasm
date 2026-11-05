@@ -125,6 +125,8 @@ import image
 import ldmap
 import interpose
 import elfstart
+import elfmain
+import elfin
 
 pub let USAGE = "usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] [-interpose obj] [-interpose_log file] inputs..."
 
@@ -501,6 +503,33 @@ fn main() {
             Ok(_) -> exit(0)
             Err(e) -> {
                 eprint("link: cannot write {a[3]}: {e}")
+                exit(1)
+            }
+        }
+    }
+    // ELF inputs: the ELF linker (elfmain.gr, docs/self-hosting.md §6.18).
+    let (el0, el_start, el_problems) = elfmain.parse(a)
+    var first = bytes_filled(0, 0)
+    for k in 0..el0.in_kind.len() {
+        if first.len() == 0 and (el0.in_kind[k] == "o" or el0.in_kind[k] == "i") {
+            first = match read_bytes(el0.in_arg[k]) {
+                Ok(b) -> b
+                Err(_) -> bytes_filled(0, 0)
+            }
+        }
+    }
+    if elfin.is_elf(first) {
+        if el_problems.len() > 0 {
+            for m in el_problems {
+                eprint(m)
+            }
+            exit(2)
+        }
+        var el = el0
+        match elfmain.run(el, el_start, first) {
+            Ok(_) -> exit(0)
+            Err(e) -> {
+                eprint("link: " + e)
                 exit(1)
             }
         }

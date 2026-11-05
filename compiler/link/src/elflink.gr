@@ -1,0 +1,1833 @@
+// The ELF linker's passes after resolution (docs/self-hosting.md §6.18):
+// the dynamic symbols, their versions and the tables that hold them, the
+// output sections and where they go, the relocations, and the file. What it
+// writes is what GNU ld 2.45 writes for `-pie -z now -z relro
+// --hash-style=gnu --gc-sections --build-id=none` and the same inputs, each
+// rule read off ld's output and its source:
+//
+//   * output sections in the order and with the input-section patterns of
+//     ld's default script for the target (`ld --verbose -pie -z now`), merged
+//     strings as `elfmerge.gr` makes them, an empty `.eh_frame` on x86-64
+//     where ld makes one for its PLT's unwind information and leaves it so;
+//   * the text segment from the headers' end; on x86-64 the code and then
+//     the read-only data each starting a page (`-z separate-code`); the data
+//     segment placed by DATA_SEGMENT_ALIGN and RELRO_END, so the relro part
+//     ends on a page (64 KiB on arm64, 4 KiB on x86-64);
+//   * the dynamic symbols in the order ld's hash table holds them: by bucket
+//     of bfd's string hash of `name@@VERSION`, in a table of the size ld's
+//     grows to for the symbols the link enters (`hash_size`); the PLT and
+//     its GOT slots in that order; `.dynstr` holding the symbols' names in
+//     the order the libraries bound them, the libraries' names, then the
+//     version names, each string once and one that ends another inside it;
+//     version needs prepended as found, so written last-found first;
+//   * `.dynamic` with ld's tags in ld's order and five spare entries, one
+//     of them DT_RELACOUNT when there are relative relocations, sorted
+//     first in `.rela.dyn`.
+import rd
+import elfstate
+import elfmerge
+import elfresolve
+
+// ----- relocation types -----------------------------------------------------------
+
+let A_ABS64 = 257
+let A_ABS32 = 258
+let A_PREL32 = 261
+let A_ADR_PREL_PG_HI21 = 275
+let A_ADD_ABS_LO12_NC = 277
+let A_LDST8 = 278
+let A_JUMP26 = 282
+let A_CALL26 = 283
+let A_LDST16 = 284
+let A_LDST32 = 285
+let A_LDST64 = 286
+let A_LDST128 = 299
+let A_ADR_GOT_PAGE = 311
+let A_LD64_GOT_LO12_NC = 312
+let A_TPREL_HI12 = 549
+let A_TPREL_LO12_NC = 551
+let A_GLOB_DAT = 1025
+let A_JUMP_SLOT = 1026
+let A_RELATIVE = 1027
+
+let X_64 = 1
+let X_PC32 = 2
+let X_PLT32 = 4
+let X_GLOB_DAT = 6
+let X_JUMP_SLOT = 7
+let X_RELATIVE = 8
+let X_GOTPCREL = 9
+let X_32 = 10
+let X_32S = 11
+let X_TPOFF32 = 23
+let X_GOTPCRELX = 41
+let X_REX_GOTPCRELX = 42
+
+// ----- small things ------------------------------------------------------------------
+
+fn align_up(x: i64, a: i64) -> i64 {
+    if a <= 1 {
+        return x
+    }
+    (x + a - 1) / a * a
+}
+
+/// bfd's string hash (`bfd_hash_hash`), 64 bits wide as on the host ld runs on.
+fn bfd_hash(s: str) -> u64 {
+    let bs = s.to_bytes()
+    var h: u64 = 0.as_u64()
+    for k in 0..bs.len() {
+        let c = bs.at(k).as_u64()
+        h = h + c + c.shl(17)
+        h = h.bit_xor(h.shr(2))
+    }
+    let n = bs.len().as_u64()
+    h = h + n + n.shl(17)
+    h = h.bit_xor(h.shr(2))
+    h
+}
+
+/// The ELF hash of a version name (`vna_hash`).
+fn elf_hash(s: str) -> i64 {
+    let bs = s.to_bytes()
+    var h = 0
+    for k in 0..bs.len() {
+        h = h.shl(4) + bs.at(k)
+        let g = h.bit_and(0xF0000000)
+        if g != 0 {
+            h = h.bit_xor(g.ushr(24))
+        }
+        h = h.bit_and(0x0FFFFFFF).bit_and(g.bit_not())
+    }
+    h
+}
+
+/// Whether global `g` is imported from a shared library.
+fn imported(l: El, g: i64) -> bool {
+    g >= 0 and l.g_kind[g] == elfstate.G_DYN
+}
+
+// ----- the hash table ld's dynamic symbols come out of ------------------------------
+
+/// The size ld's symbol hash table has grown to by the end of the link: it
+/// starts at 4051 entries and is replaced by the next prime near twice its
+/// size whenever more than three quarters full. The entries are every
+/// global name the objects hold, the `--defsym` names the interposition
+/// stands for, and for each dynamic symbol of each library ld reads (its
+/// DT_NEEDED ones too): `name@@VER`, `name` and `name@VER` for a default
+/// version, `name@VER` for a hidden one or a reference, `name` unversioned.
+fn hash_size(l: El, aliases: i64) -> i64 {
+    var names: Map[str, bool] = {}
+    for y in 0..l.y_name.len() {
+        if l.y_g[y] >= 0 {
+            names.set(l.y_name[y], true)
+        }
+    }
+    var count = names.len() + aliases
+    var seen: Map[str, bool] = {}
+    for fi in 0..l.f_path.len() {
+        if l.f_kind[fi] != 1 {
+            continue
+        }
+        for k in l.f_sym0[fi] + 1..l.f_sym0[fi] + l.f_nsym[fi] {
+            if l.dl_bind[k] == elfstate.STB_LOCAL {
+                continue
+            }
+            let n = l.dl_name[k]
+            let v = l.dl_ver[k]
+            if v == "" {
+                if not names.has(n) and not seen.has(n) {
+                    seen.set(n, true)
+                    count += 1
+                }
+            } else if l.dl_def[k] and not l.dl_hidden[k] {
+                for key in [n + "@@" + v, n, n + "@" + v] {
+                    if not names.has(key) and not seen.has(key) {
+                        seen.set(key, true)
+                        count += 1
+                    }
+                }
+            } else {
+                let key = n + "@" + v
+                if not seen.has(key) {
+                    seen.set(key, true)
+                    count += 1
+                }
+            }
+        }
+    }
+    // What the script and the dynamic sections define.
+    count += 12
+    var size = 4051
+    let primes = [8191, 16381, 32749, 65521, 131071, 262139, 524287, 1048573]
+    var p = 0
+    while count > size * 3 / 4 and p < primes.len() {
+        size = primes[p]
+        p += 1
+    }
+    size
+}
+
+/// The key ld's hash table holds dynamic symbol `g` under.
+fn dyn_key(l: El, g: i64) -> str {
+    if imported(l, g) and l.g_ver[g] != "" {
+        return l.g_name[g] + "@@" + l.g_ver[g]
+    }
+    l.g_name[g]
+}
+
+// ----- relocation scan -------------------------------------------------------------
+
+fn is_call(l: El, t: i64) -> bool {
+    if l.x64 { t == X_PLT32 } else { t == A_CALL26 or t == A_JUMP26 }
+}
+
+fn is_got(l: El, t: i64) -> bool {
+    if l.x64 { t == X_GOTPCREL or t == X_GOTPCRELX or t == X_REX_GOTPCRELX } else { t == A_ADR_GOT_PAGE or t == A_LD64_GOT_LO12_NC }
+}
+
+fn is_abs64(l: El, t: i64) -> bool {
+    if l.x64 { t == X_64 } else { t == A_ABS64 }
+}
+
+/// Whether GOT reference `r` in section `s` is one ld makes a direct one:
+/// on x86-64, `movq sym@GOTPCREL(%rip), %r` to a symbol defined here
+/// becomes `leaq sym(%rip), %r` (ld's `elf_x86_64_convert_load_reloc`,
+/// for a `mov` whichever of the three GOTPCREL types, with the addend -4).
+fn got_relaxed(l: El, s: i64, r: i64) -> bool {
+    let t = l.r_type[r]
+    if not l.x64 or not (t == X_GOTPCREL or t == X_GOTPCRELX or t == X_REX_GOTPCRELX) or l.r_add[r] != -4 or l.r_off[r] < 2 {
+        return false
+    }
+    let y = l.r_sym[r]
+    let g = l.y_g[y]
+    if g >= 0 {
+        if l.g_kind[g] != elfstate.G_DEF {
+            return false
+        }
+    } else if l.y_shndx[y] == 0 or l.y_shndx[y] >= 0xFF00 {
+        return false
+    }
+    l.f_data[l.s_file[s]].at(l.s_off[s] + l.r_off[r] - 2) == 0x8B
+}
+
+// ----- output sections -----------------------------------------------------------------
+
+/// The output section an input section goes to by ld's default script, and
+/// its sorting group in it; ("", 0) when dropped.
+fn place(l: El, s: i64) -> (str, i64) {
+    let n = l.s_name[s]
+    let f = l.s_flags[s]
+    if f.bit_and(elfstate.SHF_ALLOC) == 0 {
+        if n == ".comment" {
+            return (".comment", 0)
+        }
+        if n.starts_with(".debug_line") {
+            return (".debug_line", 0)
+        }
+        if n.starts_with(".debug_") {
+            return (n, 0)
+        }
+        return ("", 0)
+    }
+    if n == ".text" or n.starts_with(".text.") or n == ".stub" or n.starts_with(".gnu.linkonce.t.") {
+        if n == ".text.unlikely" or n.starts_with(".text.unlikely.") or (n.starts_with(".text.") and n.ends_with("_unlikely")) {
+            return (".text", 0)
+        }
+        if n == ".text.exit" or n.starts_with(".text.exit.") {
+            return (".text", 1)
+        }
+        if n == ".text.startup" or n.starts_with(".text.startup.") {
+            return (".text", 2)
+        }
+        if n == ".text.hot" or n.starts_with(".text.hot.") {
+            return (".text", 3)
+        }
+        if n.starts_with(".text.sorted.") {
+            return (".text", 4)
+        }
+        return (".text", 5)
+    }
+    if n == ".rodata" or n.starts_with(".rodata.") or n.starts_with(".gnu.linkonce.r.") {
+        return (".rodata", 0)
+    }
+    if n == ".rodata1" {
+        return (".rodata1", 0)
+    }
+    if n == ".eh_frame" or n.starts_with(".eh_frame.") {
+        return (".eh_frame", 0)
+    }
+    if n.starts_with(".gcc_except_table") {
+        return (".gcc_except_table", 0)
+    }
+    if n == ".tdata" or n.starts_with(".tdata.") {
+        return (".tdata", 0)
+    }
+    if n == ".tbss" or n.starts_with(".tbss.") {
+        return (".tbss", 0)
+    }
+    if n == ".preinit_array" {
+        return (".preinit_array", 0)
+    }
+    if n.starts_with(".init_array.") {
+        return (".init_array", 0)
+    }
+    if n == ".init_array" {
+        return (".init_array", 1)
+    }
+    if n.starts_with(".fini_array.") {
+        return (".fini_array", 0)
+    }
+    if n == ".fini_array" {
+        return (".fini_array", 1)
+    }
+    if n.starts_with(".data.rel.ro.local") {
+        return (".data.rel.ro", 0)
+    }
+    if n == ".data.rel.ro" or n.starts_with(".data.rel.ro.") {
+        return (".data.rel.ro", 1)
+    }
+    if n == ".data" or n.starts_with(".data.") or n.starts_with(".gnu.linkonce.d.") {
+        return (".data", 0)
+    }
+    if n == ".data1" {
+        return (".data1", 0)
+    }
+    if n == ".bss" or n.starts_with(".bss.") or n.starts_with(".gnu.linkonce.b.") {
+        return (".bss", 0)
+    }
+    (n, 0)
+}
+
+/// The script's order of the output sections that can hold input sections
+/// or the linker's own, allocated first, then the rest.
+fn script_order() -> [str] {
+    [".interp", ".gnu.hash", ".dynsym", ".dynstr", ".gnu.version", ".gnu.version_r", ".rela.dyn", ".rela.plt", ".init", ".plt", ".plt.got",
+        ".text", ".fini", ".rodata", ".rodata1", ".eh_frame_hdr", ".eh_frame", ".gcc_except_table", ".tdata", ".tbss",
+        ".preinit_array", ".init_array", ".fini_array", ".data.rel.ro", ".dynamic", ".got", ".data", ".data1", ".bss", ".comment",
+        ".debug_aranges", ".debug_pubnames", ".debug_info", ".debug_abbrev", ".debug_line", ".debug_frame", ".debug_str",
+        ".debug_loc", ".debug_macinfo", ".debug_pubtypes", ".debug_ranges", ".debug_addr", ".debug_line_str", ".debug_loclists",
+        ".debug_macro", ".debug_names", ".debug_rnglists", ".debug_str_offsets"]
+}
+
+// ----- the link ------------------------------------------------------------------------
+
+/// Everything after resolution and marking: the executable's bytes.
+pub fn link(inout l: El, aliases: i64) -> bytes ! str {
+    let x64 = l.x64
+    // ----- what the live code needs from the dynamic linker
+    var plt: Map[i64, bool] = {}
+    var got: Map[i64, bool] = {}
+    var got_y: Map[i64, bool] = {}
+    var nrelative = 0
+    for s in 0..l.s_file.len() {
+        if not l.s_live[s] or l.s_flags[s].bit_and(elfstate.SHF_ALLOC) == 0 {
+            continue
+        }
+        for r in l.s_rel0[s]..l.s_rel0[s] + l.s_nrel[s] {
+            let t = l.r_type[r]
+            let g = l.y_g[l.r_sym[r]]
+            if g >= 0 and l.g_kind[g] == elfstate.G_UNDEF and not l.g_weak[g] {
+                if l.g_name[g] != "" {
+                    fail("{l.f_path[l.s_file[s]]}: undefined reference to `{l.g_name[g]}'")
+                }
+            }
+            if is_call(l, t) and imported(l, g) {
+                plt.set(g, true)
+            } else if is_got(l, t) and not got_relaxed(l, s, r) {
+                // A slot: a global's, or a local symbol's of its file.
+                if g >= 0 {
+                    got.set(g, true)
+                } else {
+                    got_y.set(l.r_sym[r], true)
+                }
+            } else if is_abs64(l, t) {
+                if imported(l, g) {
+                    fail("{l.f_path[l.s_file[s]]}: a 64-bit pointer to an imported symbol is not taken yet")
+                }
+                nrelative += 1
+            } else if imported(l, g) and not is_call(l, t) {
+                fail("{l.f_path[l.s_file[s]]}: relocation type {t} against imported `{l.g_name[g]}' is not taken")
+            }
+        }
+    }
+    // ----- the dynamic symbols, in ld's hash table's order
+    var dyn: [i64] = []
+    for g in 0..l.g_name.len() {
+        if imported(l, g) and l.g_used[g] {
+            dyn.push(g)
+        }
+    }
+    let size = hash_size(l, aliases)
+    var keyed: [i64] = []
+    for g in dyn {
+        // Bucket, then the later-entered first within it.
+        let b = (bfd_hash(dyn_key(l, g)) % size.as_u64()).as_i64()
+        keyed.push(b * 4194304 + (4194303 - l.g_disc[g]))
+    }
+    var ordix: [i64] = []
+    for i in 0..dyn.len() {
+        ordix.push(i)
+    }
+    ordix.sort_by(|i| keyed[i])
+    var trav: [i64] = []
+    for i in ordix {
+        trav.push(dyn[i])
+    }
+    // The PLT's entries in that order; on x86-64 a symbol that has a GOT
+    // slot too is called through it, from `.plt.got` (ld's non-lazy PLT),
+    // and has no `.plt` entry or JUMP_SLOT.
+    var plts: [i64] = []
+    var pltgot: [i64] = []
+    var pltgot_ix: Map[i64, i64] = {}
+    for g in trav {
+        if plt.has(g) {
+            if x64 and got.has(g) {
+                pltgot_ix.set(g, pltgot.len())
+                pltgot.push(g)
+            } else {
+                l.g_plt[g] = plts.len()
+                plts.push(g)
+            }
+        }
+    }
+    // The final order: the symbols `.gnu.hash` leaves out keep their
+    // places, and the hashed ones -- on x86-64 an import with a `.plt.got`
+    // entry, whose address must be one -- follow, by bucket
+    // (`elf_gnu_hash_process_symidx`).
+    var hashed: [i64] = []
+    var dynsyms: [i64] = []
+    for g in trav {
+        if pltgot_ix.has(g) {
+            hashed.push(g)
+        } else {
+            dynsyms.push(g)
+        }
+    }
+    let nhash = hashed.len()
+    let nbuckets = gnu_buckets(nhash)
+    var hpos: Map[i64, i64] = {}
+    for k in 0..hashed.len() {
+        hpos.set(hashed[k], k)
+    }
+    hashed.sort_by(|g| (gnu_hash(l.g_name[g]) % nbuckets) * 4194304 + (hpos.get(g) ?? 0))
+    for g in hashed {
+        dynsyms.push(g)
+    }
+    for k in 0..dynsyms.len() {
+        l.g_dyn[dynsyms[k]] = k + 1
+    }
+    // The GOT's slots (ld's `size_dynamic_sections`): each object's local
+    // symbols' first, file by file in symbol order; then the globals' in
+    // its hash table's order, imported ones bound by GLOB_DAT and the rest
+    // by RELATIVE relocations. On arm64 the GOT starts with one word of its
+    // own, `_DYNAMIC`.
+    let got_head = if x64 { 0 } else { 1 }
+    var got_locals: [i64] = []
+    for (y, _v) in got_y.entries() {
+        got_locals.push(y)
+    }
+    got_locals.sort()
+    var got_slot_y: Map[i64, i64] = {}
+    for k in 0..got_locals.len() {
+        got_slot_y.set(got_locals[k], got_head + k)
+    }
+    var got_globals: [i64] = []
+    var gkeys: [i64] = []
+    for (g, _v) in got.entries() {
+        got_globals.push(g)
+        let b = (bfd_hash(dyn_key(l, g)) % size.as_u64()).as_i64()
+        gkeys.push(b * 4194304 + (4194303 - (if l.g_disc[g] >= 0 { l.g_disc[g] } else { 0 })))
+    }
+    var gix: [i64] = []
+    for i in 0..got_globals.len() {
+        gix.push(i)
+    }
+    gix.sort_by(|i| gkeys[i])
+    var gots: [i64] = []
+    for i in gix {
+        let g = got_globals[i]
+        l.g_got[g] = got_head + got_locals.len() + gots.len()
+        gots.push(g)
+    }
+    var n_glob_dat = 0
+    for g in gots {
+        if imported(l, g) {
+            n_glob_dat += 1
+        }
+    }
+    let n_got_rel = got_locals.len() + gots.len() - n_glob_dat
+    // ----- versions needed: each library's list and each list's names
+    // prepended as found
+    var vn_lib: [i64] = []
+    var vn_names: [[str]] = []
+    var vn_idx: [[i64]] = []
+    var vcount = 1
+    for g in trav {
+        if l.g_ver[g] == "" {
+            l.g_vidx[g] = 1
+            continue
+        }
+        var t = -1
+        for q in 0..vn_lib.len() {
+            if vn_lib[q] == l.g_lib[g] {
+                t = q
+            }
+        }
+        if t < 0 {
+            vn_lib = [l.g_lib[g]] + vn_lib
+            vn_names = [[]] + vn_names
+            vn_idx = [[]] + vn_idx
+            t = 0
+        }
+        var found = -1
+        let names = vn_names[t]
+        for q in 0..names.len() {
+            if names[q] == l.g_ver[g] {
+                found = vn_idx[t][q]
+            }
+        }
+        if found < 0 {
+            vcount += 1
+            found = vcount
+            vn_names[t] = [l.g_ver[g]] + vn_names[t]
+            vn_idx[t] = [found] + vn_idx[t]
+        }
+        l.g_vidx[g] = found
+    }
+    // ----- .dynstr: the names in binding order, the libraries', the
+    // versions'
+    var strs: [str] = []
+    var byorder: [i64] = []
+    for g in dynsyms {
+        byorder.push(g)
+    }
+    byorder.sort_by(|g| l.g_disc[g])
+    for g in byorder {
+        strs.push(l.g_name[g])
+    }
+    for fi in l.dt_needed {
+        strs.push(l.f_soname[fi])
+    }
+    for q in 0..vn_lib.len() {
+        strs.push(l.f_soname[vn_lib[q]])
+        for n in vn_names[q] {
+            strs.push(n)
+        }
+    }
+    let ds = strtab(strs)
+    let dynstr = ds.0
+    let dsoff = ds.1
+    // ----- sizes of the linker's sections
+    let interp = if x64 { "/lib64/ld-linux-x86-64.so.2" } else { "/lib/ld-linux-aarch64.so.1" }
+    var nvaux = 0
+    for q in 0..vn_lib.len() {
+        nvaux += vn_names[q].len()
+    }
+    let plt_size = if plts.len() == 0 { 0 } else if x64 { 16 + 16 * plts.len() } else { 32 + 16 * plts.len() }
+    let gotplt_n = if plts.len() > 0 or x64 { 3 + plts.len() } else { 3 }
+    let got_size = 8 * gotplt_n + 8 * (got_head + got_locals.len() + gots.len())
+    // ----- output sections
+    var by_name: Map[str, i64] = {}
+    let order = script_order()
+    // Input sections to their output sections, in input order within each
+    // sorting group.
+    var placed_name: [str] = []
+    var placed_grp: [i64] = []
+    var placed_sec: [i64] = []
+    for s in 0..l.s_file.len() {
+        if not l.s_live[s] {
+            continue
+        }
+        let p = place(l, s)
+        if p.0 == "" {
+            continue
+        }
+        if l.strip and l.s_flags[s].bit_and(elfstate.SHF_ALLOC) == 0 and p.0 != ".comment" {
+            continue
+        }
+        placed_name.push(p.0)
+        placed_grp.push(p.1)
+        placed_sec.push(s)
+    }
+    for n in order {
+        var any = false
+        for k in 0..placed_name.len() {
+            if placed_name[k] == n {
+                any = true
+            }
+        }
+        let synth = n == ".interp" or n == ".gnu.hash" or n == ".dynsym" or n == ".dynstr" or n == ".dynamic" or
+        (n == ".gnu.version" and vn_lib.len() > 0) or (n == ".gnu.version_r" and vn_lib.len() > 0) or
+        (n == ".rela.dyn" and nrelative + got_locals.len() + gots.len() > 0) or (n == ".rela.plt" and plts.len() > 0) or
+        (n == ".plt" and plts.len() > 0) or (n == ".plt.got" and pltgot.len() > 0) or n == ".got" or (n == ".eh_frame" and x64 and plts.len() > 0)
+        if not any and not synth {
+            continue
+        }
+        let o = elfstate.new_out(l, n, elfstate.O_INPUT, elfstate.SHT_PROGBITS, 0, 1)
+        by_name.set(n, o)
+    }
+    for k in 0..placed_name.len() {
+        if not by_name.has(placed_name[k]) {
+            fail("{l.f_path[l.s_file[placed_sec[k]]]}: section `{l.s_name[placed_sec[k]]}' has no place in the output")
+        }
+    }
+    // Each output section's input sections, sorted by group then input order.
+    var keys: [i64] = []
+    for k in 0..placed_name.len() {
+        keys.push(placed_grp[k] * 1099511627776 + k)
+    }
+    var pk: [i64] = []
+    for k in 0..placed_name.len() {
+        pk.push(k)
+    }
+    pk.sort_by(|k| keys[k])
+    for o in 0..l.o_name.len() {
+        l.o_in0[o] = l.oi.len()
+        for k in pk {
+            if placed_name[k] == l.o_name[o] {
+                l.oi.push(placed_sec[k])
+                l.s_out[placed_sec[k]] = o
+            }
+        }
+        l.o_inn[o] = l.oi.len() - l.o_in0[o]
+    }
+    // ----- arm64's section symbols: in a position-independent executable
+    // with dynamic relocations, ld gives `.dynsym` a local symbol for the
+    // first read-only and the first writable section that are not its own
+    // (`_bfd_elf_init_2_index_sections`; the writable one past any TLS
+    // section); x86-64 gives none.
+    var local_secs: [i64] = []
+    if not x64 and nrelative + got_locals.len() + gots.len() > 0 {
+        var text_ix = -1
+        var data_ix = -1
+        var data_done = false
+        for o in 0..l.o_name.len() {
+            if l.o_inn[o] == 0 {
+                continue
+            }
+            let f = l.s_flags[l.oi[l.o_in0[o]]]
+            if f.bit_and(elfstate.SHF_ALLOC) == 0 {
+                continue
+            }
+            if f.bit_and(elfstate.SHF_WRITE) != 0 {
+                if not data_done {
+                    data_ix = o
+                    data_done = f.bit_and(elfstate.SHF_TLS) == 0
+                }
+            } else if text_ix < 0 {
+                text_ix = o
+            }
+        }
+        for o in 0..l.o_name.len() {
+            if o == text_ix or o == data_ix {
+                local_secs.push(o)
+            }
+        }
+    }
+    let nlocal = local_secs.len()
+    for g in dynsyms {
+        l.g_dyn[g] += nlocal
+    }
+    let ndyn = dynsyms.len() + 1 + nlocal
+    // ----- merged strings, then each output section's size, flags and
+    // alignment
+    var merged: Map[i64, bytes] = {}
+    for o in 0..l.o_name.len() {
+        var group: [i64] = []
+        for q in l.o_in0[o]..l.o_in0[o] + l.o_inn[o] {
+            let s = l.oi[q]
+            if elfmerge.mergeable(l, s) {
+                group.push(s)
+            }
+        }
+        if group.len() > 0 {
+            // One merge per flags and alignment; the corpus has one kind.
+            let blob = elfmerge.merge(l, group)
+            merged.set(group[0], blob)
+            for s in group {
+                l.s_size[s] = 0
+            }
+            l.s_size[group[0]] = blob.len()
+        }
+    }
+    for o in 0..l.o_name.len() {
+        let n = l.o_name[o]
+        var off = 0
+        var flags = -1
+        var align = 1
+        var typ = elfstate.SHT_PROGBITS
+        var allmerge = true
+        var first_ms = 0
+        var entsize = -1
+        for q in l.o_in0[o]..l.o_in0[o] + l.o_inn[o] {
+            let s = l.oi[q]
+            let a = l.s_align[s]
+            if a > align {
+                align = a
+            }
+            off = align_up(off, a)
+            l.s_outoff[s] = off
+            off += l.s_size[s]
+            let f = l.s_flags[s].bit_and(0xFFFFFFFF - elfstate.SHF_GROUP - elfstate.SHF_INFO_LINK)
+            flags = if flags < 0 { f } else { flags.bit_or(f) }
+            // ld keeps SHF_MERGE and SHF_STRINGS only while every input has
+            // the same ones and the same entity size.
+            let ms = l.s_flags[s].bit_and(elfstate.SHF_MERGE + elfstate.SHF_STRINGS)
+            if q == l.o_in0[o] {
+                first_ms = ms
+            } else if ms != first_ms or (ms.bit_and(elfstate.SHF_MERGE) != 0 and l.s_entsize[s] != entsize) {
+                allmerge = false
+            }
+            if ms.bit_and(elfstate.SHF_MERGE) == 0 {
+                allmerge = false
+            }
+            if l.s_type[s] == elfstate.SHT_NOBITS {
+                typ = elfstate.SHT_NOBITS
+            } else if l.s_type[s] == elfstate.SHT_INIT_ARRAY or l.s_type[s] == elfstate.SHT_FINI_ARRAY {
+                typ = l.s_type[s]
+            }
+            if entsize < 0 {
+                entsize = l.s_entsize[s]
+            } else if entsize != l.s_entsize[s] {
+                entsize = 0
+            }
+        }
+        if flags < 0 {
+            flags = 0
+        }
+        if not allmerge {
+            flags = flags.bit_and(0xFFFFFFFF - elfstate.SHF_MERGE - elfstate.SHF_STRINGS)
+        }
+        l.o_size[o] = off
+        l.o_flags[o] = flags
+        l.o_align[o] = align
+        l.o_type[o] = typ
+        l.o_entsize[o] = if flags.bit_and(elfstate.SHF_MERGE) != 0 and entsize > 0 { entsize } else { 0 }
+        // The linker's own.
+        if n == ".interp" {
+            l.o_kind[o] = elfstate.O_INTERP
+            l.o_size[o] = interp.to_bytes().len() + 1
+            l.o_flags[o] = elfstate.SHF_ALLOC
+        } else if n == ".gnu.hash" {
+            l.o_kind[o] = elfstate.O_GNU_HASH
+            l.o_type[o] = elfstate.SHT_GNU_HASH
+            l.o_size[o] = if nhash == 0 { 28 } else { 16 + 8 * gnu_maskwords(nhash) + 4 * nbuckets + 4 * nhash }
+            l.o_flags[o] = elfstate.SHF_ALLOC
+            l.o_align[o] = 8
+        } else if n == ".dynsym" {
+            l.o_kind[o] = elfstate.O_DYNSYM
+            l.o_type[o] = elfstate.SHT_DYNSYM
+            l.o_size[o] = 24 * ndyn
+            l.o_flags[o] = elfstate.SHF_ALLOC
+            l.o_align[o] = 8
+            l.o_entsize[o] = 24
+            l.o_info[o] = 1 + nlocal
+        } else if n == ".dynstr" {
+            l.o_kind[o] = elfstate.O_DYNSTR
+            l.o_type[o] = elfstate.SHT_STRTAB
+            l.o_size[o] = dynstr.len()
+            l.o_flags[o] = elfstate.SHF_ALLOC
+        } else if n == ".gnu.version" {
+            l.o_kind[o] = elfstate.O_VERSYM
+            l.o_type[o] = elfstate.SHT_GNU_VERSYM
+            l.o_size[o] = 2 * ndyn
+            l.o_flags[o] = elfstate.SHF_ALLOC
+            l.o_align[o] = 2
+            l.o_entsize[o] = 2
+        } else if n == ".gnu.version_r" {
+            l.o_kind[o] = elfstate.O_VERNEED
+            l.o_type[o] = elfstate.SHT_GNU_VERNEED
+            l.o_size[o] = 16 * vn_lib.len() + 16 * nvaux
+            l.o_flags[o] = elfstate.SHF_ALLOC
+            l.o_align[o] = 8
+            l.o_info[o] = vn_lib.len()
+        } else if n == ".rela.dyn" {
+            l.o_kind[o] = elfstate.O_RELA_DYN
+            l.o_type[o] = elfstate.SHT_RELA
+            l.o_size[o] = 24 * (nrelative + got_locals.len() + gots.len())
+            l.o_flags[o] = elfstate.SHF_ALLOC
+            l.o_align[o] = 8
+            l.o_entsize[o] = 24
+        } else if n == ".rela.plt" {
+            l.o_kind[o] = elfstate.O_RELA_PLT
+            l.o_type[o] = elfstate.SHT_RELA
+            l.o_size[o] = 24 * plts.len()
+            l.o_flags[o] = elfstate.SHF_ALLOC + elfstate.SHF_INFO_LINK
+            l.o_align[o] = 8
+            l.o_entsize[o] = 24
+        } else if n == ".plt.got" {
+            l.o_kind[o] = elfstate.O_PLT_GOT
+            l.o_size[o] = 8 * pltgot.len()
+            l.o_flags[o] = elfstate.SHF_ALLOC + elfstate.SHF_EXECINSTR
+            l.o_align[o] = 8
+            l.o_entsize[o] = 8
+        } else if n == ".plt" {
+            l.o_kind[o] = elfstate.O_PLT
+            l.o_size[o] = plt_size
+            l.o_flags[o] = elfstate.SHF_ALLOC + elfstate.SHF_EXECINSTR
+            l.o_align[o] = 16
+            l.o_entsize[o] = if x64 { 16 } else { 0 }
+        } else if n == ".got" {
+            l.o_kind[o] = elfstate.O_GOT
+            l.o_size[o] = got_size
+            l.o_flags[o] = elfstate.SHF_ALLOC + elfstate.SHF_WRITE
+            l.o_align[o] = 8
+            l.o_entsize[o] = 8
+        } else if n == ".dynamic" {
+            l.o_kind[o] = elfstate.O_DYNAMIC
+            l.o_type[o] = elfstate.SHT_DYNAMIC
+            l.o_flags[o] = elfstate.SHF_ALLOC + elfstate.SHF_WRITE
+            l.o_align[o] = 8
+            l.o_entsize[o] = 16
+        } else if n == ".eh_frame" and l.o_inn[o] == 0 {
+            l.o_kind[o] = elfstate.O_EH_FRAME
+            l.o_flags[o] = elfstate.SHF_ALLOC
+            l.o_align[o] = 8
+        }
+    }
+    // .dynamic's tags, in ld's order.
+    var tags: [i64] = []
+    for fi in l.dt_needed {
+        tags.push(1)
+    }
+    for t in [elfstate.SHT_PREINIT_ARRAY, elfstate.SHT_INIT_ARRAY, elfstate.SHT_FINI_ARRAY] {
+        let nm = if t == elfstate.SHT_PREINIT_ARRAY { ".preinit_array" } else if t == elfstate.SHT_INIT_ARRAY { ".init_array" } else { ".fini_array" }
+        if by_name.has(nm) {
+            tags.push(if t == elfstate.SHT_PREINIT_ARRAY { 32 } else if t == elfstate.SHT_INIT_ARRAY { 25 } else { 26 })
+            tags.push(if t == elfstate.SHT_PREINIT_ARRAY { 33 } else if t == elfstate.SHT_INIT_ARRAY { 27 } else { 28 })
+        }
+    }
+    for t in [0x6ffffef5, 5, 6, 10, 11, 21] {
+        tags.push(t)
+    }
+    if plts.len() > 0 or got_size > 0 {
+        tags.push(3)
+    }
+    if plts.len() > 0 {
+        tags.push(2)
+        tags.push(20)
+        tags.push(23)
+    }
+    if nrelative + got_locals.len() + gots.len() > 0 {
+        tags.push(7)
+        tags.push(8)
+        tags.push(9)
+    }
+    tags.push(30)
+    tags.push(0x6ffffffb)
+    if vn_lib.len() > 0 {
+        tags.push(0x6ffffffe)
+        tags.push(0x6fffffff)
+        tags.push(0x6ffffff0)
+    }
+    let dyn_o = by_name.get(".dynamic") ?? -1
+    l.o_size[dyn_o] = 16 * (tags.len() + 1 + 5)
+    // ----- addresses and file offsets
+    // PHDR, INTERP, the LOADs, DYNAMIC, TLS, GNU_STACK, GNU_RELRO.
+    let has_tls = by_name.has(".tdata") or by_name.has(".tbss")
+    var phnum = 5 + (if x64 { 4 } else { 2 })
+    if has_tls {
+        phnum += 1
+    }
+    let maxpage = if x64 { 4096 } else { 65536 }
+    let commonpage = 4096
+    let hdr = 64 + 56 * phnum
+    var dot = hdr
+    var alloc_order: [i64] = []
+    for o in 0..l.o_name.len() {
+        if l.o_flags[o].bit_and(elfstate.SHF_ALLOC) != 0 {
+            alloc_order.push(o)
+        }
+    }
+    // The text segment and, on x86-64, the code's and the read-only data's
+    // pages.
+    var data_first = -1
+    var seen_text = false
+    var seen_ro = false
+    for o in alloc_order {
+        let n = l.o_name[o]
+        if is_data(n) {
+            data_first = o
+            break
+        }
+        if x64 and not seen_text and (n == ".init" or n == ".plt" or n == ".plt.got" or n == ".text" or n == ".fini") {
+            dot = align_up(dot, maxpage)
+            seen_text = true
+        }
+        if x64 and not seen_ro and (n == ".rodata" or n == ".rodata1" or n == ".eh_frame_hdr" or n == ".eh_frame" or n == ".gcc_except_table") {
+            dot = align_up(dot, maxpage)
+            seen_ro = true
+        }
+        dot = align_up(dot, l.o_align[o])
+        l.o_addr[o] = dot
+        l.o_off[o] = dot
+        dot += l.o_size[o]
+    }
+    let text_end = dot
+    // The data segment: laid out from the next page, then moved up so the
+    // relro part ends on a page.
+    var base = align_up(dot, maxpage)
+    var relro_names = [".tdata", ".tbss", ".preinit_array", ".init_array", ".fini_array", ".data.rel.ro", ".dynamic", ".got"]
+    var relro_secs: [i64] = []
+    var rest_secs: [i64] = []
+    var started = false
+    for o in alloc_order {
+        if o == data_first {
+            started = true
+        }
+        if not started {
+            continue
+        }
+        if relro_names.contains(l.o_name[o]) {
+            relro_secs.push(o)
+        } else {
+            rest_secs.push(o)
+        }
+    }
+    var d2 = base
+    for o in relro_secs {
+        d2 = align_up(d2, l.o_align[o])
+        l.o_addr[o] = d2
+        if not is_tbss(l, o) {
+            d2 += l.o_size[o]
+        }
+    }
+    let relro_end = align_up(d2, maxpage)
+    var desired = relro_end
+    var k = relro_secs.len() - 1
+    while k >= 0 {
+        let o = relro_secs[k]
+        var start = l.o_addr[o]
+        var end = start
+        if not is_tbss(l, o) {
+            end += l.o_size[o]
+        }
+        start += desired - end
+        start = start.bit_and((l.o_align[o] - 1).bit_not())
+        desired = start
+        k -= 1
+    }
+    if relro_secs.len() > 0 {
+        base = desired
+    }
+    d2 = base
+    for o in relro_secs {
+        d2 = align_up(d2, l.o_align[o])
+        l.o_addr[o] = d2
+        if not is_tbss(l, o) {
+            d2 += l.o_size[o]
+        }
+    }
+    l.relro_start = base
+    l.relro_end = d2
+    for o in rest_secs {
+        d2 = align_up(d2, l.o_align[o])
+        l.o_addr[o] = d2
+        d2 += l.o_size[o]
+    }
+    // File offsets in the data segment: congruent to the address modulo the
+    // page, from the text segment's end.
+    var foff = text_end
+    var data_secs = relro_secs + rest_secs
+    for o in data_secs {
+        let want = l.o_addr[o] % maxpage
+        if foff % maxpage != want {
+            var f2 = foff - foff % maxpage + want
+            if f2 < foff {
+                f2 += maxpage
+            }
+            foff = f2
+        }
+        l.o_off[o] = foff
+        if l.o_type[o] != elfstate.SHT_NOBITS {
+            foff += l.o_size[o]
+        }
+    }
+    // TLS.
+    var tls_first = -1
+    var tls_end = 0
+    var tls_align = 1
+    var tdata_size = 0
+    for o in relro_secs {
+        if l.o_flags[o].bit_and(elfstate.SHF_TLS) != 0 {
+            if tls_first < 0 {
+                tls_first = o
+            }
+            tls_end = l.o_addr[o] + l.o_size[o]
+            if l.o_align[o] > tls_align {
+                tls_align = l.o_align[o]
+            }
+            if l.o_type[o] != elfstate.SHT_NOBITS {
+                tdata_size = tls_end - l.o_addr[tls_first]
+            }
+        }
+    }
+    if tls_first >= 0 {
+        l.tls_addr = l.o_addr[tls_first]
+        l.tls_size = tls_end - l.tls_addr
+        l.tls_align = tls_align
+    }
+    // Unallocated sections, then .shstrtab.
+    var shnames: [str] = []
+    shnames.push(".shstrtab")
+    for o in 0..l.o_name.len() {
+        shnames.push(l.o_name[o])
+    }
+    let sh = strtab(shnames)
+    let shstr = sh.0
+    for o in 0..l.o_name.len() {
+        if l.o_flags[o].bit_and(elfstate.SHF_ALLOC) == 0 {
+            foff = align_up(foff, l.o_align[o])
+            l.o_addr[o] = 0
+            l.o_off[o] = foff
+            foff += l.o_size[o]
+        }
+    }
+    let shstr_off = foff
+    foff += shstr.len()
+    let shoff = align_up(foff, 8)
+    let shnum = l.o_name.len() + 2
+    // ----- symbol addresses
+    var gaddr: [i64] = []
+    for g in 0..l.g_name.len() {
+        gaddr.push(0)
+    }
+    for g in 0..l.g_name.len() {
+        if l.g_kind[g] == elfstate.G_DEF {
+            gaddr[g] = sym_addr(l, l.g_y[g])
+        } else if l.g_kind[g] == elfstate.G_ABS {
+            gaddr[g] = l.y_value[l.g_y[g]]
+        }
+    }
+    let plt_o = by_name.get(".plt") ?? -1
+    let got_o = by_name.get(".got") ?? -1
+    let got_base = l.o_addr[got_o]
+    let gotplt = got_base
+    // Where the .got part starts (after .got.plt): its slot k is at
+    // got_part + 8 * k, the header (arm64's) slot 0.
+    let got_part = got_base + 8 * gotplt_n + 8 * got_head
+    // ----- the file
+    var out = bytes_filled(shoff + 64 * shnum, 0)
+    // Input sections' contents.
+    for o in 0..l.o_name.len() {
+        if l.o_kind[o] != elfstate.O_INPUT or l.o_type[o] == elfstate.SHT_NOBITS {
+            continue
+        }
+        for q in l.o_in0[o]..l.o_in0[o] + l.o_inn[o] {
+            let s = l.oi[q]
+            if l.s_type[s] == elfstate.SHT_NOBITS or l.s_size[s] == 0 {
+                continue
+            }
+            let at = l.o_off[o] + l.s_outoff[s]
+            match merged.get(s) {
+                Some(blob) -> out.copy_from(at, blob)
+                None -> {
+                    let d = l.f_data[l.s_file[s]]
+                    out.copy_from(at, d.slice(l.s_off[s], l.s_off[s] + l.s_size[s]))
+                }
+            }
+        }
+        // Fill between input sections of code: `nop`s, as ld fills them.
+        if l.o_flags[o].bit_and(elfstate.SHF_EXECINSTR) != 0 {
+            fill_nops(l, o, out)
+        }
+    }
+    // Relocations.
+    var rel_dyn_off: [i64] = []
+    var rel_dyn_add: [i64] = []
+    for o in 0..l.o_name.len() {
+        if l.o_kind[o] != elfstate.O_INPUT {
+            continue
+        }
+        let alloc = l.o_flags[o].bit_and(elfstate.SHF_ALLOC) != 0
+        for q in l.o_in0[o]..l.o_in0[o] + l.o_inn[o] {
+            let s = l.oi[q]
+            for r in l.s_rel0[s]..l.s_rel0[s] + l.s_nrel[s] {
+                let t = l.r_type[r]
+                let y = l.r_sym[r]
+                let g = l.y_g[y]
+                let p_off = l.o_off[o] + l.s_outoff[s] + l.r_off[r]
+                let p = l.o_addr[o] + l.s_outoff[s] + l.r_off[r]
+                // S: the symbol's address; a merged section's symbol plus
+                // addend maps through the merge.
+                var sv = 0
+                var a = l.r_add[r]
+                if g >= 0 {
+                    sv = gaddr[g]
+                    if imported(l, g) {
+                        sv = 0
+                    }
+                } else {
+                    let ts = l.y_sec[y]
+                    if ts >= 0 and l.s_out[ts] >= 0 and l.s_ms0[ts] + l.s_msn[ts] > l.s_ms0[ts] and l.y_type[y] == elfstate.STT_SECTION {
+                        // A section symbol's addend is a place in the
+                        // section, which the merge moves (as ld maps it).
+                        sv = l.o_addr[l.s_out[ts]] + l.s_outoff[first_of_merge(l, ts)] + elfmerge.map_offset(l, ts, l.y_value[y] + a)
+                        a = 0
+                    } else {
+                        sv = sym_addr(l, y)
+                    }
+                }
+                if x64 {
+                    if t == X_64 {
+                        rd.put64(out, p_off, sv + a)
+                        if alloc {
+                            rel_dyn_off.push(p)
+                            rel_dyn_add.push(sv + a)
+                        }
+                    } else if t == X_32 or t == X_32S {
+                        rd.put32(out, p_off, sv + a)
+                    } else if t == X_PC32 {
+                        try put_s32(out, p_off, sv + a - p, l, s, r)
+                    } else if t == X_PLT32 {
+                        var target = sv
+                        if imported(l, g) {
+                            target = match pltgot_ix.get(g) {
+                                Some(k3) -> l.o_addr[by_name.get(".plt.got") ?? 0] + 8 * k3
+                                None -> l.o_addr[plt_o] + 16 + 16 * l.g_plt[g]
+                            }
+                        }
+                        try put_s32(out, p_off, target + a - p, l, s, r)
+                    } else if is_got(l, t) and got_relaxed(l, s, r) {
+                        // `movq sym@GOTPCREL(%rip)` made `leaq sym(%rip)`.
+                        rd.put8(out, p_off - 2, 0x8D)
+                        try put_s32(out, p_off, sv + a - p, l, s, r)
+                    } else if is_got(l, t) {
+                        let slot = got_part - 8 * got_head + 8 * (if g >= 0 { l.g_got[g] } else { got_slot_y.get(y) ?? 0 })
+                        try put_s32(out, p_off, slot + a - p, l, s, r)
+                    } else if t == X_TPOFF32 {
+                        // x86-64's variant II: below the thread pointer,
+                        // by the TLS segment's size (ld's `elf_x86_64_tpoff`,
+                        // its static TLS alignment 1 on Linux).
+                        rd.put32(out, p_off, sv + a - l.tls_size - l.tls_addr)
+                    } else {
+                        fail("{l.f_path[l.s_file[s]]}: relocation type {t} is not taken")
+                    }
+                } else {
+                    let w = rd.u32(out, p_off)
+                    if t == A_ABS64 {
+                        rd.put64(out, p_off, sv + a)
+                        if alloc {
+                            rel_dyn_off.push(p)
+                            rel_dyn_add.push(sv + a)
+                        }
+                    } else if t == A_ABS32 {
+                        rd.put32(out, p_off, sv + a)
+                    } else if t == A_PREL32 {
+                        rd.put32(out, p_off, sv + a - p)
+                    } else if t == A_ADR_PREL_PG_HI21 {
+                        rd.put32(out, p_off, adrp(w, sv + a, p))
+                    } else if t == A_ADR_GOT_PAGE {
+                        let slot = got_part - 8 * got_head + 8 * (if g >= 0 { l.g_got[g] } else { got_slot_y.get(y) ?? 0 })
+                        rd.put32(out, p_off, adrp(w, slot, p))
+                    } else if t == A_ADD_ABS_LO12_NC {
+                        rd.put32(out, p_off, w.bit_and(0xFFC003FF).bit_or((sv + a).bit_and(0xFFF).shl(10)))
+                    } else if t == A_LDST8 or t == A_LDST16 or t == A_LDST32 or t == A_LDST64 or t == A_LDST128 {
+                        let sh2 = if t == A_LDST8 { 0 } else if t == A_LDST16 { 1 } else if t == A_LDST32 { 2 } else if t == A_LDST64 { 3 } else { 4 }
+                        rd.put32(out, p_off, w.bit_and(0xFFC003FF).bit_or((sv + a).bit_and(0xFFF).ushr(sh2).shl(10)))
+                    } else if t == A_LD64_GOT_LO12_NC {
+                        let slot = got_part - 8 * got_head + 8 * (if g >= 0 { l.g_got[g] } else { got_slot_y.get(y) ?? 0 })
+                        rd.put32(out, p_off, w.bit_and(0xFFC003FF).bit_or(slot.bit_and(0xFFF).ushr(3).shl(10)))
+                    } else if t == A_CALL26 or t == A_JUMP26 {
+                        let target = if imported(l, g) { l.o_addr[plt_o] + 32 + 16 * l.g_plt[g] } else { sv + a }
+                        let disp = target - p
+                        if disp < -134217728 or disp >= 134217728 {
+                            fail("{l.f_path[l.s_file[s]]}: a branch out of range")
+                        }
+                        rd.put32(out, p_off, w.bit_and(0xFC000000).bit_or(disp.ushr(2).bit_and(0x3FFFFFF)))
+                    } else if t == A_TPREL_HI12 or t == A_TPREL_LO12_NC {
+                        let tp = sv + a - (l.tls_addr - align_up(16, first_tls_align(l, relro_secs)))
+                        let v = if t == A_TPREL_HI12 { tp.ushr(12).bit_and(0xFFF) } else { tp.bit_and(0xFFF) }
+                        rd.put32(out, p_off, w.bit_and(0xFFC003FF).bit_or(v.shl(10)))
+                    } else {
+                        fail("{l.f_path[l.s_file[s]]}: relocation type {t} is not taken")
+                    }
+                }
+            }
+        }
+    }
+    // The GOT's slots for symbols defined here: their addresses, and a
+    // RELATIVE relocation each.
+    let slot0 = got_base + 8 * gotplt_n
+    let slot0_off = l.o_off[got_o] + 8 * gotplt_n
+    for k2 in 0..got_locals.len() {
+        let i = got_head + k2
+        let v = sym_addr(l, got_locals[k2])
+        rd.put64(out, slot0_off + 8 * i, v)
+        rel_dyn_off.push(slot0 + 8 * i)
+        rel_dyn_add.push(v)
+    }
+    for g in gots {
+        if not imported(l, g) {
+            let v = gaddr[g]
+            rd.put64(out, slot0_off + 8 * l.g_got[g], v)
+            rel_dyn_off.push(slot0 + 8 * l.g_got[g])
+            rel_dyn_add.push(v)
+        }
+    }
+    // ----- the linker's sections' contents
+    let dynamic_addr = l.o_addr[dyn_o]
+    for o in 0..l.o_name.len() {
+        let at = l.o_off[o]
+        let kind = l.o_kind[o]
+        if kind == elfstate.O_INTERP {
+            out.copy_from(at, interp.to_bytes())
+        } else if kind == elfstate.O_GNU_HASH {
+            if nhash == 0 {
+                // No symbol is hashed: one bucket, an empty filter.
+                rd.put32(out, at, 1)
+                rd.put32(out, at + 4, 1)
+                rd.put32(out, at + 8, 1)
+            } else {
+                gnu_hash_section(l, out, at, hashed, ndyn - nhash, nbuckets)
+            }
+        } else if kind == elfstate.O_DYNSYM {
+            for k2 in 0..nlocal {
+                let so = local_secs[k2]
+                let e = at + 24 * (k2 + 1)
+                rd.put8(out, e + 4, elfstate.STT_SECTION)
+                rd.put16(out, e + 6, 1 + so)
+                rd.put64(out, e + 8, l.o_addr[so])
+            }
+            for k2 in 0..dynsyms.len() {
+                let g = dynsyms[k2]
+                let e = at + 24 * (k2 + 1 + nlocal)
+                rd.put32(out, e, dsoff.get(l.g_name[g]) ?? 0)
+                let bind = if l.g_weak[g] { elfstate.STB_WEAK } else { elfstate.STB_GLOBAL }
+                // An indirect function is imported as a function.
+                let ty = if l.g_stype[g] == elfstate.STT_GNU_IFUNC { elfstate.STT_FUNC } else { l.g_stype[g] }
+                rd.put8(out, e + 4, bind.shl(4).bit_or(ty))
+            }
+        } else if kind == elfstate.O_DYNSTR {
+            out.copy_from(at, dynstr)
+        } else if kind == elfstate.O_VERSYM {
+            for k2 in 0..dynsyms.len() {
+                rd.put16(out, at + 2 * (k2 + 1 + nlocal), l.g_vidx[dynsyms[k2]])
+            }
+        } else if kind == elfstate.O_VERNEED {
+            var e = at
+            for q in 0..vn_lib.len() {
+                let names = vn_names[q]
+                rd.put16(out, e, 1)
+                rd.put16(out, e + 2, names.len())
+                rd.put32(out, e + 4, dsoff.get(l.f_soname[vn_lib[q]]) ?? 0)
+                rd.put32(out, e + 8, 16)
+                let last = q + 1 == vn_lib.len()
+                rd.put32(out, e + 12, if last { 0 } else { 16 + 16 * names.len() })
+                var x = e + 16
+                for j in 0..names.len() {
+                    rd.put32(out, x, elf_hash(names[j]))
+                    rd.put16(out, x + 4, 0)
+                    rd.put16(out, x + 6, vn_idx[q][j])
+                    rd.put32(out, x + 8, dsoff.get(names[j]) ?? 0)
+                    rd.put32(out, x + 12, if j + 1 == names.len() { 0 } else { 16 })
+                    x += 16
+                }
+                e = x
+            }
+        } else if kind == elfstate.O_RELA_PLT {
+            for k2 in 0..plts.len() {
+                let g = plts[k2]
+                let e = at + 24 * k2
+                rd.put64(out, e, gotplt + 8 * (3 + k2))
+                rd.put64(out, e + 8, l.g_dyn[g].shl(32).bit_or(if x64 { X_JUMP_SLOT } else { A_JUMP_SLOT }))
+            }
+        } else if kind == elfstate.O_RELA_DYN {
+            // Relative relocations first, by offset; then the GOT's.
+            var ix: [i64] = []
+            for q in 0..rel_dyn_off.len() {
+                ix.push(q)
+            }
+            ix.sort_by(|q| rel_dyn_off[q])
+            var e = at
+            for q in ix {
+                rd.put64(out, e, rel_dyn_off[q])
+                rd.put64(out, e + 8, if x64 { X_RELATIVE } else { A_RELATIVE })
+                rd.put64(out, e + 16, rel_dyn_add[q])
+                e += 24
+            }
+            // Then the imports' slots, by symbol then place.
+            var gd: [i64] = []
+            for g in gots {
+                if imported(l, g) {
+                    gd.push(g)
+                }
+            }
+            // ld (`elf_link_sort_relocs`) sorts the rest by their symbol's
+            // first place, then by place: one slot a symbol, by place.
+            gd.sort_by(|g| l.g_got[g])
+            for g in gd {
+                rd.put64(out, e, slot0 + 8 * l.g_got[g])
+                rd.put64(out, e + 8, l.g_dyn[g].shl(32).bit_or(if x64 { X_GLOB_DAT } else { A_GLOB_DAT }))
+                e += 24
+            }
+        } else if kind == elfstate.O_PLT_GOT {
+            // jmpq *slot(%rip); xchg %ax, %ax
+            for k2 in 0..pltgot.len() {
+                let e = at + 8 * k2
+                let ea = l.o_addr[o] + 8 * k2
+                rd.put8(out, e, 0xFF)
+                rd.put8(out, e + 1, 0x25)
+                rd.put32(out, e + 2, slot0 + 8 * l.g_got[pltgot[k2]] - (ea + 6))
+                rd.put8(out, e + 6, 0x66)
+                rd.put8(out, e + 7, 0x90)
+            }
+        } else if kind == elfstate.O_PLT {
+            let pa = l.o_addr[o]
+            if x64 {
+                // pushq GOT+8(%rip); jmpq *GOT+16(%rip); nopl (%rax)
+                rd.put8(out, at, 0xFF)
+                rd.put8(out, at + 1, 0x35)
+                rd.put32(out, at + 2, gotplt + 8 - (pa + 6))
+                rd.put8(out, at + 6, 0xFF)
+                rd.put8(out, at + 7, 0x25)
+                rd.put32(out, at + 8, gotplt + 16 - (pa + 12))
+                rd.put32(out, at + 12, 0x00401F0F)
+                for k2 in 0..plts.len() {
+                    let e = at + 16 + 16 * k2
+                    let ea = pa + 16 + 16 * k2
+                    rd.put8(out, e, 0xFF)
+                    rd.put8(out, e + 1, 0x25)
+                    rd.put32(out, e + 2, gotplt + 8 * (3 + k2) - (ea + 6))
+                    rd.put8(out, e + 6, 0x68)
+                    rd.put32(out, e + 7, k2)
+                    rd.put8(out, e + 11, 0xE9)
+                    rd.put32(out, e + 12, pa - (ea + 16))
+                }
+            } else {
+                let g2 = gotplt + 16
+                rd.put32(out, at, 0xA9BF7BF0)
+                rd.put32(out, at + 4, adrp(0x90000010, g2, pa + 4))
+                rd.put32(out, at + 8, 0xF9400211.bit_or(g2.bit_and(0xFFF).ushr(3).shl(10)))
+                rd.put32(out, at + 12, 0x91000210.bit_or(g2.bit_and(0xFFF).shl(10)))
+                rd.put32(out, at + 16, 0xD61F0220)
+                rd.put32(out, at + 20, 0xD503201F)
+                rd.put32(out, at + 24, 0xD503201F)
+                rd.put32(out, at + 28, 0xD503201F)
+                for k2 in 0..plts.len() {
+                    let e = at + 32 + 16 * k2
+                    let ea = pa + 32 + 16 * k2
+                    let slot = gotplt + 8 * (3 + k2)
+                    rd.put32(out, e, adrp(0x90000010, slot, ea))
+                    rd.put32(out, e + 4, 0xF9400211.bit_or(slot.bit_and(0xFFF).ushr(3).shl(10)))
+                    rd.put32(out, e + 8, 0x91000210.bit_or(slot.bit_and(0xFFF).shl(10)))
+                    rd.put32(out, e + 12, 0xD61F0220)
+                }
+            }
+        } else if kind == elfstate.O_GOT {
+            if x64 {
+                rd.put64(out, at, dynamic_addr)
+                for k2 in 0..plts.len() {
+                    rd.put64(out, at + 8 * (3 + k2), l.o_addr[plt_o] + 16 + 16 * k2 + 6)
+                }
+            } else {
+                for k2 in 0..plts.len() {
+                    rd.put64(out, at + 8 * (3 + k2), l.o_addr[plt_o])
+                }
+                rd.put64(out, at + 8 * gotplt_n, dynamic_addr)
+            }
+        } else if kind == elfstate.O_DYNAMIC {
+            var e = at
+            var ni = 0
+            for t in tags {
+                var v = 0
+                if t == 1 {
+                    v = dsoff.get(l.f_soname[l.dt_needed[ni]]) ?? 0
+                    ni += 1
+                } else if t == 0x6ffffef5 {
+                    v = l.o_addr[by_name.get(".gnu.hash") ?? 0]
+                } else if t == 5 {
+                    v = l.o_addr[by_name.get(".dynstr") ?? 0]
+                } else if t == 6 {
+                    v = l.o_addr[by_name.get(".dynsym") ?? 0]
+                } else if t == 10 {
+                    v = dynstr.len()
+                } else if t == 11 {
+                    v = 24
+                } else if t == 3 {
+                    v = gotplt
+                } else if t == 2 {
+                    v = 24 * plts.len()
+                } else if t == 20 {
+                    v = 7
+                } else if t == 23 {
+                    v = l.o_addr[by_name.get(".rela.plt") ?? 0]
+                } else if t == 7 {
+                    v = l.o_addr[by_name.get(".rela.dyn") ?? 0]
+                } else if t == 8 {
+                    v = 24 * (nrelative + got_locals.len() + gots.len())
+                } else if t == 9 {
+                    v = 24
+                } else if t == 30 {
+                    v = 8
+                } else if t == 0x6ffffffb {
+                    v = 0x08000001
+                } else if t == 0x6ffffffe {
+                    v = l.o_addr[by_name.get(".gnu.version_r") ?? 0]
+                } else if t == 0x6fffffff {
+                    v = vn_lib.len()
+                } else if t == 0x6ffffff0 {
+                    v = l.o_addr[by_name.get(".gnu.version") ?? 0]
+                } else if t == 25 {
+                    v = l.o_addr[by_name.get(".init_array") ?? 0]
+                } else if t == 27 {
+                    v = l.o_size[by_name.get(".init_array") ?? 0]
+                } else if t == 26 {
+                    v = l.o_addr[by_name.get(".fini_array") ?? 0]
+                } else if t == 28 {
+                    v = l.o_size[by_name.get(".fini_array") ?? 0]
+                } else if t == 32 {
+                    v = l.o_addr[by_name.get(".preinit_array") ?? 0]
+                } else if t == 33 {
+                    v = l.o_size[by_name.get(".preinit_array") ?? 0]
+                }
+                rd.put64(out, e, t)
+                rd.put64(out, e + 8, v)
+                e += 16
+            }
+            if nrelative + n_got_rel > 0 {
+                rd.put64(out, e, 0x6ffffff9)
+                rd.put64(out, e + 8, nrelative + n_got_rel)
+            }
+        }
+    }
+    out.copy_from(shstr_off, shstr)
+    // ----- the ELF header and the program headers
+    let entry_g = l.g_map.get(l.entry) ?? -1
+    let entry = if entry_g >= 0 { gaddr[entry_g] } else { 0 }
+    write_ident(out)
+    rd.put16(out, 16, 3)
+    rd.put16(out, 18, if x64 { elfstate.EM_X86_64 } else { elfstate.EM_AARCH64 })
+    rd.put32(out, 20, 1)
+    rd.put64(out, 24, entry)
+    rd.put64(out, 32, 64)
+    rd.put64(out, 40, shoff)
+    rd.put32(out, 48, 0)
+    rd.put16(out, 52, 64)
+    rd.put16(out, 54, 56)
+    rd.put16(out, 56, phnum)
+    rd.put16(out, 58, 64)
+    rd.put16(out, 60, shnum)
+    rd.put16(out, 62, shnum - 1)
+    var ph = 64
+    // PHDR, INTERP.
+    let interp_o = by_name.get(".interp") ?? -1
+    ph = phdr(out, ph, 6, 4, 64, 64, 56 * phnum, 56 * phnum, 8)
+    ph = phdr(out, ph, 3, 4, l.o_off[interp_o], l.o_addr[interp_o], l.o_size[interp_o], l.o_size[interp_o], 1)
+    // LOADs.
+    if x64 {
+        var r0 = -1
+        var r1 = -1
+        var x0 = -1
+        var x1 = -1
+        var o0 = -1
+        var o1 = -1
+        for o in alloc_order {
+            if data_secs.contains(o) {
+                continue
+            }
+            if l.o_flags[o].bit_and(elfstate.SHF_EXECINSTR) != 0 {
+                if x0 < 0 {
+                    x0 = o
+                }
+                x1 = o
+            } else if x0 < 0 {
+                if r0 < 0 {
+                    r0 = o
+                }
+                r1 = o
+            } else {
+                if o0 < 0 {
+                    o0 = o
+                }
+                o1 = o
+            }
+        }
+        let e0 = l.o_off[r1] + l.o_size[r1]
+        ph = phdr(out, ph, 1, 4, 0, 0, e0, e0, maxpage)
+        let xs = l.o_addr[x0]
+        let xe = l.o_addr[x1] + l.o_size[x1]
+        ph = phdr(out, ph, 1, 5, xs, xs, xe - xs, xe - xs, maxpage)
+        let rs = l.o_addr[o0]
+        let re = l.o_addr[o1] + l.o_size[o1]
+        ph = phdr(out, ph, 1, 4, rs, rs, re - rs, re - rs, maxpage)
+    } else {
+        ph = phdr(out, ph, 1, 5, 0, 0, text_end, text_end, maxpage)
+    }
+    let d0 = data_secs[0]
+    var dfile_end = 0
+    var dmem_end = 0
+    for o in data_secs {
+        if l.o_type[o] != elfstate.SHT_NOBITS {
+            dfile_end = l.o_off[o] + l.o_size[o]
+        }
+        if not is_tbss(l, o) {
+            dmem_end = l.o_addr[o] + l.o_size[o]
+        }
+    }
+    ph = phdr(out, ph, 1, 6, l.o_off[d0], l.o_addr[d0], dfile_end - l.o_off[d0], dmem_end - l.o_addr[d0], maxpage)
+    ph = phdr(out, ph, 2, 6, l.o_off[dyn_o], l.o_addr[dyn_o], l.o_size[dyn_o], l.o_size[dyn_o], 8)
+    if has_tls {
+        ph = phdr(out, ph, 7, 4, l.o_off[tls_first], l.tls_addr, tdata_size, l.tls_size, tls_align)
+    }
+    ph = phdr(out, ph, 0x6474e551, 6, 0, 0, 0, 0, 16)
+    ph = phdr(out, ph, 0x6474e552, 4, l.o_off[relro_secs[0]], l.relro_start, l.relro_end - l.relro_start, l.relro_end - l.relro_start, 1)
+    // ----- the section headers
+    var e = shoff + 64
+    for o in 0..l.o_name.len() {
+        rd.put32(out, e, sh.1.get(l.o_name[o]) ?? 0)
+        rd.put32(out, e + 4, l.o_type[o])
+        rd.put64(out, e + 8, l.o_flags[o])
+        rd.put64(out, e + 16, l.o_addr[o])
+        rd.put64(out, e + 24, l.o_off[o])
+        rd.put64(out, e + 32, l.o_size[o])
+        var link = 0
+        var info = l.o_info[o]
+        let kind = l.o_kind[o]
+        if kind == elfstate.O_GNU_HASH or kind == elfstate.O_VERSYM or kind == elfstate.O_RELA_PLT or kind == elfstate.O_RELA_DYN {
+            link = 1 + (by_name.get(".dynsym") ?? 0)
+        } else if kind == elfstate.O_DYNSYM or kind == elfstate.O_VERNEED or kind == elfstate.O_DYNAMIC {
+            link = 1 + (by_name.get(".dynstr") ?? 0)
+        }
+        if kind == elfstate.O_RELA_PLT {
+            info = 1 + got_o
+        }
+        rd.put32(out, e + 40, link)
+        rd.put32(out, e + 44, info)
+        rd.put64(out, e + 48, l.o_align[o])
+        rd.put64(out, e + 56, l.o_entsize[o])
+        e += 64
+    }
+    rd.put32(out, e, sh.1.get(".shstrtab") ?? 0)
+    rd.put32(out, e + 4, elfstate.SHT_STRTAB)
+    rd.put64(out, e + 24, shstr_off)
+    rd.put64(out, e + 32, shstr.len())
+    rd.put64(out, e + 48, 1)
+    out
+}
+
+fn write_ident(inout out: bytes) {
+    let id = [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0]
+    for k in 0..id.len() {
+        out.set(k, id[k])
+    }
+    ()
+}
+
+/// A program header at `at`; where the next goes.
+fn phdr(inout out: bytes, at: i64, typ: i64, flags: i64, off: i64, addr: i64, filesz: i64, memsz: i64, align: i64) -> i64 {
+    rd.put32(out, at, typ)
+    rd.put32(out, at + 4, flags)
+    rd.put64(out, at + 8, off)
+    rd.put64(out, at + 16, addr)
+    rd.put64(out, at + 24, addr)
+    rd.put64(out, at + 32, filesz)
+    rd.put64(out, at + 40, memsz)
+    rd.put64(out, at + 48, align)
+    at + 56
+}
+
+fn is_data(n: str) -> bool {
+    n == ".tdata" or n == ".tbss" or n == ".preinit_array" or n == ".init_array" or n == ".fini_array" or n == ".data.rel.ro" or
+    n == ".dynamic" or n == ".got" or n == ".data" or n == ".data1" or n == ".bss"
+}
+
+fn is_tbss(l: El, o: i64) -> bool {
+    l.o_type[o] == elfstate.SHT_NOBITS and l.o_flags[o].bit_and(elfstate.SHF_TLS) != 0
+}
+
+fn first_tls_align(l: El, secs: [i64]) -> i64 {
+    for o in secs {
+        if l.o_flags[o].bit_and(elfstate.SHF_TLS) != 0 {
+            return l.o_align[o]
+        }
+    }
+    1
+}
+
+/// The first section of the merge `s` is in: where its blob is.
+fn first_of_merge(l: El, s: i64) -> i64 {
+    let o = l.s_out[s]
+    for q in l.o_in0[o]..l.o_in0[o] + l.o_inn[o] {
+        let t = l.oi[q]
+        if elfmerge.mergeable(l, t) {
+            return t
+        }
+    }
+    s
+}
+
+/// File symbol `y`'s address: its section's place plus its value.
+fn sym_addr(l: El, y: i64) -> i64 {
+    let s = l.y_sec[y]
+    if s < 0 {
+        return l.y_value[y]
+    }
+    let o = l.s_out[s]
+    if o < 0 {
+        return 0
+    }
+    if l.s_ms0[s] + l.s_msn[s] > l.s_ms0[s] {
+        return l.o_addr[o] + l.s_outoff[first_of_merge(l, s)] + elfmerge.map_offset(l, s, l.y_value[y])
+    }
+    l.o_addr[o] + l.s_outoff[s] + l.y_value[y]
+}
+
+fn put_s32(inout out: bytes, at: i64, v: i64, l: El, s: i64, r: i64) -> () ! str {
+    if v < -2147483648 or v > 2147483647 {
+        fail("{l.f_path[l.s_file[s]]}: a 32-bit displacement out of range (relocation {l.r_type[r]})")
+    }
+    rd.put32(out, at, v)
+    ()
+}
+
+/// An `adrp` to `target`'s page from `p`.
+fn adrp(w: i64, target: i64, p: i64) -> i64 {
+    let d = target.bit_and(-4096) - p.bit_and(-4096)
+    let imm = d.shr(12)
+    w.bit_and(0x9F00001F).bit_or(imm.bit_and(3).shl(29)).bit_or(imm.shr(2).bit_and(0x7FFFF).shl(5))
+}
+
+/// The gaps between code sections: on arm64 `nop`s; on x86-64 the longest
+/// `nop`s first, as ld fills them (bfd's `bfd_arch_i386_fill`).
+fn fill_nops(l: El, o: i64, inout out: bytes) {
+    let nops = [[0x90], [0x66, 0x90], [0x0F, 0x1F, 0x00], [0x0F, 0x1F, 0x40, 0x00], [0x0F, 0x1F, 0x44, 0x00, 0x00],
+        [0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00], [0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+        [0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], [0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]]
+    var pos = 0
+    for q in l.o_in0[o]..l.o_in0[o] + l.o_inn[o] {
+        let s = l.oi[q]
+        var p = pos
+        if l.x64 {
+            var count = l.s_outoff[s] - pos
+            while count > 0 {
+                let n = if count >= 10 { 10 } else { count }
+                let pat = nops[n - 1]
+                for k in 0..n {
+                    rd.put8(out, l.o_off[o] + p + k, pat[k])
+                }
+                p += n
+                count -= n
+            }
+        } else {
+            while p + 4 <= l.s_outoff[s] {
+                rd.put32(out, l.o_off[o] + p, 0xD503201F)
+                p += 4
+            }
+        }
+        pos = l.s_outoff[s] + l.s_size[s]
+    }
+    ()
+}
+
+/// A string table as ld's are made (`elf-strtab.c`): the strings in the
+/// order given, each once, and a string that ends another kept string
+/// pointing inside it. The table and each string's offset.
+pub fn strtab(strs: [str]) -> (bytes, Map[str, i64]) {
+    var uniq: [str] = []
+    var seen: Map[str, bool] = {}
+    for s in strs {
+        if not seen.has(s) {
+            seen.set(s, true)
+            uniq.push(s)
+        }
+    }
+    var bs: [bytes] = []
+    var ix: [i64] = []
+    for i in 0..uniq.len() {
+        bs.push(uniq[i].to_bytes())
+        ix.push(i)
+    }
+    // Sorted from the end; a string ending the next longer is merged.
+    let sorted = sort_strs(bs, ix)
+    var into: [i64] = []
+    for i in 0..uniq.len() {
+        into.push(-1)
+    }
+    if sorted.len() > 0 {
+        var e = sorted[sorted.len() - 1]
+        var q = sorted.len() - 2
+        while q >= 0 {
+            let c = sorted[q]
+            let a = bs[e]
+            let b = bs[c]
+            if a.len() > b.len() and a.slice(a.len() - b.len(), a.len()) == b {
+                into[c] = e
+            } else {
+                e = c
+            }
+            q -= 1
+        }
+    }
+    var out = byte_builder()
+    out.push_byte(0)
+    var off: Map[str, i64] = {}
+    var pos: [i64] = []
+    for i in 0..uniq.len() {
+        pos.push(0)
+        if into[i] < 0 {
+            pos[i] = out.len()
+            out.push_bytes(bs[i])
+            out.push_byte(0)
+        }
+    }
+    for i in 0..uniq.len() {
+        if into[i] >= 0 {
+            var t = into[i]
+            while into[t] >= 0 {
+                t = into[t]
+            }
+            pos[i] = pos[t] + bs[t].len() - bs[i].len()
+        }
+        off.set(uniq[i], pos[i])
+    }
+    off.set("", 0)
+    (out.to_bytes(), off)
+}
+
+fn sort_strs(bs: [bytes], ix: [i64]) -> [i64] {
+    if ix.len() <= 1 {
+        return ix
+    }
+    let mid = ix.len() / 2
+    let a = sort_strs(bs, ix.slice(0, mid))
+    let b = sort_strs(bs, ix.slice(mid, ix.len()))
+    var out: [i64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() and j < b.len() {
+        if rev_before(bs[b[j]], bs[a[i]]) {
+            out.push(b[j])
+            j += 1
+        } else {
+            out.push(a[i])
+            i += 1
+        }
+    }
+    while i < a.len() {
+        out.push(a[i])
+        i += 1
+    }
+    while j < b.len() {
+        out.push(b[j])
+        j += 1
+    }
+    out
+}
+
+fn rev_before(a: bytes, b: bytes) -> bool {
+    var i = a.len() - 1
+    var j = b.len() - 1
+    while i >= 0 and j >= 0 {
+        if a.at(i) != b.at(j) {
+            return a.at(i) < b.at(j)
+        }
+        i -= 1
+        j -= 1
+    }
+    a.len() < b.len()
+}
+
+/// The GNU hash of a name (`dl_new_hash`).
+fn gnu_hash(name: str) -> i64 {
+    let bs = name.to_bytes()
+    var h = 5381
+    for k in 0..bs.len() {
+        h = (h * 33 + bs.at(k)).bit_and(0xFFFFFFFF)
+    }
+    h
+}
+
+/// `.gnu.hash`'s bucket count for `n` symbols (`compute_bucket_count`,
+/// not optimizing).
+fn gnu_buckets(n: i64) -> i64 {
+    let sizes = [1, 3, 17, 37, 67, 97, 131, 197, 263, 521, 1031, 2053, 4099, 8209, 16411, 32771]
+    var best = 1
+    var i = 0
+    while i < sizes.len() {
+        best = sizes[i]
+        if i + 1 >= sizes.len() or n < sizes[i + 1] {
+            break
+        }
+        i += 1
+    }
+    if best < 2 { 2 } else { best }
+}
+
+fn gnu_maskbitslog2(n: i64) -> i64 {
+    var x = n
+    var m = 1
+    x = x.ushr(1)
+    while x != 0 {
+        m += 1
+        x = x.ushr(1)
+    }
+    if m < 3 {
+        m = 5
+    } else if 1.shl(m - 2).bit_and(n) != 0 {
+        m += 3
+    } else {
+        m += 2
+    }
+    if m == 5 { 6 } else { m }
+}
+
+fn gnu_maskwords(n: i64) -> i64 {
+    1.shl(gnu_maskbitslog2(n) - 6)
+}
+
+/// `.gnu.hash` for `hashed`, which are dynamic symbols `first`.. in order.
+fn gnu_hash_section(l: El, inout out: bytes, at: i64, hashed: [i64], first: i64, nb: i64) {
+    let lg = gnu_maskbitslog2(hashed.len())
+    let maskwords = 1.shl(lg - 6)
+    let maskbits = 1.shl(lg)
+    rd.put32(out, at, nb)
+    rd.put32(out, at + 4, first)
+    rd.put32(out, at + 8, maskwords)
+    rd.put32(out, at + 12, lg)
+    var words: [i64] = []
+    for k in 0..maskwords {
+        words.push(0)
+    }
+    var counts: [i64] = []
+    var starts: [i64] = []
+    for k in 0..nb {
+        counts.push(0)
+        starts.push(0)
+    }
+    for g in hashed {
+        counts[gnu_hash(l.g_name[g]) % nb] += 1
+    }
+    var cnt = first
+    for b in 0..nb {
+        if counts[b] != 0 {
+            starts[b] = cnt
+            cnt += counts[b]
+        }
+    }
+    let buckets = at + 16 + 8 * maskwords
+    for b in 0..nb {
+        rd.put32(out, buckets + 4 * b, if counts[b] == 0 { 0 } else { starts[b] })
+    }
+    let chains = buckets + 4 * nb
+    var left = counts
+    for g in hashed {
+        let h = gnu_hash(l.g_name[g])
+        let b = h % nb
+        let val = h.ushr(6).bit_and(maskbits.ushr(6) - 1)
+        words[val] = words[val].bit_or(1.shl(h.bit_and(63))).bit_or(1.shl(h.ushr(lg).bit_and(63)))
+        var v = h.bit_and(0xFFFFFFFE)
+        if left[b] == 1 {
+            v = v.bit_or(1)
+        }
+        rd.put32(out, chains + 4 * (starts[b] - first), v)
+        starts[b] += 1
+        left[b] -= 1
+    }
+    for k in 0..maskwords {
+        rd.put64(out, at + 16 + 8 * k, words[k])
+    }
+    ()
+}

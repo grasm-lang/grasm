@@ -10,13 +10,16 @@
 #
 #   * membership -- the backend compiles every program the rule has in and
 #     refuses (exit 3) every one it has out;
-#   * agreement -- `s3 --target <t>` compiles it, and it is linked with the
-#     Grasm runtime built for Linux (`compiler/rt` with `os/linux.gr`,
-#     `s3 --runtime --target <t>`) and `compiler/link`'s `_start`, glibc's
-#     `libm.so.6` and `libc.so.6`, by GNU ld -- until `compiler/link` links
-#     ELF (step four of §6.18, this gate's recorded gap) -- with each of the
-#     program's runtime names bound to the Grasm runtime's, as `link
-#     -interpose` binds them. The reference is the Cranelift build for the
+#   * agreement -- `s3 --target <t>` compiles it, and `compiler/link` links
+#     it on the Mac with the Grasm runtime built for Linux (`compiler/rt`
+#     with `os/linux.gr`, `s3 --runtime --target <t>`), its own `_start`,
+#     glibc's `libm.so.6` and `libc.so.6` (`-sysroot`: the machine's own
+#     root, or `GRASM_X64_ROOT`), each of the program's runtime names bound
+#     to the Grasm runtime's (`-interpose`), `-dead_strip -strip`; the glibc
+#     each link requires must be 2.34 (§6.18's floor), or a newer version
+#     only for a function `scripts/glibc_floor.txt` lists with it, and on a
+#     whole run every listed function must be needed by some link. The
+#     reference is the Cranelift build for the
 #     triple (`grasm build --native --target <triple>`'s object) linked with
 #     the Rust runtime built for the triple by the machine's toolchain (gcc;
 #     for x86-64, the cross ld, crt files and glibc of `GRASM_X64_ROOT`).
@@ -58,6 +61,7 @@ corpus_require
 WORK=$(linux_workdir)
 trap 'rm -rf "$WORK"' EXIT
 linux_x64_root
+linux_a64_root
 linux_isolate_check
 . scripts/lib/s3.sh
 s3_driver
@@ -68,12 +72,12 @@ TARGETS=${ELF_TARGETS:-aarch64-linux x86_64-linux}
 # shellcheck disable=SC2206
 TG=($TARGETS)
 CARGO_OUT=${CARGO_TARGET_DIR:-./target}
-declare -a TRIPLE=() RUST_RT=() GRASM_RT=() START=()
+declare -a TRIPLE=() ROOT=() RUST_RT=() GRASM_RT=()
 for i in "${!TG[@]}"; do
     t=${TG[$i]}
     case $t in
-    aarch64-linux) triple=aarch64-unknown-linux-gnu; var=ELF_RT_A64; arch=aarch64 ;;
-    x86_64-linux) triple=x86_64-unknown-linux-gnu; var=ELF_RT_X64; arch=x86_64 ;;
+    aarch64-linux) triple=aarch64-unknown-linux-gnu; var=ELF_RT_A64; ROOT[$i]=$A64_ROOT ;;
+    x86_64-linux) triple=x86_64-unknown-linux-gnu; var=ELF_RT_X64; ROOT[$i]=$X64_ROOT ;;
     *) echo "error: ELF_TARGETS names $t"; exit 1 ;;
     esac
     TRIPLE[$i]=$triple
@@ -93,15 +97,6 @@ for i in "${!TG[@]}"; do
         sed 's/^/  /' "${GRASM_RT[$i]}.log" | head -20
         exit 1
     fi
-    if ! linux_defsyms "${GRASM_RT[$i]}" "$WORK/defsyms-$t.txt"; then
-        echo "error: the Grasm runtime for $t defines no runtime name"
-        exit 1
-    fi
-    START[$i]="$WORK/start-$t.o"
-    if ! "$LINK" -start-object "$arch" -o "${START[$i]}" >"$WORK/start.log" 2>&1; then
-        echo "error: compiler/link does not write _start for $arch: $(head -1 "$WORK/start.log")"
-        exit 1
-    fi
 done
 
 s3_collect
@@ -109,10 +104,10 @@ linux_filter_programs
 STOP=${S3_STOP_AT_FIRST:-}
 stopped=0
 external=0
-declare -a IN_SUBSET=() OUT_SUBSET=() PASS=() FAIL=() TIMEDOUT=() KNOWN_N=()
+declare -a IN_SUBSET=() OUT_SUBSET=() PASS=() FAIL=() TIMEDOUT=() KNOWN_N=() FLOOR_MAX=()
 declare -a FAILED=() TIMEDOUT_L=() EXTERNAL=() KNOWN_L=()
 for i in "${!TG[@]}"; do
-    IN_SUBSET[$i]=0; OUT_SUBSET[$i]=0; PASS[$i]=0; FAIL[$i]=0; TIMEDOUT[$i]=0; KNOWN_N[$i]=0
+    IN_SUBSET[$i]=0; OUT_SUBSET[$i]=0; PASS[$i]=0; FAIL[$i]=0; TIMEDOUT[$i]=0; KNOWN_N[$i]=0; FLOOR_MAX[$i]=none
 done
 : >"$WORK/batch.txt"
 mkdir -p "$WORK/i"
@@ -155,6 +150,20 @@ for k in "${!S3_SRC[@]}"; do
             FAILED+=("$t $src — the Cranelift build for ${TRIPLE[$i]} fails: $(head -1 "$d/c.log")")
             continue
         fi
+        # compiler/link, here on the Mac; a failed link leaves `s.link`
+        # not empty, which the machine's half and the agreement read.
+        if "$LINK" -sysroot "${ROOT[$i]}" "$d/s.o" -interpose "${GRASM_RT[$i]}" -dead_strip -strip -o "$d/s.x" >"$d/s.link" 2>&1; then
+            if ! linux_glibc_floor "$d/s.x" "$WORK/listed-$t.txt" >"$d/s.floor"; then
+                FAIL[$i]=$((FAIL[$i] + 1))
+                FAILED+=("$t $src — $(cat "$d/s.floor")")
+            fi
+            v=$LINUX_GLIBC_NEWEST
+            if [ "$v" != none ] && { [ "${FLOOR_MAX[$i]}" = none ] || linux_version_newer "$v" "${FLOOR_MAX[$i]}"; }; then
+                FLOOR_MAX[$i]=$v
+            fi
+        else
+            echo "compiler/link: exit $?" >>"$d/s.link"
+        fi
         printf '%s\t%s\t%s\n' "$i" "$k" "$d" >>"$WORK/batch.txt"
         want_run=1
     done
@@ -174,20 +183,17 @@ done
     echo '#!/bin/bash'
     echo "cd '$PWD'"
     for i in "${!TG[@]}"; do
-        echo "TG[$i]=${TG[$i]}; RRT[$i]='${RUST_RT[$i]}'; GRT[$i]='${GRASM_RT[$i]}'; ST[$i]='${START[$i]}'; DS[$i]='$WORK/defsyms-${TG[$i]}.txt'"
+        echo "TG[$i]=${TG[$i]}; RRT[$i]='${RUST_RT[$i]}'"
     done
     cat <<EOF
 X64_LD='$X64_LD'; X64_RUN='$X64_RUN'; XR='$X64_ROOT'; XL='$X64_LIB'
 LIMIT=$S3_RUN_SECONDS
-FLAGS="-pie -z now -z relro --hash-style=gnu --gc-sections --build-id=none"
 one() {
     i=\$1; d=\$2
     if [ "\${TG[\$i]}" = aarch64-linux ]; then
-        ld \$FLAGS -dynamic-linker /lib/ld-linux-aarch64.so.1 "\${ST[\$i]}" "\$d/s.o" "\${GRT[\$i]}" /lib/aarch64-linux-gnu/libm.so.6 /lib/aarch64-linux-gnu/libc.so.6 @"\${DS[\$i]}" -o "\$d/s.x" >"\$d/s.link" 2>&1 || echo "exit \$?" >>"\$d/s.link"
         gcc "\$d/c.o" "\${RRT[\$i]}" -lm -o "\$d/c.x" -Wl,--gc-sections >"\$d/c.link" 2>&1 || echo "exit \$?" >>"\$d/c.link"
         run=""
     else
-        "\$X64_LD" \$FLAGS -dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "\$XR\$XL" "\${ST[\$i]}" "\$d/s.o" "\${GRT[\$i]}" "\$XR\$XL/libm.so.6" "\$XR\$XL/libc.so.6" @"\${DS[\$i]}" -o "\$d/s.x" >"\$d/s.link" 2>&1 || echo "exit \$?" >>"\$d/s.link"
         "\$X64_LD" -pie -z now -dynamic-linker /lib64/ld-linux-x86-64.so.2 "\$XR\$XL/Scrt1.o" "\$XR\$XL/crti.o" "\$d/c.o" "\${RRT[\$i]}" -L=\$XL -lm -lc "\$XR\$XL/libgcc_s.so.1" "\$XR\$XL/crtn.o" --gc-sections -o "\$d/c.x" >"\$d/c.link" 2>&1 || echo "exit \$?" >>"\$d/c.link"
         run="\$X64_RUN"
     fi
@@ -270,7 +276,19 @@ for i in "${!TG[@]}"; do
     echo "${TG[$i]}: subset: ${IN_SUBSET[$i]} in, ${OUT_SUBSET[$i]} out, $external external, of ${#S3_SRC[@]} programs with a main"
     echo "${TG[$i]}: identical: ${PASS[$i]}   mismatched: ${FAIL[$i]}   timed out: ${TIMEDOUT[$i]}   agreeing with the Cranelift build and not the interpreter, as listed: ${KNOWN_N[$i]}"
 done
-echo "linked by GNU ld ($(linux_run sh -c 'ld --version | head -1')), the Grasm runtime's names bound by --defsym; glibc $(linux_run sh -c 'ldd --version | head -1 | sed "s/.* //"')"
+for i in "${!TG[@]}"; do
+    echo "${TG[$i]}: linked by compiler/link; the newest glibc a link requires: ${FLOOR_MAX[$i]} (floor $LINUX_GLIBC_FLOOR; above it, as listed: $(linux_glibc_listed "$WORK/listed-${TG[$i]}.txt"))"
+done
+# On a whole run, a listed function no link needed is a stale line.
+if [ -z "${DIRS:-}" ]; then
+    while IFS=$'\t' read -r name ver _why; do
+        case "$name" in '' | '#'*) continue ;; esac
+        if ! cat "$WORK"/listed-*.txt 2>/dev/null | awk -v n="$name" -v v="$ver" '$1 == n && $2 == v { found = 1 } END { exit !found }'; then
+            FAILED+=("$LINUX_GLIBC_LIST lists $name $ver, which no link needed: take it off the list")
+        fi
+    done <"$LINUX_GLIBC_LIST"
+fi
+echo "the references linked by $(linux_run sh -c 'ld --version | head -1'); run on glibc $(linux_run sh -c 'ldd --version | head -1 | sed "s/.* //"')"
 if [ "$external" -gt 0 ]; then
     corpus_external_covered "${EXTERNAL[@]}" || exit 1
 fi

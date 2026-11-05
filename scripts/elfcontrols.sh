@@ -52,8 +52,31 @@
 #                  runtime)
 #   elf-sockopt    Linux's runtime takes Darwin's `SOL_SOCKET` -> elfrtswap
 #
+# The ELF linker (step four), each caught by linkdiff_elf, against GNU ld's
+# bytes:
+#
+#   link-call26    an arm64 call lands one instruction past its target
+#   link-slot      a PLT slot's JUMP_SLOT relocation names the next import
+#   link-version   an import's version index is the one before its own, so
+#                  it requires the wrong version
+#   link-relative  a pointer in arm64 data gets no RELATIVE relocation (its
+#                  entry left empty), so it would keep its unrelocated
+#                  address (on `examples/ranges.gr`: `hello`'s link has no
+#                  such pointer)
+#   link-tls       arm64's thread-local offsets are laid out as x86-64's
+#                  variant, below the thread pointer
+#   link-relro     PT_GNU_RELRO stops a word short of the GOT's end, so the
+#                  last slot stays writable
+#
+# And the glibc floor:
+#
+#   floor-list     `scripts/glibc_floor.txt` without `hypot`, so a program
+#                  calling it requires glibc 2.35 unlisted -> linkdiff_elf
+#                  (given the list as ELF_GLIBC_LIST)
+#
 # The runtime's faults are planted in a copy of `compiler/rt`, which the
-# gates are given as `ELF_RT_SRC`. Needs what the gates need
+# gates are given as `ELF_RT_SRC`; the linker's in a copy of `compiler/link`,
+# built and given to the gates as `LINK`. Needs what the gates need
 # (scripts/lib/linux.sh); without the machine it does not run (exit 77).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -84,11 +107,31 @@ control() {
         return
     fi
     local driver="$WORK/s3-$name"
-    if ! "$GRASM" build "$WORK/src/compiler/s3/src/main.gr" --native -o "$driver" >"$WORK/build-$name.log" 2>&1; then
-        MISSED+=("$name: the mutated backend does not build")
-        sed 's/^/    /' "$WORK/build-$name.log" | head -5
-        return
-    fi
+    local -a linker=()
+    case $file in
+    compiler/link/*)
+        # The linker's fault: the backend is the checkout's, the linker the
+        # mutated one.
+        driver="$WORK/s3"
+        if [ ! -x "$driver" ] && ! "$GRASM" build compiler/s3/src/main.gr --native -o "$driver" >"$WORK/build-s3.log" 2>&1; then
+            MISSED+=("$name: compiler/s3 does not build")
+            return
+        fi
+        if ! "$GRASM" build "$WORK/src/compiler/link/src/main.gr" --native -o "$WORK/link-$name" >"$WORK/build-$name.log" 2>&1; then
+            MISSED+=("$name: the mutated linker does not build")
+            sed 's/^/    /' "$WORK/build-$name.log" | head -5
+            return
+        fi
+        linker=("LINK=$WORK/link-$name")
+        ;;
+    *)
+        if ! "$GRASM" build "$WORK/src/compiler/s3/src/main.gr" --native -o "$driver" >"$WORK/build-$name.log" 2>&1; then
+            MISSED+=("$name: the mutated backend does not build")
+            sed 's/^/    /' "$WORK/build-$name.log" | head -5
+            return
+        fi
+        ;;
+    esac
     while [ $# -ge 2 ]; do
         local gate=$1 symptom=$2
         shift 2
@@ -97,7 +140,7 @@ control() {
         read -ra cmd <<<"$gate"
         gate=${cmd[${#cmd[@]} - 1]}
         local log="$WORK/$name-$(basename "$gate" .sh).log"
-        S3="$driver" ELF_RT_SRC="$WORK/src/compiler/rt" S3_STOP_AT_FIRST=1 env "${cmd[@]}" >"$log" 2>&1
+        S3="$driver" ELF_RT_SRC="$WORK/src/compiler/rt" S3_STOP_AT_FIRST=1 env ${linker[@]+"${linker[@]}"} "${cmd[@]}" >"$log" 2>&1
         local code=$?
         if [ "$code" = 77 ]; then
             MISSED+=("$name: $(basename "$gate" .sh) did not run: $(tail -1 "$log")")
@@ -192,6 +235,56 @@ control elf-sockopt compiler/rt/os/linux.gr \
     "pub let SOL_SOCKET = 1" "pub let SOL_SOCKET = 65535" -- \
     "ELF_TARGETS=x86_64-linux ELF_PROGRAMS=L-LIB-NET.gr $SWAP" "FAILED:"
 
+# The ELF linker (step four):
+L=compiler/link/src/elflink.gr
+LD="DIRS=examples ELF_PROGRAMS=hello scripts/linkdiff_elf.sh"
+
+control link-call26 $L \
+    $'                        let disp = target - p\n' $'                        let disp = target - p + 4\n' -- \
+    "ELF_TARGETS=aarch64-linux $LD" ".text: contents differ"
+
+control link-slot $L \
+    "rd.put64(out, e + 8, l.g_dyn[g].shl(32).bit_or(if x64 { X_JUMP_SLOT } else { A_JUMP_SLOT }))" \
+    "rd.put64(out, e + 8, (l.g_dyn[g] + 1).shl(32).bit_or(if x64 { X_JUMP_SLOT } else { A_JUMP_SLOT }))" -- \
+    "ELF_TARGETS=x86_64-linux $LD" ".rela.plt: contents differ"
+
+control link-version $L \
+    "        l.g_vidx[g] = found" "        l.g_vidx[g] = if found > 2 { found - 1 } else { found }" -- \
+    "ELF_TARGETS=aarch64-linux $LD" ".gnu.version: contents differ"
+
+control link-relative $L \
+    $'                    if t == A_ABS64 {\n                        rd.put64(out, p_off, sv + a)\n                        if alloc {' \
+    $'                    if t == A_ABS64 {\n                        rd.put64(out, p_off, sv + a)\n                        if false {' -- \
+    "ELF_TARGETS=aarch64-linux DIRS=examples ELF_PROGRAMS=ranges scripts/linkdiff_elf.sh" ".rela.dyn: contents differ"
+
+control link-tls $L \
+    "                        let tp = sv + a - (l.tls_addr - align_up(16, first_tls_align(l, relro_secs)))" \
+    "                        let tp = sv + a - l.tls_size - l.tls_addr" -- \
+    "ELF_TARGETS=aarch64-linux $LD" ".text: contents differ"
+
+control link-relro $L \
+    "    l.relro_end = d2" "    l.relro_end = d2 - 8" -- \
+    "ELF_TARGETS=x86_64-linux $LD" "GNU_RELRO"
+
+# The glibc floor: a list without `hypot`, and a program that calls it.
+grep -v '^hypot' scripts/glibc_floor.txt >"$WORK/floor-list.txt"
+controls=$((controls + 1))
+ELF_GLIBC_LIST="$WORK/floor-list.txt" ELF_TARGETS=x86_64-linux DIRS=spec/conformance ELF_PROGRAMS=L-LIB-MATH S3_STOP_AT_FIRST=1 \
+    scripts/linkdiff_elf.sh >"$WORK/floor-list.log" 2>&1
+code=$?
+symptom="hypot@GLIBC_2.35 -- above the floor 2.34"
+if [ "$code" = 77 ]; then
+    MISSED+=("floor-list: linkdiff_elf did not run: $(tail -1 "$WORK/floor-list.log")")
+elif [ "$code" != 0 ] && grep -cF -- "$symptom" "$WORK/floor-list.log" >/dev/null; then
+    caught=$((caught + 1))
+    echo "caught: floor-list by linkdiff_elf (exit $code; \"$symptom\")"
+elif [ "$code" != 0 ]; then
+    MISSED+=("floor-list: linkdiff_elf failed (exit $code) but not with \"$symptom\"")
+    tail -5 "$WORK/floor-list.log" | sed 's/^/    /'
+else
+    MISSED+=("floor-list: linkdiff_elf passed with hypot unlisted")
+fi
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -200,8 +293,8 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-if [ "$controls" -ne 17 ] || [ "$caught" -ne 17 ]; then
-    echo "expected 17 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 24 ] || [ "$caught" -ne 24 ]; then
+    echo "expected 24 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

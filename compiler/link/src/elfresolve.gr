@@ -1,0 +1,218 @@
+// Symbol resolution and garbage collection for the ELF linker
+// (docs/self-hosting.md §6.18), as GNU ld does them for the inputs a Grasm
+// program has: inputs in command-line order, an archive's members loaded
+// while they define something still undefined, each shared library binding
+// the references nothing before it defined -- to a symbol's default version
+// -- and, with `--gc-sections`, every section the entry point and the
+// sections kept by name do not reach through relocations dropped.
+//
+// `-interpose <obj>`: a program's undefined `grasm_<name>` is bound to the
+// interposed runtime's `grt_<name>` where it defines one, as
+// `compiler/link -interpose` binds them for Mach-O and as the Linux gates'
+// GNU ld is told by `--defsym grasm_<name>=grt_<name>`.
+import elfstate
+
+/// Renames each undefined `grasm_<name>` in the objects that are not the
+/// interposed runtime to `grt_<name>`, where the runtime defines that.
+/// Answers how many names the runtime offers (each a `--defsym` ld is given).
+pub fn interpose(inout l: El) -> i64 {
+    var offered: Map[str, bool] = {}
+    for fi in 0..l.f_path.len() {
+        if l.f_kind[fi] != 0 or not l.f_interposed[fi] {
+            continue
+        }
+        for y in l.f_sym0[fi]..l.f_sym0[fi] + l.f_nsym[fi] {
+            if l.y_bind[y] != elfstate.STB_LOCAL and l.y_shndx[y] != 0 and l.y_name[y].starts_with("grt_") {
+                offered.set(l.y_name[y], true)
+            }
+        }
+    }
+    if offered.len() == 0 {
+        return 0
+    }
+    for fi in 0..l.f_path.len() {
+        if l.f_kind[fi] != 0 or l.f_interposed[fi] {
+            continue
+        }
+        for y in l.f_sym0[fi]..l.f_sym0[fi] + l.f_nsym[fi] {
+            let n = l.y_name[y]
+            if l.y_shndx[y] == 0 and l.y_bind[y] != elfstate.STB_LOCAL and n.starts_with("grasm_") {
+                let to = "grt_" + n.substr(6, n.len() - 6)
+                if offered.has(to) {
+                    l.y_name[y] = to
+                }
+            }
+        }
+    }
+    offered.len()
+}
+
+/// Enters object `fi`'s global symbols, defining or referencing each.
+pub fn add_object(inout l: El, fi: i64) -> () ! str {
+    for y in l.f_sym0[fi]..l.f_sym0[fi] + l.f_nsym[fi] {
+        if l.y_bind[y] == elfstate.STB_LOCAL or y == l.f_sym0[fi] {
+            continue
+        }
+        let g = elfstate.gsym(l, l.y_name[y])
+        l.y_g[y] = g
+        let sh = l.y_shndx[y]
+        if sh == 0 {
+            if l.y_bind[y] != elfstate.STB_WEAK {
+                l.g_sref[g] = true
+            }
+            continue
+        }
+        if sh == 0xFFF2 {
+            fail("{l.f_path[fi]}: common symbol `{l.y_name[y]}` is not taken")
+        }
+        let weak = l.y_bind[y] == elfstate.STB_WEAK
+        let k = l.g_kind[g]
+        if k == elfstate.G_UNDEF or k == elfstate.G_DYN or ((k == elfstate.G_DEF or k == elfstate.G_ABS) and l.g_weak[g] and not weak) {
+            l.g_kind[g] = if sh == 0xFFF1 { elfstate.G_ABS } else { elfstate.G_DEF }
+            l.g_y[g] = y
+            l.g_weak[g] = weak
+            l.g_lib[g] = -1
+        } else if (k == elfstate.G_DEF or k == elfstate.G_ABS) and not weak and not l.g_weak[g] {
+            fail("{l.f_path[fi]}: multiple definition of `{l.y_name[y]}'")
+        }
+    }
+    ()
+}
+
+/// Binds the references nothing has defined to shared library `fi`'s
+/// default versions; each binding is numbered in discovery order, which is
+/// `.dynstr`'s.
+pub fn add_shared(inout l: El, fi: i64, inout disc: i64) {
+    for k in l.f_sym0[fi] + 1..l.f_sym0[fi] + l.f_nsym[fi] {
+        if l.dl_bind[k] == elfstate.STB_LOCAL or not l.dl_def[k] or l.dl_hidden[k] {
+            continue
+        }
+        match l.g_map.get(l.dl_name[k]) {
+            Some(g) -> {
+                if l.g_kind[g] == elfstate.G_UNDEF {
+                    l.g_kind[g] = elfstate.G_DYN
+                    l.g_lib[g] = fi
+                    l.g_ver[g] = l.dl_ver[k]
+                    l.g_stype[g] = l.dl_type[k]
+                    l.g_ssize[g] = l.dl_size[k]
+                    l.g_disc[g] = disc
+                    disc += 1
+                }
+            }
+            None -> ()
+        }
+    }
+    ()
+}
+
+/// The section a symbol reference leads to, or -1: a local symbol's own,
+/// a global's definition's.
+pub fn target_section(l: El, y: i64) -> i64 {
+    let g = l.y_g[y]
+    if g < 0 {
+        return l.y_sec[y]
+    }
+    if l.g_kind[g] == elfstate.G_DEF {
+        return l.y_sec[l.g_y[g]]
+    }
+    -1
+}
+
+fn kept_by_name(name: str) -> bool {
+    name == ".init_array" or name.starts_with(".init_array.") or name == ".fini_array" or name.starts_with(".fini_array.") or
+    name == ".preinit_array" or name == ".ctors" or name.starts_with(".ctors.") or name == ".dtors" or name.starts_with(".dtors.") or
+    name == ".jcr" or name == ".init" or name == ".fini"
+}
+
+/// Marks what is live: with `gc`, what the entry, the exports and the
+/// sections kept by name reach; without, every allocated section. Then each
+/// object's debug and other unallocated sections, when something allocated
+/// in it is live, as ld keeps them; and every global a live section
+/// references, `g_used`.
+pub fn mark(inout l: El) -> () ! str {
+    var work: [i64] = []
+    for s in 0..l.s_file.len() {
+        let f = l.s_flags[s]
+        if l.s_index[s] == 0 or f.bit_and(elfstate.SHF_ALLOC) == 0 or l.s_type[s] == elfstate.SHT_GROUP {
+            continue
+        }
+        if f.bit_and(elfstate.SHF_EXCLUDE) != 0 {
+            continue
+        }
+        if not l.gc or kept_by_name(l.s_name[s]) or f.bit_and(elfstate.SHF_GNU_RETAIN) != 0 {
+            if not l.s_live[s] {
+                l.s_live[s] = true
+                work.push(s)
+            }
+        }
+    }
+    var roots = [l.entry]
+    for e in l.exports {
+        roots.push(e)
+    }
+    for name in roots {
+        match l.g_map.get(name) {
+            Some(g) -> {
+                l.g_used[g] = true
+                if l.g_kind[g] == elfstate.G_DEF {
+                    let s = l.y_sec[l.g_y[g]]
+                    if s >= 0 and not l.s_live[s] {
+                        l.s_live[s] = true
+                        work.push(s)
+                    }
+                }
+            }
+            None -> {
+                if name == l.entry {
+                    fail("undefined entry symbol `{name}`")
+                }
+            }
+        }
+    }
+    var i = 0
+    while i < work.len() {
+        let s = work[i]
+        i += 1
+        for r in l.s_rel0[s]..l.s_rel0[s] + l.s_nrel[s] {
+            let y = l.r_sym[r]
+            let g = l.y_g[y]
+            if g >= 0 {
+                l.g_used[g] = true
+            }
+            let t = target_section(l, y)
+            if t >= 0 and not l.s_live[t] and l.s_flags[t].bit_and(elfstate.SHF_ALLOC) != 0 {
+                l.s_live[t] = true
+                work.push(t)
+            }
+        }
+    }
+    // Unallocated sections of files with something live.
+    for fi in 0..l.f_path.len() {
+        if l.f_kind[fi] != 0 {
+            continue
+        }
+        var some = false
+        for s in l.f_sec0[fi]..l.f_sec0[fi] + l.f_nsec[fi] {
+            if l.s_live[s] and l.s_type[s] != elfstate.SHT_NOTE {
+                some = true
+            }
+        }
+        if not some {
+            continue
+        }
+        for s in l.f_sec0[fi]..l.f_sec0[fi] + l.f_nsec[fi] {
+            let t = l.s_type[s]
+            if l.s_index[s] == 0 or l.s_flags[s].bit_and(elfstate.SHF_ALLOC) != 0 {
+                continue
+            }
+            if t == elfstate.SHT_SYMTAB or t == elfstate.SHT_STRTAB or t == elfstate.SHT_RELA or t == elfstate.SHT_GROUP {
+                continue
+            }
+            if l.s_name[s] == ".note.GNU-stack" or l.s_flags[s].bit_and(elfstate.SHF_EXCLUDE) != 0 {
+                continue
+            }
+            l.s_live[s] = true
+        }
+    }
+    ()
+}

@@ -143,6 +143,7 @@ run_gate fuzz_x64      scripts/fuzz_x64.sh
 run_gate objtest_elf   scripts/objtest_elf.sh
 run_gate elfsubset     scripts/elfsubset.sh
 run_gate elfrtswap     scripts/elfrtswap.sh
+run_gate linkdiff_elf  scripts/linkdiff_elf.sh
 run_gate objtest       scripts/objtest.sh
 run_gate ra_check      scripts/ra_check.sh
 run_gate s3rc          scripts/s3rc.sh

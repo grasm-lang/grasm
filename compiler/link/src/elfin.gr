@@ -1,0 +1,317 @@
+// Reading the ELF linker's inputs (docs/self-hosting.md §6.18): relocatable
+// objects (ET_REL), GNU archives of them, and shared libraries (ET_DYN),
+// whose dynamic symbols and versions are all a link takes from them.
+import rd
+import elfstate
+
+/// The section header `k` of the ELF file `d`: (name offset, type, flags,
+/// addr, offset, size, link, info, align, entsize).
+fn shdr(d: bytes, k: i64) -> [i64] {
+    let shoff = rd.u64(d, 0x28)
+    let at = shoff + 64 * k
+    [rd.u32(d, at), rd.u32(d, at + 4), rd.u64(d, at + 8), rd.u64(d, at + 16), rd.u64(d, at + 24), rd.u64(d, at + 32),
+        rd.u32(d, at + 40), rd.u32(d, at + 44), rd.u64(d, at + 48), rd.u64(d, at + 56)]
+}
+
+fn check_header(d: bytes, path: str, want: i64) -> i64 ! str {
+    if d.len() < 64 or d.at(0) != 0x7F or d.at(1) != 0x45 or d.at(2) != 0x4C or d.at(3) != 0x46 {
+        fail("{path}: not an ELF file")
+    }
+    if d.at(4) != 2 or d.at(5) != 1 {
+        fail("{path}: not a little-endian ELF64 file")
+    }
+    let typ = rd.u16(d, 16)
+    if typ != want {
+        fail("{path}: ELF type {typ}, not {want}")
+    }
+    rd.u16(d, 18)
+}
+
+/// Whether `d` is an ELF file.
+pub fn is_elf(d: bytes) -> bool {
+    d.len() >= 4 and d.at(0) == 0x7F and d.at(1) == 0x45 and d.at(2) == 0x4C and d.at(3) == 0x46
+}
+
+/// The machine `d` is for (`e_machine`).
+pub fn machine(d: bytes) -> i64 {
+    rd.u16(d, 18)
+}
+
+/// Reads relocatable object `d` into the linker; its file id.
+pub fn read_object(inout l: El, path: str, d: bytes, interposed: bool) -> i64 ! str {
+    let m = try check_header(d, path, 1)
+    if m != (if l.x64 { elfstate.EM_X86_64 } else { elfstate.EM_AARCH64 }) {
+        fail("{path}: machine {m}, not this link's")
+    }
+    let shnum = rd.u16(d, 0x3C)
+    let shstrndx = rd.u16(d, 0x3E)
+    if shnum == 0 {
+        fail("{path}: extended section numbering is not taken")
+    }
+    let fi = l.f_path.len()
+    l.f_path.push(path)
+    l.f_data.push(d)
+    l.f_kind.push(0)
+    l.f_soname.push("")
+    l.f_interposed.push(interposed)
+    l.f_needed0.push(0)
+    l.f_nneeded.push(0)
+    let sec0 = l.s_file.len()
+    l.f_sec0.push(sec0)
+    l.f_nsec.push(shnum)
+    let strh = shdr(d, shstrndx)
+    var symtab = -1
+    for k in 0..shnum {
+        let h = shdr(d, k)
+        l.s_file.push(fi)
+        l.s_index.push(k)
+        l.s_name.push(if k == 0 { "" } else { rd.cstr(d, strh[4] + h[0]) })
+        l.s_type.push(h[1])
+        l.s_flags.push(h[2])
+        l.s_align.push(if h[8] == 0 { 1 } else { h[8] })
+        l.s_entsize.push(h[9])
+        l.s_off.push(h[4])
+        l.s_size.push(h[5])
+        l.s_info.push(h[7])
+        l.s_rel0.push(0)
+        l.s_nrel.push(0)
+        l.s_live.push(false)
+        l.s_out.push(-1)
+        l.s_outoff.push(0)
+        l.s_ms0.push(0)
+        l.s_msn.push(0)
+        if h[1] == elfstate.SHT_SYMTAB {
+            symtab = k
+        }
+    }
+    // Symbols.
+    let sym0 = l.y_name.len()
+    l.f_sym0.push(sym0)
+    if symtab < 0 {
+        l.f_nsym.push(0)
+    } else {
+        let h = shdr(d, symtab)
+        let strs = shdr(d, h[6])
+        let n = h[5] / 24
+        l.f_nsym.push(n)
+        for k in 0..n {
+            let at = h[4] + 24 * k
+            let info = rd.u8(d, at + 4)
+            let shndx = rd.u16(d, at + 6)
+            l.y_name.push(rd.cstr(d, strs[4] + rd.u32(d, at)))
+            l.y_bind.push(info.ushr(4))
+            l.y_type.push(info.bit_and(15))
+            l.y_other.push(rd.u8(d, at + 5))
+            l.y_shndx.push(shndx)
+            l.y_value.push(rd.u64(d, at + 8))
+            l.y_size.push(rd.u64(d, at + 16))
+            l.y_sec.push(if shndx > 0 and shndx < 0xFF00 { sec0 + shndx } else { -1 })
+            l.y_g.push(-1)
+        }
+    }
+    // Relocations, each section's a run.
+    for k in 0..shnum {
+        let h = shdr(d, k)
+        if h[1] == elfstate.SHT_RELA {
+            let target = sec0 + h[7]
+            if h[6] != symtab {
+                fail("{path}: relocations against a symbol table not the object's")
+            }
+            if h[7] <= 0 or h[7] >= shnum {
+                fail("{path}: relocations for section {h[7]}")
+            }
+            l.s_rel0[target] = l.r_off.len()
+            let n = h[5] / 24
+            l.s_nrel[target] = n
+            for q in 0..n {
+                let at = h[4] + 24 * q
+                let info = rd.u64(d, at + 8)
+                l.r_off.push(rd.u64(d, at))
+                l.r_type.push(info.bit_and(0xFFFFFFFF))
+                l.r_sym.push(sym0 + info.ushr(32))
+                l.r_add.push(rd.u64(d, at + 16))
+            }
+        }
+    }
+    fi
+}
+
+/// Reads shared library `d` into the linker: its dynamic symbols with their
+/// versions, its DT_SONAME and DT_NEEDED. Its file id.
+pub fn read_shared(inout l: El, path: str, d: bytes) -> i64 ! str {
+    let m = try check_header(d, path, 3)
+    if m != (if l.x64 { elfstate.EM_X86_64 } else { elfstate.EM_AARCH64 }) {
+        fail("{path}: machine {m}, not this link's")
+    }
+    let shnum = rd.u16(d, 0x3C)
+    var dynsym = -1
+    var versym = -1
+    var verdef = -1
+    var dynamic = -1
+    for k in 0..shnum {
+        let t = shdr(d, k)[1]
+        if t == elfstate.SHT_DYNSYM {
+            dynsym = k
+        } else if t == elfstate.SHT_GNU_VERSYM {
+            versym = k
+        } else if t == elfstate.SHT_GNU_VERDEF {
+            verdef = k
+        } else if t == elfstate.SHT_DYNAMIC {
+            dynamic = k
+        }
+    }
+    if dynsym < 0 {
+        fail("{path}: a shared library with no dynamic symbols")
+    }
+    let fi = l.f_path.len()
+    l.f_path.push(path)
+    l.f_data.push(d)
+    l.f_kind.push(1)
+    l.f_interposed.push(false)
+    l.f_sec0.push(l.s_file.len())
+    l.f_nsec.push(0)
+    // Version definitions: index to name.
+    var vnames: Map[i64, str] = {}
+    if verdef >= 0 {
+        let h = shdr(d, verdef)
+        let strs = shdr(d, h[6])
+        var at = h[4]
+        var k = 0
+        while k < h[7] {
+            let ndx = rd.u16(d, at + 4)
+            let aux = rd.u32(d, at + 12)
+            let next = rd.u32(d, at + 16)
+            vnames.set(ndx, rd.cstr(d, strs[4] + rd.u32(d, at + aux)))
+            if next == 0 {
+                break
+            }
+            at += next
+            k += 1
+        }
+    }
+    // The name and DT_NEEDED entries.
+    let parts = path.split("/")
+    var soname = parts[parts.len() - 1]
+    l.f_needed0.push(l.needed.len())
+    var nneeded = 0
+    if dynamic >= 0 {
+        let h = shdr(d, dynamic)
+        let strs = shdr(d, h[6])
+        var at = h[4]
+        while at + 16 <= h[4] + h[5] {
+            let tag = rd.u64(d, at)
+            let val = rd.u64(d, at + 8)
+            if tag == 0 {
+                break
+            }
+            if tag == 14 {
+                soname = rd.cstr(d, strs[4] + val)
+            } else if tag == 1 {
+                l.needed.push(rd.cstr(d, strs[4] + val))
+                nneeded += 1
+            }
+            at += 16
+        }
+    }
+    l.f_nneeded.push(nneeded)
+    l.f_soname.push(soname)
+    // Dynamic symbols, from 1.
+    let h = shdr(d, dynsym)
+    let strs = shdr(d, h[6])
+    let vh = if versym >= 0 { shdr(d, versym) } else { [] }
+    let n = h[5] / 24
+    l.f_sym0.push(l.dl_name.len())
+    l.f_nsym.push(n)
+    for k in 0..n {
+        let at = h[4] + 24 * k
+        let info = rd.u8(d, at + 4)
+        let shndx = rd.u16(d, at + 6)
+        var ver = ""
+        var hidden = false
+        if versym >= 0 {
+            let v = rd.u16(d, vh[4] + 2 * k)
+            hidden = v.bit_and(0x8000) != 0
+            ver = vnames.get(v.bit_and(0x7FFF)) ?? ""
+            if v.bit_and(0x7FFF) <= 1 {
+                ver = ""
+            }
+        }
+        l.dl_name.push(rd.cstr(d, strs[4] + rd.u32(d, at)))
+        l.dl_ver.push(ver)
+        l.dl_hidden.push(hidden)
+        l.dl_def.push(shndx != 0)
+        l.dl_bind.push(info.ushr(4))
+        l.dl_type.push(info.bit_and(15))
+        l.dl_size.push(rd.u64(d, at + 16))
+    }
+    fi
+}
+
+// ----- archives ------------------------------------------------------------------
+
+/// A GNU archive's members: (name, data start, data size) of each, and its
+/// symbol table: symbol name to member header offset, in table order.
+type ArMap = {
+    names: [str],
+    offs: [i64],
+}
+
+fn ar_size(d: bytes, at: i64) -> i64 ! str {
+    if at + 60 > d.len() {
+        fail("a member header past the end")
+    }
+    let text = d.slice(at + 48, at + 58).to_str().trim()
+    text.parse_int() ?? fail("a member size that is not a number: '{text}'")
+}
+
+/// The archive's symbol table (the `/` member).
+pub fn ar_map(d: bytes, path: str) -> ArMap ! str {
+    if d.len() < 8 or d.slice(0, 8).to_str() != "!<arch>\n" {
+        fail("{path}: not an archive")
+    }
+    var m = ArMap{ names: [], offs: [] }
+    let at = 8
+    let raw = d.slice(at, at + 16).to_str().trim()
+    if raw != "/" {
+        return m
+    }
+    let start = at + 60
+    let n = rd.u8(d, start).shl(24).bit_or(rd.u8(d, start + 1).shl(16)).bit_or(rd.u8(d, start + 2).shl(8)).bit_or(rd.u8(d, start + 3))
+    var s = start + 4 + 4 * n
+    for k in 0..n {
+        let p = start + 4 + 4 * k
+        let off = rd.u8(d, p).shl(24).bit_or(rd.u8(d, p + 1).shl(16)).bit_or(rd.u8(d, p + 2).shl(8)).bit_or(rd.u8(d, p + 3))
+        let name = rd.cstr(d, s)
+        s += name.to_bytes().len() + 1
+        m.names.push(name)
+        m.offs.push(off)
+    }
+    m
+}
+
+/// The member whose header is at `at`: its name and its bytes.
+pub fn ar_member(d: bytes, at: i64) -> (str, bytes) ! str {
+    let size = try ar_size(d, at)
+    var name = d.slice(at, at + 16).to_str().trim()
+    if name.starts_with("/") and name.len() > 1 {
+        // A long name: an offset into the `//` member.
+        let off = name.substr(1, name.len() - 1).parse_int() ?? -1
+        var p = 8
+        while p + 60 <= d.len() {
+            let nm = d.slice(p, p + 16).to_str().trim()
+            let sz = try ar_size(d, p)
+            if nm == "//" {
+                var e = p + 60 + off
+                while e < d.len() and d.at(e) != 0x2F and d.at(e) != 10 {
+                    e += 1
+                }
+                name = d.slice(p + 60 + off, e).to_str()
+                break
+            }
+            p += 60 + sz + sz % 2
+        }
+    } else if name.ends_with("/") {
+        name = name.substr(0, name.len() - 1)
+    }
+    (name, d.slice(at + 60, at + 60 + size))
+}

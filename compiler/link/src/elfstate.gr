@@ -1,0 +1,287 @@
+// The ELF linker's state (docs/self-hosting.md §6.18, stage S7): every
+// input file, section, symbol and relocation, and every output section, in
+// arrays indexed by integer ids, as `state.gr` keeps the Mach-O linker's.
+// One `El` value is threaded `inout` through the passes in `elfmain.gr`.
+
+pub let EM_AARCH64 = 183
+pub let EM_X86_64 = 62
+
+pub let SHT_PROGBITS = 1
+pub let SHT_SYMTAB = 2
+pub let SHT_STRTAB = 3
+pub let SHT_RELA = 4
+pub let SHT_HASH = 5
+pub let SHT_DYNAMIC = 6
+pub let SHT_NOTE = 7
+pub let SHT_NOBITS = 8
+pub let SHT_DYNSYM = 11
+pub let SHT_INIT_ARRAY = 14
+pub let SHT_FINI_ARRAY = 15
+pub let SHT_PREINIT_ARRAY = 16
+pub let SHT_GROUP = 17
+pub let SHT_GNU_HASH = 0x6ffffff6
+pub let SHT_GNU_VERDEF = 0x6ffffffd
+pub let SHT_GNU_VERNEED = 0x6ffffffe
+pub let SHT_GNU_VERSYM = 0x6fffffff
+
+pub let SHF_WRITE = 1
+pub let SHF_ALLOC = 2
+pub let SHF_EXECINSTR = 4
+pub let SHF_MERGE = 16
+pub let SHF_STRINGS = 32
+pub let SHF_INFO_LINK = 64
+pub let SHF_GROUP = 512
+pub let SHF_TLS = 1024
+pub let SHF_EXCLUDE = 0x80000000
+pub let SHF_GNU_RETAIN = 0x200000
+
+pub let STB_LOCAL = 0
+pub let STB_GLOBAL = 1
+pub let STB_WEAK = 2
+pub let STT_NOTYPE = 0
+pub let STT_OBJECT = 1
+pub let STT_FUNC = 2
+pub let STT_SECTION = 3
+pub let STT_FILE = 4
+pub let STT_TLS = 6
+pub let STT_GNU_IFUNC = 10
+
+/// Global symbol kinds.
+pub let G_UNDEF = 0
+/// Defined in an input object's section (`g_y`).
+pub let G_DEF = 1
+/// Defined by a shared library (`g_lib`, `g_ver`): imported.
+pub let G_DYN = 2
+/// Defined by the linker or the script, at an output address (`g_addr`).
+pub let G_LINKER = 3
+/// An absolute value from an object (SHN_ABS).
+pub let G_ABS = 4
+
+/// Output section kinds: input sections laid end to end, or one the linker
+/// makes.
+pub let O_INPUT = 0
+pub let O_INTERP = 1
+pub let O_GNU_HASH = 2
+pub let O_DYNSYM = 3
+pub let O_DYNSTR = 4
+pub let O_VERSYM = 5
+pub let O_VERNEED = 6
+pub let O_RELA_DYN = 7
+pub let O_RELA_PLT = 8
+pub let O_PLT = 9
+pub let O_GOT = 10
+pub let O_DYNAMIC = 11
+pub let O_SHSTRTAB = 12
+pub let O_SYMTAB = 13
+pub let O_STRTAB = 14
+pub let O_EH_FRAME = 15
+pub let O_PLT_GOT = 16
+
+type El = {
+    // ----- options
+    out: str,
+    entry: str,
+    gc: bool,
+    strip: bool,
+    sysroot: str,
+    lib_dirs: [str],
+    /// Positional inputs: kind ("o" a path, "l" a library name, "i" the
+    /// interposed runtime object) and the argument.
+    in_kind: [str],
+    in_arg: [str],
+    nostdlib: bool,
+    /// `-exported_symbol`: names exported from the executable.
+    exports: [str],
+    map_path: str,
+    x64: bool,
+    // ----- input files: objects (kind 0) and shared libraries (kind 1)
+    f_path: [str],
+    f_data: [bytes],
+    f_kind: [i64],
+    f_sec0: [i64],
+    f_nsec: [i64],
+    f_sym0: [i64],
+    f_nsym: [i64],
+    /// A shared library's DT_SONAME (or its file name), and whether it is
+    /// the interposed runtime (an object).
+    f_soname: [str],
+    f_interposed: [bool],
+    // ----- input sections of objects
+    s_file: [i64],
+    s_index: [i64],
+    s_name: [str],
+    s_type: [i64],
+    s_flags: [i64],
+    s_align: [i64],
+    s_entsize: [i64],
+    s_off: [i64],
+    s_size: [i64],
+    s_info: [i64],
+    s_rel0: [i64],
+    s_nrel: [i64],
+    s_live: [bool],
+    /// The output section, and the offset in it; -1 when dropped.
+    s_out: [i64],
+    s_outoff: [i64],
+    /// For a merged string section: where each input offset went
+    /// (`elfmerge.gr`), as runs: start of the run in `ms_*`.
+    s_ms0: [i64],
+    s_msn: [i64],
+    // ----- relocations, by input section
+    r_off: [i64],
+    r_type: [i64],
+    r_sym: [i64],
+    r_add: [i64],
+    // ----- the merged-string offset maps: input offset, output offset
+    ms_in: [i64],
+    ms_out: [i64],
+    // ----- symbols of objects, by file
+    y_name: [str],
+    y_bind: [i64],
+    y_type: [i64],
+    y_other: [i64],
+    y_shndx: [i64],
+    y_value: [i64],
+    y_size: [i64],
+    y_sec: [i64],
+    y_g: [i64],
+    // ----- global symbols
+    g_name: [str],
+    g_map: Map[str, i64],
+    g_kind: [i64],
+    g_y: [i64],
+    g_weak: [bool],
+    g_lib: [i64],
+    g_ver: [str],
+    g_stype: [i64],
+    g_ssize: [i64],
+    g_addr: [i64],
+    /// When a shared library's definition first bound it (for `.dynstr`'s
+    /// order), or -1.
+    g_disc: [i64],
+    /// Referenced from a live section.
+    g_used: [bool],
+    /// Referenced by some object other than weakly.
+    g_sref: [bool],
+    g_plt: [i64],
+    g_got: [i64],
+    g_dyn: [i64],
+    g_vidx: [i64],
+    // ----- shared libraries' dynamic symbols, by file (`f_sym0`, `f_nsym`)
+    dl_name: [str],
+    dl_ver: [str],
+    dl_hidden: [bool],
+    dl_def: [bool],
+    dl_bind: [i64],
+    dl_type: [i64],
+    dl_size: [i64],
+    /// A shared library's DT_NEEDED names.
+    f_needed0: [i64],
+    f_nneeded: [i64],
+    needed: [str],
+    /// The libraries named on the command line, in order: DT_NEEDED's.
+    dt_needed: [i64],
+    // ----- output sections
+    o_name: [str],
+    o_kind: [i64],
+    o_type: [i64],
+    o_flags: [i64],
+    o_align: [i64],
+    o_entsize: [i64],
+    o_link: [i64],
+    o_info: [i64],
+    o_addr: [i64],
+    o_off: [i64],
+    o_size: [i64],
+    o_data: [bytes],
+    /// The input sections in it, in order: a run of `oi`.
+    o_in0: [i64],
+    o_inn: [i64],
+    oi: [i64],
+    /// The output sections in file order (all of them, the null one aside).
+    o_order: [i64],
+    // ----- what the dynamic sections hold
+    dyn_syms: [i64],
+    dynstr_names: [str],
+    plt_syms: [i64],
+    got_syms: [i64],
+    /// Relocations for `.rela.dyn`: offset (address), type, symbol (dynsym
+    /// index), addend.
+    rd_off: [i64],
+    rd_type: [i64],
+    rd_sym: [i64],
+    rd_add: [i64],
+    tls_addr: i64,
+    tls_size: i64,
+    tls_align: i64,
+    relro_start: i64,
+    relro_end: i64,
+    entry_addr: i64,
+}
+
+pub fn new_el() -> El {
+    El{
+        out: "a.out", entry: "_start", gc: false, strip: false, sysroot: "/", lib_dirs: [], in_kind: [], in_arg: [], nostdlib: false,
+        exports: [], map_path: "", x64: false,
+        f_path: [], f_data: [], f_kind: [], f_sec0: [], f_nsec: [], f_sym0: [], f_nsym: [], f_soname: [], f_interposed: [],
+        s_file: [], s_index: [], s_name: [], s_type: [], s_flags: [], s_align: [], s_entsize: [], s_off: [], s_size: [], s_info: [],
+        s_rel0: [], s_nrel: [], s_live: [], s_out: [], s_outoff: [], s_ms0: [], s_msn: [],
+        r_off: [], r_type: [], r_sym: [], r_add: [], ms_in: [], ms_out: [],
+        y_name: [], y_bind: [], y_type: [], y_other: [], y_shndx: [], y_value: [], y_size: [], y_sec: [], y_g: [],
+        g_name: [], g_map: {}, g_kind: [], g_y: [], g_weak: [], g_lib: [], g_ver: [], g_stype: [], g_ssize: [], g_addr: [], g_disc: [],
+        g_used: [], g_sref: [], g_plt: [], g_got: [], g_dyn: [], g_vidx: [],
+        dl_name: [], dl_ver: [], dl_hidden: [], dl_def: [], dl_bind: [], dl_type: [], dl_size: [], f_needed0: [], f_nneeded: [], needed: [], dt_needed: [],
+        o_name: [], o_kind: [], o_type: [], o_flags: [], o_align: [], o_entsize: [], o_link: [], o_info: [], o_addr: [], o_off: [],
+        o_size: [], o_data: [], o_in0: [], o_inn: [], oi: [], o_order: [],
+        dyn_syms: [], dynstr_names: [], plt_syms: [], got_syms: [], rd_off: [], rd_type: [], rd_sym: [], rd_add: [],
+        tls_addr: 0, tls_size: 0, tls_align: 1, relro_start: 0, relro_end: 0, entry_addr: 0,
+    }
+}
+
+/// The global symbol named `name`, made undefined if it is new.
+pub fn gsym(inout l: El, name: str) -> i64 {
+    match l.g_map.get(name) {
+        Some(g) -> g
+        None -> {
+            let g = l.g_name.len()
+            l.g_name.push(name)
+            l.g_map.set(name, g)
+            l.g_kind.push(G_UNDEF)
+            l.g_y.push(-1)
+            l.g_weak.push(false)
+            l.g_lib.push(-1)
+            l.g_ver.push("")
+            l.g_stype.push(0)
+            l.g_ssize.push(0)
+            l.g_addr.push(0)
+            l.g_disc.push(-1)
+            l.g_used.push(false)
+            l.g_sref.push(false)
+            l.g_plt.push(-1)
+            l.g_got.push(-1)
+            l.g_dyn.push(-1)
+            l.g_vidx.push(1)
+            g
+        }
+    }
+}
+
+/// A new output section, its id.
+pub fn new_out(inout l: El, name: str, kind: i64, typ: i64, flags: i64, align: i64) -> i64 {
+    let o = l.o_name.len()
+    l.o_name.push(name)
+    l.o_kind.push(kind)
+    l.o_type.push(typ)
+    l.o_flags.push(flags)
+    l.o_align.push(align)
+    l.o_entsize.push(0)
+    l.o_link.push(0)
+    l.o_info.push(0)
+    l.o_addr.push(0)
+    l.o_off.push(0)
+    l.o_size.push(0)
+    l.o_data.push(bytes_filled(0, 0))
+    l.o_in0.push(0)
+    l.o_inn.push(0)
+    o
+}

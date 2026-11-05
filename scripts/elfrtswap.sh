@@ -14,9 +14,10 @@
 #   * the Cranelift build's object (`grasm build --native --target
 #     <triple>`), linked with the Rust runtime by the machine's toolchain
 #     (gcc; the x86-64 cross ld and glibc of `GRASM_X64_ROOT`) and again with
-#     the Grasm runtime alone, by GNU ld with `compiler/link`'s `_start` and
-#     each of the program's runtime names bound to the Grasm runtime's --
-#     until `compiler/link` links ELF (§6.18 step four);
+#     the Grasm runtime alone, by `compiler/link` on the Mac (`-sysroot`, the
+#     machine's own root or `GRASM_X64_ROOT`; `-interpose`, which binds each
+#     of the program's runtime names to the Grasm runtime's; `-dead_strip
+#     -strip`);
 #   * the same two links from the Rust runtime built with `grasm_rt/poison`
 #     and the Grasm runtime's poisoned build, which must agree and report no
 #     use after free;
@@ -52,6 +53,7 @@ corpus_require
 WORK=$(linux_workdir)
 trap 'rm -rf "$WORK"' EXIT
 linux_x64_root
+linux_a64_root
 linux_isolate_check
 . scripts/lib/s3.sh
 s3_driver
@@ -63,12 +65,12 @@ TARGETS=${ELF_TARGETS:-aarch64-linux x86_64-linux}
 TG=($TARGETS)
 CARGO_OUT=${CARGO_TARGET_DIR:-./target}
 moved=$(awk '!/^#/ && NF >= 2 { print $2 }' compiler/rt/families.txt | LC_ALL=C sort -u)
-declare -a TRIPLE=() RRT=() RRTP=() GRT=() GRTP=() START=()
+declare -a TRIPLE=() ROOT=() RRT=() RRTP=() GRT=() GRTP=()
 for i in "${!TG[@]}"; do
     t=${TG[$i]}
     case $t in
-    aarch64-linux) triple=aarch64-unknown-linux-gnu; v=A64; arch=aarch64 ;;
-    x86_64-linux) triple=x86_64-unknown-linux-gnu; v=X64; arch=x86_64 ;;
+    aarch64-linux) triple=aarch64-unknown-linux-gnu; v=A64; ROOT[$i]=$A64_ROOT ;;
+    x86_64-linux) triple=x86_64-unknown-linux-gnu; v=X64; ROOT[$i]=$X64_ROOT ;;
     *) echo "error: ELF_TARGETS names $t"; exit 1 ;;
     esac
     TRIPLE[$i]=$triple
@@ -117,13 +119,16 @@ for i in "${!TG[@]}"; do
         exit 1
     fi
     linux_defsyms "${GRT[$i]}" "$WORK/defsyms-$t.txt" || exit 1
-    START[$i]="$WORK/start-$t.o"
-    if ! "$LINK" -start-object "$arch" -o "${START[$i]}" >"$WORK/start.log" 2>&1; then
-        echo "error: compiler/link does not write _start for $arch: $(head -1 "$WORK/start.log")"
-        exit 1
-    fi
 done
 echo "the Grasm runtime for ${TG[*]}: $(echo "$moved" | grep -c .) names moved, exported as families.txt lists; it calls none of the Rust runtime's"
+
+# Links object `$2` with the Grasm runtime `$3` alone into `$d/$1.x`, by
+# compiler/link; what it says, and its exit status when not 0, go to
+# `$d/$1.link`, which the machine's half reads as a failed link.
+glink() {
+    "$LINK" -sysroot "${ROOT[$i]}" "$2" -interpose "$3" -dead_strip -strip -o "$d/$1.x" >"$d/$1.link" 2>&1 ||
+        echo "compiler/link: exit $?" >>"$d/$1.link"
+}
 
 s3_collect
 linux_filter_programs
@@ -158,6 +163,13 @@ for k in "${!S3_SRC[@]}"; do
                 FAILED+=("$t $src — in the subset, and the backend does not compile it: $(head -1 "$d/s3.log")")
             fi
         fi
+        # The links with the Grasm runtime alone, here: compiler/link runs
+        # on the Mac.
+        glink c.grasm "$d/c.o" "${GRT[$i]}"
+        glink c.grasmp "$d/c.o" "${GRTP[$i]}"
+        if [ "$s" = 1 ]; then
+            glink s.grasm "$d/s.o" "${GRT[$i]}"
+        fi
         printf '%s\t%s\t%s\t%s\n' "$i" "$k" "$d" "$s" >>"$WORK/batch.txt"
     done
 done
@@ -168,12 +180,11 @@ done
     echo '#!/bin/bash'
     echo "cd '$PWD'"
     for i in "${!TG[@]}"; do
-        echo "TG[$i]=${TG[$i]}; RRT[$i]='${RRT[$i]}'; RRTP[$i]='${RRTP[$i]}'; GRT[$i]='${GRT[$i]}'; GRTP[$i]='${GRTP[$i]}'; ST[$i]='${START[$i]}'; DS[$i]='$WORK/defsyms-${TG[$i]}.txt'"
+        echo "TG[$i]=${TG[$i]}; RRT[$i]='${RRT[$i]}'; RRTP[$i]='${RRTP[$i]}'"
     done
     cat <<EOF
 X64_LD='$X64_LD'; X64_RUN='$X64_RUN'; XR='$X64_ROOT'; XL='$X64_LIB'
 LIMIT=$S3_RUN_SECONDS
-FLAGS="-pie -z now -z relro --hash-style=gnu --gc-sections --build-id=none"
 # with the Rust runtime: obj archive out
 rust() {
     if [ "\${TG[\$i]}" = aarch64-linux ]; then
@@ -182,19 +193,17 @@ rust() {
         "\$X64_LD" -pie -z now -dynamic-linker /lib64/ld-linux-x86-64.so.2 "\$XR\$XL/Scrt1.o" "\$XR\$XL/crti.o" "\$1" "\$2" -L=\$XL -lm -lc "\$XR\$XL/libgcc_s.so.1" "\$XR\$XL/crtn.o" --gc-sections -o "\$3"
     fi
 }
-# with the Grasm runtime alone: obj runtime out
-grasm() {
-    if [ "\${TG[\$i]}" = aarch64-linux ]; then
-        ld \$FLAGS -dynamic-linker /lib/ld-linux-aarch64.so.1 "\${ST[\$i]}" "\$1" "\$2" /lib/aarch64-linux-gnu/libm.so.6 /lib/aarch64-linux-gnu/libc.so.6 @"\${DS[\$i]}" -o "\$3"
-    else
-        "\$X64_LD" \$FLAGS -dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "\$XR\$XL" "\${ST[\$i]}" "\$1" "\$2" "\$XR\$XL/libm.so.6" "\$XR\$XL/libc.so.6" @"\${DS[\$i]}" -o "\$3"
-    fi
-}
-# links and runs one: name how obj runtime
+# links (with the Rust runtime) and runs one: name rust obj runtime; or runs
+# one compiler/link linked on the Mac: name linked
 one() {
     local n=\$1 how=\$2
-    if ! \$how "\$3" "\$4" "\$d/\$n.x" >"\$d/\$n.link" 2>&1 || [ -s "\$d/\$n.link" ]; then
-        echo "exit \$?" >>"\$d/\$n.link"
+    if [ "\$how" = rust ]; then
+        if ! rust "\$3" "\$4" "\$d/\$n.x" >"\$d/\$n.link" 2>&1 || [ -s "\$d/\$n.link" ]; then
+            echo "exit \$?" >>"\$d/\$n.link"
+            echo 127 >"\$d/\$n.code"
+            return
+        fi
+    elif [ -s "\$d/\$n.link" ] || [ ! -f "\$d/\$n.x" ]; then
         echo 127 >"\$d/\$n.code"
         return
     fi
@@ -208,12 +217,12 @@ one() {
 prog() {
     i=\$1; d=\$2; s=\$3
     one c.rust rust "\$d/c.o" "\${RRT[\$i]}"
-    one c.grasm grasm "\$d/c.o" "\${GRT[\$i]}"
+    one c.grasm linked
     one c.rustp rust "\$d/c.o" "\${RRTP[\$i]}"
-    one c.grasmp grasm "\$d/c.o" "\${GRTP[\$i]}"
+    one c.grasmp linked
     if [ "\$s" = 1 ]; then
         one s.rust rust "\$d/s.o" "\${RRT[\$i]}"
-        one s.grasm grasm "\$d/s.o" "\${GRT[\$i]}"
+        one s.grasm linked
     fi
 }
 while IFS="\$(printf '\t')" read -r i k d s; do
@@ -306,7 +315,7 @@ for i in "${!TG[@]}"; do
     fi
     [ "$nd" -gt 0 ] || FAILED+=("$t — no program references a runtime name: nothing was compared")
 done
-echo "linked by GNU ld ($(linux_run sh -c 'ld --version | head -1')), the Grasm runtime's names bound by --defsym"
+echo "with the Grasm runtime, linked by compiler/link (-interpose); with the Rust runtime, by $(linux_run sh -c 'ld --version | head -1')"
 if [ "$external" -gt 0 ]; then
     corpus_external_covered "${EXTERNAL[@]}" || exit 1
 fi

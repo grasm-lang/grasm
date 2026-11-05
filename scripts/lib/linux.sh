@@ -86,6 +86,73 @@ EOF
     chmod +x "$X64_LD" "$X64_RUN"
 }
 
+# Stops the gate as not run when the machine's own root cannot be read from
+# the Mac; otherwise sets `A64_ROOT` to it: the arm64 C library
+# `compiler/link -sysroot` reads, the files the machine's ld reads.
+# OrbStack mounts a machine's root at `~/OrbStack/<machine>`;
+# `GRASM_A64_ROOT` names another.
+linux_a64_root() {
+    A64_ROOT=${GRASM_A64_ROOT:-$HOME/OrbStack/$LINUX_MACHINE}
+    if [ ! -f "$A64_ROOT/lib/aarch64-linux-gnu/libc.so.6" ]; then
+        echo "not run: the machine's root is not readable from the Mac at $A64_ROOT (GRASM_A64_ROOT; docs/self-hosting.md §6.18)"
+        exit "$LINUX_NOT_RUN"
+    fi
+    A64_ROOT=$(cd "$A64_ROOT" && pwd -P)
+}
+
+# Whether version `$1` (2.34) is newer than version `$2`.
+linux_version_newer() {
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        n = split(a, x, "."); m = split(b, y, ".")
+        for (k = 1; k <= (n > m ? n : m); k++) {
+            if ((x[k] + 0) != (y[k] + 0)) { exit !((x[k] + 0) > (y[k] + 0)) }
+        }
+        exit 1
+    }'
+}
+
+# The glibc floor (docs/self-hosting.md §6.18): the oldest glibc a Linux
+# executable of Grasm's runs on is the newest version among its imports'
+# (`.gnu.version_r`), 2.34 for `__libc_start_main`; a newer one only for the
+# functions `scripts/glibc_floor.txt` lists, each with its version
+# (`ELF_GLIBC_LIST=` names another list: the controls').
+LINUX_GLIBC_FLOOR=2.34
+LINUX_GLIBC_LIST=${ELF_GLIBC_LIST:-scripts/glibc_floor.txt}
+
+# Checks executable `$1` against the floor: answers 0, appending each listed
+# import above the floor it needs to `$2` (`name version`) and setting
+# `LINUX_GLIBC_NEWEST` to the newest version it requires; or 1, saying why
+# on stdout -- an import above the floor that is not listed with its version,
+# or no GLIBC_ version at all.
+linux_glibc_floor() {
+    local out
+    LINUX_GLIBC_NEWEST=none
+    if ! out=$(python3 scripts/elfcmp.py --floor "$LINUX_GLIBC_FLOOR" "$LINUX_GLIBC_LIST" "$1" 2>&1); then
+        echo "its versions cannot be read: $out"
+        return 1
+    fi
+    LINUX_GLIBC_NEWEST=$(awk '$1 == "newest" { print $2 }' <<<"$out")
+    awk '$1 == "listed" { print $2, $3 }' <<<"$out" >>"$2"
+    if grep -c '^above ' <<<"$out" >/dev/null; then
+        echo "requires $(awk '$1 == "above" { printf "%s@GLIBC_%s ", $2, $3 }' <<<"$out")-- above the floor $LINUX_GLIBC_FLOOR, and not so listed in $LINUX_GLIBC_LIST"
+        return 1
+    fi
+    if [ "$LINUX_GLIBC_NEWEST" = none ] || [ -z "$LINUX_GLIBC_NEWEST" ]; then
+        echo "requires no GLIBC_ version: the floor cannot be read"
+        return 1
+    fi
+}
+
+# The listed imports file `$1` collected, summed: `fmod 2.38 in 13 links,
+# hypot 2.35 in 3`; or "none".
+linux_glibc_listed() {
+    if [ ! -s "$1" ]; then
+        echo none
+        return
+    fi
+    sort "$1" | uniq -c | awk '{ printf "%s%s %s in %d link%s", (NR > 1 ? ", " : ""), $2, $3, $1, ($1 == 1 ? "" : "s") }'
+}
+
 # The packages `GRASM_X64_ROOT` holds, fetched by the machine's apt from its
 # own sources (no root needed, nothing installed) and unpacked into `$1`.
 LINUX_X64_PACKAGES="libc6-amd64-cross libc6-dev-amd64-cross linux-libc-dev-amd64-cross libgcc-s1-amd64-cross binutils-x86-64-linux-gnu"

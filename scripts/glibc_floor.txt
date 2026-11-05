@@ -1,0 +1,12 @@
+# The glibc functions whose default version, in the glibc the Linux gates
+# link against (2.42, Ubuntu 25.10), is newer than the floor of 2.34
+# (docs/self-hosting.md §6.18). GNU ld, and compiler/link as it does, binds
+# a call to the version a library gives as its default, so a program that
+# calls one of these needs that glibc; the runtime and every other program
+# need 2.34 (`__libc_start_main@@GLIBC_2.34`).
+#
+# One a line: name<TAB>version<TAB>why. `linkdiff_elf` and `elfsubset` fail
+# on an import above the floor that is not listed with its version, and
+# `elfsubset`, on a whole run, on a line no link needed.
+fmod	2.38	glibc 2.38 gave fmod a new default version (the old one stays, for executables linked before); the Grasm runtime's float % calls it
+hypot	2.35	glibc 2.35 gave hypot a new default version (the old one stays, for executables linked before); the Grasm runtime's hypot calls it

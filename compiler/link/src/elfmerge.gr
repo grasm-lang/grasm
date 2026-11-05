@@ -1,0 +1,184 @@
+// Merged string sections (SHF_MERGE | SHF_STRINGS), as GNU ld merges them
+// (bfd/merge.c, docs/self-hosting.md §6.18): the live input sections of one
+// output section with the same flags, entity size and alignment become one
+// blob, at the first of them -- every distinct string once, in the order it
+// is first met, and a string that ends another string kept (its tail merged
+// into the longer one's) not written at all. The other input sections become
+// empty, and every offset into any of them is mapped into the blob.
+import elfstate
+
+/// A string's bytes, NUL included, as a map key that keeps distinct bytes
+/// distinct.
+fn key_of(bs: bytes) -> str {
+    let s = bs.to_str()
+    if s.to_bytes() == bs {
+        return s
+    }
+    var b = str_builder()
+    b.push_str("\u{1}")
+    for k in 0..bs.len() {
+        b.push_str(bs.at(k).to_base(16))
+        b.push_str(",")
+    }
+    b.to_str()
+}
+
+/// Whether string `a` sorts before `b` compared from their last bytes, the
+/// shorter first when one ends the other (`strrevcmp`).
+fn rev_less(a: bytes, b: bytes) -> bool {
+    var i = a.len() - 1
+    var j = b.len() - 1
+    while i >= 0 and j >= 0 {
+        let x = a.at(i)
+        let y = b.at(j)
+        if x != y {
+            return x < y
+        }
+        i -= 1
+        j -= 1
+    }
+    a.len() < b.len()
+}
+
+fn sort_rev(strs: [bytes], ix: [i64]) -> [i64] {
+    if ix.len() <= 1 {
+        return ix
+    }
+    let mid = ix.len() / 2
+    let a = sort_rev(strs, ix.slice(0, mid))
+    let b = sort_rev(strs, ix.slice(mid, ix.len()))
+    var out: [i64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() and j < b.len() {
+        if rev_less(strs[b[j]], strs[a[i]]) {
+            out.push(b[j])
+            j += 1
+        } else {
+            out.push(a[i])
+            i += 1
+        }
+    }
+    while i < a.len() {
+        out.push(a[i])
+        i += 1
+    }
+    while j < b.len() {
+        out.push(b[j])
+        j += 1
+    }
+    out
+}
+
+/// Whether input section `s` is one ld merges.
+pub fn mergeable(l: El, s: i64) -> bool {
+    let f = l.s_flags[s]
+    f.bit_and(elfstate.SHF_MERGE) != 0 and f.bit_and(elfstate.SHF_STRINGS) != 0 and l.s_entsize[s] == 1 and
+    l.s_nrel[s] == 0 and l.s_size[s] > 0 and l.s_type[s] == elfstate.SHT_PROGBITS
+}
+
+/// Merges the string sections among `group` (live input sections in
+/// order, all of one output section, flags, alignment): the first's
+/// contents become the blob, the rest size 0; each section's offsets go to
+/// `ms_*`. Answers the blob.
+pub fn merge(inout l: El, group: [i64]) -> bytes {
+    var strs: [bytes] = []
+    var at: Map[str, i64] = {}
+    for s in group {
+        let d = l.f_data[l.s_file[s]]
+        let base = l.s_off[s]
+        let n = l.s_size[s]
+        l.s_ms0[s] = l.ms_in.len()
+        var p = 0
+        while p < n {
+            var e = p
+            while e < n and d.at(base + e) != 0 {
+                e += 1
+            }
+            // A string without its NUL at the end of a section gets one.
+            let piece = d.slice(base + p, base + (if e < n { e } else { n }))
+            let k = key_of(piece)
+            var idx = at.get(k) ?? -1
+            if idx < 0 {
+                idx = strs.len()
+                strs.push(piece)
+                at.set(k, idx)
+            }
+            l.ms_in.push(p)
+            l.ms_out.push(idx)
+            p = e + 1
+        }
+        l.s_msn[s] = l.ms_in.len() - l.s_ms0[s]
+    }
+    // Tail merging.
+    var ix: [i64] = []
+    for i in 0..strs.len() {
+        ix.push(i)
+    }
+    let sorted = sort_rev(strs, ix)
+    var into: [i64] = []
+    for i in 0..strs.len() {
+        into.push(-1)
+    }
+    if sorted.len() > 0 {
+        var e = sorted[sorted.len() - 1]
+        var q = sorted.len() - 2
+        while q >= 0 {
+            let c = sorted[q]
+            let a = strs[e]
+            let b = strs[c]
+            if a.len() > b.len() and a.slice(a.len() - b.len(), a.len()) == b {
+                into[c] = e
+            } else {
+                e = c
+            }
+            q -= 1
+        }
+    }
+    // Positions: the kept strings in first-met order, then the merged ones
+    // inside the string they end.
+    var pos: [i64] = []
+    var blob = byte_builder()
+    for i in 0..strs.len() {
+        pos.push(-1)
+        if into[i] < 0 {
+            pos[i] = blob.len()
+            blob.push_bytes(strs[i])
+            blob.push_byte(0)
+        }
+    }
+    for i in 0..strs.len() {
+        if into[i] >= 0 {
+            var t = into[i]
+            while into[t] >= 0 {
+                t = into[t]
+            }
+            pos[i] = pos[t] + strs[t].len() - strs[i].len()
+        }
+    }
+    for s in group {
+        for m in l.s_ms0[s]..l.s_ms0[s] + l.s_msn[s] {
+            l.ms_out[m] = pos[l.ms_out[m]]
+        }
+    }
+    blob.to_bytes()
+}
+
+/// Where offset `off` of merged input section `s` went in its blob.
+pub fn map_offset(l: El, s: i64, off: i64) -> i64 {
+    var lo = l.s_ms0[s]
+    var hi = l.s_ms0[s] + l.s_msn[s] - 1
+    if hi < lo {
+        return off
+    }
+    // The last string starting at or before `off`.
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if l.ms_in[mid] <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    l.ms_out[lo] + (off - l.ms_in[lo])
+}
