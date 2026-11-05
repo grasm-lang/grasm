@@ -4085,6 +4085,351 @@ gates that run through the `grasm` command (§6.14's last list) can now
 take the Grasm command for the subcommands it has; none was pointed at it
 here.
 
+### 6.18 S7 part two: Linux ELF on arm64 and x86-64
+
+Written 2026-11-04, before any code, as the design to build to. S7's second
+half is "Linux ELF on x86-64 and arm64 with a system-call layer and an ELF
+linker", and its exit "crosstest, and a Linux CI run". Part one (§6.16) left
+it waiting on the owner's decision of where Linux binaries run. **The
+owner's decision (2026-11-03): in OrbStack on the development Mac**, in the
+owner's existing `ubuntu` machine (arm64, Ubuntu 25.10, glibc 2.42, kernel
+6.17), used to run and inspect binaries only, with x86-64 binaries run
+through OrbStack's Rosetta support. Everything else here was taken by the
+agent implementing this part unless it says otherwise, and the owner may
+reverse any of it.
+
+**The targets.** Two triples, `aarch64-linux-gnu` and `x86_64-linux-gnu`
+(the `-unknown-` spellings Rust and Cranelift use mean the same):
+little-endian, LP64, glibc, the platform's System V ABIs -- AAPCS64 and the
+System V AMD64 ABI. `s3 --target aarch64-linux` and `s3 --target
+x86_64-linux` select them; `aarch64` and `x86_64` keep meaning macOS, so no
+command line that works today changes meaning. An operating system is a
+property of the target next to its instruction set: MIR stays target-neutral
+and TIR stays the same for every target, as part one found for x86-64.
+
+**What the machine is, measured** (2026-11-04, a one-minute load of about 4
+on the Mac): Rosetta is registered with `binfmt_misc` for x86-64 ELF and
+runs it -- a 156-byte static x86-64 executable written by hand, making two
+system calls, printed and exited 0 -- but the machine holds no x86-64 C
+library: no `/lib64/ld-linux-x86-64.so.2`, no `/lib/x86_64-linux-gnu`. Its
+own toolchain is arm64's: gcc 15.2, GNU ld 2.45 (arm64 emulations only),
+readelf and objdump, glibc's `libc.a`, `libm.a` and `crt1.o`; no lld. Its
+CPU flags offer no pointer authentication (`paca`, `pacg` absent: the VM
+hides it), and its pages are 4 KiB. The Mac's own directories are mounted in
+it at the same paths, so a program built on the Mac runs there in place, and
+starting a command in it costs about 28 ms. The Mac has LLVM 21.1.8's
+`llvm-readelf`, `llvm-objdump`, `llvm-dwarfdump` and `llvm-mc` (Homebrew's
+`llvm@21`), which read and disassemble ELF for both instruction sets, and
+Rust's standard library for `x86_64-unknown-linux-gnu` but not for
+`aarch64-unknown-linux-gnu`.
+
+**Linking: dynamic, against glibc.** A Grasm program on Linux is a
+position-independent executable that names `libc.so.6` and `libm.so.6` and
+the dynamic loader, with every import bound at load (`BIND_NOW`, read-only
+after relocation), and the runtime calls the C library for its system
+calls, as the Darwin runtime calls libSystem. Measured, three ways to say
+"hi" on arm64 in the machine, gcc 15.2 at `-O2`, 500 runs each through the
+shell's fork and exec:
+
+| | size | per run |
+|---|---:|---:|
+| dynamic, glibc | 70,408 bytes | 324 µs |
+| static, glibc's `libc.a` | 777,632 bytes | 285 µs |
+| static, no C library (two system calls) | 1,576 bytes | 200 µs |
+
+The dynamic loader costs about a tenth of a millisecond a run; macOS charges
+450 ms for a new executable's first run. What decides it is what the runtime
+takes from the C library: 95 distinct C functions, of which 24 are libm's
+(`sin`, `pow`, `exp`, `log`, ...), and `getaddrinfo` (the resolver, with
+`/etc/hosts`, `resolv.conf` and NSS behind it), `strerror` (whose words are
+the error texts programs print), the threads (`pthread_create`, `join`, keys
+with destructors), `malloc` and its family, and `dlsym` for the C `exit`
+that runs `atexit` work. None of these is a system call. Without a C library
+the runtime would need a libm -- §4's correctly rounded one, not yet written,
+and differing in the last place from glibc's, which the Cranelift build the
+corpus is held to uses -- a resolver, threads over `clone` and futexes, and
+an allocator over `mmap`; and a program's own `extern fn` and `links`
+(11 corpus files declare C functions) would have nothing to call. Static
+linking of glibc's archives was the third way: it needs `IRELATIVE`
+relocations for the string functions glibc picks per processor and every
+thread-local model, glibc warns against static `getaddrinfo` and `dlopen`, and the
+machine has no x86-64 archive either. So §1's last line stands as the
+finish line -- Linux binaries *can* be fully static, with no C library --
+and is reached after the Grasm libm, not in this part. The cost of the
+choice is the one the measurement above shows: an x86-64 binary needs an
+x86-64 glibc to run in the machine, which it does not have (decision (2)
+below).
+
+The glibc a program needs: the linker binds each import to the version
+glibc's own `.gnu.version_d` gives as the default (as ld does), and the
+oldest glibc that can run the program is the newest of those versions.
+`__libc_start_main@@GLIBC_2.34` sets the floor at 2.34 (Ubuntu 22.04,
+Debian 12, RHEL 9 and later); a gate prints the floor of every link and
+fails above 2.34.
+
+**The start.** No `crt1.o`, `crti.o` or `crtn.o`: those are in glibc's
+development package, which a user's machine need not have. The linker writes
+`_start` itself, as Go's and Zig's do: clear the frame pointer, pass `main`,
+`argc`, `argv`, no initializer and no finalizer (glibc 2.34 and later run the
+executable's `.init_array` themselves), the loader's finalizer and the stack's
+end to `__libc_start_main`, and trap if it returns. For comparing with ld the
+linker writes the same `_start` as an object (`link -start-object`), and ld
+is given that object in place of glibc's start files.
+
+**The object** (step two). `compiler/macho`'s object description (`MoObj`:
+the code, functions, relocations, data, process cells, thread-local
+variables and the line table) is already format-neutral; a new package,
+`compiler/elf`, writes it as a relocatable ELF64 (`ET_REL`) for `EM_AARCH64`
+or `EM_X86_64`, as clang writes one with `-ffunction-sections
+-fdata-sections`:
+
+- a section per function (`.text.<name>`), per constant (`.rodata.<name>`),
+  per writable datum (`.data.<name>`) and per process cell (`.bss.<name>`),
+  and C strings in `.rodata.str1.1` (`SHF_MERGE | SHF_STRINGS`), so that
+  `--gc-sections` removes what Mach-O's dead-stripping removes, function by
+  function -- the Cranelift build's objects have one `.text`, as now;
+- the runtime's thread-local variables in `.tbss.<name>` (`SHF_TLS`,
+  `STT_TLS` symbols), with no descriptors: ELF needs none;
+- `.rela.*` for each section that has relocations (ELF on both instruction
+  sets uses explicit addends); `.note.GNU-stack`, empty, so the stack is not
+  executable; `.symtab` with the locals first; `.strtab`, `.shstrtab`; and
+  the line table's four sections (`.debug_abbrev`, `.debug_info`,
+  `.debug_str`, `.debug_line`), DWARF 4 as on Mach-O, but with the
+  relocations ELF needs and Mach-O does not: each function's sequence starts
+  at its own section's address, and each offset from one debug section into
+  another is relocated (ld concatenates them across objects, where Mach-O's
+  debug map leaves them in place);
+- symbols without Mach-O's leading underscore; nothing that depends on time,
+  paths other than the compile directory, or hash order.
+
+Relocations, by what the backend asks for:
+
+| use | aarch64 | x86-64 |
+|---|---|---|
+| a call | `R_AARCH64_CALL26` | `R_X86_64_PLT32`, -4 |
+| a datum's address | `ADR_PREL_PG_HI21` + `ADD_ABS_LO12_NC` | `R_X86_64_PC32`, -4 (`leaq`) |
+| a load through the GOT | `ADR_GOT_PAGE` + `LD64_GOT_LO12_NC` | `R_X86_64_REX_GOTPCRELX`, -4 |
+| a pointer in data | `R_AARCH64_ABS64` | `R_X86_64_64` |
+| a thread-local variable | `TLSLE_ADD_TPREL_HI12` + `_LO12_NC` | `R_X86_64_TPOFF32` |
+| DWARF: an address, an offset | `ABS64`, `ABS32` | `R_X86_64_64`, `R_X86_64_32` |
+
+`objtest_elf` holds every object of the subset, for both instruction sets,
+to the system's readers: `readelf -a -W` in the machine (binutils 2.45) and
+`llvm-readelf`, `llvm-objdump -d -r` and `llvm-dwarfdump --verify` on the
+Mac; every relocation against the instruction it patches (a script, as
+`s3_macho.py` and `x64_macho.py` do for Mach-O); the line table's rows
+against the literals they load, as `objtest` counts them; GNU ld accepting
+every arm64 object, and every x86-64 one once an x86-64 ld exists (decision
+(2)); and each object compiled twice the same bytes. Its controls, in a new
+`elfcontrols`: a relocation's addend off by four, a section's flags without
+`SHF_ALLOC`, a symbol's binding local where it must be global, the locals
+not first, an offset into `.debug_abbrev` left unrelocated, the clock in an
+object.
+
+**The backend** (step three). Selection and allocation are the same for both
+operating systems; what differs is at the edges:
+
+- *Names.* No leading underscore; `main` is `main`.
+- *Variadic C functions.* Linux's AAPCS64 passes a variadic argument as a
+  fixed one, in the next register -- Apple's arm64 puts it on the stack --
+  so `open`'s mode and `fcntl`'s argument go as on x86-64: the per-target
+  table of part one's decision (1) applies to both Linux targets, and the
+  runtime's declarations do not change.
+- *Thread-local variables.* The runtime is linked into the executable, so
+  the local-exec model reaches its variables with no call: on arm64 `mrs x0,
+  tpidr_el0` and two `add`s with the `TLSLE` relocations, on x86-64 `movq
+  %fs:0, %rax` and `leaq v@tpoff(%rax), %rax`. These are the getters'
+  bodies (`leaves.gr`); the context switch is the same leaf on both
+  operating systems.
+- *Pointer authentication on arm64.* Darwin's frames sign the return address
+  with `pacibsp` and return with `retab`. `retab` is not in the hint space:
+  on a processor without pointer authentication -- ARMv8.0 to 8.2, the
+  Graviton2 and Cortex-A76 among them -- it is undefined and the program
+  dies of SIGILL. (The machine runs it, measured: the processor has
+  authentication though the VM's flags hide it.) Linux arm64 frames sign
+  with `paciasp` and return with `autiasp` then `ret`, both hints: a no-op
+  where there is no authentication, a check where the kernel enables it --
+  what gcc's `-mbranch-protection=pac-ret` emits, with gcc's key (A). No
+  branch-target identification: it guards a page only when every object in
+  the executable is marked for it, and neither the Cranelift build's
+  objects nor the Rust runtime's are; it is left until every input is this
+  backend's. Darwin's frames do not change.
+- *Darwin x86-64's `$INODE64`* is Darwin's alone; the per-target table of C
+  names gains Linux's one rename, `__error` to `__errno_location` (the same
+  signature: the address of the calling thread's error number).
+
+Darwin's output must not change: every object of the subset and the
+runtime's, from the same TIR in the same directory, the same bytes from the
+branch's driver as from master's, for both Darwin targets, as part one
+checked; and `fixpoint`.
+
+**The runtime** (step three). `compiler/rt` assumes Darwin in constants and
+in a few functions, found by reading every `extern fn` and every constant:
+
+| what | Darwin | Linux (glibc, both instruction sets) |
+|---|---|---|
+| error number's address | `__error` | `__errno_location` |
+| `EAGAIN`, `EILSEQ` | 35, 92 | 11, 84 |
+| `O_APPEND`, `O_CREAT`, `O_TRUNC`, `O_NONBLOCK` | 8, 512, 1024, 4 | 1024, 64, 512, 2048 |
+| `CLOCK_MONOTONIC` (also a literal 6 in `par.gr`) | 6 | 1 |
+| `_SC_NPROCESSORS_ONLN` | 58 | 84 |
+| `mmap`'s private anonymous flags (a literal in `fiber.gr`) | 4098 | 34 |
+| `dlsym`'s `RTLD_DEFAULT` | -2 | 0 |
+| a `dirent`'s name | at 21 | at 19 |
+| `SOL_SOCKET`, `SO_REUSEADDR`, `AF_INET6` | 65535, 4, 30 | 1, 2, 10 |
+| a `sockaddr`'s family | a byte at 1, after a length byte | 16 bits at 0 |
+| `addrinfo`'s `ai_canonname`, `ai_addr` | at 24, 32 | at 32, 24 |
+| `poll`'s count | 32 bits | 64 bits (`nfds_t`) |
+| `pthread_setname_np` | the name | the thread and the name |
+| `net_wait` | a `kqueue` per thread, else `poll` | `poll` (as the Rust runtime on Linux) |
+| `open`, `fcntl`, variadic | ninth argument, on the stack | in the next register (the backend's table) |
+
+The rest -- the other error numbers, `open`'s read and write flags, `fcntl`'s
+commands, `poll`'s events, signals, the `pthread` calls' arguments, `getentropy`
+-- is the same, and a gate checks each constant against the C library
+(`elfrtlayout`: a C probe compiled in the machine prints each one, as
+`rtlayout` probes the Rust runtime's layouts). Each difference is also what
+the Rust runtime does under its `cfg(not(target_os = "macos"))` branches,
+which is the oracle's behaviour.
+
+How the runtime selects: the language is frozen, has no conditional
+compilation, and the Rust frontend, which makes the runtime's TIR in stage
+0, does not change. Two ways were measured on the runtime's object,
+2026-11-04: moving a literal constant (`O_CREAT`) from `fsys.gr` into
+another module left every instruction the same -- a literal is that literal
+where it is read (§6.12) -- and changed only the line-table rows of the
+loads it moved (599 bytes of `__debug_line`); putting one function's body
+under `if build.LINUX { ... } else { ... }` with `LINUX` a literal `false`,
+as `build.POISON` selects the poisoned build, changed register allocation in
+the code around it. So the selection is by module, not by branch:
+`compiler/rt/src/os.gr` holds every constant and every function in the table
+above, for Darwin, and `compiler/rt/os/linux.gr` is the same module for
+Linux, with the same public names. The Linux runtime is the package with
+`src/os.gr` replaced by it: the gates build its TIR from a copy so replaced
+(as `rtswap.sh` builds the poisoned runtime from a copy with `build.gr`
+changed), and the Grasm `grasm` command's loader takes the replacement when
+it builds the runtime for a Linux triple. Darwin's runtime object then
+differs from master's only where the code moved into `os.gr` (its line
+rows, and the order of the functions that moved), each difference listed
+when step three is measured, and its behaviour is held by `rtswap`,
+`rtcontrols` and the family fuzzers as before. A control that plants a fault
+into code that moves is moved with it, in the same commit.
+
+`s3 --runtime --target aarch64-linux` and `--target x86_64-linux` make the
+two Linux runtimes, held by `elfrtswap` to the Rust runtime built for the
+same triple.
+
+**The linker** (step four). `compiler/link` reads the objects' format and
+links ELF in modules of its own beside the Mach-O ones, sharing the archive
+reader, symbol resolution and the reachability walk; an ELF link has
+sections where Mach-O has atoms, and dead code goes by section
+(`--gc-sections`), as GNU ld removes it. It writes what GNU ld 2.45 writes
+for `-pie -z now -z relro --hash-style=gnu --gc-sections --build-id=none
+-nostdlib` and the same inputs, read off ld's output as the Mach-O half was
+read off ld-prime's: the program headers (`PT_PHDR`, `PT_INTERP`, the
+`PT_LOAD`s with ld's pages -- on x86-64 the code in a segment of its own,
+as ld's `-z separate-code` default is there, and each instruction set's
+maximum page size as ld's defaults set it, measured at step four),
+`PT_DYNAMIC`, `PT_TLS`, `PT_GNU_RELRO`, `PT_GNU_STACK`
+not executable; `.interp` (`/lib/ld-linux-aarch64.so.1`,
+`/lib64/ld-linux-x86-64.so.2`); `.dynsym`, `.dynstr`, `.gnu.hash`,
+`.gnu.version` and `.gnu.version_r`; `.rela.dyn` (the `RELATIVE`
+relocations, counted first) and `.rela.plt` (`JUMP_SLOT`), the PLT and the
+GOT; `.init_array`, which the Rust runtime's archive may carry; a
+thread-local segment laid out as each architecture's variant puts it
+relative to the thread pointer; and `.eh_frame` with `.eh_frame_hdr` when
+an input has unwind tables (the Rust runtime does; this backend writes none,
+§6.16). The libraries are read as ld reads them: `libc.so.6` and `libm.so.6`
+from a system root (`-sysroot`, the machine's own root through OrbStack's
+mount on the Mac), their dynamic symbols and version definitions. The
+output's sections are stripped of symbols for `grasm build --native`, as ld's
+`-s` leaves them.
+
+`linkdiff_elf` links every fourth program of the subset, for each
+instruction set, from the Grasm backend's objects and from the Cranelift
+build's, with the Grasm runtime and with the Rust runtime for the triple, and
+requires the bytes to be ld's, or every difference named, explained and
+counted by the gate; then `readelf -a -W`'s full report, `objdump -d`'s
+disassembly and every section's bytes against ld's link of the same inputs.
+`elfcontrols` plants the linker's faults: a `CALL26` one instruction off, a
+`JUMP_SLOT` bound to the wrong import, a version requirement naming the wrong
+version, a `RELATIVE` relocation missing, the TLS offset of the wrong
+variant, `PT_GNU_RELRO` covering the `.got.plt`.
+
+**The oracle, crosstest's.** `crosstest` holds the Cranelift build for a
+target to the interpreter. For Linux its reference is the Cranelift build
+for the triple -- the object `grasm build --native --target <triple>`
+already emits (Rust's command emits an object, not an executable, for a
+cross target) -- linked with the Rust runtime built for the triple by the
+machine's own toolchain (gcc for arm64; an x86-64 ld for x86-64, decision
+(2)), and run in the machine. The Grasm backend's program, linked by
+`compiler/link` with the Grasm runtime for the triple, must print, exit and
+write to stderr exactly as that reference does, and as the interpreter does
+on the Mac -- where the two references disagree (glibc's libm and Apple's
+differ in the last place on some arguments, as the demos found for arm64
+and x86-64 macOS; glibc's `strerror` words some errors differently), the
+gate names the program and the reason and counts it apart. That is
+`elfsubset`, run for both triples. The other corpus gates for Linux are
+`elfrtswap` (above), `elfrepro` (every link and object twice, the same
+bytes) and `objtest_elf`.
+
+**The `grasm` command in Grasm** (step five). `build --native --target`
+accepts `aarch64-linux-gnu`, `x86_64-linux-gnu` and their `-unknown-`
+spellings and writes the object `s3 --target <arch>-linux` writes, under
+the Rust command's name and message, as it does for x86-64 macOS (§6.17);
+`build compiler/rt/src/main.gr --native --target <linux>` builds that
+runtime's object. Linking a Linux executable from the Mac is the linker's
+(`link -sysroot`); a `grasm` command that runs on Linux, finding itself
+through `/proc/self/exe` where it now asks `_NSGetExecutablePath`, is S8's.
+`clidiff` gains the Linux triples' lines; `clicontrols` a control that
+refuses them.
+
+**Gates that need the machine** skip when OrbStack or the machine is not
+there: they say why on their last line and exit with 77 (automake's "skipped"),
+and `allgates.sh` prints such a gate as `NOT RUN`, counts it apart from the
+passed and the failed, and its last line says how many did not run -- never
+"every gate passed" while one did not. S7's exit asks for "a Linux CI
+run"; here that is these gates, run in the machine by `allgates.sh` on the
+Mac. A hosted CI service is not part of this part, and nothing is pushed.
+
+**Decisions** (raised with this note, 2026-11-04):
+
+1. Dynamic linking against glibc, the runtime calling the C library, a
+   position-independent executable bound at load, glibc 2.34 or later --
+   taken by the agent implementing this part, measured above; the owner may
+   reverse it for static linking with no C library, which needs the Grasm
+   libm first.
+2. *Open, the owner's:* how x86-64 programs get a C library to run in the
+   machine, and an x86-64 ld for the reference and `linkdiff_elf`. Ubuntu's
+   arm64 cross packages hold both: `libc6-amd64-cross`,
+   `libc6-dev-amd64-cross`, `linux-libc-dev-amd64-cross`,
+   `libgcc-s1-amd64-cross` (the unwinder the Rust runtime's archive names)
+   and `binutils-x86-64-linux-gnu` (about 7.5 MB to download, about 40 MB
+   unpacked).
+   (a) Unpacked with `apt-get download` and `dpkg-deb -x` into the scratch
+   directory on the Mac, nothing installed in the machine, programs started
+   as `<root>/lib64/ld-linux-x86-64.so.2 --library-path <root>/lib ./prog`
+   -- the recommendation; (b) installed with apt into the machine, and
+   removed when S7 ends; (c) multiarch `libc6:amd64`, which changes the
+   machine's package sources. Until it is decided the x86-64 half stops at
+   objects held to the readers.
+3. *Open, the owner's:* the Rust runtime for `aarch64-unknown-linux-gnu`,
+   which the reference and `elfrtswap` link, needs Rust's standard library
+   for that target on the Mac (`rustup target add`, about 150 MB, as the
+   installed `x86_64-unknown-linux-gnu` takes 159 MB). Without it the arm64
+   reference is the Cranelift build linked with the Grasm runtime, and the
+   Rust runtime's comparison is x86-64's alone.
+4. Pointer authentication on Linux arm64 by hints (`paciasp`, `autiasp`,
+   `ret`), no branch-target identification -- the agent's, above.
+5. The runtime selects its operating system by module (`os.gr` and
+   `os/linux.gr`), not by branch -- the agent's, measured above.
+6. A section per function and per datum, so `--gc-sections` is
+   dead-stripping -- the agent's.
+7. The linker writes `_start`; no C start files -- the agent's.
+8. Everything is built and linked on the Mac and run in the machine from the
+   Mac's scratch directory through OrbStack's mount: nothing is written to
+   the machine's own filesystem -- the agent's, within the owner's decision.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
@@ -4110,7 +4455,10 @@ binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
 Grasm), `linkdiff_x64` (the linker against ld's x86-64 output), `fuzz_x64`
 (the fuzzers on the x86-64 backend) and `x64controls` (§6.16), `clidiff`
 (the `grasm` command in Grasm against the Rust one) and `clicontrols`
-(§6.17), `ddc`,
+(§6.17), `objtest_elf` (ELF objects against the system's readers),
+`elfsubset` (crosstest for the Linux triples, in the OrbStack machine),
+`elfrtswap`, `elfrtlayout`, `elfrepro`, `linkdiff_elf` (the linker against
+GNU ld) and `elfcontrols` (§6.18), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -4438,7 +4786,9 @@ Measured, not estimated; each line is a gate's result on master.
   stage 2's, the command executing nothing but itself; `clicontrols` 7 of
   7. Built by itself, its stage 3 is its stage 2 (`fixpoint`, 54 of 54), and
   its build of the compiler's programs is the stage pipeline's to the byte.
-- **Not started:** the rest of S8, S9, and S7's part two (Linux).
+- **S7 part two** (Linux ELF, §6.18): the design, with the owner's decision
+  of where Linux runs (OrbStack on the Mac) and two decisions open.
+- **Not started:** the rest of S8, and S9.
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
 subcommands in Grasm, so that the gates which build, run, check and test
