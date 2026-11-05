@@ -4646,7 +4646,8 @@ arm64). `scripts/glibc_floor.txt` lists the two functions with their
 versions and why, and the floor check (`linux_glibc_floor` in
 `scripts/lib/linux.sh`, run on every link `linkdiff_elf` and `elfsubset`
 make) fails on any import above 2.34 not listed with its version, and, on a
-whole `elfsubset` run, on a listed function no link needed.
+whole `elfsubset` run, on a listed function no link needed. The effective
+floor is therefore 2.38 for a program that uses a float `%`.
 
 **Step five: the `grasm` command** (2026-11-04). `build --native --target`
 takes `aarch64-linux-gnu`, `x86_64-linux-gnu` and their `-unknown-`
@@ -4664,8 +4665,9 @@ Linux triples refused as before) and `linux-macho` (a Linux target given a
 Mach-O object).
 
 **Decisions in steps four and five** (2026-11-04), taken by the agent
-implementing this part; the coordinator or the owner may reverse any of
-them:
+implementing this part and accepted by the coordinating session on
+2026-11-05, with the refusal of a runtime package's Linux object (step
+five); the owner may reverse any of them:
 
 10. The floor is 2.34 but for the functions `scripts/glibc_floor.txt`
     lists (`fmod`, 2.38; `hypot`, 2.35), bound as ld binds them. Keeping
@@ -4673,7 +4675,9 @@ them:
     versions -- the backend naming the import `fmod@GLIBC_2.17` (x86-64:
     `@GLIBC_2.2.5`) as a `.symver` does, which ld honours and this linker
     would have to -- or a float remainder that does not call `fmod`, or
-    linking against an older glibc.
+    linking against an older glibc. The coordinator ruled out binding the
+    old versions, which would bring back glibc's error handling for `fmod`
+    from before 2.38.
 11. Only a stripped executable is written (`-strip` required; `grasm build
     --native` strips): ld's unstripped symbol table order and the debug
     sections' relocations, tombstones for discarded code among them, are
@@ -4774,7 +4778,10 @@ ELF input to the ELF linker before it reads its arguments as Mach-O's, and
 no whole `allgates.sh`. The runs of the gates above that run corpus
 programs left a `target/` in the worktree (programs' `target/demo-out`, the
 conformance programs' directories, and a poisoned runtime one of
-`s3controls`' gates builds into `target/s3rc-poison`), removed after.
+`s3controls`' gates builds into `target/s3rc-poison`), removed after. That
+last was `s3rc`, which took a poisoned runtime by `S3_POISON_RT` alone and
+built one in the checkout when given `RT_POISON`, the name the other
+runtime gates take it by; it now takes either.
 
 **What is left for S7's exit.** The Linux gates -- `objtest_elf`,
 `elfsubset`, `elfrtswap`, `linkdiff_elf` and `elfcontrols` -- run in the

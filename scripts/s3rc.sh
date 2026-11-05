@@ -24,7 +24,10 @@
 # reaching the leak check that the count means something.
 #
 # `S3_POISON_RT=<libgrasm_rt_abi.a>` names a poisoned runtime instead of
-# building one (into `target/s3rc-poison`, a staticlib of a few megabytes).
+# building one (into `target/s3rc-poison`, a staticlib of a few megabytes);
+# so does `RT_POISON=`, the name `rtswap`, `rtlayout` and `fuzz_rtrelease`
+# take it by, when it is not empty -- a caller that names it for them, as
+# `s3controls` passes its environment on, gets no build in the checkout.
 # `S3=`, `S3_EXTRA` and `S3_STOP_AT_FIRST` as in `scripts/s3subset.sh`, for
 # the controls.
 set -uo pipefail
@@ -46,7 +49,7 @@ EXTRA=${S3_EXTRA:-}
 STOP=${S3_STOP_AT_FIRST:-}
 stopped=0
 
-POISON_RT=${S3_POISON_RT:-}
+POISON_RT=${S3_POISON_RT:-${RT_POISON:-}}
 if [ -z "$POISON_RT" ]; then
     if ! cargo build --release -q -p grasm_rt_abi --features grasm_rt/poison --target-dir target/s3rc-poison; then
         echo "error: the poisoned runtime does not build"
