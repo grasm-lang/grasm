@@ -148,7 +148,20 @@ fn is_cond_branch(m: i64) -> bool {
 
 /// Encodes a function. `callee_sym` and `rt_names` only name things in the
 /// assembly listing.
-pub fn emit(t: Target, al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [str]) -> A64Code ! str {
+/// The return: `retab` on macOS; on Linux `autiasp` then `ret`, both of
+/// which a processor without pointer authentication runs (`retab` it does
+/// not: it is not a hint).
+fn ret(inout e: Emit, linux: bool) -> () ! str {
+    if linux {
+        try word(e, mach.A_AUTIASP, -1, -1, -1, 0, 0)
+        try word(e, mach.A_RET, -1, -1, -1, 0, 0)
+    } else {
+        try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)
+    }
+    ()
+}
+
+pub fn emit(t: Target, al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [str], linux: bool) -> A64Code ! str {
     var e = Emit{
         words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [],
         want_asm: want_asm, fx_word: [], fx_mop: [], fx_reg: [], fx_cc: [], fx_tgt: [],
@@ -184,10 +197,12 @@ pub fn emit(t: Target, al: Alloc, sym: str, want_asm: bool, callee_sym: [str], r
     // Prologue: the function's own line. The return address is signed on
     // entry, whatever comes after.
     at_src(e, al.span0)
-    let pac = try mach.encode(mach.A_PACIBSP, -1, -1, -1, -1, 0, 0, -1, 0)
+    // On Linux by a hint, which a processor without pointer authentication
+    // runs as a no-op (docs/self-hosting.md §6.18).
+    let pac = try mach.encode(if linux { mach.A_PACIASP } else { mach.A_PACIBSP }, -1, -1, -1, -1, 0, 0, -1, 0)
     e.words.push(pac)
     if want_asm {
-        e.asm.push("pacibsp")
+        e.asm.push(if linux { "paciasp" } else { "pacibsp" })
     }
     var label: [i64] = []
     for b in 0..nb {
@@ -226,7 +241,7 @@ pub fn emit(t: Target, al: Alloc, sym: str, want_asm: bool, callee_sym: [str], r
             at_src(e, al.src[i])
             if m == mach.P_RETURN and not framed[b] {
                 // No frame on this path: the return address never left x30.
-                try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)
+                try ret(e, linux)
                 i += 1
                 continue
             }
@@ -243,7 +258,7 @@ pub fn emit(t: Target, al: Alloc, sym: str, want_asm: bool, callee_sym: [str], r
                     k -= 1
                 }
                 try word(e, mach.A_LDP_POST, 29, mach.R_SP, 30, 16, 0)
-                try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)
+                try ret(e, linux)
                 i += 1
                 continue
             }

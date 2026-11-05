@@ -134,9 +134,22 @@ fn tlv_get(cell: str) -> X64Leaf ! str {
     l
 }
 
+/// The same on Linux (docs/self-hosting.md §6.18): the runtime is linked
+/// into the executable, so its variables are in the executable's own
+/// thread-local block at an offset from the thread pointer the linker works
+/// out (the local-exec model): the thread pointer from `%fs:0`, plus the
+/// offset. No call and no frame.
+fn tlv_get_linux(cell: str) -> X64Leaf ! str {
+    var l = new_leaf("_" + ir.rt_tlv_getter(cell))
+    try put(l, mach.X_LOAD_FS0, mach.RAX, -1, -1, 0)
+    try put_rel(l, mach.X_LEA_TPOFF, mach.RAX, mach.RAX, ir.tlv_var_sym(cell))
+    try put(l, mach.X_RET, -1, -1, -1, 0)
+    l
+}
+
 /// The leaves a runtime that calls `rt_name` needs, given its thread-local
 /// cells: none when the name is not one of them.
-pub fn leaves_for(rt_name: str, cells: [str]) -> [X64Leaf] ! str {
+pub fn leaves_for(rt_name: str, cells: [str], linux: bool) -> [X64Leaf] ! str {
     if rt_name == ir.RT_CTX_SWITCH {
         return [try switch_leaf()]
     }
@@ -145,7 +158,7 @@ pub fn leaves_for(rt_name: str, cells: [str]) -> [X64Leaf] ! str {
     }
     for c in cells {
         if rt_name == ir.rt_tlv_getter(c) {
-            return [try tlv_get(c)]
+            return [if linux { try tlv_get_linux(c) } else { try tlv_get(c) }]
         }
     }
     []
@@ -156,6 +169,6 @@ pub fn leaf_mops() -> [i64] {
     [
         mach.X_STORE, mach.X_LOAD, mach.X_STMXCSR, mach.X_FNSTCW, mach.X_LDMXCSR, mach.X_FLDCW, mach.X_RET,
         mach.X_ANDI, mach.X_LEA_RIP, mach.X_LEA, mach.X_MOVI32, mach.X_MOV, mach.X_CALLR, mach.X_UD2,
-        mach.X_PUSH, mach.X_LOAD_TLV, mach.X_CALLM, mach.X_POP,
+        mach.X_PUSH, mach.X_LOAD_TLV, mach.X_CALLM, mach.X_POP, mach.X_LOAD_FS0, mach.X_LEA_TPOFF,
     ]
 }

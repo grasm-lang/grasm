@@ -7,6 +7,7 @@
 // and a replayed sleep does not wait.
 import layout
 import sys
+import os
 import sysv
 import journal
 
@@ -15,7 +16,6 @@ extern fn nanosleep(want: addr, left: addr) -> i32
 
 let CLOCK_REALTIME = 0
 /// macOS's `CLOCK_MONOTONIC`.
-let CLOCK_MONOTONIC = 6
 
 /// When the monotonic clocks started counting, in nanoseconds on
 /// `CLOCK_MONOTONIC`; 0 until first asked (the clock is never 0).
@@ -37,7 +37,7 @@ fn reading(clock: i64, inout secs: i64, inout nanos: i64) {
 fn mono_now() -> i64 {
     var s = 0
     var ns = 0
-    reading(CLOCK_MONOTONIC, s, ns)
+    reading(os.CLOCK_MONOTONIC, s, ns)
     s * 1000000000 + ns
 }
 

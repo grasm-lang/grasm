@@ -84,7 +84,9 @@ fn key() -> i64 {
         if k != 0 {
             return k - 1
         }
-        let at = sys.alloc(8)
+        // Zeroed: a key is 64 bits on macOS and 32 on Linux, and is read as a
+        // word.
+        let at = sys.alloc_zeroed(8)
         if pthread_key_create(at, mem_fn_addr(thread_end)) != 0 {
             panic.say(mem_static("cannot make the allocator's thread key"), mem_static_len("cannot make the allocator's thread key"))
         }

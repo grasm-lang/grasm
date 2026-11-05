@@ -35,13 +35,18 @@ type A64Opts = {
     ra: i64,
     /// The target description (`desc.gr`), made once.
     tg: Target,
+    /// Linux rather than macOS (docs/self-hosting.md §6.18): the frame signs
+    /// with hints (`paciasp`, `autiasp; ret`), a variadic C function's
+    /// arguments go in registers as fixed ones do, and the runtime's
+    /// thread-local variables are reached from the thread pointer.
+    linux: bool,
 }
 
 pub let RA_LINEAR = 0
 pub let RA_BACKTRACK = 1
 
 pub fn default_opts() -> A64Opts {
-    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false, ra: RA_BACKTRACK, tg: desc.description() }
+    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false, ra: RA_BACKTRACK, tg: desc.description(), linux: false }
 }
 
 /// The kinds of planted allocation error, by the names the driver takes.
@@ -67,7 +72,7 @@ type A64Result = {
 /// runtime functions its calls reach, by id (`MirProg.rt_syms`).
 pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, callee_sym: [str], rt_syms: [str]) -> A64Result ! str {
     let t = opts.tg
-    let vc = try isel.select(t, f, rs, ccm, fccm)
+    let vc = try isel.select(t, f, rs, ccm, fccm, if opts.linux { rt_syms } else { [] })
     let al = if opts.ra == RA_BACKTRACK { try backtrack.allocate(t, vc, opts.max_regs, opts.corrupt) } else { try regalloc.allocate(t, vc, opts.max_regs, opts.corrupt) }
     let errs = check.check(t, al)
     var vtext = ""
@@ -80,7 +85,7 @@ pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, 
         let none = A64Code{ sym: f.sym, words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [], frame: 0, nspill: al.nspill, nsaved: 0, frame_at: 0, row_word: [], row_src: [] }
         return A64Result{ code: none, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
     }
-    let code = try emit.emit(t, al, f.sym, opts.want_asm, callee_sym, rt_syms)
+    let code = try emit.emit(t, al, f.sym, opts.want_asm, callee_sym, rt_syms, opts.linux)
     A64Result{ code: code, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
 }
 
@@ -135,6 +140,10 @@ pub fn emittable_forms() -> [str] {
     for m in [mach.A_MOV, mach.A_BL, mach.A_LDR, mach.A_STR, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_LDP_POST, mach.A_ADDI, mach.A_SUBI, mach.A_RETAB, mach.A_B, mach.A_BCOND, mach.A_CBZ, mach.A_CBNZ, mach.A_FMOV, mach.A_FLDR, mach.A_FSTR, mach.A_FSTP_PRE, mach.A_FLDP_POST, mach.A_BLR] {
         seen[m] = true
     }
+    // Linux's frame (docs/self-hosting.md §6.18).
+    for m in [mach.A_PACIASP, mach.A_AUTIASP, mach.A_RET] {
+        seen[m] = true
+    }
     // The runtime dialect's leaves (`leaves.gr`).
     for m in leaves.leaf_mops() {
         seen[m] = true
@@ -154,6 +163,6 @@ pub fn encode_cases() -> EncCases ! str {
 
 /// The fixed leaves the runtime's call of `rt_name` needs ([T-RUNTIME]),
 /// given its thread-local cells; none when the name is not one of them.
-pub fn leaves_for(rt_name: str, cells: [str]) -> [A64Leaf] ! str {
-    leaves.leaves_for(rt_name, cells)
+pub fn leaves_for(rt_name: str, cells: [str], linux: bool) -> [A64Leaf] ! str {
+    leaves.leaves_for(rt_name, cells, linux)
 }

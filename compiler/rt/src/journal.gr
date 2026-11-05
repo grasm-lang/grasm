@@ -19,6 +19,7 @@
 // function did.
 import layout
 import sys
+import os
 import alloc
 import strread
 import numstr
@@ -102,7 +103,7 @@ fn open() {
     var n = 0
     let rec = unsafe { env_text(mem_static("GRASM_RECORD"), n) }
     if not sysv.null(rec) {
-        let fd = fsys.open_path(rec, n, fsys.O_WRONLY + fsys.O_CREAT + fsys.O_TRUNC, 438)
+        let fd = fsys.open_path(rec, n, fsys.O_WRONLY + os.O_CREAT + os.O_TRUNC, 438)
         if fd < 0 {
             let why = display.text_new()
             sysv.put_os(why, 0 - fd)

@@ -20,6 +20,7 @@
 // does not wait; and the `kqueue`, with the set registered on it.
 import layout
 import sys
+import os
 import alloc
 import strread
 import bytes
@@ -48,18 +49,13 @@ extern fn getsockname(fd: i32, a: addr, len: addr) -> i32
 extern fn getpeername(fd: i32, a: addr, len: addr) -> i32
 extern fn inet_ntop(family: i32, a: addr, out: addr, len: i32) -> addr
 extern fn poll(fds: addr, n: i32, timeout: i32) -> i32
-extern fn kqueue() -> i32
-extern fn kevent(kq: i32, changes: addr, nchanges: i32, events: addr, nevents: i32, timeout: addr) -> i32
 extern fn strlen(p: addr) -> i64
 
 let SOCK_STREAM = 1
 let SOCK_DGRAM = 2
-let SOL_SOCKET = 65535
-let SO_REUSEADDR = 4
 let IPPROTO_TCP = 6
 let TCP_NODELAY = 1
 let AF_INET = 2
-let AF_INET6 = 30
 
 let POLLIN = 1
 let POLLHUP = 16
@@ -530,7 +526,7 @@ fn resolve(host: addr, hn: i64, port: i64, all: bool, out: addr, room: i64) -> i
     unsafe {
         while not sysv.null(node) and count < room {
             let len = node.offset(16).load_u32().as_i64()
-            let a = node.offset(32).load_addr()
+            let a = node.offset(os.AI_ADDR).load_addr()
             if not all or (not sysv.null(a) and len > 0) {
                 let rec = out.offset(8 * count).load_addr()
                 let keep = if len > 128 { 128 } else { len }
@@ -563,9 +559,9 @@ fn parts(a: addr, t: addr) -> i64 {
             return 0
         }
         let port = b.offset(2).load_u8().as_i64() * 256 + b.offset(3).load_u8().as_i64()
-        let family = b.offset(1).load_u8().as_i64()
-        let at = if family == AF_INET6 { 8 } else { 4 }
-        let want = if family == AF_INET6 { 46 } else { 16 }
+        let family = b.offset(os.SA_FAMILY).load_u8().as_i64()
+        let at = if family == os.AF_INET6 { 8 } else { 4 }
+        let want = if family == os.AF_INET6 { 46 } else { 16 }
         if len < at {
             return port
         }
@@ -614,7 +610,7 @@ fn set_nonblocking(fd: i64, on: bool) -> i64 {
     if flags < 0 {
         return sysv.errno()
     }
-    let want = if on { flags.bit_or(fsys.O_NONBLOCK) } else { flags.bit_and(fsys.O_NONBLOCK.bit_not()) }
+    let want = if on { flags.bit_or(os.O_NONBLOCK) } else { flags.bit_and(os.O_NONBLOCK.bit_not()) }
     if fsys.fcntl3(fd, fsys.F_SETFL, want) < 0 {
         return sysv.errno()
     }
@@ -653,7 +649,7 @@ fn listen_on(host: addr, hn: i64, port: i64) -> i64 {
         sys.dealloc(a)
         return fd
     }
-    var e = set_opt(fd, SOL_SOCKET, SO_REUSEADDR, true)
+    var e = set_opt(fd, os.SOL_SOCKET, os.SO_REUSEADDR, true)
     if e == 0 {
         if unsafe { bind(fd.as_i32(), a.offset(A_BYTES), a.offset(A_LEN).load_i64().as_i32()) }.as_i64() < 0 {
             e = sysv.errno()
@@ -797,7 +793,7 @@ fn accept_from(fd: i64, ready: bool, why: addr) -> i64 {
             return c
         }
         let e = sysv.errno()
-        if e == sysv.EAGAIN {
+        if e == os.EAGAIN {
             if ready {
                 unsafe { sysv.put_s(why, mem_static("no connection is waiting"), mem_static_len("no connection is waiting")) }
                 return -1
@@ -972,7 +968,7 @@ fn kq_same(hs: addr, n: i64) -> bool {
 fn kq_wait(hs: addr, n: i64, timeout: i64, ready: addr, lis: addr, why: addr) -> i64 {
     unsafe {
         if mem_tls(KQ).load_i64() == 0 {
-            let kq = kqueue().as_i64()
+            let kq = os.kq_new()
             if kq < 0 {
                 return 0
             }
@@ -1060,7 +1056,7 @@ fn kq_wait(hs: addr, n: i64, timeout: i64, ready: addr, lis: addr, why: addr) ->
             if nch > 0 {
                 let receipts = sys.alloc(KEV * nch)
                 sys.copy(receipts, changes, KEV * nch)
-                let got = kevent(kq.as_i32(), changes, nch.as_i32(), receipts, nch.as_i32(), mem_addr(0)).as_i64()
+                let got = os.kq_event(kq, changes, nch, receipts, nch, mem_addr(0))
                 if got < 0 {
                     let e = sysv.errno()
                     sys.dealloc(receipts)
@@ -1084,7 +1080,7 @@ fn kq_wait(hs: addr, n: i64, timeout: i64, ready: addr, lis: addr, why: addr) ->
                     if rc.offset(10).load_u16().as_i64().bit_and(EV_ERROR) != 0 and data != 0 and added {
                         // What is registered is no longer known: start over.
                         let _ = close(kq.as_i32())
-                        mem_tls(KQ).store_i64(kqueue().as_i64() + 1)
+                        mem_tls(KQ).store_i64(os.kq_new() + 1)
                         kq_forget()
                         sys.dealloc(receipts)
                         sys.dealloc(changes)
@@ -1151,7 +1147,7 @@ fn kq_wait(hs: addr, n: i64, timeout: i64, ready: addr, lis: addr, why: addr) ->
             tp = ts
         }
         while true {
-            let got = kevent(kq.as_i32(), mem_addr(0), 0.as_i32(), ev, cap.as_i32(), tp).as_i64()
+            let got = os.kq_event(kq, mem_addr(0), 0, ev, cap, tp)
             if got >= 0 {
                 i = 0
                 while i < n {

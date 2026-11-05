@@ -198,6 +198,15 @@ pub let A_ASRI = 109
 pub let A_ANDI = 110
 pub let A_ORRI = 111
 pub let A_EORI = 112
+// Linux (docs/self-hosting.md §6.18): return-address signing by hints, which
+// a processor without pointer authentication runs as no-ops, and the thread
+// pointer the local-exec thread-local model adds offsets to.
+/// `paciasp`: sign x30 with key A against `sp` (`hint #25`).
+pub let A_PACIASP = 113
+/// `autiasp`: authenticate x30 against `sp` (`hint #29`), before `ret`.
+pub let A_AUTIASP = 114
+/// `mrs xd, tpidr_el0`: the thread pointer.
+pub let A_MRS_TP = 115
 /// Not an instruction: the function's return, which becomes the epilogue.
 /// `imm` 1 when it returns x0, 2 when it returns d0.
 pub let P_RETURN = 150
@@ -210,7 +219,7 @@ pub let NMOPS = 160
 /// The opcodes that are real instructions, for whoever wants all of them.
 pub fn all_mops() -> [i64] {
     var out: [i64] = []
-    for m in 1..113 {
+    for m in 1..A_MRS_TP + 1 {
         out.push(m)
     }
     out
@@ -351,6 +360,9 @@ pub fn mop_name(m: i64) -> str {
         110 -> "and"
         111 -> "orr"
         112 -> "eor"
+        113 -> "paciasp"
+        114 -> "autiasp"
+        115 -> "mrs"
         150 -> "<return>"
         151 -> "<movimm>"
         _ -> "<?>"
@@ -472,6 +484,9 @@ pub fn form_name(m: i64) -> str {
         110 -> "and-imm"
         111 -> "orr-imm"
         112 -> "eor-imm"
+        113 -> "paciasp"
+        114 -> "autiasp"
+        115 -> "mrs-tpidr"
         _ -> "?"
     }
 }
@@ -510,6 +525,8 @@ let F_LDRGOT = 24
 let F_SHIFTI = 25
 /// A logical operation with a bitmask immediate: Rd, Rn, #mask.
 let F_LOGI = 26
+/// A read of the thread pointer: Rd.
+let F_MRS = 27
 
 fn mop_fmt(m: i64) -> i64 {
     if m >= A_FADD {
@@ -599,6 +616,10 @@ fn fp_fmt(m: i64) -> i64 {
         F_SHIFTI
     } else if m >= A_ANDI and m <= A_EORI {
         F_LOGI
+    } else if m == A_PACIASP or m == A_AUTIASP {
+        F_FIXED
+    } else if m == A_MRS_TP {
+        F_MRS
     } else {
         0
     }
@@ -741,6 +762,9 @@ fn mop_base(m: i64) -> i64 {
         110 -> 0x92000000
         111 -> 0xB2000000
         112 -> 0xD2000000
+        113 -> 0xD503233F
+        114 -> 0xD50323BF
+        115 -> 0xD53BD040
         _ -> 0
     }
 }
@@ -754,7 +778,7 @@ pub let ROLE_USE = 2
 pub let ROLE_USEDEF = 3
 
 pub fn role_d(m: i64) -> i64 {
-    if m == A_CMPR or m == A_CMPI or m == A_CMNI or m == A_FCMP or m == A_B or m == A_BL or m == A_BLR or m == A_BCOND or m == A_CBZ or m == A_CBNZ or m == A_RET or m == A_RETAB or m == A_PACIBSP or m == A_BRK or m == P_RETURN {
+    if m == A_CMPR or m == A_CMPI or m == A_CMNI or m == A_FCMP or m == A_B or m == A_BL or m == A_BLR or m == A_BCOND or m == A_CBZ or m == A_CBNZ or m == A_RET or m == A_RETAB or m == A_PACIBSP or m == A_PACIASP or m == A_AUTIASP or m == A_BRK or m == P_RETURN {
         0
     } else if m == A_MOVK or (m >= A_CASALB and m <= A_CASALX) {
         3
@@ -1101,6 +1125,10 @@ pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, c
         }
         return base.bit_or(enc.shl(10)).bit_or(n.shl(5)).bit_or(d)
     }
+    if f == F_MRS {
+        let d = try reg_field(m, 0, rd)
+        return base.bit_or(d)
+    }
     fail("opcode {m} has no encoding")
 }
 
@@ -1375,6 +1403,9 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
     }
     if f == F_LOGI {
         return "{name} {d}, {n}, #{hex64(imm)}"
+    }
+    if f == F_MRS {
+        return "{name} {d}, tpidr_el0"
     }
     if m == P_RETURN {
         return "<return>"

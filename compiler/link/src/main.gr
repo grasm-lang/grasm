@@ -124,6 +124,7 @@ import apply
 import image
 import ldmap
 import interpose
+import elfstart
 
 pub let USAGE = "usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] [-interpose obj] [-interpose_log file] inputs..."
 
@@ -485,7 +486,26 @@ pub fn parse_args(a: [str]) -> (Ld, [str]) {
 }
 
 fn main() {
-    let (l0, problems) = parse_args(args())
+    let a = args()
+    // `_start` for an ELF executable, as an object (`elfstart.gr`).
+    if a.len() == 4 and a[0] == "-start-object" and a[2] == "-o" and (a[1] == "aarch64" or a[1] == "x86_64") {
+        let obj = match elfstart.start_object(a[1] == "x86_64") {
+            Ok(b) -> b
+            Err(e) -> {
+                eprint("link: {e}")
+                exit(1)
+                return
+            }
+        }
+        match write_bytes(a[3], obj) {
+            Ok(_) -> exit(0)
+            Err(e) -> {
+                eprint("link: cannot write {a[3]}: {e}")
+                exit(1)
+            }
+        }
+    }
+    let (l0, problems) = parse_args(a)
     if problems.len() > 0 {
         for m in problems {
             eprint(m)

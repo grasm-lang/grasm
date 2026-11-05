@@ -235,6 +235,17 @@ pub fn cases() -> X64Cases ! str {
             }
         } else if m == mach.X_RET or m == mach.X_UD2 {
             try add(c, m, -1, -1, -1, -1, 0, -1, 0, "")
+        } else if m == mach.X_LOAD_FS0 {
+            for k in 0..16 {
+                try add(c, m, reg_of(g, m, k, 0), -1, -1, -1, 0, -1, 0, "")
+            }
+        } else if m == mach.X_LEA_TPOFF {
+            // A displacement the assembler too writes in 32 bits, whose
+            // field the linker fills in the getter.
+            for k in 0..n {
+                let d = if k % 2 == 0 { 128 + 4099 * k } else { -129 - 8191 * k }
+                try add(c, m, reg_of(g, m, k, 0), reg_of(g, m, k, 1), -1, -1, d, -1, 0, "")
+            }
         } else if m == mach.X_JMP8 or m == mach.X_JCC8 {
             for k in 0..n {
                 try add(c, m, -1, -1, -1, -1, 0, k % 16, off_for(g, k, 2, 8), "")

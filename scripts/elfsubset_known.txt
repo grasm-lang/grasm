@@ -1,0 +1,6 @@
+# Programs whose Linux builds -- the Grasm backend's and the Cranelift build for the
+# same triple -- agree with each other and differ from the interpreter on the
+# Mac, each with the reason (scripts/elfsubset.sh; docs/self-hosting.md §6.18).
+# One a line: the target, the program, the reason, separated by tabs.
+aarch64-linux	spec/conformance/T-EXTERN-POINTER.gr	declares memcmp, whose result C makes an int, as returning i64, so it reads the register's upper half, which C leaves unspecified: glibc leaves it zero under a negative int (memcmp orders: false), Apple's libSystem sign-extends (true)
+x86_64-linux	spec/conformance/T-EXTERN-POINTER.gr	declares memcmp, whose result C makes an int, as returning i64, so it reads the register's upper half, which C leaves unspecified: glibc leaves it zero under a negative int (memcmp orders: false), Apple's libSystem sign-extends (true)

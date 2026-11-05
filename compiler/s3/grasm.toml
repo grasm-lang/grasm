@@ -17,3 +17,6 @@ path = "../macho"
 
 [dependencies.x86_64]
 path = "../x86_64"
+
+[dependencies.elf]
+path = "../elf"

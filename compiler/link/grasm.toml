@@ -17,3 +17,11 @@ path = "../../packages/exporttrie"
 
 [dependencies.crypto_hash]
 path = "../../packages/crypto_hash"
+
+# The ELF object writer, for the `_start` an ELF executable begins at
+# (docs/self-hosting.md §6.18).
+[dependencies.elf]
+path = "../elf"
+
+[dependencies.macho]
+path = "../macho"

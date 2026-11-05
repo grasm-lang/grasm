@@ -234,6 +234,27 @@ pub fn sections(u: DwUnit, foff: [i64], text_size: i64) -> DwSections {
     put8(info, 8)
     info.push_bytes(body.to_bytes())
 
+    let lt = line_table(u, foff, fsize, false)
+    DwSections{
+        abbrev: ab.to_bytes(), info: info.to_bytes(), str: sp.b.to_bytes(), line: lt.bytes,
+        info_rel: info_rel, line_rel: lt.rel,
+    }
+}
+
+/// `__debug_line` (`.debug_line`): the header, then one sequence per
+/// function with rows. `rel` holds the byte offsets of each sequence's
+/// 8-byte start address and `rel_fn` its function: on Mach-O the address is
+/// the function's offset in `__text`, relocated against the section; in an
+/// ELF object, where each function is a section of its own, it is 0 and
+/// relocated against the function.
+type DwLine = {
+    bytes: bytes,
+    rel: [i64],
+    rel_fn: [i64],
+}
+
+fn line_table(u: DwUnit, foff: [i64], fsize: [i64], elf: bool) -> DwLine {
+    let nf = foff.len()
     // __debug_line: the header after its length, version and header length.
     var hdr = byte_builder()
     put8(hdr, 1)
@@ -257,6 +278,7 @@ pub fn sections(u: DwUnit, foff: [i64], text_size: i64) -> DwSections {
     put8(hdr, 0)
     var prog = byte_builder()
     var prog_rel: [i64] = []
+    var prog_fn: [i64] = []
     var r = 0
     let nr = u.row_fn.len()
     for k in 0..nf {
@@ -272,7 +294,8 @@ pub fn sections(u: DwUnit, foff: [i64], text_size: i64) -> DwSections {
         uleb(prog, 9)
         put8(prog, LNE_SET_ADDRESS)
         prog_rel.push(prog.len())
-        put64(prog, foff[k])
+        prog_fn.push(k)
+        put64(prog, if elf { 0 } else { foff[k] })
         var file = 1
         var line = 1
         var off = 0
@@ -319,12 +342,182 @@ pub fn sections(u: DwUnit, foff: [i64], text_size: i64) -> DwSections {
     lt.push_bytes(hdr.to_bytes())
     let pbase = lt.len()
     lt.push_bytes(prog.to_bytes())
-    var line_rel: [i64] = []
+    var rel: [i64] = []
     for o in prog_rel {
-        line_rel.push(pbase + o)
+        rel.push(pbase + o)
     }
-    DwSections{
-        abbrev: ab.to_bytes(), info: info.to_bytes(), str: sp.b.to_bytes(), line: lt.to_bytes(),
-        info_rel: info_rel, line_rel: line_rel,
+    DwLine{ bytes: lt.to_bytes(), rel: rel, rel_fn: prog_fn }
+}
+
+/// The debug sections of an ELF object (docs/self-hosting.md §6.18), where
+/// each function is a section of its own and the linker concatenates debug
+/// sections across objects, so every address and every offset from one
+/// debug section into another is a relocation, as clang writes them with
+/// `-ffunction-sections`: the compile unit's code is a list of ranges
+/// (`.debug_ranges`) rather than one span. The relocated fields hold 0 and
+/// the relocation's addend holds the value.
+type DwElf = {
+    abbrev: bytes,
+    info: bytes,
+    ranges: bytes,
+    str: bytes,
+    line: bytes,
+    /// 8-byte addresses: the section (`DWS_*`), the offset in it, the
+    /// function, and the addend from the function's start.
+    a_sect: [i64],
+    a_off: [i64],
+    a_fn: [i64],
+    a_add: [i64],
+    /// 4-byte offsets in `.debug_info` into another debug section: the
+    /// offset in `.debug_info`, the section pointed into (`DWS_*`), and the
+    /// offset in it.
+    o_off: [i64],
+    o_sect: [i64],
+    o_add: [i64],
+}
+
+pub let DWS_ABBREV = 0
+pub let DWS_INFO = 1
+pub let DWS_RANGES = 2
+pub let DWS_STR = 3
+pub let DWS_LINE = 4
+
+let AT_RANGES = 0x55
+
+pub fn sections_elf(u: DwUnit, foff: [i64], text_size: i64) -> DwElf {
+    let nf = foff.len()
+    var fsize: [i64] = []
+    for k in 0..nf {
+        let end = if k + 1 < nf { foff[k + 1] } else { text_size }
+        fsize.push(end - foff[k])
     }
+    var d = DwElf{
+        abbrev: byte_builder().to_bytes(), info: byte_builder().to_bytes(), ranges: byte_builder().to_bytes(),
+        str: byte_builder().to_bytes(), line: byte_builder().to_bytes(),
+        a_sect: [], a_off: [], a_fn: [], a_add: [], o_off: [], o_sect: [], o_add: [],
+    }
+
+    // .debug_abbrev: the compile unit with ranges in place of a span.
+    var ab = byte_builder()
+    uleb(ab, 1)
+    uleb(ab, TAG_COMPILE_UNIT)
+    put8(ab, 1)
+    for pair in [[AT_PRODUCER, FORM_STRP], [AT_NAME, FORM_STRP], [AT_STMT_LIST, FORM_SEC_OFFSET], [AT_COMP_DIR, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_RANGES, FORM_SEC_OFFSET]] {
+        uleb(ab, pair[0])
+        uleb(ab, pair[1])
+    }
+    put8(ab, 0)
+    put8(ab, 0)
+    uleb(ab, 2)
+    uleb(ab, TAG_SUBPROGRAM)
+    put8(ab, 0)
+    for pair in [[AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4], [AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA]] {
+        uleb(ab, pair[0])
+        uleb(ab, pair[1])
+    }
+    put8(ab, 0)
+    put8(ab, 0)
+    uleb(ab, 3)
+    uleb(ab, TAG_SUBPROGRAM)
+    put8(ab, 0)
+    for pair in [[AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4], [AT_NAME, FORM_STRP]] {
+        uleb(ab, pair[0])
+        uleb(ab, pair[1])
+    }
+    put8(ab, 0)
+    put8(ab, 0)
+    put8(ab, 0)
+    d.abbrev = ab.to_bytes()
+
+    // .debug_ranges: each function's start and end, then the list's end.
+    var rg = byte_builder()
+    for k in 0..nf {
+        if fsize[k] <= 0 {
+            continue
+        }
+        d.a_sect.push(DWS_RANGES)
+        d.a_off.push(rg.len())
+        d.a_fn.push(k)
+        d.a_add.push(0)
+        put64(rg, 0)
+        d.a_sect.push(DWS_RANGES)
+        d.a_off.push(rg.len())
+        d.a_fn.push(k)
+        d.a_add.push(fsize[k])
+        put64(rg, 0)
+    }
+    put64(rg, 0)
+    put64(rg, 0)
+    d.ranges = rg.to_bytes()
+
+    // .debug_info: the header (the abbreviations' offset relocated), the
+    // compile unit, a subprogram per function.
+    var sp = StrPool{ b: byte_builder(), at: {} }
+    var info = byte_builder()
+    put32(info, 0)
+    put16(info, 4)
+    d.o_off.push(info.len())
+    d.o_sect.push(DWS_ABBREV)
+    d.o_add.push(0)
+    put32(info, 0)
+    put8(info, 8)
+    uleb(info, 1)
+    for s in [u.producer, u.name] {
+        d.o_off.push(info.len())
+        d.o_sect.push(DWS_STR)
+        d.o_add.push(intern(sp, s))
+        put32(info, 0)
+    }
+    d.o_off.push(info.len())
+    d.o_sect.push(DWS_LINE)
+    d.o_add.push(0)
+    put32(info, 0)
+    d.o_off.push(info.len())
+    d.o_sect.push(DWS_STR)
+    d.o_add.push(intern(sp, u.comp_dir))
+    put32(info, 0)
+    put64(info, 0)
+    d.o_off.push(info.len())
+    d.o_sect.push(DWS_RANGES)
+    d.o_add.push(0)
+    put32(info, 0)
+    for k in 0..nf {
+        if fsize[k] <= 0 {
+            continue
+        }
+        let with_line = u.fn_line[k] > 0
+        uleb(info, if with_line { 2 } else { 3 })
+        d.a_sect.push(DWS_INFO)
+        d.a_off.push(info.len())
+        d.a_fn.push(k)
+        d.a_add.push(0)
+        put64(info, 0)
+        put32(info, fsize[k])
+        d.o_off.push(info.len())
+        d.o_sect.push(DWS_STR)
+        d.o_add.push(intern(sp, u.fn_name[k]))
+        put32(info, 0)
+        if with_line {
+            uleb(info, u.fn_file[k])
+            uleb(info, u.fn_line[k])
+        }
+    }
+    put8(info, 0)
+    // The unit's length, counted from after itself.
+    let n = info.len() - 4
+    for q in 0..4 {
+        info.set(q, n.ushr(8 * q).bit_and(255))
+    }
+    d.info = info.to_bytes()
+    d.str = sp.b.to_bytes()
+
+    let lt = line_table(u, foff, fsize, true)
+    d.line = lt.bytes
+    for q in 0..lt.rel.len() {
+        d.a_sect.push(DWS_LINE)
+        d.a_off.push(lt.rel[q])
+        d.a_fn.push(lt.rel_fn[q])
+        d.a_add.push(0)
+    }
+    d
 }

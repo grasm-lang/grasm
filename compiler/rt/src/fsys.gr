@@ -24,9 +24,6 @@ extern fn fsync(fd: i32) -> i32
 pub let O_RDONLY = 0
 pub let O_WRONLY = 1
 pub let O_RDWR = 2
-pub let O_APPEND = 8
-pub let O_CREAT = 512
-pub let O_TRUNC = 1024
 pub let SEEK_SET = 0
 pub let SEEK_CUR = 1
 pub let SEEK_END = 2
@@ -34,7 +31,6 @@ pub let F_GETFL = 3
 pub let F_SETFL = 4
 pub let F_SETFD = 2
 pub let FD_CLOEXEC = 1
-pub let O_NONBLOCK = 4
 
 /// `fcntl(fd, cmd, arg)`, the argument where C reads a variadic one.
 pub fn fcntl3(fd: i64, cmd: i64, arg: i64) -> i64 {

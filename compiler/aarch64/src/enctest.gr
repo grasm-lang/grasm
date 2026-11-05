@@ -193,8 +193,12 @@ pub fn cases() -> EncCases ! str {
                 let rt = reg_for(g, k, 1, mach.R_ZR)
                 try add(c, m, -1, rt, -1, -1, 0, 0, -1, off_for(g, k, 19), "")
             }
-        } else if m == mach.A_RET or m == mach.A_RETAB or m == mach.A_PACIBSP {
+        } else if m == mach.A_RET or m == mach.A_RETAB or m == mach.A_PACIBSP or m == mach.A_PACIASP or m == mach.A_AUTIASP {
             try add(c, m, -1, -1, -1, -1, 0, 0, -1, 0, "")
+        } else if m == mach.A_MRS_TP {
+            for k in 0..31 {
+                try add(c, m, k, -1, -1, -1, 0, 0, -1, 0, "")
+            }
         } else if m == mach.A_BRK {
             for k in 0..16 {
                 try add(c, m, -1, -1, -1, -1, uimm_for(g, k, 16), 0, -1, 0, "")

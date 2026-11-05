@@ -1,0 +1,67 @@
+// The operating system's numbers, and the few calls that differ between the
+// systems this runtime runs on (docs/self-hosting.md §6.18): Darwin's, here.
+// `compiler/rt/os/linux.gr` is this module for Linux with glibc, with the
+// same public names; the Linux runtime is this package with that file in
+// this one's place, as the poisoned runtime is this package with `build.gr`
+// changed. Each value is what the Rust runtime uses on the same system
+// (`crates/grasm_sys`, its `cfg(target_os = "macos")` branches), and
+// `elfrtlayout` holds Linux's to the C library's headers.
+//
+// A constant here is a literal, so it is that literal where it is read
+// (§6.12): moving one here from the module that reads it changed no
+// instruction of the runtime.
+
+/// `EAGAIN`, `EILSEQ`: the error numbers that differ.
+pub let EAGAIN = 35
+pub let EILSEQ = 92
+
+/// `open`'s flags that differ.
+pub let O_APPEND = 8
+pub let O_CREAT = 512
+pub let O_TRUNC = 1024
+pub let O_NONBLOCK = 4
+
+/// `clock_gettime`'s monotonic clock.
+pub let CLOCK_MONOTONIC = 6
+
+/// `sysconf`'s name for the processors online.
+pub let SC_NPROCESSORS_ONLN = 58
+
+/// `mmap`'s flags for private anonymous memory: MAP_PRIVATE | MAP_ANON.
+pub let MAP_PRIVATE_ANON = 4098
+
+/// `dlsym`'s handle for every image the process has loaded.
+pub let RTLD_DEFAULT = -2
+
+/// Where a `struct dirent`'s name starts.
+pub let DIRENT_NAME = 21
+
+/// Sockets: the option level, the option, the IPv6 family.
+pub let SOL_SOCKET = 65535
+pub let SO_REUSEADDR = 4
+pub let AF_INET6 = 30
+/// Where a `sockaddr`'s family is read, as a byte: after its length byte.
+pub let SA_FAMILY = 1
+/// Where an `addrinfo` keeps its address (after `ai_canonname` here).
+pub let AI_ADDR = 32
+
+extern fn kqueue() -> i32
+extern fn kevent(kq: i32, changes: addr, nchanges: i32, events: addr, nevents: i32, timeout: addr) -> i32
+extern fn pthread_setname_np(name: addr) -> i32
+
+/// A new `kqueue`, or a negative number when there is none.
+pub fn kq_new() -> i64 {
+    unsafe { kqueue().as_i64() }
+}
+
+/// `kevent`.
+pub fn kq_event(kq: i64, changes: addr, nchanges: i64, events: addr, nevents: i64, timeout: addr) -> i64 {
+    unsafe { kevent(kq.as_i32(), changes, nchanges.as_i32(), events, nevents.as_i32(), timeout).as_i64() }
+}
+
+/// Names the calling thread (macOS names only the calling thread).
+pub fn name_thread(name: addr) {
+    unsafe {
+        let _ = pthread_setname_np(name)
+    }
+}

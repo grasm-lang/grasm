@@ -17,6 +17,7 @@
 // entered (`stack_floor`) or asks on entry (`stack_check`).
 import layout
 import sys
+import os
 import alloc
 import panic
 
@@ -125,7 +126,7 @@ fn take_stack(f: addr, size: i64) {
             }
             i -= 1
         }
-        let base = mmap(mem_addr(0), len, 3.as_i32(), 4098.as_i32(), -1.as_i32(), 0)
+        let base = mmap(mem_addr(0), len, 3.as_i32(), os.MAP_PRIVATE_ANON.as_i32(), -1.as_i32(), 0)
         if base.as_i64() == 0 or base.as_i64() == -1 {
             // `assert!` with a formatted message, which the Rust runtime's
             // panic handler cannot print.

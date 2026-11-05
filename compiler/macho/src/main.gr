@@ -95,6 +95,14 @@ pub let R_GOT_PAGEOFF12 = 6
 /// offset in the page (`ARM64_RELOC_TLVP_LOAD_PAGE21`, `_PAGEOFF12`).
 pub let R_TLVP_PAGE21 = 8
 pub let R_TLVP_PAGEOFF12 = 9
+/// Kinds only an ELF object carries (`compiler/elf`, docs/self-hosting.md
+/// §6.18), which this writer refuses: a thread-local variable reached by
+/// the local-exec model, its offset from the thread pointer -- on arm64 the
+/// high 12 bits and the low 12 (`R_AARCH64_TLSLE_ADD_TPREL_HI12`,
+/// `_LO12_NC`), on x86-64 all 32 (`R_X86_64_TPOFF32`).
+pub let R_TPREL_HI12 = 10
+pub let R_TPREL_LO12 = 11
+pub let R_X64_TPOFF32 = 12
 
 pub fn new_obj() -> MoObj {
     MoObj{

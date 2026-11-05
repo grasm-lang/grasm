@@ -40,6 +40,11 @@
 // other option means what it does for arm64. `--target aarch64` is the
 // default.
 //
+// `--target aarch64-linux` and `--target x86_64-linux` (docs/self-hosting.md
+// §6.18, stage S7) compile for Linux with glibc: the same selection and
+// allocation as the macOS target of that instruction set, and a relocatable
+// ELF object (`compiler/elf`) in place of the Mach-O one.
+//
 // TIR from the Rust frontend (`grasm tir`) goes to MIR (`compiler/mir`), to
 // AArch64 code through the lowering rules, a register allocator and its
 // checker (`compiler/aarch64`), and into a relocatable Mach-O object
@@ -63,6 +68,7 @@ import mir.ir
 import aarch64
 import x86_64
 import macho
+import elf
 
 /// The largest callee inlined, in MIR instructions and terminators
 /// (`compiler/mir/src/inline.gr`); `--inline=N` sets another, 0 none.
@@ -70,6 +76,7 @@ let INLINE_LIMIT = 32
 
 fn usage() {
     eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats] [--runtime] [--inline=N]")
+    eprint("       s3 ... --target aarch64 | x86_64 | aarch64-linux | x86_64-linux")
     eprint("       s3 --check-rules | --forms | --encode-test <prefix>   [--target x86_64]")
     exit(2)
 }
@@ -260,21 +267,25 @@ fn file_line(p: MirProg, sl: SrcLines, o: i64) -> (i64, i64) {
     (k + 1, lo + 1)
 }
 
-/// The C library's name for C function `name` on the target: on x86-64 the
-/// runtime's `opendir` and `readdir` are the 64-bit-inode ones, which the
-/// library names `$INODE64` there (docs/self-hosting.md §6.16); a program's
-/// keep their plain names, as the Cranelift build's do.
-fn c_name(name: str, x64: bool, lib: bool) -> str {
-    if x64 and lib and (name == "opendir" or name == "readdir") {
+/// The C library's name for C function `name` on the target: on x86-64
+/// macOS the runtime's `opendir` and `readdir` are the 64-bit-inode ones,
+/// which the library names `$INODE64` there (docs/self-hosting.md §6.16); on
+/// Linux the runtime's `__error`, the address of the thread's error number,
+/// is glibc's `__errno_location` (§6.18). A program's keep their plain
+/// names, as the Cranelift build's do.
+fn c_name(name: str, x64: bool, lib: bool, linux: bool) -> str {
+    if linux and lib and name == "__error" {
+        "__errno_location"
+    } else if x64 and lib and not linux and (name == "opendir" or name == "readdir") {
         name + "$INODE64"
     } else {
         name
     }
 }
 
-fn reloc_symbol_for(p: MirProg, symk: i64, id: i64, x64: bool, lib: bool) -> str {
+fn reloc_symbol_for(p: MirProg, symk: i64, id: i64, x64: bool, lib: bool, linux: bool) -> str {
     if symk == 2 or symk == 5 {
-        "_" + c_name(p.rt_syms[id], x64, lib)
+        "_" + c_name(p.rt_syms[id], x64, lib, linux)
     } else {
         reloc_symbol(p, symk, id)
     }
@@ -297,10 +308,10 @@ fn reloc_symbol(p: MirProg, symk: i64, id: i64) -> str {
 /// The runtime dialect's leaves the runtime's calls reach ([T-RUNTIME]),
 /// each once, appended to the object as local functions; their code maps
 /// to no source line.
-fn add_leaves(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, inout text: StrBuilder) -> () ! str {
+fn add_leaves(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, inout text: StrBuilder, linux: bool) -> () ! str {
     var done: Map[str, bool] = {}
     for name in p.rt_syms {
-        for lf in try aarch64.leaves_for(name, p.tcells) {
+        for lf in try aarch64.leaves_for(name, p.tcells, linux) {
             if done.has(lf.sym) {
                 continue
             }
@@ -337,10 +348,10 @@ fn add_leaves(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, i
 }
 
 /// The x86-64 leaves, as `add_leaves` adds AArch64's.
-fn add_leaves_x64(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, inout text: StrBuilder) -> () ! str {
+fn add_leaves_x64(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, inout text: StrBuilder, linux: bool) -> () ! str {
     var done: Map[str, bool] = {}
     for name in p.rt_syms {
-        for lf in try x86_64.leaves_for(name, p.tcells) {
+        for lf in try x86_64.leaves_for(name, p.tcells, linux) {
             if done.has(lf.sym) {
                 continue
             }
@@ -389,7 +400,7 @@ fn pad16(inout obj: MoObj) {
 /// Compiles every function of `p` for x86-64 into `obj`. Answers an exit
 /// status, or -1 to go on; `counts` gets functions failing the checker,
 /// corrupted, caught, spill slots, frameless and late frames.
-fn codegen_x64(p: MirProg, lib: bool, xo: X64Opts, inout obj: MoObj, inout unit: DwUnit, listing: str, inout text: StrBuilder, sl: SrcLines, inout counts: [i64]) -> i64 {
+fn codegen_x64(p: MirProg, lib: bool, linux: bool, xo: X64Opts, inout obj: MoObj, inout unit: DwUnit, listing: str, inout text: StrBuilder, sl: SrcLines, inout counts: [i64]) -> i64 {
     let rs = x86_64.rule_table()
     let ccm = x86_64.cond_map()
     let fccm = x86_64.fcond_map()
@@ -444,7 +455,7 @@ fn codegen_x64(p: MirProg, lib: bool, xo: X64Opts, inout obj: MoObj, inout unit:
                 for k in 0..r.code.rel_off.len() {
                     obj.rel_off.push(base + r.code.rel_off[k])
                     obj.rel_kind.push(r.code.rel_kind[k])
-                    obj.rel_sym.push(reloc_symbol_for(p, r.code.rel_symk[k], r.code.rel_sym[k], true, lib))
+                    obj.rel_sym.push(reloc_symbol_for(p, r.code.rel_symk[k], r.code.rel_sym[k], true, lib, linux))
                 }
                 if listing != "" {
                     text.push_str(r.vcode_text)
@@ -468,7 +479,7 @@ fn codegen_x64(p: MirProg, lib: bool, xo: X64Opts, inout obj: MoObj, inout unit:
 }
 
 /// Compiles a TIR file into an object file. Answers the exit status.
-fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool, inline_limit: i64, x64: bool) -> i64 {
+fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool, inline_limit: i64, x64: bool, linux: bool) -> i64 {
     let src = match read_bytes(inp) {
         Ok(b) -> b
         Err(e) -> {
@@ -476,7 +487,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             return 2
         }
     }
-    let (st, _object) = compile_tir(src, out, opts, listing, check, stats, lib, inline_limit, x64)
+    let (st, _object) = compile_tir(src, out, opts, listing, check, stats, lib, inline_limit, x64, linux)
     st
 }
 
@@ -484,8 +495,8 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
 /// else -- the options a stage's build gives it (docs/self-hosting.md §6.14):
 /// for `grasm build --native` (compiler/grasm, §6.17). The exit status, and
 /// the object when it is 0.
-pub fn compile_program(src: bytes, lib: bool, x64: bool) -> (i64, bytes) {
-    compile_tir(src, "", aarch64.default_opts(), "", true, false, lib, INLINE_LIMIT, x64)
+pub fn compile_program(src: bytes, lib: bool, x64: bool, linux: bool) -> (i64, bytes) {
+    compile_tir(src, "", aarch64.default_opts(), "", true, false, lib, INLINE_LIMIT, x64, linux)
 }
 
 fn no_object() -> bytes {
@@ -494,7 +505,7 @@ fn no_object() -> bytes {
 
 /// Compiles TIR into an object: the exit status, and the object's bytes when
 /// it is 0, also written to `out` unless that is "".
-fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool, inline_limit: i64, x64: bool) -> (i64, bytes) {
+fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool, inline_limit: i64, x64: bool, linux: bool) -> (i64, bytes) {
     let p = match mir.build(src, lib, inline_limit) {
         Ok(x) -> x
         Err(msg) -> {
@@ -517,6 +528,8 @@ fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, s
     let rs = aarch64.rule_table()
     let ccm = aarch64.cond_map()
     let fccm = aarch64.fcond_map()
+    var aopts = opts
+    aopts.linux = linux
     var obj = macho.new_obj()
     var text = str_builder()
     if listing != "" {
@@ -540,7 +553,7 @@ fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, s
         xo.corrupt = opts.corrupt
         xo.want_asm = opts.want_asm
         xo.ra = opts.ra
-        let st = codegen_x64(p, lib, xo, obj, unit, listing, text, sl, xcounts)
+        let st = codegen_x64(p, lib, linux, xo, obj, unit, listing, text, sl, xcounts)
         if st >= 0 {
             return (st, no_object())
         }
@@ -555,7 +568,7 @@ fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, s
         if x64 {
             break
         }
-        match aarch64.compile_fn(f, rs, ccm, fccm, opts, p.callee_sym, p.rt_syms) {
+        match aarch64.compile_fn(f, rs, ccm, fccm, aopts, p.callee_sym, p.rt_syms) {
             Ok(r) -> {
                 if r.corrupted > 0 {
                     corrupted += 1
@@ -605,7 +618,7 @@ fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, s
                 for k in 0..r.code.rel_off.len() {
                     obj.rel_off.push(base + r.code.rel_off[k])
                     obj.rel_kind.push(r.code.rel_kind[k])
-                    obj.rel_sym.push(reloc_symbol(p, r.code.rel_symk[k], r.code.rel_sym[k]))
+                    obj.rel_sym.push(reloc_symbol_for(p, r.code.rel_symk[k], r.code.rel_sym[k], false, lib, linux))
                 }
                 if listing != "" {
                     text.push_str(r.vcode_text)
@@ -632,7 +645,7 @@ fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, s
     if ra_failed > 0 {
         return (4, no_object())
     }
-    match if x64 { add_leaves_x64(p, obj, unit, listing != "", text) } else { add_leaves(p, obj, unit, listing != "", text) } {
+    match if x64 { add_leaves_x64(p, obj, unit, listing != "", text, linux) } else { add_leaves(p, obj, unit, listing != "", text, linux) } {
         Ok(_) -> ()
         Err(msg) -> {
             eprint("s3: a leaf of the runtime dialect: {msg}")
@@ -686,7 +699,7 @@ fn compile_tir(src: bytes, out: str, opts: A64Opts, listing: str, check: bool, s
         obj.wbytes.push(b.to_bytes())
         doff += 32 + 32 * n
     }
-    let bytes = match macho.write(obj) {
+    let bytes = match if linux { elf.write(obj) } else { macho.write(obj) } {
         Ok(b) -> b
         Err(msg) -> {
             eprint("s3: writing the object: {msg}")
@@ -779,6 +792,7 @@ fn main() {
     var lib = false
     var inline_limit = INLINE_LIMIT
     var x64 = false
+    var linux = false
     var i = 0
     while i < a.len() {
         let x = a[i]
@@ -820,6 +834,11 @@ fn main() {
         } else if x == "--target" and i + 1 < a.len() {
             if a[i + 1] == "x86_64" {
                 x64 = true
+            } else if a[i + 1] == "x86_64-linux" {
+                x64 = true
+                linux = true
+            } else if a[i + 1] == "aarch64-linux" {
+                linux = true
             } else if a[i + 1] != "aarch64" {
                 usage()
                 return
@@ -844,5 +863,5 @@ fn main() {
         usage()
         return
     }
-    exit(compile(inp, out, opts, listing, check, stats, lib, inline_limit, x64))
+    exit(compile(inp, out, opts, listing, check, stats, lib, inline_limit, x64, linux))
 }

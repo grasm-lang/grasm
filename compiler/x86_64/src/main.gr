@@ -135,6 +135,6 @@ pub fn encode_cases() -> X64Cases ! str {
     enctest.cases()
 }
 
-pub fn leaves_for(rt_name: str, cells: [str]) -> [X64Leaf] ! str {
-    leaves.leaves_for(rt_name, cells)
+pub fn leaves_for(rt_name: str, cells: [str], linux: bool) -> [X64Leaf] ! str {
+    leaves.leaves_for(rt_name, cells, linux)
 }

@@ -507,17 +507,47 @@ fn plan_args(fp: [bool]) -> ArgPlan {
     p
 }
 
-/// The classes of instruction `i`'s arguments.
-fn call_fp(f: MirFn, i: i64) -> [bool] {
+/// The C functions the runtime calls that C declares variadic, and how many
+/// fixed parameters each has: `open(path, flags, ...)` and `fcntl(fd, cmd,
+/// ...)`. The runtime declares each with eight register parameters and the
+/// variadic one ninth, which Apple's AAPCS64 puts on the stack where `va_arg`
+/// reads it (`compiler/rt/src/fsys.gr`). Linux's AAPCS64 passes a variadic
+/// argument as the next fixed one, in a register, so there a call with those
+/// nine passes its first two and its last (docs/self-hosting.md §6.18), as
+/// on x86-64 (`compiler/x86_64/src/isel.gr`).
+fn variadic_fixed(name: str) -> i64 {
+    if name == "open" or name == "fcntl" { 2 } else { -1 }
+}
+
+/// Which of instruction `i`'s arguments it passes, in order: all of them,
+/// or, given the runtime's names `vrt` (Linux only; empty on macOS), for a
+/// variadic C function declared as the runtime declares one, the fixed ones
+/// and the last.
+fn call_args(f: MirFn, i: i64, vrt: [str]) -> [i64] {
+    var out: [i64] = []
+    let n = f.can[i]
+    var fixed = -1
+    if f.op[i] == ir.M_CALLRT and f.imm[i] >= 0 and f.imm[i] < vrt.len() and n == 9 {
+        fixed = variadic_fixed(vrt[f.imm[i]])
+    }
+    for k in 0..n {
+        if fixed < 0 or k < fixed or k == n - 1 {
+            out.push(f.cargs[f.ca0[i] + k])
+        }
+    }
+    out
+}
+
+fn args_fp(f: MirFn, args: [i64]) -> [bool] {
     var out: [bool] = []
-    for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
-        out.push(f.vfp[f.cargs[j]])
+    for v in args {
+        out.push(f.vfp[v])
     }
     out
 }
 
 /// Selects machine instructions for a whole function.
-pub fn select(t: Target, f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
+pub fn select(t: Target, f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], vrt: [str]) -> VCode ! str {
     let s = try plan(f, rs)
     var vc = vcode.new_vcode(f.sym)
     vc.nvregs = f.nvals
@@ -537,7 +567,7 @@ pub fn select(t: Target, f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode
     // (`compiler/mir`'s `extern_ok_for`).
     for i in 0..f.op.len() {
         if f.op[i] == ir.M_CALL or f.op[i] == ir.M_CALLRT or f.op[i] == ir.M_CALLIND {
-            let ap = plan_args(call_fp(f, i))
+            let ap = plan_args(args_fp(f, call_args(f, i, vrt)))
             if ap.nstack > vc.nout {
                 vc.nout = ap.nstack
             }
@@ -573,20 +603,21 @@ pub fn select(t: Target, f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode
             vc.cur_src = f.ispan[i]
             let op = f.op[i]
             if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
-                let n = f.can[i]
-                let cfp = call_fp(f, i)
+                let args = call_args(f, i, vrt)
+                let n = args.len()
+                let cfp = args_fp(f, args)
                 let ap = plan_args(cfp)
                 // The stack arguments first: storing them reads registers the
                 // moves below may be about to fill.
                 for k in 0..n {
                     if ap.reg[k] < 0 {
-                        let x = vcode.push(vc, if cfp[k] { mach.A_FSTR } else { mach.A_STR }, vr(f.cargs[f.ca0[i] + k]), mach.R_SP, -1)
+                        let x = vcode.push(vc, if cfp[k] { mach.A_FSTR } else { mach.A_STR }, vr(args[k]), mach.R_SP, -1)
                         vc.imm[x] = 8 * ap.slot[k]
                     }
                 }
                 for k in 0..n {
                     if ap.reg[k] >= 0 {
-                        moves.mov(t, vc, ap.reg[k], vr(f.cargs[f.ca0[i] + k]))
+                        moves.mov(t, vc, ap.reg[k], vr(args[k]))
                     }
                 }
                 // A call through a function value's code is `blr` on the

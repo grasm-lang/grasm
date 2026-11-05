@@ -22,8 +22,6 @@ pub let ENOENT = 2
 pub let EINTR = 4
 pub let EBADF = 9
 pub let EEXIST = 17
-pub let EAGAIN = 35
-pub let EILSEQ = 92
 
 /// The calling thread's error number.
 pub fn errno() -> i64 {

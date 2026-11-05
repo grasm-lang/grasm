@@ -1,0 +1,70 @@
+// `_start`, where a Linux executable begins (docs/self-hosting.md §6.18):
+// written by this linker rather than taken from glibc's `crt1.o`, which is in
+// glibc's development package and need not be on the machine a program is
+// built on. It does what glibc's `start.S` does for a position-independent
+// executable, on each instruction set:
+//
+//   * clear the frame pointer (and on arm64 the link register), so a
+//     backtrace ends here;
+//   * `__libc_start_main(main, argc, argv, init, fini, rtld_fini,
+//     stack_end)`: argc and argv from the stack the kernel left, no
+//     initializer and no finalizer (glibc 2.34 and later run the
+//     executable's `.init_array` themselves), the dynamic loader's
+//     finalizer as it arrives (x0 on arm64, rdx on x86-64), and the stack's
+//     end -- on x86-64 after aligning the stack to 16 bytes;
+//   * stop (`brk #1`, `hlt`) if it returns, which it does not.
+//
+// `link -start-object aarch64|x86_64 -o start.o` writes it as an object, so
+// that GNU ld can be given the same `_start` this linker writes
+// (scripts/linkdiff_elf.sh).
+import macho
+import elf
+
+/// `_start`'s code and relocations as an object description.
+pub fn start_obj(x64: bool) -> MoObj {
+    var o = macho.new_obj()
+    o.x64 = x64
+    // Names as the backend gives them, with Mach-O's underscore, which the
+    // ELF writer takes off.
+    o.fsym.push("__start")
+    o.foff.push(0)
+    o.fext.push(true)
+    if x64 {
+        for x in [
+            0x31, 0xED, 0x49, 0x89, 0xD1, 0x5E, 0x48, 0x89, 0xE2, 0x48, 0x83, 0xE4, 0xF0, 0x50, 0x54, 0x45,
+            0x31, 0xC0, 0x31, 0xC9, 0x48, 0x8D, 0x3D, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xF4,
+        ] {
+            o.code.push(x)
+        }
+        // `leaq main(%rip), %rdi`; `call __libc_start_main`.
+        o.rel_off.push(23)
+        o.rel_kind.push(1)
+        o.rel_sym.push("_main")
+        o.rel_off.push(28)
+        o.rel_kind.push(2)
+        o.rel_sym.push("___libc_start_main")
+    } else {
+        for w in [
+            0xD280001D, 0xD280001E, 0xAA0003E5, 0xF94003E1, 0x910023E2, 0x910003E6,
+            0x90000000, 0x91000000, 0xD2800003, 0xD2800004, 0x94000000, 0xD4200020,
+        ] {
+            o.text.push(w)
+        }
+        // `adrp x0, main`; `add x0, x0, :lo12:main`; `bl __libc_start_main`.
+        o.rel_off.push(24)
+        o.rel_kind.push(macho.R_PAGE21)
+        o.rel_sym.push("_main")
+        o.rel_off.push(28)
+        o.rel_kind.push(macho.R_PAGEOFF12)
+        o.rel_sym.push("_main")
+        o.rel_off.push(40)
+        o.rel_kind.push(macho.R_BRANCH26)
+        o.rel_sym.push("___libc_start_main")
+    }
+    o
+}
+
+/// `_start` as a relocatable ELF object.
+pub fn start_object(x64: bool) -> bytes ! str {
+    elf.write(start_obj(x64))
+}

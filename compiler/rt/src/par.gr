@@ -29,6 +29,7 @@
 // when the thread ends, before `pthread_join` returns.
 import layout
 import sys
+import os
 import alloc
 import display
 import lists
@@ -43,7 +44,6 @@ extern fn pthread_attr_setstacksize(attr: addr, size: i64) -> i32
 extern fn pthread_attr_destroy(attr: addr) -> i32
 extern fn pthread_create(out: addr, attr: addr, entry: addr, arg: addr) -> i32
 extern fn pthread_join(t: addr, out: addr) -> i32
-extern fn pthread_setname_np(name: addr) -> i32
 extern fn sysconf(name: i32) -> i64
 extern fn clock_gettime(clock: i32, ts: addr) -> i32
 
@@ -56,7 +56,6 @@ thread_local TASKS_NEXT: i64
 let WORKER_STACK = 8388608
 let PAR_MIN_ELEMS = 256
 let PAR_MIN_WORK_NS = 500000
-let SC_NPROCESSORS_ONLN = 58
 let NET_WORKERS_MAX = 256
 
 // A data job, shared by its threads: the body, the captured words, the
@@ -86,7 +85,7 @@ let T_SIZE = 48
 fn mono_ns() -> i64 {
     let ts = sys.alloc_zeroed(16)
     unsafe {
-        let _ = clock_gettime(6.as_i32(), ts)
+        let _ = clock_gettime(os.CLOCK_MONOTONIC.as_i32(), ts)
         let n = ts.load_i64() * 1000000000 + ts.offset(8).load_i64()
         sys.dealloc(ts)
         n
@@ -107,7 +106,7 @@ fn workers_for(n: i64, one: i64) -> i64 {
     if not (n >= PAR_MIN_ELEMS or much) {
         return 1
     }
-    let cores = unsafe { sysconf(SC_NPROCESSORS_ONLN.as_i32()) }
+    let cores = unsafe { sysconf(os.SC_NPROCESSORS_ONLN.as_i32()) }
     let p = if cores > 0 { cores } else { 1 }
     if p < n { p } else { n }
 }
@@ -434,7 +433,7 @@ export fn grt_net_workers_indices(n: i64) -> addr {
 fn net_entry(t: addr) -> addr {
     unsafe {
         let name = t.offset(T_NAME).load_addr()
-        let _ = pthread_setname_np(name)
+        os.name_thread(name)
         let w = t.offset(T_CODE).load_addr().call_c(Lifted, t.offset(T_ENV).load_addr(), t.offset(T_X).load_i64())
         t.offset(T_OUT).load_addr().store_i64(w)
         mem_addr(0)

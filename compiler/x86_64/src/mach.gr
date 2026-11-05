@@ -253,8 +253,16 @@ pub let X_STMXCSR = 99
 pub let X_LDMXCSR = 100
 pub let X_FNSTCW = 101
 pub let X_FLDCW = 102
+// Linux's thread-local variables (docs/self-hosting.md §6.18): the runtime's
+// are in the executable's own block, at an offset from the thread pointer
+// the linker works out (the local-exec model).
+/// `movq %fs:0, %rd`: the thread pointer, which the ABI keeps at `%fs:0`.
+pub let X_LOAD_FS0 = 103
+/// `leaq disp32(%rn), %rd`, the displacement always 32 bits: in the
+/// runtime's getter, `leaq var@tpoff(%rax), %rax` (R_X86_64_TPOFF32).
+pub let X_LEA_TPOFF = 104
 /// One past the last real instruction.
-pub let X_LAST = 103
+pub let X_LAST = 105
 /// Not an instruction: the function's return, which becomes the epilogue.
 pub let P_RETURN = 150
 /// Not an instruction: a 64-bit constant, which selection expands into the
@@ -413,6 +421,8 @@ pub fn form_name(m: i64) -> str {
         100 -> "ldmxcsr"
         101 -> "fnstcw"
         102 -> "fldcw"
+        103 -> "load-fs0"
+        104 -> "lea-tpoff"
         150 -> "<return>"
         151 -> "<movimm>"
         152 -> "<sdivrem>"
@@ -547,6 +557,8 @@ fn mnem(m: i64) -> str {
         100 -> "ldmxcsr"
         101 -> "fnstcw"
         102 -> "fldcw"
+        103 -> "movq"
+        104 -> "leaq"
         _ -> "?"
     }
 }
@@ -596,6 +608,8 @@ pub fn role_d(m: i64) -> i64 {
         ROLE_DEF
     } else if (m >= X_LEA_RIP and m <= X_LOAD_TLV) or m == X_POP or m == X_MOVAPS or m == X_SQRTSD or m == X_ROUNDSD {
         ROLE_DEF
+    } else if m == X_LOAD_FS0 or m == X_LEA_TPOFF {
+        ROLE_DEF
     } else if (m >= X_CVTSI2SD and m <= X_MOVQ_FROMX) or m == X_BSR {
         ROLE_DEF
     } else {
@@ -608,7 +622,7 @@ pub fn role_n(m: i64) -> i64 {
         ROLE_USEDEF
     } else if m == X_CMP or m == X_TEST or m == X_CMPI or m == X_IMULI or m == X_CQO or m == X_UCOMISD {
         ROLE_USE
-    } else if is_mem(m) or m == X_CALLR or m == X_PUSH {
+    } else if is_mem(m) or m == X_CALLR or m == X_PUSH or m == X_LEA_TPOFF {
         ROLE_USE
     } else {
         ROLE_NONE
@@ -731,6 +745,9 @@ pub let REL_SIGNED = 1
 pub let REL_BRANCH = 2
 pub let REL_GOT_LOAD = 3
 pub let REL_TLV = 9
+/// A thread-local variable's offset from the thread pointer, in an ELF
+/// object (`compiler/macho`'s `R_X64_TPOFF32`; docs/self-hosting.md §6.18).
+pub let REL_TPOFF = 12
 
 /// The relocation type the 32-bit field at the end of form `m` takes when it
 /// names a symbol, or `REL_NONE`.
@@ -743,6 +760,8 @@ pub fn reloc_kind(m: i64) -> i64 {
         REL_GOT_LOAD
     } else if m == X_LOAD_TLV {
         REL_TLV
+    } else if m == X_LEA_TPOFF {
+        REL_TPOFF
     } else {
         REL_NONE
     }
@@ -1164,6 +1183,36 @@ pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, c
     if m == X_RET {
         return [195]
     }
+    if m == X_LOAD_FS0 {
+        // %fs, REX.W, 8B, ModRM mode 0 with rm 100, SIB with no base and no
+        // index: an absolute 32-bit address, 0, in the segment.
+        let d = try reg_field(m, 0, rd)
+        var b: [i64] = [100]
+        rex(b, true, d, 0, 0, false)
+        b.push(139)
+        b.push(d.bit_and(7).shl(3) + 4)
+        b.push(37)
+        put32(b, 0)
+        return b
+    }
+    if m == X_LEA_TPOFF {
+        // REX.W, 8D, ModRM mode 2: a 32-bit displacement whatever its value,
+        // so the linker has a field to write; a SIB byte for rsp and r12.
+        let d = try reg_field(m, 0, rd)
+        let base = try reg_field(m, 1, rn)
+        if not fits32(imm) {
+            fail("{form_name(m)}: displacement {imm} does not fit in 32 bits")
+        }
+        var b: [i64] = []
+        rex(b, true, d, 0, base, false)
+        b.push(141)
+        b.push(128 + d.bit_and(7).shl(3) + base.bit_and(7))
+        if base.bit_and(7) == 4 {
+            b.push(36)
+        }
+        put32(b, imm)
+        return b
+    }
     if m == X_UD2 {
         return [15, 11]
     }
@@ -1470,6 +1519,12 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
     }
     if m >= X_STMXCSR and m <= X_FLDCW {
         return "{name} {mem_text(rn, imm)}"
+    }
+    if m == X_LOAD_FS0 {
+        return "{name} %fs:0, {d}"
+    }
+    if m == X_LEA_TPOFF {
+        return if target != "" { "{name} {target}@TPOFF({n}), {d}" } else { "{name} {imm}({n}), {d}" }
     }
     if m == P_RETURN {
         return "<return>"

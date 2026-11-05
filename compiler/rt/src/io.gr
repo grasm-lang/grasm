@@ -21,6 +21,7 @@
 // calls the C library's `exit`. A write that fails drops what it was
 // writing, as the Rust runtime's does, and nothing reports it.
 import sys
+import os
 
 extern fn write(fd: i32, p: addr, n: i64) -> i64
 extern fn dlsym(handle: addr, name: addr) -> addr
@@ -33,7 +34,6 @@ extern fn sched_yield() -> i32
 type CExit = fn(i32)
 
 /// `RTLD_DEFAULT`: every image the process has loaded.
-let RTLD_DEFAULT = -2
 
 /// The size of each stream's buffer: what `std` gives a `BufWriter`.
 pub let BUF = 8192
@@ -272,7 +272,7 @@ pub fn leave(code: i64) {
             err_flush_held()
             err_unlock()
         }
-        let c_exit = dlsym(mem_addr(RTLD_DEFAULT), mem_static("exit"))
+        let c_exit = dlsym(mem_addr(os.RTLD_DEFAULT), mem_static("exit"))
         c_exit.call_c(CExit, code.as_i32())
     }
 }

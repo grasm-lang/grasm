@@ -350,7 +350,7 @@ fn target_is_x64(t: str) -> bool {
 
 /// The program's object, by compiler/s3 as a stage's `s3` makes it.
 fn compile(tir: str, path: str, lib: bool, x64: bool) -> bytes {
-    let (st, bytes) = s3.compile_program(tir.to_bytes(), lib, x64)
+    let (st, bytes) = s3.compile_program(tir.to_bytes(), lib, x64, false)
     if st != 0 {
         eprint("error: the Grasm backend does not compile `{path}` (s3 exit status {st})")
         exit(1)

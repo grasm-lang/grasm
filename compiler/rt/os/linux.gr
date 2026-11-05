@@ -1,0 +1,61 @@
+// `compiler/rt/src/os.gr` for Linux with glibc, on arm64 and x86-64 alike
+// (docs/self-hosting.md §6.18): the Linux runtime is the package with this
+// file in that one's place. Each value is what the Rust runtime uses on
+// Linux (`crates/grasm_sys`, its `cfg(not(target_os = "macos"))` branches),
+// and `elfrtlayout` holds each to glibc's headers.
+
+/// `EAGAIN`, `EILSEQ`: the error numbers that differ.
+pub let EAGAIN = 11
+pub let EILSEQ = 84
+
+/// `open`'s flags that differ.
+pub let O_APPEND = 1024
+pub let O_CREAT = 64
+pub let O_TRUNC = 512
+pub let O_NONBLOCK = 2048
+
+/// `clock_gettime`'s monotonic clock.
+pub let CLOCK_MONOTONIC = 1
+
+/// `sysconf`'s name for the processors online.
+pub let SC_NPROCESSORS_ONLN = 84
+
+/// `mmap`'s flags for private anonymous memory: MAP_PRIVATE | MAP_ANONYMOUS.
+pub let MAP_PRIVATE_ANON = 34
+
+/// `dlsym`'s handle for every object the process has loaded.
+pub let RTLD_DEFAULT = 0
+
+/// Where a `struct dirent`'s name starts.
+pub let DIRENT_NAME = 19
+
+/// Sockets: the option level, the option, the IPv6 family.
+pub let SOL_SOCKET = 1
+pub let SO_REUSEADDR = 2
+pub let AF_INET6 = 10
+/// Where a `sockaddr`'s family is read, as a byte: the low byte of its
+/// 16-bit family, which is every family's whole value here.
+pub let SA_FAMILY = 0
+/// Where an `addrinfo` keeps its address (before `ai_canonname` here).
+pub let AI_ADDR = 24
+
+extern fn pthread_self() -> addr
+extern fn pthread_setname_np(t: addr, name: addr) -> i32
+
+/// There is no `kqueue`: `net_wait` waits through `poll`, as the Rust
+/// runtime does on Linux.
+pub fn kq_new() -> i64 {
+    -1
+}
+
+/// Never reached: `kq_new` makes no queue.
+pub fn kq_event(kq: i64, changes: addr, nchanges: i64, events: addr, nevents: i64, timeout: addr) -> i64 {
+    -1
+}
+
+/// Names the calling thread.
+pub fn name_thread(name: addr) {
+    unsafe {
+        let _ = pthread_setname_np(pthread_self(), name)
+    }
+}

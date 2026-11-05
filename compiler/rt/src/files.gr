@@ -7,6 +7,7 @@
 // and nothing touched; under `GRASM_RECORD` the answer written down.
 import layout
 import sys
+import os
 import strread
 import bytes
 import display
@@ -28,7 +29,6 @@ extern fn memcmp(a: addr, b: addr, n: i64) -> i32
 
 /// Where a `struct dirent`'s name starts on arm64 macOS: after the inode,
 /// the seek offset, the record and name lengths and the type.
-let DIRENT_NAME = 21
 
 /// The bytes a `bytes` value holds, their count in `n`; none for anything
 /// else (the Rust runtime's `as_bytes`).
@@ -61,7 +61,7 @@ fn read_all(p: addr, n: i64, inout len: i64, inout cap: i64) -> addr {
 /// Creates (or empties) the file at the path of `n` bytes at `p` and writes
 /// the `dn` bytes at `d` into it: 0, or the error number.
 fn write_whole(p: addr, n: i64, d: addr, dn: i64) -> i64 {
-    let fd = fsys.open_path(p, n, fsys.O_WRONLY + fsys.O_CREAT + fsys.O_TRUNC, 438)
+    let fd = fsys.open_path(p, n, fsys.O_WRONLY + os.O_CREAT + os.O_TRUNC, 438)
     if fd < 0 {
         return 0 - fd
     }
@@ -90,7 +90,7 @@ fn read_file_now(path: addr) -> addr {
         if cap > 0 {
             sys.dealloc(buf)
         }
-        return sysv.failed_os(sysv.EILSEQ)
+        return sysv.failed_os(os.EILSEQ)
     }
     let s = sysv.text(buf, len)
     if cap > 0 {
@@ -191,7 +191,7 @@ export fn grt_write_bytes(path: addr, data: addr) -> addr {
 fn append_bytes_now(path: addr, data: addr) -> addr {
     var n = 0
     let p = sysv.text_arg(path, n)
-    let fd = fsys.open_path(p, n, fsys.O_WRONLY + fsys.O_APPEND + fsys.O_CREAT, 438)
+    let fd = fsys.open_path(p, n, fsys.O_WRONLY + os.O_APPEND + os.O_CREAT, 438)
     if fd < 0 {
         return sysv.failed_os(0 - fd)
     }
@@ -332,7 +332,7 @@ export fn grt_file_size(path: addr) -> addr {
 fn sync_file_now(path: addr) -> addr {
     var n = 0
     let p = sysv.text_arg(path, n)
-    let fd = fsys.open_path(p, n, fsys.O_WRONLY + fsys.O_APPEND, 438)
+    let fd = fsys.open_path(p, n, fsys.O_WRONLY + os.O_APPEND, 438)
     if fd < 0 {
         return sysv.path_err(0 - fd, p, n)
     }
@@ -581,7 +581,7 @@ fn list_dir_now(path: addr) -> addr {
         if sysv.null(ent) {
             break
         }
-        let at = unsafe { ent.offset(DIRENT_NAME) }
+        let at = unsafe { ent.offset(os.DIRENT_NAME) }
         let len = unsafe { strlen(at) }
         let dot = unsafe { len == 1 and at.load_u8().as_i64() == 46 }
         let dotdot = unsafe { len == 2 and at.load_u8().as_i64() == 46 and at.offset(1).load_u8().as_i64() == 46 }

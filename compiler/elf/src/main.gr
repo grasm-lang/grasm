@@ -1,0 +1,849 @@
+// `elf`: a relocatable ELF64 object for arm64 or x86-64 Linux
+// (docs/self-hosting.md §6.18, stage S7), from the description of an object
+// the backend fills in (`MoObj`, `compiler/macho`), which `compiler/macho`
+// writes as Mach-O. What GNU ld needs from a compiler, laid out as clang lays
+// out its own objects under `-ffunction-sections -fdata-sections`:
+//
+//     ELF header              ET_REL, EM_AARCH64 or EM_X86_64
+//     .text.<f>               a section per function, so `--gc-sections`
+//     .rela.text.<f>          removes what Mach-O's dead-stripping removes;
+//                             its relocations, with explicit addends
+//     .rodata.str1.1          C strings, merged by the linker
+//     .rodata.<d>             a section per other constant
+//     .data.<d>, .rela.data.<d>  what the runtime writes into (a struct
+//                             descriptor's cache), with its pointers
+//     .bss.<d>                the runtime's process cells
+//     .tbss.<d>               its thread-local variables (no descriptors:
+//                             ELF needs none)
+//     .debug_abbrev, .debug_info, .debug_ranges, .debug_str, .debug_line
+//                             the line table (`compiler/macho/src/dwarf.gr`,
+//                             `sections_elf`), every address and every
+//                             offset between debug sections relocated
+//     .note.GNU-stack         empty: the stack is not executable
+//     .symtab, .strtab, .shstrtab
+//
+// Names lose Mach-O's leading underscore (`_main` is `main`); the backend's
+// local labels (`l_.str.3`) keep theirs. Symbols: the null one, the debug
+// sections' section symbols, the locals in the order the object lists them,
+// then the defined globals and the undefined ones, each by name.
+//
+// Relocations, by the kind the backend asks for:
+//
+//     arm64                                 x86-64
+//     BRANCH26  CALL26 (bl), JUMP26 (b)     BRANCH    PLT32, -4
+//     PAGE21    ADR_PREL_PG_HI21            SIGNED    PC32, -4
+//     PAGEOFF12 ADD_ABS_LO12_NC (add),      GOT_LOAD  REX_GOTPCRELX, -4
+//               LDST{8,16,32,64,128}_ABS_LO12_NC (a load or store)
+//     GOT_PAGE21 / _PAGEOFF12  ADR_GOT_PAGE / LD64_GOT_LO12_NC
+//     TPREL_HI12 / _LO12  TLSLE_ADD_TPREL_HI12 / _LO12_NC   TPOFF32
+//     data      ABS64                       R_X86_64_64
+//     DWARF     ABS64, ABS32                R_X86_64_64, R_X86_64_32
+//
+// Mach-O's thread-local descriptor relocations (TLVP, TLV) have no meaning
+// here and are refused. Nothing depends on time or hash order: two
+// compilations of the same TIR in the same directory are the same bytes.
+import macho
+import macho.dwarf
+
+let SHT_PROGBITS = 1
+let SHT_SYMTAB = 2
+let SHT_STRTAB = 3
+let SHT_RELA = 4
+let SHT_NOBITS = 8
+
+let SHF_WRITE = 1
+let SHF_ALLOC = 2
+let SHF_EXECINSTR = 4
+let SHF_MERGE = 16
+let SHF_STRINGS = 32
+let SHF_INFO_LINK = 64
+let SHF_TLS = 1024
+
+let STB_LOCAL = 0
+let STB_GLOBAL = 1
+let STT_NOTYPE = 0
+let STT_OBJECT = 1
+let STT_FUNC = 2
+let STT_SECTION = 3
+let STT_TLS = 6
+
+// arm64's relocation types (ELF for the Arm 64-bit Architecture, §5.7).
+pub let R_AARCH64_ABS64 = 257
+pub let R_AARCH64_ABS32 = 258
+pub let R_AARCH64_ADR_PREL_PG_HI21 = 275
+pub let R_AARCH64_ADD_ABS_LO12_NC = 277
+pub let R_AARCH64_LDST8_ABS_LO12_NC = 278
+pub let R_AARCH64_JUMP26 = 282
+pub let R_AARCH64_CALL26 = 283
+pub let R_AARCH64_LDST16_ABS_LO12_NC = 284
+pub let R_AARCH64_LDST32_ABS_LO12_NC = 285
+pub let R_AARCH64_LDST64_ABS_LO12_NC = 286
+pub let R_AARCH64_LDST128_ABS_LO12_NC = 299
+pub let R_AARCH64_ADR_GOT_PAGE = 311
+pub let R_AARCH64_LD64_GOT_LO12_NC = 312
+pub let R_AARCH64_TLSLE_ADD_TPREL_HI12 = 549
+pub let R_AARCH64_TLSLE_ADD_TPREL_LO12_NC = 551
+
+// x86-64's (System V AMD64 ABI, §4.4).
+pub let R_X86_64_64 = 1
+pub let R_X86_64_PC32 = 2
+pub let R_X86_64_PLT32 = 4
+pub let R_X86_64_GOTPCREL = 9
+pub let R_X86_64_32 = 10
+pub let R_X86_64_TPOFF32 = 23
+pub let R_X86_64_REX_GOTPCRELX = 42
+
+// x86-64's kinds as the backend names them (`compiler/x86_64/src/mach.gr`).
+let X_SIGNED = 1
+let X_BRANCH = 2
+let X_GOT_LOAD = 3
+
+// ----- bytes ----------------------------------------------------------------------
+
+fn put8(inout b: ByteBuilder, v: i64) {
+    b.push_byte(v.bit_and(255))
+}
+
+fn put16(inout b: ByteBuilder, v: i64) {
+    put8(b, v)
+    put8(b, v.ushr(8))
+}
+
+fn put32(inout b: ByteBuilder, v: i64) {
+    put16(b, v)
+    put16(b, v.ushr(16))
+}
+
+fn put64(inout b: ByteBuilder, v: i64) {
+    put32(b, v)
+    put32(b, v.ushr(32))
+}
+
+fn align_up(x: i64, a: i64) -> i64 {
+    (x + a - 1) / a * a
+}
+
+fn has_nul(bs: bytes) -> bool {
+    for k in 0..bs.len() {
+        if bs.at(k) == 0 {
+            return true
+        }
+    }
+    false
+}
+
+/// A symbol's ELF name: Mach-O's leading underscore dropped.
+pub fn elf_name(s: str) -> str {
+    if s.starts_with("_") {
+        s.substr(1, s.len() - 1)
+    } else {
+        s
+    }
+}
+
+// ----- sections ---------------------------------------------------------------------
+
+/// The sections, in the order they are written, by parallel lists.
+type Sects = {
+    name: [str],
+    typ: [i64],
+    flags: [i64],
+    align: [i64],
+    entsize: [i64],
+    link: [i64],
+    info: [i64],
+    /// The contents, or, for SHT_NOBITS, empty with the size in `nobits`.
+    data: [bytes],
+    nobits: [i64],
+}
+
+fn add_sect(inout s: Sects, name: str, typ: i64, flags: i64, align: i64, data: bytes) -> i64 {
+    s.name.push(name)
+    s.typ.push(typ)
+    s.flags.push(flags)
+    s.align.push(align)
+    s.entsize.push(if typ == SHT_RELA { 24 } else if typ == SHT_SYMTAB { 24 } else { 0 })
+    s.link.push(0)
+    s.info.push(0)
+    s.data.push(data)
+    s.nobits.push(0)
+    s.name.len()
+}
+
+/// Relocations being collected for one section: offset, symbol index,
+/// type, addend.
+type Relas = {
+    off: [i64],
+    sym: [i64],
+    typ: [i64],
+    add: [i64],
+}
+
+fn new_relas() -> Relas {
+    Relas{ off: [], sym: [], typ: [], add: [] }
+}
+
+fn rela_bytes(r: Relas) -> bytes {
+    var b = byte_builder()
+    for k in 0..r.off.len() {
+        put64(b, r.off[k])
+        put64(b, r.sym[k].shl(32).bit_or(r.typ[k]))
+        put64(b, r.add[k])
+    }
+    b.to_bytes()
+}
+
+fn empty() -> bytes {
+    byte_builder().to_bytes()
+}
+
+/// The ELF relocation type for arm64 kind `kind` at instruction `w`.
+fn a64_type(kind: i64, w: i64) -> i64 ! str {
+    if kind == macho.R_BRANCH26 {
+        if w.bit_and(0xFC000000) == 0x94000000 {
+            return R_AARCH64_CALL26
+        }
+        if w.bit_and(0xFC000000) == 0x14000000 {
+            return R_AARCH64_JUMP26
+        }
+        fail("a branch relocation on 0x{w.to_base(16)}, which is neither `bl` nor `b`")
+    }
+    if kind == macho.R_PAGE21 {
+        return R_AARCH64_ADR_PREL_PG_HI21
+    }
+    if kind == macho.R_PAGEOFF12 {
+        // ADD (immediate), 32- or 64-bit, unshifted.
+        if w.bit_and(0x7FC00000) == 0x11000000 {
+            return R_AARCH64_ADD_ABS_LO12_NC
+        }
+        // A load or store with an unsigned offset: the size in bits 30-31,
+        // and for a SIMD&FP register (bit 26) a 128-bit one when opc's high
+        // bit (23) is set with size 0.
+        if w.bit_and(0x3B000000) == 0x39000000 {
+            let size = w.ushr(30).bit_and(3)
+            let simd = w.ushr(26).bit_and(1) == 1
+            if simd and size == 0 and w.ushr(23).bit_and(1) == 1 {
+                return R_AARCH64_LDST128_ABS_LO12_NC
+            }
+            if size == 0 {
+                return R_AARCH64_LDST8_ABS_LO12_NC
+            }
+            if size == 1 {
+                return R_AARCH64_LDST16_ABS_LO12_NC
+            }
+            if size == 2 {
+                return R_AARCH64_LDST32_ABS_LO12_NC
+            }
+            return R_AARCH64_LDST64_ABS_LO12_NC
+        }
+        fail("a page-offset relocation on 0x{w.to_base(16)}, which is neither an `add` nor a load or store")
+    }
+    if kind == macho.R_GOT_PAGE21 {
+        return R_AARCH64_ADR_GOT_PAGE
+    }
+    if kind == macho.R_GOT_PAGEOFF12 {
+        return R_AARCH64_LD64_GOT_LO12_NC
+    }
+    if kind == macho.R_TPREL_HI12 {
+        return R_AARCH64_TLSLE_ADD_TPREL_HI12
+    }
+    if kind == macho.R_TPREL_LO12 {
+        return R_AARCH64_TLSLE_ADD_TPREL_LO12_NC
+    }
+    fail("relocation kind {kind} has no arm64 ELF type")
+}
+
+/// The ELF relocation type and addend for x86-64 kind `kind` whose 4-byte
+/// field starts at `off` in `code`.
+fn x64_type(kind: i64, code: [i64], off: i64) -> (i64, i64) ! str {
+    if kind == X_SIGNED {
+        return (R_X86_64_PC32, -4)
+    }
+    if kind == X_BRANCH {
+        return (R_X86_64_PLT32, -4)
+    }
+    if kind == X_GOT_LOAD {
+        // `movq sym@GOTPCREL(%rip), %r`: REX.W, 0x8b, the ModRM byte.
+        if off >= 3 and code[off - 3].bit_and(0xF8) == 0x48 and code[off - 2] == 0x8B {
+            return (R_X86_64_REX_GOTPCRELX, -4)
+        }
+        return (R_X86_64_GOTPCREL, -4)
+    }
+    if kind == macho.R_X64_TPOFF32 {
+        return (R_X86_64_TPOFF32, 0)
+    }
+    fail("x86-64 relocation kind {kind} has no ELF type")
+}
+
+/// The function `off` (a byte offset in the code) falls in: the last whose
+/// start is at or before it.
+fn fn_at(foff: [i64], off: i64) -> i64 {
+    var lo = 0
+    var hi = foff.len() - 1
+    if hi < 0 or off < foff[0] {
+        return -1
+    }
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if foff[mid] <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo
+}
+
+// ----- the object ---------------------------------------------------------------------
+
+/// The object file's bytes.
+pub fn write(o: MoObj) -> bytes ! str {
+    let x64 = o.x64
+    let nf = o.fsym.len()
+    let text_size = if x64 { o.code.len() } else { 4 * o.text.len() }
+    var fsize: [i64] = []
+    for k in 0..nf {
+        if k > 0 and o.foff[k] < o.foff[k - 1] {
+            fail("functions out of order at `{o.fsym[k]}`")
+        }
+        let end = if k + 1 < nf { o.foff[k + 1] } else { text_size }
+        fsize.push(end - o.foff[k])
+    }
+    if nf > 0 and o.foff[0] != 0 {
+        fail("the first function starts at {o.foff[0]}, not 0")
+    }
+    for k in 0..o.tsym.len() {
+        if o.tsym[k].len() == 0 {
+            fail("a thread-local variable with no name")
+        }
+    }
+
+    // Data: C strings into one merged section, the rest a section each.
+    var cstr_ix: [i64] = []
+    var const_ix: [i64] = []
+    for k in 0..o.dsym.len() {
+        if has_nul(o.dbytes[k]) {
+            const_ix.push(k)
+        } else {
+            cstr_ix.push(k)
+        }
+    }
+    var wsym_off: [i64] = []
+    var data_size = 0
+    for k in 0..o.wsym.len() {
+        wsym_off.push(data_size)
+        data_size += align_up(o.wbytes[k].len(), 8)
+    }
+
+    // Section numbers. Each function's section, then its relocations' if it
+    // has any; then the data's; then the debug sections; then the note and
+    // the three tables.
+    // Each function's relocations are a run of `rk`, the relocations by
+    // offset: from `rs[k]` up to `rs[k + 1]`.
+    var keys: [i64] = []
+    for k in 0..o.rel_off.len() {
+        keys.push(o.rel_off[k] * 16777216 + k)
+    }
+    if o.rel_off.len() >= 16777216 {
+        fail("too many relocations ({o.rel_off.len()})")
+    }
+    keys.sort()
+    var rk: [i64] = []
+    var rs: [i64] = []
+    for key in keys {
+        let k = key.bit_and(16777215)
+        let f = fn_at(o.foff, o.rel_off[k])
+        if f < 0 {
+            fail("a relocation at {o.rel_off[k]} is in no function")
+        }
+        while rs.len() <= f {
+            rs.push(rk.len())
+        }
+        rk.push(k)
+    }
+    while rs.len() <= nf {
+        rs.push(rk.len())
+    }
+    var dkeys: [i64] = []
+    for k in 0..o.wrel_off.len() {
+        if o.wrel_off[k] % 8 != 0 or o.wrel_off[k] + 8 > data_size {
+            fail("data relocation at {o.wrel_off[k]} is not an aligned word of the data")
+        }
+        dkeys.push(o.wrel_off[k] * 16777216 + k)
+    }
+    dkeys.sort()
+    var dk: [i64] = []
+    var ds: [i64] = []
+    var w = 0
+    for key in dkeys {
+        let k = key.bit_and(16777215)
+        while w + 1 < o.wsym.len() and wsym_off[w + 1] <= o.wrel_off[k] {
+            w += 1
+        }
+        while ds.len() <= w {
+            ds.push(dk.len())
+        }
+        dk.push(k)
+    }
+    while ds.len() <= o.wsym.len() {
+        ds.push(dk.len())
+    }
+
+    var nsect = 1
+    var fsect: [i64] = []
+    var frela: [i64] = []
+    for k in 0..nf {
+        fsect.push(nsect)
+        nsect += 1
+        if rs[k + 1] > rs[k] {
+            frela.push(nsect)
+            nsect += 1
+        } else {
+            frela.push(0)
+        }
+    }
+    var cstr_sect = 0
+    if cstr_ix.len() > 0 {
+        cstr_sect = nsect
+        nsect += 1
+    }
+    var dsect: [i64] = []
+    var daddr: [i64] = []
+    for k in 0..o.dsym.len() {
+        dsect.push(0)
+        daddr.push(0)
+    }
+    var at = 0
+    for k in cstr_ix {
+        dsect[k] = cstr_sect
+        daddr[k] = at
+        at += o.dbytes[k].len() + 1
+    }
+    for k in const_ix {
+        dsect[k] = nsect
+        nsect += 1
+    }
+    var wsect: [i64] = []
+    var wrela: [i64] = []
+    for k in 0..o.wsym.len() {
+        wsect.push(nsect)
+        nsect += 1
+        if ds[k + 1] > ds[k] {
+            wrela.push(nsect)
+            nsect += 1
+        } else {
+            wrela.push(0)
+        }
+    }
+    var zsect: [i64] = []
+    for k in 0..o.zsym.len() {
+        zsect.push(nsect)
+        nsect += 1
+    }
+    var tsect: [i64] = []
+    for k in 0..o.tsym.len() {
+        tsect.push(nsect)
+        nsect += 1
+    }
+    var dw_sect = [0, 0, 0, 0, 0]
+    var dw_rela = [0, 0, 0, 0, 0]
+    var dw = dwarf.sections_elf(macho.new_unit(), [], 0)
+    if o.debug {
+        dw = dwarf.sections_elf(o.dw, o.foff, text_size)
+        // abbrev, info + its relocations, ranges + its, str, line + its.
+        dw_sect[dwarf.DWS_ABBREV] = nsect
+        dw_sect[dwarf.DWS_INFO] = nsect + 1
+        dw_rela[dwarf.DWS_INFO] = nsect + 2
+        dw_sect[dwarf.DWS_RANGES] = nsect + 3
+        dw_rela[dwarf.DWS_RANGES] = nsect + 4
+        dw_sect[dwarf.DWS_STR] = nsect + 5
+        dw_sect[dwarf.DWS_LINE] = nsect + 6
+        dw_rela[dwarf.DWS_LINE] = nsect + 7
+        nsect += 8
+    }
+    let note_sect = nsect
+    let symtab_sect = nsect + 1
+    let strtab_sect = nsect + 2
+    let shstrtab_sect = nsect + 3
+    nsect += 4
+    if nsect >= 0xFF00 {
+        fail("{nsect} sections: more than an ELF header counts without extended numbering")
+    }
+
+    // Symbols.
+    var sname: [str] = []
+    var sinfo: [i64] = []
+    var sshndx: [i64] = []
+    var svalue: [i64] = []
+    var ssize: [i64] = []
+    var defined: Map[str, i64] = {}
+    sname.push("")
+    sinfo.push(0)
+    sshndx.push(0)
+    svalue.push(0)
+    ssize.push(0)
+    var dw_sym = [0, 0, 0, 0, 0]
+    if o.debug {
+        for s in [dwarf.DWS_ABBREV, dwarf.DWS_RANGES, dwarf.DWS_STR, dwarf.DWS_LINE] {
+            dw_sym[s] = sname.len()
+            sname.push("")
+            sinfo.push(STB_LOCAL.shl(4).bit_or(STT_SECTION))
+            sshndx.push(dw_sect[s])
+            svalue.push(0)
+            ssize.push(0)
+        }
+    }
+    var fsymx: [i64] = []
+    for k in 0..nf {
+        fsymx.push(0)
+    }
+    for k in 0..nf {
+        if not o.fext[k] {
+            fsymx[k] = sname.len()
+            defined.set(o.fsym[k], sname.len())
+            sname.push(elf_name(o.fsym[k]))
+            sinfo.push(STB_LOCAL.shl(4).bit_or(STT_FUNC))
+            sshndx.push(fsect[k])
+            svalue.push(0)
+            ssize.push(fsize[k])
+        }
+    }
+    for k in cstr_ix {
+        defined.set(o.dsym[k], sname.len())
+        sname.push(elf_name(o.dsym[k]))
+        sinfo.push(STB_LOCAL.shl(4).bit_or(STT_OBJECT))
+        sshndx.push(cstr_sect)
+        svalue.push(daddr[k])
+        ssize.push(o.dbytes[k].len() + 1)
+    }
+    for k in const_ix {
+        defined.set(o.dsym[k], sname.len())
+        sname.push(elf_name(o.dsym[k]))
+        sinfo.push(STB_LOCAL.shl(4).bit_or(STT_OBJECT))
+        sshndx.push(dsect[k])
+        svalue.push(0)
+        ssize.push(o.dbytes[k].len())
+    }
+    for k in 0..o.wsym.len() {
+        defined.set(o.wsym[k], sname.len())
+        sname.push(elf_name(o.wsym[k]))
+        sinfo.push(STB_LOCAL.shl(4).bit_or(STT_OBJECT))
+        sshndx.push(wsect[k])
+        svalue.push(0)
+        ssize.push(align_up(o.wbytes[k].len(), 8))
+    }
+    for k in 0..o.zsym.len() {
+        defined.set(o.zsym[k], sname.len())
+        sname.push(elf_name(o.zsym[k]))
+        sinfo.push(STB_LOCAL.shl(4).bit_or(STT_OBJECT))
+        sshndx.push(zsect[k])
+        svalue.push(0)
+        ssize.push(align_up(o.zsize[k], 8))
+    }
+    for k in 0..o.tsym.len() {
+        defined.set(o.tsym[k], sname.len())
+        sname.push(elf_name(o.tsym[k]))
+        sinfo.push(STB_LOCAL.shl(4).bit_or(STT_TLS))
+        sshndx.push(tsect[k])
+        svalue.push(0)
+        ssize.push(align_up(o.tsize[k], 8))
+    }
+    let first_global = sname.len()
+    // The defined globals by name, then the undefined ones by name.
+    var gkeys: [str] = []
+    var gidx: Map[str, i64] = {}
+    for k in 0..nf {
+        if o.fext[k] {
+            let n = elf_name(o.fsym[k])
+            if gidx.has(n) {
+                fail("two global functions are named `{n}`")
+            }
+            gidx.set(n, k)
+            gkeys.push(n)
+        }
+    }
+    gkeys.sort()
+    for n in gkeys {
+        let k = gidx.get(n) ?? 0
+        fsymx[k] = sname.len()
+        defined.set(o.fsym[k], sname.len())
+        sname.push(n)
+        sinfo.push(STB_GLOBAL.shl(4).bit_or(STT_FUNC))
+        sshndx.push(fsect[k])
+        svalue.push(0)
+        ssize.push(fsize[k])
+    }
+    var undef: [str] = []
+    var umach: Map[str, str] = {}
+    for s in o.rel_sym {
+        if not defined.has(s) and not umach.has(elf_name(s)) {
+            umach.set(elf_name(s), s)
+            undef.push(elf_name(s))
+        }
+    }
+    for s in o.wrel_sym {
+        if not defined.has(s) and not umach.has(elf_name(s)) {
+            umach.set(elf_name(s), s)
+            undef.push(elf_name(s))
+        }
+    }
+    undef.sort()
+    for n in undef {
+        defined.set(umach.get(n) ?? n, sname.len())
+        sname.push(n)
+        sinfo.push(STB_GLOBAL.shl(4).bit_or(STT_NOTYPE))
+        sshndx.push(0)
+        svalue.push(0)
+        ssize.push(0)
+    }
+
+    // The sections' contents.
+    var s = Sects{ name: [], typ: [], flags: [], align: [], entsize: [], link: [], info: [], data: [], nobits: [] }
+    for k in 0..nf {
+        var b = byte_builder()
+        if x64 {
+            for q in o.foff[k]..o.foff[k] + fsize[k] {
+                put8(b, o.code[q])
+            }
+        } else {
+            for q in o.foff[k] / 4..(o.foff[k] + fsize[k]) / 4 {
+                put32(b, o.text[q])
+            }
+        }
+        let tn = ".text." + elf_name(o.fsym[k])
+        let ix = add_sect(s, tn, SHT_PROGBITS, SHF_ALLOC + SHF_EXECINSTR, if x64 { 16 } else { 4 }, b.to_bytes())
+        if ix != fsect[k] {
+            fail("section numbering: `{tn}` is {ix}, not {fsect[k]}")
+        }
+        if frela[k] > 0 {
+            var r = new_relas()
+            for qi in rs[k]..rs[k + 1] {
+                let q = rk[qi]
+                let sym = defined.get(o.rel_sym[q]) ?? -1
+                if sym < 0 {
+                    fail("relocation against `{o.rel_sym[q]}`, which has no symbol")
+                }
+                let off = o.rel_off[q] - o.foff[k]
+                if x64 {
+                    let ta = try x64_type(o.rel_kind[q], o.code, o.rel_off[q])
+                    r.typ.push(ta.0)
+                    r.add.push(ta.1)
+                } else {
+                    r.typ.push(try a64_type(o.rel_kind[q], o.text[o.rel_off[q] / 4]))
+                    r.add.push(0)
+                }
+                r.off.push(off)
+                r.sym.push(sym)
+            }
+            let rx = add_sect(s, ".rela" + tn, SHT_RELA, SHF_INFO_LINK, 8, rela_bytes(r))
+            s.link[rx - 1] = symtab_sect
+            s.info[rx - 1] = fsect[k]
+        }
+    }
+    if cstr_sect > 0 {
+        var b = byte_builder()
+        for k in cstr_ix {
+            b.push_bytes(o.dbytes[k])
+            put8(b, 0)
+        }
+        let ix = add_sect(s, ".rodata.str1.1", SHT_PROGBITS, SHF_ALLOC + SHF_MERGE + SHF_STRINGS, 1, b.to_bytes())
+        s.entsize[ix - 1] = 1
+    }
+    for k in const_ix {
+        let _ = add_sect(s, ".rodata." + elf_name(o.dsym[k]), SHT_PROGBITS, SHF_ALLOC, 1, o.dbytes[k])
+    }
+    let dabs = if x64 { R_X86_64_64 } else { R_AARCH64_ABS64 }
+    for k in 0..o.wsym.len() {
+        var b = byte_builder()
+        b.push_bytes(o.wbytes[k])
+        while b.len() < align_up(o.wbytes[k].len(), 8) {
+            put8(b, 0)
+        }
+        let dn = ".data." + elf_name(o.wsym[k])
+        let _ = add_sect(s, dn, SHT_PROGBITS, SHF_ALLOC + SHF_WRITE, 8, b.to_bytes())
+        if wrela[k] > 0 {
+            var r = new_relas()
+            for qi in ds[k]..ds[k + 1] {
+                let q = dk[qi]
+                let sym = defined.get(o.wrel_sym[q]) ?? -1
+                if sym < 0 {
+                    fail("data relocation against `{o.wrel_sym[q]}`, which has no symbol")
+                }
+                r.off.push(o.wrel_off[q] - wsym_off[k])
+                r.sym.push(sym)
+                r.typ.push(dabs)
+                r.add.push(0)
+            }
+            let rx = add_sect(s, ".rela" + dn, SHT_RELA, SHF_INFO_LINK, 8, rela_bytes(r))
+            s.link[rx - 1] = symtab_sect
+            s.info[rx - 1] = wsect[k]
+        }
+    }
+    for k in 0..o.zsym.len() {
+        let ix = add_sect(s, ".bss." + elf_name(o.zsym[k]), SHT_NOBITS, SHF_ALLOC + SHF_WRITE, 8, empty())
+        s.nobits[ix - 1] = align_up(o.zsize[k], 8)
+    }
+    for k in 0..o.tsym.len() {
+        let ix = add_sect(s, ".tbss." + elf_name(o.tsym[k]), SHT_NOBITS, SHF_ALLOC + SHF_WRITE + SHF_TLS, 8, empty())
+        s.nobits[ix - 1] = align_up(o.tsize[k], 8)
+    }
+    if o.debug {
+        let d32 = if x64 { R_X86_64_32 } else { R_AARCH64_ABS32 }
+        var rels = [new_relas(), new_relas(), new_relas(), new_relas(), new_relas()]
+        for q in 0..dw.a_off.len() {
+            let f = dw.a_fn[q]
+            var r = rels[dw.a_sect[q]]
+            r.off.push(dw.a_off[q])
+            r.sym.push(fsymx[f])
+            r.typ.push(dabs)
+            r.add.push(dw.a_add[q])
+            rels[dw.a_sect[q]] = r
+        }
+        // The offsets in `.debug_info`, in the order of their places, with
+        // the addresses there.
+        var ri = rels[dwarf.DWS_INFO]
+        for q in 0..dw.o_off.len() {
+            ri.off.push(dw.o_off[q])
+            ri.sym.push(dw_sym[dw.o_sect[q]])
+            ri.typ.push(d32)
+            ri.add.push(dw.o_add[q])
+        }
+        var ord: [i64] = []
+        for q in 0..ri.off.len() {
+            ord.push(ri.off[q] * 16777216 + q)
+        }
+        ord.sort()
+        var sorted = new_relas()
+        for key in ord {
+            let q = key.bit_and(16777215)
+            sorted.off.push(ri.off[q])
+            sorted.sym.push(ri.sym[q])
+            sorted.typ.push(ri.typ[q])
+            sorted.add.push(ri.add[q])
+        }
+        rels[dwarf.DWS_INFO] = sorted
+        let _ = add_sect(s, ".debug_abbrev", SHT_PROGBITS, 0, 1, dw.abbrev)
+        let _ = add_sect(s, ".debug_info", SHT_PROGBITS, 0, 1, dw.info)
+        let r1 = add_sect(s, ".rela.debug_info", SHT_RELA, SHF_INFO_LINK, 8, rela_bytes(rels[dwarf.DWS_INFO]))
+        s.link[r1 - 1] = symtab_sect
+        s.info[r1 - 1] = dw_sect[dwarf.DWS_INFO]
+        let _ = add_sect(s, ".debug_ranges", SHT_PROGBITS, 0, 1, dw.ranges)
+        let r2 = add_sect(s, ".rela.debug_ranges", SHT_RELA, SHF_INFO_LINK, 8, rela_bytes(rels[dwarf.DWS_RANGES]))
+        s.link[r2 - 1] = symtab_sect
+        s.info[r2 - 1] = dw_sect[dwarf.DWS_RANGES]
+        let sx = add_sect(s, ".debug_str", SHT_PROGBITS, SHF_MERGE + SHF_STRINGS, 1, dw.str)
+        s.entsize[sx - 1] = 1
+        let _ = add_sect(s, ".debug_line", SHT_PROGBITS, 0, 1, dw.line)
+        let r3 = add_sect(s, ".rela.debug_line", SHT_RELA, SHF_INFO_LINK, 8, rela_bytes(rels[dwarf.DWS_LINE]))
+        s.link[r3 - 1] = symtab_sect
+        s.info[r3 - 1] = dw_sect[dwarf.DWS_LINE]
+    }
+    let nx = add_sect(s, ".note.GNU-stack", SHT_PROGBITS, 0, 1, empty())
+    if nx != note_sect {
+        fail("section numbering: `.note.GNU-stack` is {nx}, not {note_sect}")
+    }
+    // .symtab and .strtab.
+    var strtab = byte_builder()
+    put8(strtab, 0)
+    var sym = byte_builder()
+    for k in 0..sname.len() {
+        var nm = 0
+        if sname[k] != "" {
+            nm = strtab.len()
+            strtab.push_str(sname[k])
+            put8(strtab, 0)
+        }
+        put32(sym, nm)
+        put8(sym, sinfo[k])
+        put8(sym, 0)
+        put16(sym, sshndx[k])
+        put64(sym, svalue[k])
+        put64(sym, ssize[k])
+    }
+    let stx = add_sect(s, ".symtab", SHT_SYMTAB, 0, 8, sym.to_bytes())
+    s.link[stx - 1] = strtab_sect
+    s.info[stx - 1] = first_global
+    let _ = add_sect(s, ".strtab", SHT_STRTAB, 0, 1, strtab.to_bytes())
+    // .shstrtab names itself too.
+    var shstr = byte_builder()
+    put8(shstr, 0)
+    var shname: [i64] = []
+    var seen: Map[str, i64] = {}
+    let all = s.name
+    for n in all + [".shstrtab"] {
+        match seen.get(n) {
+            Some(x) -> shname.push(x)
+            None -> {
+                seen.set(n, shstr.len())
+                shname.push(shstr.len())
+                shstr.push_str(n)
+                put8(shstr, 0)
+            }
+        }
+    }
+    let shx = add_sect(s, ".shstrtab", SHT_STRTAB, 0, 1, shstr.to_bytes())
+    if shx != shstrtab_sect or shx + 1 != nsect {
+        fail("section numbering: `.shstrtab` is {shx}, not {shstrtab_sect}")
+    }
+
+    // Layout: the header, each section's contents at its alignment, then
+    // the section headers.
+    var offs: [i64] = []
+    var pos = 64
+    for k in 0..s.name.len() {
+        if s.typ[k] == SHT_NOBITS {
+            offs.push(align_up(pos, s.align[k]))
+        } else {
+            pos = align_up(pos, s.align[k])
+            offs.push(pos)
+            pos += s.data[k].len()
+        }
+    }
+    let shoff = align_up(pos, 8)
+    var b = byte_builder()
+    // e_ident: ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE.
+    for x in [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+        put8(b, x)
+    }
+    put16(b, 1)
+    put16(b, if x64 { 62 } else { 183 })
+    put32(b, 1)
+    put64(b, 0)
+    put64(b, 0)
+    put64(b, shoff)
+    put32(b, 0)
+    put16(b, 64)
+    put16(b, 0)
+    put16(b, 0)
+    put16(b, 64)
+    put16(b, nsect)
+    put16(b, shstrtab_sect)
+    for k in 0..s.name.len() {
+        if s.typ[k] != SHT_NOBITS {
+            while b.len() < offs[k] {
+                put8(b, 0)
+            }
+            b.push_bytes(s.data[k])
+        }
+    }
+    while b.len() < shoff {
+        put8(b, 0)
+    }
+    // Section 0, all zero.
+    for q in 0..64 {
+        put8(b, 0)
+    }
+    for k in 0..s.name.len() {
+        put32(b, shname[k])
+        put32(b, s.typ[k])
+        put64(b, s.flags[k])
+        put64(b, 0)
+        put64(b, offs[k])
+        put64(b, if s.typ[k] == SHT_NOBITS { s.nobits[k] } else { s.data[k].len() })
+        put32(b, s.link[k])
+        put32(b, s.info[k])
+        put64(b, s.align[k])
+        put64(b, s.entsize[k])
+    }
+    b.to_bytes()
+}

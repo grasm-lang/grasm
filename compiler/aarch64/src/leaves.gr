@@ -56,6 +56,11 @@ pub let REL_PAGEOFF12 = 4
 /// variable's descriptor, its page and its offset in it.
 pub let REL_TLVP_PAGE21 = 8
 pub let REL_TLVP_PAGEOFF12 = 9
+/// The local-exec model's offset from the thread pointer, in an ELF object
+/// (docs/self-hosting.md §6.18): its high twelve bits and its low twelve
+/// (`compiler/macho`'s `R_TPREL_HI12`, `R_TPREL_LO12`).
+pub let REL_TPREL_HI12 = 10
+pub let REL_TPREL_LO12 = 11
 
 fn new_leaf(sym: str) -> A64Leaf {
     A64Leaf{ sym: sym, words: [], rel_off: [], rel_kind: [], rel_name: [], asm: [] }
@@ -70,12 +75,17 @@ fn put(inout l: A64Leaf, m: i64, rd: i64, rn: i64, rm: i64, imm: i64) -> () ! st
 
 /// An instruction the linker completes against `name`.
 fn put_rel(inout l: A64Leaf, m: i64, rd: i64, rn: i64, kind: i64, name: str) -> () ! str {
+    try put_rel2(l, m, rd, rn, 0, kind, name)
+}
+
+/// As `put_rel`, with `imm2` (an `add`'s shift by twelve).
+fn put_rel2(inout l: A64Leaf, m: i64, rd: i64, rn: i64, imm2: i64, kind: i64, name: str) -> () ! str {
     l.rel_off.push(4 * l.words.len())
     l.rel_kind.push(kind)
     l.rel_name.push(name)
-    let w = try mach.encode(m, rd, rn, -1, -1, 0, 0, -1, 0)
+    let w = try mach.encode(m, rd, rn, -1, -1, 0, imm2, -1, 0)
     l.words.push(w)
-    l.asm.push(mach.asm_text(m, rd, rn, -1, -1, 0, 0, -1, 0, name))
+    l.asm.push(mach.asm_text(m, rd, rn, -1, -1, 0, imm2, -1, 0, name))
     ()
 }
 
@@ -171,10 +181,24 @@ fn tlv_get(cell: str) -> A64Leaf ! str {
     l
 }
 
+/// The same on Linux (docs/self-hosting.md §6.18), where the runtime is
+/// linked into the executable and its variables are in the executable's own
+/// thread-local block, at a fixed offset from the thread pointer the linker
+/// works out (the local-exec model): no call, no frame, nothing to sign.
+fn tlv_get_linux(cell: str) -> A64Leaf ! str {
+    var l = new_leaf("_" + ir.rt_tlv_getter(cell))
+    let v = ir.tlv_var_sym(cell)
+    try put(l, mach.A_MRS_TP, 0, -1, -1, 0)
+    try put_rel2(l, mach.A_ADDI, 0, 0, 1, REL_TPREL_HI12, v)
+    try put_rel2(l, mach.A_ADDI, 0, 0, 0, REL_TPREL_LO12, v)
+    try put(l, mach.A_RET, -1, -1, -1, 0)
+    l
+}
+
 /// The leaves a runtime that calls `rt_name` (a `MirProg.rt_syms` name such
 /// as `grt.ctx_switch`) needs, given its thread-local cells: none when the
 /// name is not one of them.
-pub fn leaves_for(rt_name: str, cells: [str]) -> [A64Leaf] ! str {
+pub fn leaves_for(rt_name: str, cells: [str], linux: bool) -> [A64Leaf] ! str {
     if rt_name == ir.RT_CTX_SWITCH {
         return [try switch_leaf()]
     }
@@ -183,7 +207,7 @@ pub fn leaves_for(rt_name: str, cells: [str]) -> [A64Leaf] ! str {
     }
     for c in cells {
         if rt_name == ir.rt_tlv_getter(c) {
-            return [try tlv_get(c)]
+            return [if linux { try tlv_get_linux(c) } else { try tlv_get(c) }]
         }
     }
     []
@@ -194,6 +218,6 @@ pub fn leaf_mops() -> [i64] {
     [
         mach.A_STP_OFF, mach.A_LDP_OFF, mach.A_FSTP_OFF, mach.A_FLDP_OFF, mach.A_ADDI, mach.A_STR, mach.A_LDR,
         mach.A_RET, mach.A_MOVZ, mach.A_LSRV, mach.A_LSLV, mach.A_ADRP, mach.A_ADDPO, mach.A_MOV, mach.A_BLR,
-        mach.A_BRK, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_ADRP_TLV, mach.A_LDR_TLV, mach.A_LDP_POST, mach.A_RETAB,
+        mach.A_BRK, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_ADRP_TLV, mach.A_LDR_TLV, mach.A_LDP_POST, mach.A_RETAB, mach.A_MRS_TP,
     ]
 }

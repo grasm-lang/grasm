@@ -83,7 +83,9 @@ ls -A | sort > "$LOGS/top-before.txt"
 failed=0
 ran=0
 skipped=0
+notrun=0
 declare -a FAILED=()
+declare -a NOTRUN=()
 
 # Runs one gate and reports it. `$1` is the label, the rest is the command.
 run_gate() {
@@ -106,6 +108,15 @@ run_gate() {
         echo "PASS  ${note:-ok}"
     else
         local code=$?
+        # 77 is a gate saying it could not run here -- the Linux gates when
+        # the OrbStack machine is not there (scripts/lib/linux.sh) -- which
+        # is neither a pass nor a failure, and is counted as neither.
+        if [ "$code" = 77 ]; then
+            echo "NOT RUN  $(tail -1 "$log")"
+            notrun=$((notrun + 1))
+            NOTRUN+=("$name")
+            return 0
+        fi
         echo "FAIL  (exit $code) $log"
         failed=$((failed + 1))
         FAILED+=("$name")
@@ -129,11 +140,15 @@ run_gate ra_check_x64  scripts/ra_check_x64.sh
 run_gate xrtswap       scripts/xrtswap.sh
 run_gate linkdiff_x64  scripts/linkdiff_x64.sh
 run_gate fuzz_x64      scripts/fuzz_x64.sh
+run_gate objtest_elf   scripts/objtest_elf.sh
+run_gate elfsubset     scripts/elfsubset.sh
+run_gate elfrtswap     scripts/elfrtswap.sh
 run_gate objtest       scripts/objtest.sh
 run_gate ra_check      scripts/ra_check.sh
 run_gate s3rc          scripts/s3rc.sh
 run_gate s3controls    scripts/s3controls.sh
 run_gate x64controls   scripts/x64controls.sh
+run_gate elfcontrols   scripts/elfcontrols.sh
 run_gate linktest      scripts/linktest.sh
 run_gate linkdiff      scripts/linkdiff.sh
 run_gate linkcontrols  scripts/linkcontrols.sh
@@ -424,6 +439,13 @@ if [ "$ran" -eq 0 ]; then
     # Nothing matched, which is a typo in the pattern and not a pass.
     echo "no gate matched ${ONLY[*]}, so nothing ran"
     exit 1
+fi
+if [ "$notrun" -gt 0 ]; then
+    # Never "every gate passed" while one did not run.
+    echo "$((ran - notrun)) gate(s) passed; $notrun did not run here: ${NOTRUN[*]}"
+    [ "$skipped" -gt 0 ] && echo "and $skipped skipped by ${ONLY[*]} — this is a subset"
+    echo "the whole suite is $((ran + skipped)) gates"
+    exit 0
 fi
 if [ "$skipped" -gt 0 ]; then
     echo "$ran gate(s) passed, $skipped skipped by ${ONLY[*]} — this is a subset"

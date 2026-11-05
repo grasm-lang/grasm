@@ -1,0 +1,13 @@
+[package]
+name = "elf"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# Lays out a relocatable ELF64 object in memory for arm64 or x86-64 Linux
+# (docs/self-hosting.md §6.18, stage S7), from the same description of an
+# object `compiler/macho` writes as Mach-O. Pure computation: the caller
+# writes the bytes.
+capabilities = []
+
+[dependencies.macho]
+path = "../macho"
