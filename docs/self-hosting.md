@@ -4219,8 +4219,7 @@ to the system's readers: `readelf -a -W` in the machine (binutils 2.45) and
 Mac; every relocation against the instruction it patches (a script, as
 `s3_macho.py` and `x64_macho.py` do for Mach-O); the line table's rows
 against the literals they load, as `objtest` counts them; GNU ld accepting
-every arm64 object, and every x86-64 one once an x86-64 ld exists (decision
-(2)); and each object compiled twice the same bytes. Its controls, in a new
+every arm64 object, and the cross ld every x86-64 one (decision (2)); and each object compiled twice the same bytes. Its controls, in a new
 `elfcontrols`: a relocation's addend off by four, a section's flags without
 `SHF_ALLOC`, a symbol's binding local where it must be global, the locals
 not first, an offset into `.debug_abbrev` left unrelocated, the clock in an
@@ -4392,43 +4391,43 @@ passed and the failed, and its last line says how many did not run -- never
 run"; here that is these gates, run in the machine by `allgates.sh` on the
 Mac. A hosted CI service is not part of this part, and nothing is pushed.
 
-**Decisions** (raised with this note, 2026-11-04):
+**Decisions** (raised with this note, 2026-11-04). (2) and (3) are the
+owner's, taken 2026-11-04. The others were taken by the agent implementing
+this part and accepted by the coordinating session the same day; the owner
+may reverse any of them.
 
 1. Dynamic linking against glibc, the runtime calling the C library, a
-   position-independent executable bound at load, glibc 2.34 or later --
-   taken by the agent implementing this part, measured above; the owner may
-   reverse it for static linking with no C library, which needs the Grasm
-   libm first.
-2. *Open, the owner's:* how x86-64 programs get a C library to run in the
-   machine, and an x86-64 ld for the reference and `linkdiff_elf`. Ubuntu's
-   arm64 cross packages hold both: `libc6-amd64-cross`,
-   `libc6-dev-amd64-cross`, `linux-libc-dev-amd64-cross`,
-   `libgcc-s1-amd64-cross` (the unwinder the Rust runtime's archive names)
-   and `binutils-x86-64-linux-gnu` (about 7.5 MB to download, about 40 MB
-   unpacked).
-   (a) Unpacked with `apt-get download` and `dpkg-deb -x` into the scratch
-   directory on the Mac, nothing installed in the machine, programs started
-   as `<root>/lib64/ld-linux-x86-64.so.2 --library-path <root>/lib ./prog`
-   -- the recommendation; (b) installed with apt into the machine, and
-   removed when S7 ends; (c) multiarch `libc6:amd64`, which changes the
-   machine's package sources. Until it is decided the x86-64 half stops at
-   objects held to the readers.
-3. *Open, the owner's:* the Rust runtime for `aarch64-unknown-linux-gnu`,
-   which the reference and `elfrtswap` link, needs Rust's standard library
-   for that target on the Mac (`rustup target add`, about 150 MB, as the
-   installed `x86_64-unknown-linux-gnu` takes 159 MB). Without it the arm64
-   reference is the Cranelift build linked with the Grasm runtime, and the
-   Rust runtime's comparison is x86-64's alone.
+   position-independent executable bound at load, glibc 2.34 or later,
+   measured above. Static linking with no C library needs the Grasm libm
+   first.
+2. *The owner's:* x86-64 programs get their C library, and the reference
+   and `linkdiff_elf` their x86-64 ld, from Ubuntu's arm64 cross packages
+   -- `libc6-amd64-cross`, `libc6-dev-amd64-cross`,
+   `linux-libc-dev-amd64-cross`, `libgcc-s1-amd64-cross` (the unwinder the
+   Rust runtime's archive names) and `binutils-x86-64-linux-gnu`, about
+   7.5 MB to download -- fetched with `apt-get download` and unpacked with
+   `dpkg-deb -x` into the scratch directory on the Mac. Nothing is installed
+   in the machine; an x86-64 program is started through the cross loader,
+   `<root>/lib64/ld-linux-x86-64.so.2 --library-path <root>/lib ./prog`.
+   (Installing them with apt, or multiarch `libc6:amd64`, were the other
+   ways offered.)
+3. *The owner's:* Rust's standard library for `aarch64-unknown-linux-gnu`
+   is added on the Mac (`rustup target add`, about 150 MB), so that the
+   arm64 reference and `elfrtswap` link the Rust runtime built for that
+   triple, as x86-64's do.
 4. Pointer authentication on Linux arm64 by hints (`paciasp`, `autiasp`,
-   `ret`), no branch-target identification -- the agent's, above.
+   `ret`), no branch-target identification.
 5. The runtime selects its operating system by module (`os.gr` and
-   `os/linux.gr`), not by branch -- the agent's, measured above.
+   `os/linux.gr`), not by branch, measured above.
 6. A section per function and per datum, so `--gc-sections` is
-   dead-stripping -- the agent's.
-7. The linker writes `_start`; no C start files -- the agent's.
+   dead-stripping.
+7. The linker writes `_start`; no C start files.
 8. Everything is built and linked on the Mac and run in the machine from the
    Mac's scratch directory through OrbStack's mount: nothing is written to
-   the machine's own filesystem -- the agent's, within the owner's decision.
+   the machine's own filesystem (within the owner's decision of where Linux
+   runs).
+9. A gate that needs the machine and cannot reach it exits 77, and
+   `allgates.sh` counts it as not run.
 
 ## 8. Gates this adds
 
@@ -4786,8 +4785,8 @@ Measured, not estimated; each line is a gate's result on master.
   stage 2's, the command executing nothing but itself; `clicontrols` 7 of
   7. Built by itself, its stage 3 is its stage 2 (`fixpoint`, 54 of 54), and
   its build of the compiler's programs is the stage pipeline's to the byte.
-- **S7 part two** (Linux ELF, §6.18): the design, with the owner's decision
-  of where Linux runs (OrbStack on the Mac) and two decisions open.
+- **S7 part two** (Linux ELF, §6.18): the design, with the owner's decisions
+  of where Linux runs (OrbStack on the Mac) and of its two toolchain questions.
 - **Not started:** the rest of S8, and S9.
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
