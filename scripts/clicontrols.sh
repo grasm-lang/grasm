@@ -16,6 +16,8 @@
 #                  sandbox stops the Rust `grasm` from running     a line differs
 #   backend-name   the success line says Cranelift                 a line differs
 #   wrong-target   `build --native` compiles for x86-64            a build differs
+#   linux-refused  the Linux triples refused as before §6.18        a line differs
+#   linux-macho    `--target <linux>` writes a Mach-O object        a target differs
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -154,8 +156,16 @@ control backend-name '^DIFF: grasm build examples/hello.gr --native -o h ' ONLY=
     'print("built `{out}` natively ({size} bytes, Cranelift)")'
 
 control wrong-target '^DIFF: grasm build --native examples/hello.gr ' "ONLY=build FILES=$WORK/two" "$BUILD" \
-    '    let bytes = compile(tir_of(f), path, false, false)' \
-    '    let bytes = compile(tir_of(f), path, false, true)'
+    '    let bytes = compile(tir_of(f), path, false, false, false)' \
+    '    let bytes = compile(tir_of(f), path, false, true, false)'
+
+control linux-refused '^DIFF: grasm build examples/hello.gr --native --target x86_64-unknown-linux-gnu ' ONLY=lines "$BUILD" \
+    '    if gnu and parts[0] == "x86_64" {' \
+    '    if false and gnu and parts[0] == "x86_64" {'
+
+control linux-macho '^DIFF: grasm build --native --target aarch64-unknown-linux-gnu ' "ONLY=target FILES=$WORK/two" "$BUILD" \
+    '        let bytes = compile(tir_of(f), path, false, x64, linux)' \
+    '        let bytes = compile(tir_of(f), path, false, x64, false)'
 
 echo
 echo "controls: $ran   caught: $caught   missed: $missed"
@@ -163,4 +173,4 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-[ "$ran" -ge 7 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 9 ] && [ "$caught" = "$ran" ]

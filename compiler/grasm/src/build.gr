@@ -307,9 +307,9 @@ pub fn cmd_build(a: [str]) {
         exit(1)
     }
     if target != "\0" {
-        let x64 = target_is_x64(target)
+        let (x64, linux) = target_of(target)
         let obj = if out.ends_with(".o") { out } else { out + ".o" }
-        let bytes = compile(tir_of(f), path, false, x64)
+        let bytes = compile(tir_of(f), path, false, x64, linux)
         match write_bytes(obj, bytes) {
             Ok(_) -> ()
             Err(e) -> {
@@ -320,7 +320,7 @@ pub fn cmd_build(a: [str]) {
         print("emitted `{obj}` for {target} (link it with a {target} toolchain + libgrasm_rt_abi.a)")
         return
     }
-    let bytes = compile(tir_of(f), path, false, false)
+    let bytes = compile(tir_of(f), path, false, false, false)
     let size = link_executable(bytes, out, links, f.exports)
     if size == 0 {
         eprint("error: linking produced an empty file at `{out}` — it is not an executable")
@@ -329,28 +329,38 @@ pub fn cmd_build(a: [str]) {
     print("built `{out}` natively ({size} bytes, Grasm)")
 }
 
-/// Whether `--target`'s triple is x86-64 macOS, the one cross target the
-/// Grasm backend writes (docs/self-hosting.md §6.16); arm64 macOS is this
-/// machine's. Any other is refused: the Rust command emits an object for
-/// every target Cranelift knows, ELF ones included, which this backend
-/// does not write.
-fn target_is_x64(t: str) -> bool {
+/// What `--target`'s triple names: whether x86-64, and whether Linux. The
+/// Grasm backend writes Mach-O objects for x86-64 and arm64 macOS (arm64 is
+/// this machine's; docs/self-hosting.md §6.16) and ELF objects for x86-64
+/// and arm64 Linux with glibc, `<arch>-linux-gnu` or
+/// `<arch>-unknown-linux-gnu` (§6.18). Any other is refused: the Rust
+/// command emits an object for every target Cranelift knows, which this
+/// backend does not write.
+fn target_of(t: str) -> (bool, bool) {
     let parts = t.split("-")
     let apple = parts.len() >= 3 and parts[1] == "apple" and (parts[2].starts_with("darwin") or parts[2].starts_with("macos"))
     if apple and parts[0] == "x86_64" {
-        return true
+        return (true, false)
     }
     if apple and (parts[0] == "aarch64" or parts[0] == "arm64") {
-        return false
+        return (false, false)
     }
-    eprint("error: unsupported target `{t}`: the Grasm backend writes Mach-O objects for x86_64 and aarch64 macOS only")
+    let gnu = (parts.len() == 3 and parts[1] == "linux" and parts[2] == "gnu") or
+    (parts.len() == 4 and parts[1] == "unknown" and parts[2] == "linux" and parts[3] == "gnu")
+    if gnu and parts[0] == "x86_64" {
+        return (true, true)
+    }
+    if gnu and parts[0] == "aarch64" {
+        return (false, true)
+    }
+    eprint("error: unsupported target `{t}`: the Grasm backend writes objects for x86_64 and aarch64 macOS and Linux (glibc) only")
     exit(1)
-    false
+    (false, false)
 }
 
 /// The program's object, by compiler/s3 as a stage's `s3` makes it.
-fn compile(tir: str, path: str, lib: bool, x64: bool) -> bytes {
-    let (st, bytes) = s3.compile_program(tir.to_bytes(), lib, x64, false)
+fn compile(tir: str, path: str, lib: bool, x64: bool, linux: bool) -> bytes {
+    let (st, bytes) = s3.compile_program(tir.to_bytes(), lib, x64, linux)
     if st != 0 {
         eprint("error: the Grasm backend does not compile `{path}` (s3 exit status {st})")
         exit(1)
@@ -362,9 +372,16 @@ fn compile(tir: str, path: str, lib: bool, x64: bool) -> bytes {
 /// --native -o rt.o`): an object, not an executable, so `-o out.o` names it
 /// and any other `-o` gets `.o` added, as for `--target`.
 fn build_runtime(f: Checked, out: str, target: str) {
-    let x64 = if target != "\0" { target_is_x64(target) } else { false }
+    let (x64, linux) = if target != "\0" { target_of(target) } else { (false, false) }
+    if linux {
+        // The runtime's Linux object is compiled from a copy of it with
+        // `os/linux.gr` in `src/os.gr`'s place (`linux_rt_build` in
+        // scripts/lib/linux.sh), which the loader does not make.
+        eprint("error: unsupported target `{target}` for a runtime package: its Linux object is built from a copy with `os/linux.gr` as `src/os.gr` (docs/self-hosting.md §6.18)")
+        exit(1)
+    }
     let obj = if out.ends_with(".o") { out } else { out + ".o" }
-    let bytes = compile(tir_of(f), obj, true, x64)
+    let bytes = compile(tir_of(f), obj, true, x64, false)
     match write_bytes(obj, bytes) {
         Ok(_) -> ()
         Err(e) -> {

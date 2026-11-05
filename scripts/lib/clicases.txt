@@ -15,8 +15,9 @@
 #   runtime     a runtime package built `--native`: the Grasm command writes
 #               the runtime's object; the Rust one says there is no `main`
 #   target      a `--target` the Grasm backend does not write: refused in its
-#               words, where the Rust command emits an ELF or other object or
-#               refuses in Cranelift's
+#               words, where the Rust command emits an object or refuses in
+#               Cranelift's; or a runtime package built for Linux, refused
+#               (its Linux object is built from a copy, §6.18)
 #
 # Lines starting with `#` and blank lines are not cases.
 
@@ -147,7 +148,12 @@ build examples/hello.gr --native --target x86_64-apple-darwin
 build examples/hello.gr --native --target x86_64-apple-darwin -o h.o
 build examples/hello.gr --native --target aarch64-apple-darwin -o h
 build examples/hello.gr --native --target arm64-apple-darwin
-target build examples/hello.gr --native --target x86_64-unknown-linux-gnu
+build examples/hello.gr --native --target x86_64-unknown-linux-gnu
+build examples/hello.gr --native --target aarch64-unknown-linux-gnu -o h.o
+build examples/hello.gr --native --target x86_64-linux-gnu -o h
+build examples/hello.gr --native --target aarch64-linux-gnu
+target build examples/hello.gr --native --target x86_64-unknown-linux-musl
+target build compiler/rt/src/main.gr --native --target aarch64-linux-gnu -o rt.o
 target build examples/hello.gr --native --target wasm32-unknown-unknown
 target build examples/hello.gr --native --target bogus
 

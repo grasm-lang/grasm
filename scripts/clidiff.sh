@@ -23,9 +23,10 @@
 #           size and the backend's name aside), then the two executables run
 #           and compared as `linktest` compares them, then the Grasm build
 #           made again under the same name, the same bytes
-#   target  `build --native --target x86_64-apple-darwin` of every tenth of
-#           those: the same output, an x86-64 Mach-O object, made twice the
-#           same
+#   target  `build --native --target <triple>` of every tenth of those, for
+#           x86_64-apple-darwin, x86_64-unknown-linux-gnu and
+#           aarch64-unknown-linux-gnu: the same output, an object of the
+#           triple's format (Mach-O, ELF) and machine, made twice the same
 #
 # The Grasm command never starts another program: nothing in its package
 # calls `proc_run` or `proc_pipeline` (counted here), and every command but
@@ -211,7 +212,8 @@ if want lines; then
             ;;
         target)
             if [ "$g_rc" = 1 ] && [ ! -s "$WORK/l/g.files" ] &&
-                [[ "$(cat "$WORK/l/g.err")" == "error: unsupported target \`"*"\`: the Grasm backend writes Mach-O objects for x86_64 and aarch64 macOS only" ]]; then
+                { [[ "$(cat "$WORK/l/g.err")" == "error: unsupported target \`"*"\`: the Grasm backend writes objects for x86_64 and aarch64 macOS and Linux (glibc) only" ]] ||
+                    [[ "$(cat "$WORK/l/g.err")" == "error: unsupported target \`"*"-linux-gnu\` for a runtime package: its Linux object is built from a copy with \`os/linux.gr\` as \`src/os.gr\` (docs/self-hosting.md §6.18)" ]]; }; then
                 lines_target=$((lines_target + 1))
             else
                 fail "grasm $rest -- the target not refused (exit $g_rc): $(head -1 "$WORK/l/g.err")"
@@ -384,28 +386,37 @@ if want build || want target; then
         fi
         if want target && [ $((k % 10)) = 1 ]; then
             targets=$((targets + 1))
-            rm -f "$WORK/t/r/p.o" "$WORK/t/g/p.o" "$WORK/t/g2/p.o"
-            "$GRASM" build "$src" --native --target x86_64-apple-darwin -o "$WORK/t/r/p.o" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
-            r_rc=$?
-            g build "$src" --native --target x86_64-apple-darwin -o "$WORK/t/g/p.o" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
-            g_rc=$?
-            g build "$src" --native --target x86_64-apple-darwin -o "$WORK/t/g2/p.o" >/dev/null 2>&1 </dev/null
-            sed "s|$WORK/t/r/|$WORK/t/g/|g" "$WORK/r.out" >"$WORK/r.norm"
-            header=$(head -c 8 "$WORK/t/g/p.o" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-            if cmp -s "$WORK/r.norm" "$WORK/g.out" && cmp -s "$WORK/r.err" "$WORK/g.err" && [ "$r_rc" = "$g_rc" ] &&
-                { [ "$g_rc" != 0 ] || { [ "$header" = cffaedfe07000001 ] && cmp -s "$WORK/t/g/p.o" "$WORK/t/g2/p.o"; }; }; then
-                target_same=$((target_same + 1))
-            else
-                fail "grasm build --native --target x86_64-apple-darwin $src -- exit $r_rc (Rust) and $g_rc (Grasm), object header $header"
-                diff "$WORK/r.norm" "$WORK/g.out" | head -4 | sed 's/^/  /'
-            fi
+            # Each triple with the start of the object it must write: the
+            # format's magic, then its class and machine (Mach-O's cputype;
+            # ELF's class, data and version, and e_machine at offset 18).
+            for tt in x86_64-apple-darwin:cffaedfe07000001: x86_64-unknown-linux-gnu:7f454c4602010100:3e00 \
+                aarch64-unknown-linux-gnu:7f454c4602010100:b700; do
+                IFS=: read -r triple want_header want_machine <<<"$tt"
+                rm -f "$WORK/t/r/p.o" "$WORK/t/g/p.o" "$WORK/t/g2/p.o"
+                "$GRASM" build "$src" --native --target "$triple" -o "$WORK/t/r/p.o" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+                r_rc=$?
+                g build "$src" --native --target "$triple" -o "$WORK/t/g/p.o" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+                g_rc=$?
+                g build "$src" --native --target "$triple" -o "$WORK/t/g2/p.o" >/dev/null 2>&1 </dev/null
+                sed "s|$WORK/t/r/|$WORK/t/g/|g" "$WORK/r.out" >"$WORK/r.norm"
+                header=$(head -c 8 "$WORK/t/g/p.o" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+                machine=$(dd if="$WORK/t/g/p.o" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+                if cmp -s "$WORK/r.norm" "$WORK/g.out" && cmp -s "$WORK/r.err" "$WORK/g.err" && [ "$r_rc" = "$g_rc" ] &&
+                    { [ "$g_rc" != 0 ] || { [ "$header" = "$want_header" ] && { [ -z "$want_machine" ] || [ "$machine" = "$want_machine" ]; } &&
+                        cmp -s "$WORK/t/g/p.o" "$WORK/t/g2/p.o"; }; }; then
+                    target_same=$((target_same + 1))
+                else
+                    fail "grasm build --native --target $triple $src -- exit $r_rc (Rust) and $g_rc (Grasm), object header $header, machine $machine"
+                    diff "$WORK/r.norm" "$WORK/g.out" | head -4 | sed 's/^/  /'
+                fi
+            done
         fi
     done <"$WORK/mains"
     if want build; then
         echo "build: $builds programs with a main ($external link a system library)   the same output: $built_same, $build_refused of them refusals   run alike: $ran_same   built twice the same: $repro"
     fi
     if want target; then
-        echo "target: $targets programs for x86_64-apple-darwin   the same output, an x86-64 object made twice the same: $target_same"
+        echo "target: $targets programs, each for x86_64-apple-darwin, x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu   the same output, the triple's object made twice the same: $target_same of $((3 * targets))"
     fi
 fi
 
@@ -426,7 +437,7 @@ if want lines && [ $((lines_same + lines_elsewhere + lines_runtime + lines_targe
     echo "lines: the counts do not add up to $lines"
     exit 1
 fi
-if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 15 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 3 ]; }; then
+if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 15 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
     echo "lines: too few compared ($lines, $lines_elsewhere not here, $lines_runtime runtime, $lines_target target)"
     exit 1
 fi
@@ -445,7 +456,7 @@ if want build && { [ "$built_same" -ne "$builds" ] || [ "$ran_same" -ne $((build
 fi
 if [ -n "$whole" ]; then
     if [ "$listed" -lt 1700 ] || [ "$corpus_refused" -lt 120 ] || [ "$tomls" -lt 600 ] ||
-        [ "$run_same" -lt 640 ] || [ "$ran_same" -lt 640 ] || [ "$targets" -lt 60 ] || [ "$target_same" -ne "$targets" ]; then
+        [ "$run_same" -lt 640 ] || [ "$ran_same" -lt 640 ] || [ "$targets" -lt 60 ] || [ "$target_same" -ne $((3 * targets)) ]; then
         echo "too little compared for this to mean anything: $listed programs, $corpus_refused refusals, $tomls manifests, $run_same runs, $ran_same builds run, $target_same of $targets targets"
         exit 1
     fi
