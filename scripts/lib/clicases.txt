@@ -159,13 +159,13 @@ target build examples/hello.gr --native --target bogus
 
 # The subcommands part one does not cover: what the command line says of
 # them is the same; past it, they are not here.
-elsewhere test examples/hello.gr
+test examples/hello.gr
 test examples/hello.gr extra
-elsewhere test --cases -1 x.gr
+test --cases -1 x.gr
 test --cases --x x.gr
 test --seed
 test --bogus
-elsewhere bench examples/hello.gr
+bench examples/hello.gr
 bench --filter
 elsewhere doc examples/hello.gr
 doc -o
@@ -221,3 +221,27 @@ lint --only unused-binding examples/hello.gr --json
 lint examples/hello.gr -- --only nosuch
 lint -- examples/hello.gr
 lint compiler/grasm/src/main.gr --json
+
+# `test` and `bench` (§6.19): the operand past the valued flags, then the
+# options in Rust's order, then the program.
+test
+test --cases 5
+test nosuch.gr
+test examples/testing_tour.gr --seed +5
+test examples/testing_tour.gr --seed x
+test examples/testing_tour.gr --seed 18446744073709551616
+test examples/testing_tour.gr --cases 0
+test examples/testing_tour.gr --cases 4294967296
+test examples/testing_tour.gr --schedules x
+test examples/testing_tour.gr --schedule-seed -3
+test examples/testing_tour.gr --schedules 2
+test examples/testing_tour.gr --filter round --cases 7 --seed 3
+test --coverage examples/testing_tour.gr
+test spec/conformance/E-TEST-SHRINK.gr
+test spec/conformance/G-STMT-TERM.gr
+test -- examples/testing_tour.gr
+test examples/documented.gr --filter parse
+bench
+bench nosuch.gr
+bench examples/hello.gr --filter x
+bench spec/conformance/E-BENCH-WARMUP.gr --filter nosuch

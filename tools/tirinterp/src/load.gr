@@ -126,6 +126,25 @@ type TirProg = {
     some_idx: i64,
     none_idx: i64,
     ioerror_ty: i64,
+    // What `grasm test` and `bench` run (docs/self-hosting.md §6.19): each
+    // `test` and `bench` in source order -- its name, parameters' variables,
+    // frame, body, and where its body starts -- the files with their bases,
+    // and every block with its span, for coverage.
+    test_name: [str],
+    test_params: [[i64]],
+    test_frame: [[Value]],
+    test_body: [i64],
+    test_at: [i64],
+    bench_name: [str],
+    bench_frame: [[Value]],
+    bench_body: [i64],
+    bench_at: [i64],
+    file_name: [str],
+    file_path: [str],
+    file_base: [i64],
+    blk_node: [i64],
+    blk_s: [i64],
+    blk_e: [i64],
 }
 
 /// What loading builds, and what it needs along the way.
@@ -169,6 +188,25 @@ type Loader = {
     some_idx: i64,
     none_idx: i64,
     ioerror_ty: i64,
+    // What `grasm test` and `bench` run (docs/self-hosting.md §6.19): each
+    // `test` and `bench` in source order -- its name, parameters' variables,
+    // frame, body, and where its body starts -- the files with their bases,
+    // and every block with its span, for coverage.
+    test_name: [str],
+    test_params: [[i64]],
+    test_frame: [[Value]],
+    test_body: [i64],
+    test_at: [i64],
+    bench_name: [str],
+    bench_frame: [[Value]],
+    bench_body: [i64],
+    bench_at: [i64],
+    file_name: [str],
+    file_path: [str],
+    file_base: [i64],
+    blk_node: [i64],
+    blk_s: [i64],
+    blk_e: [i64],
     t: Tree,
     fn_ids: Map[str, i64],
     const_ids: Map[str, i64],
@@ -433,7 +471,19 @@ fn expr(inout ld: Loader, e: i64) -> i64 {
             }
         }
         "list" -> with_kids(ld, OP_LIST, e)
-        "block" -> with_kids(ld, OP_BLOCK, e)
+        "block" -> {
+            let id = with_kids(ld, OP_BLOCK, e)
+            let sp = word(t, e, 1)
+            if sp.starts_with("@") {
+                let parts = sp.substr(1, sp.len() - 1).split(":")
+                if parts.len() == 2 {
+                    ld.blk_node.push(id)
+                    ld.blk_s.push(parts[0].parse_int() ?? -1)
+                    ld.blk_e.push(parts[1].parse_int() ?? -1)
+                }
+            }
+            id
+        }
         "unary" -> {
             let negate = if word(t, e, 3) == "not" { 1 } else { 0 }
             node_with(ld, e, OP_UNARY, negate, narrow_of(t, at(t, e, 1)), "")
@@ -1220,6 +1270,12 @@ fn register(inout ld: Loader, e: i64) {
             ld.eff_ids.set(name, ld.eff_name.len())
             ld.eff_name.push(name)
         }
+        // `(file "name" "alias" "path" base)`.
+        "file" -> {
+            ld.file_name.push(word(t, e, 1))
+            ld.file_path.push(word(t, e, 3))
+            ld.file_base.push(int_at(t, e, 4))
+        }
         _ -> ()
     }
 }
@@ -1254,6 +1310,32 @@ fn define(inout ld: Loader, e: i64) {
         "main" -> {
             ld.main_fn = ld.fn_ids.get(word(t, e, 1)) ?? -1
         }
+        // `(test "name" (params (param let v "x" T) ...) (block ...))`.
+        "test" -> {
+            ld.max_var = -1
+            var params: [i64] = []
+            let ks = kid_elems(t, e)
+            for pe in kid_elems(t, ks[0]) {
+                let v = int_at(t, pe, 2)
+                params.push(v)
+                note_var(ld, v)
+            }
+            let body = expr(ld, ks[1])
+            ld.test_name.push(word(t, e, 1))
+            ld.test_params.push(params)
+            ld.test_body.push(body)
+            ld.test_frame.push(frame_of(ld.max_var + 1))
+            ld.test_at.push(span_start(t, ks[1]))
+        }
+        "bench" -> {
+            ld.max_var = -1
+            let ks = kid_elems(t, e)
+            let body = expr(ld, ks[0])
+            ld.bench_name.push(word(t, e, 1))
+            ld.bench_body.push(body)
+            ld.bench_frame.push(frame_of(ld.max_var + 1))
+            ld.bench_at.push(span_start(t, ks[0]))
+        }
         _ -> ()
     }
 }
@@ -1266,9 +1348,48 @@ fn code_table(names: [str]) -> Map[str, i64] {
     m
 }
 
+/// Where the node written as element `e` starts: its `@start:end`.
+fn span_start(t: Tree, e: i64) -> i64 {
+    let sp = word(t, e, 1)
+    if not sp.starts_with("@") {
+        return -1
+    }
+    let parts = sp.substr(1, sp.len() - 1).split(":")
+    parts[0].parse_int() ?? -1
+}
+
 /// The program in `t`, or what in it this interpreter cannot run.
 pub fn load(t: Tree) -> TirProg ! [str] {
-    var ld = Loader{
+    load_for(t, true)
+}
+
+/// The same; `need_main` false for `grasm test` and `bench`, which run a
+/// program's tests and benches whether it has a `main` or not.
+pub fn load_for(t: Tree, need_main: bool) -> TirProg ! [str] {
+    var ld = new_loader(t)
+    for r in t.roots {
+        register(ld, r)
+    }
+    for r in t.roots {
+        define(ld, r)
+    }
+    if ld.main_fn < 0 and need_main {
+        ld.errors.push("the program has no `main`")
+    }
+    if not ld.errors.is_empty() {
+        fail(ld.errors)
+    }
+    prog_of(ld)
+}
+
+/// A program with nothing in it, for a caller that has already ended the
+/// process but must still answer one.
+pub fn empty_prog() -> TirProg {
+    prog_of(new_loader(sexp.new_tree()))
+}
+
+fn new_loader(t: Tree) -> Loader {
+    Loader{
         op: [],
         a: [],
         b: [],
@@ -1303,6 +1424,21 @@ pub fn load(t: Tree) -> TirProg ! [str] {
         some_idx: 0,
         none_idx: 1,
         ioerror_ty: -1,
+        test_name: [],
+        test_params: [],
+        test_frame: [],
+        test_body: [],
+        test_at: [],
+        bench_name: [],
+        bench_frame: [],
+        bench_body: [],
+        bench_at: [],
+        file_name: [],
+        file_path: [],
+        file_base: [],
+        blk_node: [],
+        blk_s: [],
+        blk_e: [],
         t: t,
         fn_ids: map(),
         const_ids: map(),
@@ -1316,18 +1452,9 @@ pub fn load(t: Tree) -> TirProg ! [str] {
         decl_log: [],
         errors: [],
     }
-    for r in t.roots {
-        register(ld, r)
-    }
-    for r in t.roots {
-        define(ld, r)
-    }
-    if ld.main_fn < 0 {
-        ld.errors.push("the program has no `main`")
-    }
-    if not ld.errors.is_empty() {
-        fail(ld.errors)
-    }
+}
+
+fn prog_of(ld: Loader) -> TirProg {
     TirProg{
         op: ld.op,
         a: ld.a,
@@ -1363,5 +1490,20 @@ pub fn load(t: Tree) -> TirProg ! [str] {
         some_idx: ld.some_idx,
         none_idx: ld.none_idx,
         ioerror_ty: ld.ioerror_ty,
+        test_name: ld.test_name,
+        test_params: ld.test_params,
+        test_frame: ld.test_frame,
+        test_body: ld.test_body,
+        test_at: ld.test_at,
+        bench_name: ld.bench_name,
+        bench_frame: ld.bench_frame,
+        bench_body: ld.bench_body,
+        bench_at: ld.bench_at,
+        file_name: ld.file_name,
+        file_path: ld.file_path,
+        file_base: ld.file_base,
+        blk_node: ld.blk_node,
+        blk_s: ld.blk_s,
+        blk_e: ld.blk_e,
     }
 }

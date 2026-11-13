@@ -73,7 +73,7 @@ pub fn tir_to_run(path: str) -> str {
 }
 
 /// `Program::runtime_refusal`.
-fn refuse_runtime(pkg: str, engine: str) {
+pub fn refuse_runtime(pkg: str, engine: str) {
     eprint("error: package `{pkg}` is a runtime package (`runtime = true` in its grasm.toml), so {engine} does not take it: the runtime written in Grasm is compiled only by the Grasm backend, `s3 --runtime` ([T-RUNTIME])")
     exit(1)
 }

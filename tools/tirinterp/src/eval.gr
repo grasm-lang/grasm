@@ -6,8 +6,12 @@
 // function's numbering. Leaving a construct early -- `break`, `continue`,
 // `return`, and an error on its way out (`try`, `fail`) -- is a flag on the
 // context that every caller checks after evaluating a child, the way the
-// reference passes `Flow` up through `?`. A panic ends the process here and
-// now, with the host's own `panic`, which prints what the reference prints.
+// reference passes `Flow` up through `?`. A panic of the program goes
+// through `fault`: under `run` it ends the process here and now, with the
+// host's own `panic`, which prints what the reference prints; under `test`
+// and `bench` (`trap`) it is one more way out, as the reference's
+// `Flow::Panic` is, and the runner reports it (docs/self-hosting.md §6.19).
+// So is `exit`.
 //
 // Each call of the program is several nested host calls here, inside the
 // 6 MiB a native program may use, so the host stack is spent with care. A
@@ -31,6 +35,8 @@ pub let CTL_BREAK = 1
 pub let CTL_CONTINUE = 2
 pub let CTL_RETURN = 3
 pub let CTL_ERR = 4
+pub let CTL_PANIC = 5
+pub let CTL_EXIT = 6
 
 /// Everything a run carries: the program, the frame being evaluated, and
 /// the state the program's statements change.
@@ -89,6 +95,13 @@ type Cx = {
     // the sandbox's, which `mem_free` refuses.
     cells: Map[str, i64],
     cell_at: Map[i64, bool],
+    // `grasm test` and `bench`: a panic and `exit` unwind (`fault`) rather
+    // than end the process; how many `concurrent` blocks have run tasks;
+    // and, with `--coverage`, every statement a block reached, by node.
+    trap: bool,
+    blocks_run: i64,
+    cov: bool,
+    hits: Map[i64, bool],
 }
 
 pub fn new_cx(p: TirProg, args: [str]) -> Cx {
@@ -142,7 +155,43 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         c_addrs: map(),
         cells: map(),
         cell_at: map(),
+        trap: false,
+        blocks_run: 0,
+        cov: false,
+        hits: map(),
     }
+}
+
+/// A panic of the program, saying `msg`. Under `run` the host's own, which
+/// prints `panic: msg` and exits 101 as the reference does. Under `test` and
+/// `bench` it unwinds as an error does, carrying the message, for the runner
+/// to report -- but not inside a task of a `concurrent` block, whose
+/// siblings the host's scheduler cannot abort ([E-TASK-PANIC];
+/// docs/known-issues.md). A fault while one is already unwinding is not a
+/// second one.
+pub fn fault(inout cx: Cx, msg: str) -> Value {
+    if not cx.trap or not cx.baton.is_empty() {
+        panic(msg)
+    }
+    if cx.ctl == 0 {
+        cx.ctl = CTL_PANIC
+        cx.carry = VStr(msg)
+    }
+    VUnit
+}
+
+/// `exit(code)`: the host's under `run`; under `test` and `bench` a way out
+/// the runner reports, as the reference's `Flow::Exit` is.
+pub fn exit_with(inout cx: Cx, code: i64) -> Value {
+    if not cx.trap or not cx.baton.is_empty() {
+        exit(code)
+    }
+    // The low eight bits, as the reference's `Flow::Exit` carries them.
+    if cx.ctl == 0 {
+        cx.ctl = CTL_EXIT
+        cx.carry = VInt(code.bit_and(255))
+    }
+    VUnit
 }
 
 /// What frame slot `v` holds, moved out and the slot left `()`, so the
@@ -393,10 +442,16 @@ fn block_prefix(inout cx: Cx, e: i64) -> i64 {
     }
     let base = cx.k0[e]
     for i in 0..(n - 1) {
+        if cx.cov {
+            cx.hits.set(cx.kids[base + i], true)
+        }
         ev(cx, cx.kids[base + i])
         if cx.ctl != 0 {
             return -1
         }
+    }
+    if cx.cov {
+        cx.hits.set(cx.kids[base + n - 1], true)
     }
     cx.kids[base + n - 1]
 }
@@ -525,12 +580,12 @@ fn binary(inout cx: Cx, e: i64) -> Value {
     }
     match l {
         VInt(x) -> match r {
-            VInt(y) -> return narrowed(cx.b[e], int_op(op, x, y))
+            VInt(y) -> return narrowed(cx.b[e], int_op(cx, op, x, y))
             _ -> ()
         }
         _ -> ()
     }
-    narrowed(cx.b[e], apply_binary(cx.p, op, l, r))
+    narrowed(cx.b[e], apply_binary(cx, op, l, r))
 }
 
 /// Whether `and`, `or` or `??` needs its right side, given its left.
@@ -553,7 +608,7 @@ fn short_value(p: TirProg, l: Value) -> Value {
     }
 }
 
-fn int_op(op: i64, x: i64, y: i64) -> Value {
+fn int_op(inout cx: Cx, op: i64, x: i64, y: i64) -> Value {
     match op {
         1 -> VInt(x + y)
         2 -> VInt(x - y)
@@ -566,19 +621,19 @@ fn int_op(op: i64, x: i64, y: i64) -> Value {
         12 -> VBool(x >= y)
         4 -> {
             if y == 0 {
-                panic("division by zero")
+                return fault(cx, "division by zero")
             }
             VInt(x / y)
         }
         5 -> {
             if y == 0 {
-                panic("remainder by zero")
+                return fault(cx, "remainder by zero")
             }
             VInt(x % y)
         }
         6 -> {
             if y < 0 {
-                panic("negative integer exponent (use floats)")
+                return fault(cx, "negative integer exponent (use floats)")
             }
             VInt(x ^ y)
         }
@@ -588,7 +643,7 @@ fn int_op(op: i64, x: i64, y: i64) -> Value {
 
 /// The integer operators on `u64`: the same bits as on `i64`, read
 /// unsigned in `/`, `%`, `^` and the comparisons ([T-U64]).
-fn u64_op(op: i64, x: u64, y: u64) -> Value {
+fn u64_op(inout cx: Cx, op: i64, x: u64, y: u64) -> Value {
     match op {
         1 -> VU64(x + y)
         2 -> VU64(x - y)
@@ -601,13 +656,13 @@ fn u64_op(op: i64, x: u64, y: u64) -> Value {
         12 -> VBool(x >= y)
         4 -> {
             if y == 0 {
-                panic("division by zero")
+                return fault(cx, "division by zero")
             }
             VU64(x / y)
         }
         5 -> {
             if y == 0 {
-                panic("remainder by zero")
+                return fault(cx, "remainder by zero")
             }
             VU64(x % y)
         }
@@ -635,10 +690,11 @@ fn float_op(op: i64, x: f64, y: f64) -> Value {
 }
 
 /// `apply_binary`: the operator on two evaluated operands.
-pub fn apply_binary(p: TirProg, op: i64, l: Value, r: Value) -> Value {
+pub fn apply_binary(inout cx: Cx, op: i64, l: Value, r: Value) -> Value {
+    let p = cx.p
     match l {
         VInt(x) -> match r {
-            VInt(y) -> return int_op(op, x, y)
+            VInt(y) -> return int_op(cx, op, x, y)
             VFloat(y) -> return float_op(op, x.as_f64(), y)
             _ -> ()
         }
@@ -650,15 +706,15 @@ pub fn apply_binary(p: TirProg, op: i64, l: Value, r: Value) -> Value {
         // The checker never mixes `u64` with `i64`; an `i64` beside a `u64`
         // is a literal of it, read as its bits, as the reference reads it.
         VU64(x) -> match r {
-            VU64(y) -> return u64_op(op, x, y)
-            VInt(y) -> return u64_op(op, x, y.as_u64())
+            VU64(y) -> return u64_op(cx, op, x, y)
+            VInt(y) -> return u64_op(cx, op, x, y.as_u64())
             _ -> ()
         }
         _ -> ()
     }
     match r {
         VU64(y) -> match l {
-            VInt(x) -> return u64_op(op, x.as_u64(), y)
+            VInt(x) -> return u64_op(cx, op, x.as_u64(), y)
             _ -> ()
         }
         _ -> ()
@@ -748,13 +804,13 @@ fn range(inout cx: Cx, e: i64) -> Value {
 // ----- reading -----------------------------------------------------------------------
 
 /// What a reference points at; a stale one panics ([T-REF-STALE]).
-pub fn deref(cx: Cx, v: Value) -> Value {
+pub fn deref(inout cx: Cx, v: Value) -> Value {
     match v {
         VRef(slot, gen) -> {
             if slot < cx.slab.len() and cx.gens[slot] == gen and cx.live[slot] {
                 return cx.slab[slot]
             }
-            panic("stale reference: the value it pointed to was released")
+            fault(cx, "stale reference: the value it pointed to was released")
         }
         _ -> v
     }
@@ -770,6 +826,9 @@ fn field(inout cx: Cx, e: i64) -> Value {
         _ -> ()
     }
     let v = deref(cx, raw)
+    if cx.ctl != 0 {
+        return VUnit
+    }
     match v {
         VStruct(_, fs) -> fs[cx.a[e]]
         _ -> panic("`{value.show(cx.p, v)}` has no field `{cx.a[e]}`")
@@ -789,6 +848,9 @@ fn tuple_field(inout cx: Cx, e: i64) -> Value {
         _ -> ()
     }
     let v = deref(cx, raw)
+    if cx.ctl != 0 {
+        return VUnit
+    }
     match v {
         VTuple(items) -> {
             if i < items.len() {
@@ -814,7 +876,7 @@ fn index(inout cx: Cx, e: i64) -> Value {
         VList(items) -> match i {
             VInt(ix) -> {
                 if ix < 0 or ix >= items.len() {
-                    panic("index {ix} out of bounds (len {items.len()})")
+                    return fault(cx, "index {ix} out of bounds (len {items.len()})")
                 }
                 return items[ix]
             }
@@ -1120,6 +1182,9 @@ fn match_arm(inout cx: Cx, e: i64) -> i64 {
     }
     // Matching through a reference matches what it points at.
     let v = if cx.c[e] == 1 { deref(cx, raw) } else { raw }
+    if cx.ctl != 0 {
+        return -1
+    }
     for i in 1..cx.nk[e] {
         let arm = kid(cx, e, i)
         if pmatch(cx, kid(cx, arm, 0), v) {
@@ -1136,7 +1201,8 @@ fn match_arm(inout cx: Cx, e: i64) -> i64 {
             }
         }
     }
-    panic("no match arm matched `{value.show(cx.p, v)}`")
+    fault(cx, "no match arm matched `{value.show(cx.p, v)}`")
+    -1
 }
 
 /// Whether pattern `pt` matches `v`, binding into the frame as it goes.
@@ -1261,22 +1327,27 @@ fn place_path(inout cx: Cx, e: i64) -> Path {
                 return path
             }
             path.push(2)
-            path.push(index_value(cx.p, ix))
+            path.push(index_value(cx, ix))
+            if cx.ctl != 0 {
+                path[0] = -1
+                return path
+            }
         }
         i -= 1
     }
     path
 }
 
-fn index_value(p: TirProg, ix: Value) -> i64 {
+fn index_value(inout cx: Cx, ix: Value) -> i64 {
     match ix {
         VInt(n) -> {
             if n < 0 {
-                panic("negative index {n}")
+                fault(cx, "negative index {n}")
+                return 0
             }
             n
         }
-        _ -> panic("index must be an int, got `{value.show(p, ix)}`")
+        _ -> panic("index must be an int, got `{value.show(cx.p, ix)}`")
     }
 }
 
@@ -1315,7 +1386,11 @@ pub fn expr_path(inout cx: Cx, e: i64) -> Path {
                 return path
             }
             path.push(2)
-            path.push(index_value(cx.p, ix))
+            path.push(index_value(cx, ix))
+            if cx.ctl != 0 {
+                path[0] = -2
+                return path
+            }
         }
         i -= 1
     }
@@ -1329,6 +1404,9 @@ pub fn read_path(inout cx: Cx, path: Path) -> Value {
         let kind = path[1 + 2 * k]
         let i = path[2 + 2 * k]
         v = deref(cx, v)
+        if cx.ctl != 0 {
+            return VUnit
+        }
         if kind == 3 {
             continue
         }
@@ -1342,7 +1420,7 @@ pub fn read_path(inout cx: Cx, path: Path) -> Value {
             }
             VList(items) -> {
                 if i >= items.len() {
-                    panic("index {i} out of bounds (len {items.len()})")
+                    return fault(cx, "index {i} out of bounds (len {items.len()})")
                 }
                 items[i]
             }
@@ -1375,7 +1453,7 @@ pub fn swap_path(inout cx: Cx, path: Path, nv: Value) -> Value {
         match v {
             VRef(s, g) -> {
                 if not (s < cx.slab.len() and cx.gens[s] == g and cx.live[s]) {
-                    panic("stale reference: the value it pointed to was released")
+                    return fault(cx, "stale reference: the value it pointed to was released")
                 }
                 at = k
                 slot = s
@@ -1433,7 +1511,9 @@ fn swap_in(inout cx: Cx, inout slot: Value, path: Path, k: i64, nv: Value) -> Va
         }
         var xs = value.list_of(value.take(whole))
         if i >= xs.len() {
-            panic("index {i} out of bounds (len {xs.len()})")
+            let n = xs.len()
+            slot = VList(xs)
+            return fault(cx, "index {i} out of bounds (len {n})")
         }
         var child = value.take(xs[i])
         let old = swap_in(cx, child, path, k + 1, nv)
@@ -1462,7 +1542,10 @@ fn assign_element(inout cx: Cx, e: i64, pl: i64, slot: i64) -> Value {
     if cx.ctl != 0 {
         return VUnit
     }
-    let i = index_value(cx.p, ix)
+    let i = index_value(cx, ix)
+    if cx.ctl != 0 {
+        return VUnit
+    }
     let v = ev(cx, kid(cx, e, 1))
     if cx.ctl != 0 {
         return VUnit
@@ -1470,13 +1553,20 @@ fn assign_element(inout cx: Cx, e: i64, pl: i64, slot: i64) -> Value {
     var whole = take_local(cx, slot)
     var xs = value.list_of(value.take(whole))
     if i >= xs.len() {
-        panic("index {i} out of bounds (len {xs.len()})")
+        let n = xs.len()
+        cx.fr[slot] = VList(xs)
+        return fault(cx, "index {i} out of bounds (len {n})")
     }
     let op = cx.a[e]
     if op == 0 {
         xs[i] = v
     } else {
-        xs[i] = narrowed(cx.b[e], apply_binary(cx.p, op, xs[i], v))
+        let nv = narrowed(cx.b[e], apply_binary(cx, op, xs[i], v))
+        if cx.ctl != 0 {
+            cx.fr[slot] = VList(xs)
+            return VUnit
+        }
+        xs[i] = nv
     }
     cx.fr[slot] = VList(xs)
     VUnit
@@ -1497,7 +1587,12 @@ fn assign_field(inout cx: Cx, e: i64, f: i64, slot: i64) -> Value {
     if op == 0 {
         fs[f] = v
     } else {
-        fs[f] = narrowed(cx.b[e], apply_binary(cx.p, op, fs[f], v))
+        let nv = narrowed(cx.b[e], apply_binary(cx, op, fs[f], v))
+        if cx.ctl != 0 {
+            cx.fr[slot] = VStruct(ty, fs)
+            return VUnit
+        }
+        fs[f] = nv
     }
     cx.fr[slot] = VStruct(ty, fs)
     VUnit
@@ -1516,7 +1611,11 @@ fn assign(inout cx: Cx, e: i64) -> Value {
         if op == 0 {
             cx.fr[slot] = v
         } else {
-            cx.fr[slot] = narrowed(cx.b[e], apply_binary(cx.p, op, cx.fr[slot], v))
+            let nv = narrowed(cx.b[e], apply_binary(cx, op, cx.fr[slot], v))
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            cx.fr[slot] = nv
         }
         return VUnit
     }
@@ -1545,7 +1644,14 @@ fn assign(inout cx: Cx, e: i64) -> Value {
         swap_path(cx, path, v)
     } else {
         let old = read_path(cx, path)
-        swap_path(cx, path, narrowed(cx.b[e], apply_binary(cx.p, op, old, v)))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        let nv = narrowed(cx.b[e], apply_binary(cx, op, old, v))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        swap_path(cx, path, nv)
     }
     VUnit
 }
@@ -1575,7 +1681,7 @@ let MAX_DEPTH = 100000
 /// A function's or a closure's body, one call deeper.
 fn body(inout cx: Cx, node: i64) -> Value {
     if cx.depth >= MAX_DEPTH {
-        panic("stack overflow: recursion too deep")
+        return fault(cx, "stack overflow: recursion too deep")
     }
     cx.depth += 1
     // Not inside a task of a `concurrent` block: the host runs a nested
@@ -1619,6 +1725,8 @@ fn finish(inout cx: Cx, r: Value, fallible: bool) -> Value {
             return VErr(value.take(cx.carry))
         }
         return VUnit
+    } else if cx.ctl == CTL_PANIC or cx.ctl == CTL_EXIT {
+        return VUnit
     } else if cx.ctl != 0 {
         cx.ctl = 0
     }
@@ -1639,6 +1747,17 @@ fn swap_frame(inout cx: Cx, inout other: [Value]) {
     let mine = cx.fr
     cx.fr = other
     other = mine
+}
+
+/// Runs `node`, a test's or a bench's body, as a body in `frame`, which
+/// holds its parameters: what `grasm test` and `grasm bench` run. How it
+/// ended is the context's to say -- `ctl` and `carry` -- and the runner's to
+/// read and reset.
+pub fn run_body(inout cx: Cx, node: i64, inout frame: [Value]) -> Value {
+    swap_frame(cx, frame)
+    let r = body(cx, node)
+    swap_frame(cx, frame)
+    r
 }
 
 /// Runs a declared function's body in `frame`, which holds its arguments.
@@ -1695,7 +1814,7 @@ pub fn call_value(inout cx: Cx, f: Value, inout args: [Value]) -> Value {
             finish(cx, r, cx.b[node] == 1)
         }
         VFn(fid) -> call_fn(cx, fid, args)
-        _ -> panic("`{value.show(cx.p, f)}` is not callable (call)")
+        _ -> fault(cx, "`{value.show(cx.p, f)}` is not callable (call)")
     }
 }
 
@@ -1980,6 +2099,7 @@ fn concurrent_block(inout cx: Cx, e: i64) -> Value {
     if cx.ctl != 0 or bodies.is_empty() {
         return VUnit
     }
+    cx.blocks_run += 1
     run_tasks(cx, bodies, frames)
     VUnit
 }

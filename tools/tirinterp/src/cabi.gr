@@ -36,8 +36,8 @@ fn short(q: str) -> str {
     parts[parts.len() - 1]
 }
 
-fn not_found(name: str) {
-    panic("cannot find the C function `{name}` in this process — a compiled build links it, `grasm run` can only reach what is already loaded")
+fn not_found(inout cx: Cx, name: str) -> Value {
+    eval.fault(cx, "cannot find the C function `{name}` in this process — a compiled build links it, `grasm run` can only reach what is already loaded")
 }
 
 /// Whether the sandbox made `at`, for memory or for a function.
@@ -59,7 +59,7 @@ pub fn call_extern(inout cx: Cx, fid: i64, inout args: [Value]) -> Value {
     let name = short(cx.p.fn_name[fid])
     let at = find(name)
     if at == 0 {
-        not_found(name)
+        return not_found(cx, name)
     }
     c_call(cx, name, at, cx.p.fn_csig[fid], args)
 }
@@ -96,7 +96,7 @@ fn c_call(inout cx: Cx, name: str, at: i64, sig: str, args: [Value]) -> Value {
         let k = match args[i] {
             VInt(n) -> {
                 if p == "addr" and made(cx, n) {
-                    panic("`grasm run` cannot hand C an address from its own sandbox (argument {i + 1} of `{name}`): C would read a made-up number, not memory")
+                    return eval.fault(cx, "`grasm run` cannot hand C an address from its own sandbox (argument {i + 1} of `{name}`): C would read a made-up number, not memory")
                 }
                 "i"
             }
@@ -105,8 +105,7 @@ fn c_call(inout cx: Cx, name: str, at: i64, sig: str, args: [Value]) -> Value {
             VStr(_) -> "s"
             VBytes(_) -> "b"
             _ -> {
-                panic("`{name}` cannot take this value across the C boundary")
-                ""
+                return eval.fault(cx, "`{name}` cannot take this value across the C boundary")
             }
         }
         ks.push(k)
@@ -131,10 +130,7 @@ fn c_call(inout cx: Cx, name: str, at: i64, sig: str, args: [Value]) -> Value {
             }
         }
         Some(v) -> v
-        None -> {
-            panic("`{name}` has a signature this interpreter cannot call (at most three arguments, and no mixed shapes past two)")
-            VUnit
-        }
+        None -> eval.fault(cx, "`{name}` has a signature this interpreter cannot call (at most three arguments, and no mixed shapes past two)")
     }
 }
 
@@ -146,7 +142,7 @@ pub fn fn_addr(inout cx: Cx, e: i64) -> Value {
         let name = short(cx.p.fn_name[fid])
         let at = find(name)
         if at == 0 {
-            not_found(name)
+            return not_found(cx, name)
         }
         cx.c_addrs.set(at, true)
         return VInt(at)
@@ -178,14 +174,14 @@ pub fn call_c_node(inout cx: Cx, e: i64) -> Value {
     var args: [Value] = vs.slice(1, vs.len())
     let sig = cx.s[e]
     if at == 0 {
-        panic("call_c through the null address")
+        return eval.fault(cx, "call_c through the null address")
     }
     match cx.fn_at.get(at) {
         Some(fid) -> {
             let mine = cx.p.fn_csig[fid]
             if mine != sig {
                 let f = short(cx.p.fn_name[fid])
-                panic("call_c through the address of `{f}`, which is {mine}, as {sig}")
+                return eval.fault(cx, "call_c through the address of `{f}`, which is {mine}, as {sig}")
             }
             eval.call_fn(cx, fid, args)
         }
@@ -193,8 +189,7 @@ pub fn call_c_node(inout cx: Cx, e: i64) -> Value {
             if cx.c_addrs.has(at) {
                 c_call(cx, "call_c", at, sig, args)
             } else {
-                panic("call_c through an address that holds no function")
-                VUnit
+                eval.fault(cx, "call_c through an address that holds no function")
             }
         }
     }

@@ -1,0 +1,1770 @@
+// `grasm test` and `grasm bench` (docs/self-hosting.md §6.19): the program
+// checked as `grasm run` checks it, its TIR read by the TIR interpreter, and
+// its tests and benchmarks run in that interpreter, in this process -- the
+// Rust runner (`crates/grasm_interp/src/lib.rs`, `testing.rs`) ported
+// decision for decision. A test's panic, error or `exit` is a way out of
+// its evaluation (`eval.fault`), which the runner reports and goes on.
+//
+// Everything a property test does is driven by `--seed`: the same splitmix64
+// stream, the same boundary values walked first, the same generator by the
+// parameter's *written* type, the same greedy shrink within the same budget.
+// So a failure prints the counterexample and the replay line the Rust
+// command prints.
+import front
+import front.loader
+import front.emit
+import front.ast
+import front.rdebug
+import front.prog
+import front.sema
+import tirinterp.sexp
+import tirinterp.load
+import tirinterp.eval
+import tirinterp.value
+import build
+
+/// `--seed`'s default, `0x5eed`.
+let DEFAULT_SEED = 24301
+/// Cases a property test walks the boundary lists in before drawing.
+let BOUNDARY_CASES = 10
+/// Shrink attempts allowed for one failure.
+let SHRINK_BUDGET = 2000
+/// Each benchmark is sampled for this long, in nanoseconds, and at most
+/// this many iterations.
+let BENCH_TARGET_NS = 200000000
+let BENCH_MAX_ITERS = 20000000
+
+/// The options of one `grasm test` (`TestOptions`).
+type TestOpts = {
+    seed: i64,
+    cases: i64,
+    coverage: bool,
+    filter: str,
+    contracts: bool,
+    schedules: i64,
+    has_schedule_seed: bool,
+}
+
+/// A program ready to run: its TIR loaded, the context it runs in, and what
+/// of the source the runner reads besides -- the modules' ASTs, sources,
+/// paths and bases.
+type TestRunner = {
+    prog: TirProg,
+    cx: Cx,
+    l: Loaded,
+    esc: EscTable,
+    passed: i64,
+    failed: i64,
+    // `--contracts`: whether a run is a contract's, and how many inputs its
+    // `requires` turned away.
+    contract_mode: bool,
+    discards: i64,
+}
+
+// ---------------------------------------------------------------------
+// The command line
+// ---------------------------------------------------------------------
+
+/// The value after the first `flag` among `a`, or "\0" (`flag_value`).
+fn flag_value(a: [str], flag: str) -> str {
+    for i in 0..a.len() {
+        if a[i] == flag {
+            if i + 1 < a.len() {
+                return a[i + 1]
+            }
+            return "\0"
+        }
+    }
+    "\0"
+}
+
+/// Rust's `str::parse` of an unsigned integer no larger than `max` (as
+/// `u64`): an optional `+`, then one digit or more; as its bits, and
+/// whether it parsed.
+fn parse_unsigned(s: str, max: u64) -> (bool, i64) {
+    let b = s.to_bytes()
+    var i = 0
+    if b.len() > 0 and b.at(0) == 43 {
+        i = 1
+    }
+    if i >= b.len() {
+        return (false, 0)
+    }
+    var v: u64 = 0
+    let ten: u64 = 10
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 48 or c > 57 {
+            return (false, 0)
+        }
+        let d = (c - 48).as_u64()
+        if v > (max - d) / ten {
+            return (false, 0)
+        }
+        v = v * ten + d
+        i += 1
+    }
+    (true, v.as_i64())
+}
+
+fn max_u64() -> u64 {
+    let m: u64 = 18446744073709551615
+    m
+}
+
+fn max_u32() -> u64 {
+    let m: u64 = 4294967295
+    m
+}
+
+/// `parse_test_opts`: the options, or the first one that is wrong, worded.
+fn parse_opts(a: [str]) -> TestOpts {
+    var o = TestOpts{ seed: DEFAULT_SEED, cases: 100, coverage: a.contains("--coverage"), filter: "", contracts: a.contains("--contracts"), schedules: 0, has_schedule_seed: false }
+    let f = flag_value(a, "--filter")
+    if f != "\0" {
+        o.filter = f
+    }
+    let seed = flag_value(a, "--seed")
+    if seed != "\0" {
+        let (ok, v) = parse_unsigned(seed, max_u64())
+        if not ok {
+            eprint("error: --seed expects a number, got `{seed}`")
+            exit(1)
+        }
+        o.seed = v
+    }
+    let cases = flag_value(a, "--cases")
+    if cases != "\0" {
+        let (ok, v) = parse_unsigned(cases, max_u32())
+        if not ok {
+            eprint("error: --cases expects a number, got `{cases}`")
+            exit(1)
+        }
+        if v == 0 {
+            eprint("error: --cases must be at least 1")
+            exit(1)
+        }
+        o.cases = v
+    }
+    let sch = flag_value(a, "--schedules")
+    if sch != "\0" {
+        let (ok, v) = parse_unsigned(sch, max_u32())
+        if not ok {
+            eprint("error: --schedules expects a number, got `{sch}`")
+            exit(1)
+        }
+        o.schedules = v
+    }
+    let ss = flag_value(a, "--schedule-seed")
+    if ss != "\0" {
+        let (ok, _v) = parse_unsigned(ss, max_u64())
+        if not ok {
+            eprint("error: --schedule-seed expects a number, got `{ss}`")
+            exit(1)
+        }
+        o.has_schedule_seed = true
+    }
+    o
+}
+
+/// The program checked, refused if it is a runtime package, and its TIR
+/// loaded; with the modules it came from.
+fn prepare(path: str) -> TestRunner {
+    let (l, p, c, t0) = front.checked(path)
+    var t = t0
+    var runtime = ""
+    for k in l.runtime.keys() {
+        if runtime == "" {
+            runtime = l.runtime.get(k) ?? ""
+        }
+    }
+    if runtime != "" {
+        build.refuse_runtime(runtime, "the interpreter")
+    }
+    let (text, holes) = emit.emit(c, t, p)
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+    runner_of(text, path, l)
+}
+
+/// The runner of a program whose TIR is `text`.
+pub fn runner_of(text: str, path: str, l: Loaded) -> TestRunner {
+    match sexp.read(text.to_bytes()) {
+        Ok(tree) -> match load.load_for(tree, false) {
+            Ok(tp) -> {
+                var cx = eval.new_cx(tp, [])
+                cx.trap = true
+                TestRunner{ prog: tp, cx: cx, l: l, esc: rdebug.new_esc_table(), passed: 0, failed: 0, contract_mode: false, discards: 0 }
+            }
+            Err(problems) -> {
+                for m in problems {
+                    eprint("tirinterp: {path}: {m}")
+                }
+                exit(3)
+                TestRunner{ prog: load.empty_prog(), cx: eval.new_cx(load.empty_prog(), []), l: l, esc: rdebug.new_esc_table(), passed: 0, failed: 0, contract_mode: false, discards: 0 }
+            }
+        }
+        Err(msg) -> {
+            eprint("error: the TIR of `{path}` does not read back: {msg}")
+            exit(1)
+            TestRunner{ prog: load.empty_prog(), cx: eval.new_cx(load.empty_prog(), []), l: l, esc: rdebug.new_esc_table(), passed: 0, failed: 0, contract_mode: false, discards: 0 }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Running a body, and how it ended
+// ---------------------------------------------------------------------
+
+/// Runs `body` in a copy of `frame` with `vars` holding `inputs`: "\0" when
+/// it held, else why not (`try_case`).
+fn try_case(inout r: TestRunner, body: i64, frame: [Value], vars: [i64], inputs: [Value]) -> str {
+    var fr = frame
+    for i in 0..vars.len() {
+        fr[vars[i]] = inputs[i]
+    }
+    eval.run_body(r.cx, body, fr)
+    outcome(r)
+}
+
+/// How the last run ended, and the context made ready for the next: "\0"
+/// when it held.
+fn outcome(inout r: TestRunner) -> str {
+    let ctl = r.cx.ctl
+    let carry = r.cx.carry
+    r.cx.ctl = 0
+    r.cx.carry = VUnit
+    if ctl == 0 or ctl == eval.CTL_RETURN {
+        return "\0"
+    }
+    if ctl == eval.CTL_PANIC {
+        let m = match carry {
+            VStr(s) -> s
+            _ -> ""
+        }
+        // Fuzzing a function's contracts: an input its `requires` turns
+        // away is outside its domain, not a failure.
+        if r.contract_mode and m.starts_with("requires `") {
+            r.discards += 1
+            return "\0"
+        }
+        return m
+    }
+    if ctl == eval.CTL_ERR {
+        if r.contract_mode {
+            return "\0"
+        }
+        return "error: {value.show(r.prog, carry)}"
+    }
+    if ctl == eval.CTL_EXIT {
+        let c = match carry {
+            VInt(n) -> n
+            _ -> 0
+        }
+        return "exit({c}) inside a test"
+    }
+    "unexpected control flow"
+}
+
+// ---------------------------------------------------------------------
+// Deterministic randomness: splitmix64, on the bits of an `i64`
+// ---------------------------------------------------------------------
+
+type PropRng = { state: i64 }
+
+let GOLDEN = -7046029254386353131
+
+fn rng_new(seed: i64) -> PropRng {
+    PropRng{ state: seed.bit_xor(GOLDEN) }
+}
+
+fn next_u64(inout g: PropRng) -> i64 {
+    g.state = g.state + GOLDEN
+    var z = g.state
+    z = z.bit_xor(z.ushr(30)) * -4658895280553007687
+    z = z.bit_xor(z.ushr(27)) * -7723592293110705685
+    z.bit_xor(z.ushr(31))
+}
+
+/// Uniform in `0..n` (unsigned remainder); 0 for `n == 0`.
+fn below(inout g: PropRng, n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let x = next_u64(g)
+    (x.as_u64() % n.as_u64()).as_i64()
+}
+
+fn rbool(inout g: PropRng) -> bool {
+    next_u64(g).bit_and(1) == 1
+}
+
+// ---------------------------------------------------------------------
+// Generation, by the parameter's written type
+// ---------------------------------------------------------------------
+
+fn interesting_int(i: i64) -> i64 {
+    let them = [0, 1, -1, 2, -2, 10, 100, -9223372036854775807 - 1, 9223372036854775807, -9223372036854775807]
+    them[i]
+}
+
+fn interesting_float(i: i64) -> f64 {
+    let bits = [0, -9223372036854775807 - 1, 4607182418800017408, -4616189618054758400, 9218868437227405312, -4503599627370496, 9221120237041090560, 4503599627370496, 9218868437227405311, -4503599627370497]
+    bits[i].from_bits()
+}
+
+fn interesting_char(i: i64) -> str {
+    let them = ["a", "b", "z", "A", "Z", "0", "9", " ", "\t", "\n", "\"", "\\", "\{", "}", "/", "-", "_", "é", "ß", "中", "🙂"]
+    them[i]
+}
+
+fn sl(a: Ast, id: i64, i: i64) -> i64 {
+    a.pool[a.off[id] + i]
+}
+
+fn items(a: Ast, v: i64) -> [i64] {
+    a.pool.slice(a.off[v], a.off[v] + a.n[v])
+}
+
+/// A path's segments joined with `.` (`Path::dotted`).
+fn dotted(a: Ast, path: i64) -> str {
+    var parts: [str] = []
+    for s in items(a, sl(a, path, 0)) {
+        parts.push(a.t[s])
+    }
+    parts.join(".")
+}
+
+/// A value of the type `te` describes (`generate`); `boundary` is -1 past
+/// the opening cases.
+fn generate(p: TirProg, inout g: PropRng, a: Ast, te: i64, size: i64, boundary: i64) -> Value {
+    let k = a.k[te]
+    if k == ast.Y_LIST {
+        let cap = if size < 32 { size } else { 32 }
+        let n = below(g, cap + 1)
+        var out: [Value] = []
+        for i in 0..n {
+            out.push(generate(p, g, a, sl(a, te, 0), size, if boundary < 0 { -1 } else { boundary + i }))
+        }
+        return VList(out)
+    }
+    if k == ast.Y_TUPLE {
+        var out: [Value] = []
+        let ts = items(a, sl(a, te, 0))
+        for i in 0..ts.len() {
+            out.push(generate(p, g, a, ts[i], size, if boundary < 0 { -1 } else { boundary + i }))
+        }
+        return VTuple(out)
+    }
+    if k == ast.Y_UNION {
+        let ts = items(a, sl(a, te, 0))
+        if ts.is_empty() {
+            return VUnit
+        }
+        return generate(p, g, a, ts[0], size, boundary)
+    }
+    if k != ast.Y_NAME {
+        return VUnit
+    }
+    let name = dotted(a, sl(a, te, 0))
+    if name == "i64" {
+        if boundary >= 0 {
+            return VInt(interesting_int(boundary % 10))
+        }
+        if below(g, 4) == 0 {
+            return VInt(interesting_int(below(g, 10)))
+        }
+        var span = size * 8
+        if span < 16 {
+            span = 16
+        }
+        let x = next_u64(g)
+        let r = (x.as_u64() % (span * 2 + 1).as_u64()).as_i64()
+        return VInt(r - span)
+    }
+    if name == "f64" {
+        if boundary >= 0 {
+            return VFloat(interesting_float(boundary % 10))
+        }
+        if below(g, 8) == 0 {
+            return VFloat(interesting_float(below(g, 10)))
+        }
+        let scale = if size < 1 { 1.0 } else { size.as_f64() }
+        let unit = next_u64(g).as_u64().as_f64() / 18446744073709551616.0
+        return VFloat((unit * 2.0 - 1.0) * scale)
+    }
+    if name == "bool" {
+        if boundary >= 0 {
+            return VBool(boundary % 2 == 0)
+        }
+        return VBool(rbool(g))
+    }
+    if name == "str" {
+        if boundary >= 0 {
+            if boundary == 0 {
+                return VStr("")
+            }
+            return VStr(interesting_char((boundary - 1) % 21))
+        }
+        let cap = if size < 24 { size } else { 24 }
+        let n = below(g, cap + 1)
+        var parts: [str] = []
+        for _ in 0..n {
+            parts.push(interesting_char(below(g, 21)))
+        }
+        return VStr(parts.join(""))
+    }
+    if name == "Option" {
+        let args = items(a, sl(a, te, 1))
+        if args.len() > 0 and below(g, 4) != 0 {
+            return value.some_v(p, generate(p, g, a, args[0], size, boundary))
+        }
+        return value.none_v(p)
+    }
+    VUnit
+}
+
+/// Whether `--contracts` can invent a value of this type: the scalars, and
+/// lists and tuples of them (`generatable`).
+fn generatable(a: Ast, te: i64) -> bool {
+    let k = a.k[te]
+    if k == ast.Y_NAME {
+        let n = dotted(a, sl(a, te, 0))
+        return items(a, sl(a, te, 1)).is_empty() and (n == "i64" or n == "f64" or n == "bool" or n == "str")
+    }
+    if k == ast.Y_LIST {
+        return generatable(a, sl(a, te, 0))
+    }
+    if k == ast.Y_TUPLE {
+        let ts = items(a, sl(a, te, 0))
+        if ts.is_empty() {
+            return false
+        }
+        for x in ts {
+            if not generatable(a, x) {
+                return false
+            }
+        }
+        return true
+    }
+    false
+}
+
+// ---------------------------------------------------------------------
+// Shrinking
+// ---------------------------------------------------------------------
+
+fn is_some(p: TirProg, v: Value) -> bool {
+    match v {
+        VVariant(ty, idx, _) -> p.ty_variants[ty][idx] == "Some"
+        _ -> false
+    }
+}
+
+/// Smaller values to try in place of `v`, most aggressive first (`shrink`).
+fn shrink(p: TirProg, v: Value) -> [Value] {
+    var out: [Value] = []
+    match v {
+        VInt(n) -> {
+            if n == 0 {
+                return out
+            }
+            out.push(VInt(0))
+            var delta = n
+            while delta != 0 {
+                let c = n - delta
+                if c != n and c != 0 {
+                    out.push(VInt(c))
+                }
+                delta = delta / 2
+            }
+            if n < 0 {
+                out.push(VInt(0 - n))
+            }
+        }
+        VFloat(f) -> {
+            if f == 0.0 {
+                return out
+            }
+            out.push(VFloat(0.0))
+            if f.is_finite() {
+                out.push(VFloat(f / 2.0))
+                out.push(VFloat(if f < 0.0 { f.ceil() } else { f.floor() }))
+            }
+        }
+        VBool(b) -> if b {
+            out.push(VBool(false))
+        }
+        VStr(s) -> {
+            if s == "" {
+                return out
+            }
+            let cs = s.chars()
+            let n = cs.len()
+            out.push(VStr(""))
+            if n > 1 {
+                out.push(VStr(cs.slice(0, n / 2).join("")))
+                out.push(VStr(cs.slice(n / 2, n).join("")))
+            }
+            for i in 0..n {
+                var c = cs
+                c.remove(i)
+                out.push(VStr(c.join("")))
+            }
+            for i in 0..n {
+                if cs[i] != "a" {
+                    var c = cs
+                    c[i] = "a"
+                    out.push(VStr(c.join("")))
+                }
+            }
+        }
+        VList(xs) -> {
+            let n = xs.len()
+            if n == 0 {
+                return out
+            }
+            out.push(VList([]))
+            if n > 1 {
+                out.push(VList(xs.slice(0, n / 2)))
+                out.push(VList(xs.slice(n / 2, n)))
+            }
+            for i in 0..n {
+                var c = xs
+                c.remove(i)
+                out.push(VList(c))
+            }
+            let (any, together) = all_at_once(p, xs)
+            if any {
+                out.push(VList(together))
+            }
+            for i in 0..n {
+                for smaller in shrink(p, xs[i]) {
+                    var c = xs
+                    c[i] = smaller
+                    out.push(VList(c))
+                }
+            }
+        }
+        VTuple(xs) -> {
+            let (any, together) = all_at_once(p, xs)
+            if any {
+                out.push(VTuple(together))
+            }
+            for i in 0..xs.len() {
+                for smaller in shrink(p, xs[i]) {
+                    var c = xs
+                    c[i] = smaller
+                    out.push(VTuple(c))
+                }
+            }
+        }
+        VVariant(ty, idx, fs) -> if p.ty_variants[ty][idx] == "Some" {
+            out.push(value.none_v(p))
+            if fs.len() > 0 {
+                for smaller in shrink(p, fs[0]) {
+                    out.push(value.some_v(p, smaller))
+                }
+            }
+        }
+        _ -> ()
+    }
+    out
+}
+
+/// Each part replaced by its most aggressive shrink at once; false when
+/// nothing in it can shrink (`all_at_once`).
+fn all_at_once(p: TirProg, xs: [Value]) -> (bool, [Value]) {
+    var any = false
+    var out: [Value] = []
+    for v in xs {
+        let s = shrink(p, v)
+        if s.is_empty() {
+            out.push(v)
+        } else {
+            any = true
+            out.push(s[0])
+        }
+    }
+    (any, out)
+}
+
+/// Greedily replaces `inputs` with smaller ones that still fail, within
+/// the budget (`shrink_failure`).
+fn shrink_failure(inout r: TestRunner, body: i64, frame: [Value], vars: [i64], inout inputs: [Value], inout message: str) {
+    var budget = SHRINK_BUDGET
+    var improved = true
+    while improved and budget > 0 {
+        improved = false
+        if inputs.len() > 1 and budget > 0 {
+            let (any, together) = all_at_once(r.prog, inputs)
+            if any {
+                budget -= 1
+                let m = try_case(r, body, frame, vars, together)
+                if m != "\0" {
+                    inputs = together
+                    message = m
+                    improved = true
+                }
+            }
+        }
+        for i in 0..inputs.len() {
+            var stop = false
+            for candidate in shrink(r.prog, inputs[i]) {
+                if stop or budget == 0 {
+                    stop = true
+                } else {
+                    budget -= 1
+                    var trial = inputs
+                    trial[i] = candidate
+                    let m = try_case(r, body, frame, vars, trial)
+                    if m != "\0" {
+                        inputs = trial
+                        message = m
+                        improved = true
+                        stop = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A value with its strings quoted, at any depth (`quoted`).
+fn quoted(r: TestRunner, v: Value) -> str {
+    match v {
+        VStr(s) -> rdebug.str_debug(r.esc, s)
+        VList(xs) -> {
+            var parts: [str] = []
+            for x in xs {
+                parts.push(quoted(r, x))
+            }
+            "[" + parts.join(", ") + "]"
+        }
+        VTuple(xs) -> {
+            var parts: [str] = []
+            for x in xs {
+                parts.push(quoted(r, x))
+            }
+            "(" + parts.join(", ") + ")"
+        }
+        VMap(_, _, _, _, _) -> {
+            var parts: [str] = []
+            let ks = value.map_keys(v)
+            let vs = value.map_values(v)
+            for i in 0..ks.len() {
+                parts.push(quoted(r, ks[i]) + ": " + quoted(r, vs[i]))
+            }
+            "\{" + parts.join(", ") + "}"
+        }
+        _ -> value.show(r.prog, v)
+    }
+}
+
+fn render_inputs(r: TestRunner, names: [str], inputs: [Value]) -> str {
+    var parts: [str] = []
+    for i in 0..names.len() {
+        parts.push("{names[i]} = {quoted(r, inputs[i])}")
+    }
+    parts.join(", ")
+}
+
+/// One property run (`run_property`): the case it failed on (1-based) with
+/// the shrunk inputs and message, or 0 when every case held.
+fn run_property(inout r: TestRunner, o: TestOpts, a: Ast, types: [i64], body: i64, frame: [Value], vars: [i64], inout inputs: [Value], inout message: str) -> i64 {
+    var g = rng_new(o.seed)
+    for case in 0..o.cases {
+        let size = 1 + case / 2
+        let boundary = if case < BOUNDARY_CASES { case } else { -1 }
+        var ins: [Value] = []
+        for i in 0..types.len() {
+            ins.push(generate(r.prog, g, a, types[i], size, if boundary < 0 { -1 } else { boundary + i }))
+        }
+        let m = try_case(r, body, frame, vars, ins)
+        if m != "\0" {
+            var shrunk = ins
+            var msg = m
+            shrink_failure(r, body, frame, vars, shrunk, msg)
+            inputs = shrunk
+            message = msg
+            return case + 1
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------
+// The runner
+// ---------------------------------------------------------------------
+
+/// The module a TIR offset belongs to: the last file whose base is at or
+/// below it.
+fn file_at(p: TirProg, at: i64) -> i64 {
+    var k = 0
+    for i in 0..p.file_base.len() {
+        if p.file_base[i] <= at {
+            k = i
+        }
+    }
+    k
+}
+
+/// What a test the default schedule ran with tasks would need: a seeded
+/// scheduler, which the TIR interpreter's tasks do not have (§6.19,
+/// decision 4). Said, and exit 1.
+fn schedules_not_here(o: TestOpts) {
+    let flag = if o.has_schedule_seed { "--schedule-seed" } else { "--schedules" }
+    eprint("error: `grasm test {flag}` is not in the Grasm toolchain yet")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links`, `fmt`, `lint`, `test` and `bench`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
+    exit(1)
+}
+
+/// The AST of every `test` in the program, in the TIR's order: (module,
+/// declaration).
+fn ast_tests(l: Loaded) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    for f in 0..l.mods.len() {
+        let a = l.mods[f].a
+        for d in l.mods[f].decls {
+            if a.k[d] == ast.D_TEST {
+                out.push((f, d))
+            }
+        }
+    }
+    out
+}
+
+pub fn cmd_test(a: [str]) {
+    let rest = a.slice(1, a.len())
+    let path = build.first_operand(rest, ["--seed", "--cases", "--filter", "--schedules", "--schedule-seed"])
+    if path == "\0" {
+        eprint("usage: grasm test <file.gr> [--coverage] [--contracts] [--seed N] [--cases N] [--filter TEXT] [--schedules N] [--schedule-seed S]")
+        exit(1)
+    }
+    let o = parse_opts(rest)
+    var r = prepare(path)
+    if o.coverage {
+        r.cx.cov = true
+    }
+    let p = r.prog
+    let multi = p.file_name.len() > 1
+    let decls = ast_tests(r.l)
+    for ti in 0..p.test_name.len() {
+        let f = file_at(p, p.test_at[ti])
+        let label = if multi { "{p.file_name[f]}::{p.test_name[ti]}" } else { p.test_name[ti] }
+        if o.filter != "" and not label.contains(o.filter) {
+            continue
+        }
+        let vars = p.test_params[ti]
+        if vars.is_empty() {
+            let before = r.cx.blocks_run
+            let m = try_case(r, p.test_body[ti], p.test_frame[ti], [], [])
+            let ran_tasks = r.cx.blocks_run > before
+            if ran_tasks and (o.has_schedule_seed or (m == "\0" and o.schedules > 0)) {
+                schedules_not_here(o)
+            }
+            if m == "\0" {
+                print("test \"{label}\" ... ok")
+                r.passed += 1
+            } else {
+                print("test \"{label}\" ... FAILED: {m}")
+                r.failed += 1
+            }
+            continue
+        }
+        // The parameters' written types, from the declaration the TIR's
+        // test came from.
+        let (df, dd) = decls[ti]
+        let da = r.l.mods[df].a
+        var types: [i64] = []
+        var names: [str] = []
+        for prm in items(da, sl(da, dd, 0)) {
+            names.push(da.t[sl(da, prm, 1)])
+            types.push(sl(da, prm, 2))
+        }
+        var inputs: [Value] = []
+        var message = ""
+        let case = run_property(r, o, da, types, p.test_body[ti], p.test_frame[ti], vars, inputs, message)
+        if case == 0 {
+            print("test \"{label}\" ... ok ({o.cases} cases)")
+            r.passed += 1
+        } else {
+            print("test \"{label}\" ... FAILED on case {case} of {o.cases}\n  {message}\n  counterexample: {render_inputs(r, names, inputs)}\n  replay: --seed {o.seed.as_u64()} --cases {o.cases}")
+            r.failed += 1
+        }
+    }
+    if o.contracts {
+        run_contracts(r, o, multi)
+    }
+    let unit_hits = r.cx.hits
+    var doc_hits: [(str, i64)] = []
+    run_doc_examples(r, o.filter, o.coverage, doc_hits)
+    print("{r.passed} passed, {r.failed} failed")
+    if o.coverage {
+        print_coverage(r, unit_hits, doc_hits)
+    }
+    if r.failed > 0 {
+        exit(1)
+    }
+}
+
+/// `--contracts`: each function with a body and an `ensures` becomes a
+/// property of its own parameters.
+fn run_contracts(inout r: TestRunner, o: TestOpts, multi: bool) {
+    var fn_ids: Map[str, i64] = map()
+    for i in 0..r.prog.fn_name.len() {
+        fn_ids.set(r.prog.fn_name[i], i)
+    }
+    for f in 0..r.l.mods.len() {
+        let a = r.l.mods[f].a
+        let module = r.l.names[f]
+        var names: [str] = []
+        for d in r.l.mods[f].decls {
+            if a.k[d] == ast.D_FN {
+                names.push(a.t[sl(a, d, 2)])
+            }
+        }
+        for d in r.l.mods[f].decls {
+            if a.k[d] != ast.D_FN {
+                continue
+            }
+            let fname = a.t[sl(a, d, 2)]
+            let ensures = "{fname}@ensures"
+            var has_ensures = false
+            for n in names {
+                if n.starts_with(ensures) {
+                    has_ensures = true
+                }
+            }
+            if not names.contains("{fname}@body") or not has_ensures {
+                continue
+            }
+            let label = if multi { "contracts of {module}::{fname}" } else { "contracts of {fname}" }
+            if o.filter != "" and not label.contains(o.filter) {
+                continue
+            }
+            var why = ""
+            if not items(a, sl(a, d, 3)).is_empty() {
+                why = "it is generic, and there is no one type to generate"
+            } else {
+                for prm in items(a, sl(a, d, 5)) {
+                    if why == "" and not generatable(a, sl(a, prm, 2)) {
+                        why = "`{a.t[sl(a, prm, 1)]}` has a type the generator cannot produce"
+                    }
+                }
+            }
+            if why != "" {
+                print("test \"{label}\" ... not fuzzed: {why}")
+                continue
+            }
+            let fid = fn_ids.get("{module}::{fname}") ?? -1
+            var types: [i64] = []
+            var pnames: [str] = []
+            for prm in items(a, sl(a, d, 5)) {
+                pnames.push(a.t[sl(a, prm, 1)])
+                types.push(sl(a, prm, 2))
+            }
+            r.contract_mode = true
+            r.discards = 0
+            var inputs: [Value] = []
+            var message = ""
+            let case = contract_property(r, o, a, types, fid, inputs, message)
+            let turned_away = r.discards
+            r.contract_mode = false
+            if case == 0 and turned_away >= o.cases {
+                print("test \"{label}\" ... inconclusive: none of {o.cases} generated inputs met `requires`")
+                r.passed += 1
+            } else if case == 0 {
+                print("test \"{label}\" ... ok ({o.cases} cases, {turned_away} outside `requires`)")
+                r.passed += 1
+            } else {
+                print("test \"{label}\" ... FAILED on case {case} of {o.cases}\n  {message}\n  counterexample: {render_inputs(r, pnames, inputs)}\n  replay: --contracts --seed {o.seed.as_u64()} --cases {o.cases}")
+                r.failed += 1
+            }
+        }
+    }
+}
+
+/// A contract's property run: `run_property` with a call of the function
+/// for the body.
+fn contract_property(inout r: TestRunner, o: TestOpts, a: Ast, types: [i64], fid: i64, inout inputs: [Value], inout message: str) -> i64 {
+    var g = rng_new(o.seed)
+    for case in 0..o.cases {
+        let size = 1 + case / 2
+        let boundary = if case < BOUNDARY_CASES { case } else { -1 }
+        var ins: [Value] = []
+        for i in 0..types.len() {
+            ins.push(generate(r.prog, g, a, types[i], size, if boundary < 0 { -1 } else { boundary + i }))
+        }
+        let m = call_case(r, fid, ins)
+        if m != "\0" {
+            var shrunk = ins
+            var msg = m
+            shrink_call(r, fid, shrunk, msg)
+            inputs = shrunk
+            message = msg
+            return case + 1
+        }
+    }
+    0
+}
+
+fn call_case(inout r: TestRunner, fid: i64, inputs: [Value]) -> str {
+    var args = inputs
+    eval.call_fn(r.cx, fid, args)
+    outcome(r)
+}
+
+/// `shrink_failure` for a contract's call.
+fn shrink_call(inout r: TestRunner, fid: i64, inout inputs: [Value], inout message: str) {
+    var budget = SHRINK_BUDGET
+    var improved = true
+    while improved and budget > 0 {
+        improved = false
+        if inputs.len() > 1 and budget > 0 {
+            let (any, together) = all_at_once(r.prog, inputs)
+            if any {
+                budget -= 1
+                let m = call_case(r, fid, together)
+                if m != "\0" {
+                    inputs = together
+                    message = m
+                    improved = true
+                }
+            }
+        }
+        for i in 0..inputs.len() {
+            var stop = false
+            for candidate in shrink(r.prog, inputs[i]) {
+                if stop or budget == 0 {
+                    stop = true
+                } else {
+                    budget -= 1
+                    var trial = inputs
+                    trial[i] = candidate
+                    let m = call_case(r, fid, trial)
+                    if m != "\0" {
+                        inputs = trial
+                        message = m
+                        improved = true
+                        stop = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Coverage
+// ---------------------------------------------------------------------
+
+/// Where a statement starts (`stmt_start`), in its module's own offsets.
+fn stmt_start(a: Ast, s: i64) -> i64 {
+    if a.k[s] == ast.S_EXPR {
+        return expr_start(a, sl(a, s, 0))
+    }
+    a.s[s]
+}
+
+fn expr_start(a: Ast, e: i64) -> i64 {
+    let k = a.k[e]
+    if k == ast.E_IDENT or k == ast.E_BLOCK or k == ast.E_REGION or k == ast.E_UNSAFE {
+        return a.s[sl(a, e, 0)]
+    }
+    a.s[e]
+}
+
+/// Line (1-based) of offset `at` in a module whose line starts are `starts`.
+fn line_in(starts: [i64], at: i64) -> i64 {
+    var lo = 0
+    var hi = starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= at {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo + 1
+}
+
+pub fn line_starts(src: bytes) -> [i64] {
+    var starts = [0]
+    for i in 0..src.len() {
+        if src.at(i) == 10 {
+            starts.push(i + 1)
+        }
+    }
+    starts
+}
+
+/// Every line that holds a statement (`executable_lines`), as "path\tline"
+/// keys.
+fn block_lines(a: Ast, starts: [i64], path: str, b: i64, inout out: Map[str, bool]) {
+    for s in items(a, sl(a, b, 0)) {
+        out.set(path + "\t{line_in(starts, stmt_start(a, s))}", true)
+        let k = a.k[s]
+        if k == ast.S_WHILE {
+            expr_lines(a, starts, path, sl(a, s, 0), out)
+            block_lines(a, starts, path, sl(a, s, 1), out)
+        } else if k == ast.S_FOR {
+            expr_lines(a, starts, path, sl(a, s, 1), out)
+            block_lines(a, starts, path, sl(a, s, 2), out)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            block_lines(a, starts, path, sl(a, s, 0), out)
+        } else if k == ast.S_WITH {
+            expr_lines(a, starts, path, sl(a, s, 1), out)
+            block_lines(a, starts, path, sl(a, s, 2), out)
+        } else if k == ast.S_LET {
+            expr_lines(a, starts, path, sl(a, s, 3), out)
+        } else if k == ast.S_ASSIGN {
+            expr_lines(a, starts, path, sl(a, s, 0), out)
+            expr_lines(a, starts, path, sl(a, s, 2), out)
+        } else if k == ast.S_EXPR {
+            expr_lines(a, starts, path, sl(a, s, 0), out)
+        } else if k == ast.S_RETURN and sl(a, s, 0) >= 0 {
+            expr_lines(a, starts, path, sl(a, s, 0), out)
+        }
+    }
+}
+
+fn expr_lines(a: Ast, starts: [i64], path: str, e: i64, inout out: Map[str, bool]) {
+    let k = a.k[e]
+    if k == ast.E_IF {
+        expr_lines(a, starts, path, sl(a, e, 0), out)
+        block_lines(a, starts, path, sl(a, e, 1), out)
+        let eb = sl(a, e, 2)
+        if eb >= 0 {
+            if a.k[eb] == ast.EB_ELSE {
+                block_lines(a, starts, path, sl(a, eb, 0), out)
+            } else {
+                expr_lines(a, starts, path, sl(a, eb, 0), out)
+            }
+        }
+    } else if k == ast.E_MATCH {
+        expr_lines(a, starts, path, sl(a, e, 0), out)
+        for arm in items(a, sl(a, e, 1)) {
+            let g = sl(a, arm, 1)
+            if g >= 0 {
+                expr_lines(a, starts, path, g, out)
+            }
+            expr_lines(a, starts, path, sl(a, arm, 2), out)
+        }
+    } else if k == ast.E_BLOCK {
+        block_lines(a, starts, path, sl(a, e, 0), out)
+    } else if k == ast.E_CLOSURE {
+        expr_lines(a, starts, path, sl(a, e, 1), out)
+    } else if k == ast.E_TRY {
+        expr_lines(a, starts, path, sl(a, e, 0), out)
+    } else if k == ast.E_UNARY {
+        expr_lines(a, starts, path, sl(a, e, 1), out)
+    } else if k == ast.E_BINARY {
+        expr_lines(a, starts, path, sl(a, e, 1), out)
+        expr_lines(a, starts, path, sl(a, e, 2), out)
+    } else if k == ast.E_CALL {
+        for x in items(a, sl(a, e, 1)) {
+            expr_lines(a, starts, path, x, out)
+        }
+    } else if k == ast.E_METHOD {
+        expr_lines(a, starts, path, sl(a, e, 0), out)
+        for x in items(a, sl(a, e, 2)) {
+            expr_lines(a, starts, path, x, out)
+        }
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for x in items(a, sl(a, e, 0)) {
+            expr_lines(a, starts, path, x, out)
+        }
+    } else if k == ast.E_MAP {
+        for kv in items(a, sl(a, e, 0)) {
+            expr_lines(a, starts, path, sl(a, kv, 0), out)
+            expr_lines(a, starts, path, sl(a, kv, 1), out)
+        }
+    }
+}
+
+/// The statement starts of every AST block of module `f`, by its span in
+/// the program's offsets ("start:end").
+fn ast_blocks(l: Loaded, f: i64, inout out: Map[str, [i64]]) {
+    let a = l.mods[f].a
+    let base = l.bases[f]
+    for id in 0..a.k.len() {
+        if a.k[id] == ast.A_BLOCK and a.s[id] >= 0 {
+            var ss: [i64] = []
+            for s in items(a, sl(a, id, 0)) {
+                ss.push(stmt_start(a, s) + base)
+            }
+            out.set("{a.s[id] + base}:{a.e[id] + base}", ss)
+        }
+    }
+}
+
+/// The offset each TIR statement node starts at, found through its block's
+/// span in the AST.
+pub fn stmt_offsets(p: TirProg, l: Loaded) -> Map[i64, i64] {
+    var blocks: Map[str, [i64]] = map()
+    for f in 0..l.mods.len() {
+        ast_blocks(l, f, blocks)
+    }
+    var out: Map[i64, i64] = map()
+    for b in 0..p.blk_node.len() {
+        let node = p.blk_node[b]
+        match blocks.get("{p.blk_s[b]}:{p.blk_e[b]}") {
+            Some(ss) -> if ss.len() == p.nk[node] {
+                for i in 0..ss.len() {
+                    out.set(p.kids[p.k0[node] + i], ss[i])
+                }
+            }
+            None -> ()
+        }
+    }
+    out
+}
+
+/// `(path, line)` of a program offset.
+fn place_of(l: Loaded, starts: [[i64]], at: i64) -> (str, i64) {
+    var f = 0
+    for i in 0..l.bases.len() {
+        if at >= l.bases[i] {
+            f = i
+        }
+    }
+    (l.paths[f], line_in(starts[f], at - l.bases[f]))
+}
+
+/// The coverage report (`print_coverage`).
+fn print_coverage(r: TestRunner, hits: Map[i64, bool], doc_hits: [(str, i64)]) {
+    let l = r.l
+    var starts: [[i64]] = []
+    for f in 0..l.srcs.len() {
+        starts.push(line_starts(l.srcs[f]))
+    }
+    var exec: Map[str, bool] = map()
+    for f in 0..l.mods.len() {
+        let a = l.mods[f].a
+        for d in l.mods[f].decls {
+            let k = a.k[d]
+            var body = -1
+            if k == ast.D_FN {
+                body = sl(a, d, 9)
+            } else if k == ast.D_TEST {
+                body = sl(a, d, 1)
+            } else if k == ast.D_BENCH {
+                body = sl(a, d, 0)
+            }
+            if body >= 0 {
+                block_lines(a, starts[f], l.paths[f], body, exec)
+            }
+        }
+    }
+    var covered: Map[str, bool] = map()
+    let offs = stmt_offsets(r.prog, l)
+    for node in hits.keys() {
+        match offs.get(node) {
+            Some(at) -> {
+                let (path, line) = place_of(l, starts, at)
+                covered.set(path + "\t{line}", true)
+            }
+            None -> ()
+        }
+    }
+    for h in doc_hits {
+        let (path, line) = h
+        covered.set(path + "\t{line}", true)
+    }
+    // The executable lines in order: by path, then by line.
+    var keys: [(str, i64)] = []
+    for k in exec.keys() {
+        let parts = k.split("\t")
+        keys.push((parts[0], parts[1].parse_int() ?? 0))
+    }
+    keys.sort()
+    var hit = 0
+    for k in keys {
+        let (path, line) = k
+        if covered.has(path + "\t{line}") {
+            hit += 1
+        }
+    }
+    let pct = if keys.is_empty() { 100.0 } else { hit.as_f64() * 100.0 / keys.len().as_f64() }
+    print("")
+    print("coverage: {pct.to_fixed(1)}% of statement lines")
+    var i = 0
+    while i < keys.len() {
+        let (path, _l0) = keys[i]
+        var lines: [i64] = []
+        var same = true
+        while i < keys.len() and same {
+            let (p2, line) = keys[i]
+            if p2 != path {
+                same = false
+            } else {
+                if not covered.has(path + "\t{line}") {
+                    lines.push(line)
+                }
+                i += 1
+            }
+        }
+        if not lines.is_empty() {
+            print("  {path}: {lines.len()} uncovered — {format_ranges(lines)}")
+        }
+    }
+}
+
+/// `3-7, 11` (`format_ranges`).
+fn format_ranges(lines: [i64]) -> str {
+    var parts: [str] = []
+    var i = 0
+    while i < lines.len() {
+        let start = lines[i]
+        var end = start
+        while i + 1 < lines.len() and lines[i + 1] == end + 1 {
+            i += 1
+            end = lines[i]
+        }
+        parts.push(if start == end { "{start}" } else { "{start}-{end}" })
+        i += 1
+    }
+    parts.join(", ")
+}
+
+// ---------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------
+
+/// Times one benchmark (`run_bench`): "\0" and the iterations and
+/// nanoseconds, or why it failed.
+fn run_bench(inout r: TestRunner, b: i64) -> (str, i64, i64) {
+    let p = r.prog
+    var fr = p.bench_frame[b]
+    eval.run_body(r.cx, p.bench_body[b], fr)
+    let ctl = r.cx.ctl
+    let carry = r.cx.carry
+    r.cx.ctl = 0
+    r.cx.carry = VUnit
+    if ctl == eval.CTL_PANIC {
+        return (match carry {
+            VStr(s) -> s
+            _ -> ""
+        }, 0, 0)
+    }
+    if ctl == eval.CTL_ERR {
+        return ("error: {value.show(p, carry)}", 0, 0)
+    }
+    if ctl != 0 and ctl != eval.CTL_RETURN {
+        return ("unexpected control flow", 0, 0)
+    }
+    let start = monotonic_nanos()
+    var iterations = 0
+    while monotonic_nanos() - start < BENCH_TARGET_NS and iterations < BENCH_MAX_ITERS {
+        for _ in 0..16 {
+            var f2 = p.bench_frame[b]
+            eval.run_body(r.cx, p.bench_body[b], f2)
+            let c = r.cx.ctl
+            let v = r.cx.carry
+            r.cx.ctl = 0
+            r.cx.carry = VUnit
+            if c == eval.CTL_PANIC {
+                return (match v {
+                    VStr(s) -> s
+                    _ -> ""
+                }, 0, 0)
+            }
+        }
+        iterations += 16
+    }
+    let elapsed = monotonic_nanos() - start
+    ("\0", iterations, elapsed)
+}
+
+/// Nanoseconds per operation, in the unit that keeps three or four
+/// significant digits (`format_duration`).
+fn format_duration(ns: f64) -> str {
+    if ns < 1000.0 {
+        return "{ns.to_fixed(1)} ns/op"
+    }
+    if ns < 1000000.0 {
+        return "{(ns / 1000.0).to_fixed(2)} µs/op"
+    }
+    "{(ns / 1000000.0).to_fixed(2)} ms/op"
+}
+
+pub fn cmd_bench(a: [str]) {
+    let rest = a.slice(1, a.len())
+    let path = build.first_operand(rest, ["--filter"])
+    if path == "\0" {
+        eprint("usage: grasm bench <file.gr> [--filter TEXT]")
+        exit(1)
+    }
+    var filter = flag_value(rest, "--filter")
+    if filter == "\0" {
+        filter = ""
+    }
+    var r = prepare(path)
+    let p = r.prog
+    let multi = p.file_name.len() > 1
+    var names: [str] = []
+    var errs: [str] = []
+    var iters: [i64] = []
+    var nanos: [i64] = []
+    for b in 0..p.bench_name.len() {
+        if filter != "" and not p.bench_name[b].contains(filter) {
+            continue
+        }
+        let f = file_at(p, p.bench_at[b])
+        names.push(if multi { "{p.file_name[f]}::{p.bench_name[b]}" } else { p.bench_name[b] })
+        let (err, n, ns) = run_bench(r, b)
+        errs.push(err)
+        iters.push(n)
+        nanos.push(ns)
+    }
+    if names.is_empty() {
+        print("no benchmarks found (declare one with `bench \"name\" \{ ... }`)")
+        return
+    }
+    // The column is the longest name's length in bytes, padded in
+    // characters, as `{:<width$}` pads (docs/known-issues.md).
+    var width = 0
+    for n in names {
+        if n.to_bytes().len() > width {
+            width = n.to_bytes().len()
+        }
+    }
+    var failed = false
+    for i in 0..names.len() {
+        var name = names[i]
+        while name.len() < width {
+            name = name + " "
+        }
+        if errs[i] != "\0" {
+            print("{name}  FAILED: {errs[i]}")
+            failed = true
+        } else {
+            let n = if iters[i] > 0 { iters[i] } else { 1 }
+            var d = format_duration(nanos[i].as_f64() / n.as_f64())
+            while d.len() < 12 {
+                d = " " + d
+            }
+            print("{name}  {d}  ({iters[i]} iterations)")
+        }
+    }
+    if failed {
+        exit(1)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Doc examples
+// ---------------------------------------------------------------------
+
+/// `str::lines`: split at `\n`, a `\r` before it dropped, no last empty
+/// line for a text that ends in one.
+fn text_lines(s: str) -> [str] {
+    var out: [str] = []
+    if s == "" {
+        return out
+    }
+    let parts = s.split("\n")
+    for i in 0..parts.len() {
+        var x = parts[i]
+        if i == parts.len() - 1 and x == "" {
+            continue
+        }
+        if i < parts.len() - 1 and x.ends_with("\r") {
+            let b = x.to_bytes()
+            x = b.slice(0, b.len() - 1).to_str()
+        }
+        out.push(x)
+    }
+    out
+}
+
+/// The bodies of a doc comment's fenced blocks that are Grasm, `# ` markers
+/// stripped (`fenced_blocks`).
+fn fenced_blocks(doc: str) -> [str] {
+    var blocks: [str] = []
+    var cur: [str] = []
+    var open = false
+    var skipping = false
+    for line in text_lines(doc) {
+        let trimmed = line.trim_start()
+        if trimmed.starts_with("```") {
+            if skipping {
+                skipping = false
+                continue
+            }
+            if open {
+                blocks.push(cur.join("\n"))
+                cur = []
+                open = false
+            } else {
+                let tb = trimmed.to_bytes()
+                let info = tb.slice(3, tb.len()).to_str().trim()
+                if info == "" or info == "grasm" {
+                    open = true
+                    cur = []
+                } else {
+                    skipping = true
+                }
+            }
+            continue
+        }
+        if open {
+            if trimmed.starts_with("# ") {
+                let tb = trimmed.to_bytes()
+                cur.push(tb.slice(2, tb.len()).to_str())
+            } else {
+                cur.push(line)
+            }
+        }
+    }
+    if open {
+        blocks.push(cur.join("\n"))
+    }
+    blocks
+}
+
+/// The name a declaration is documented under (`decl_name`).
+fn decl_name(a: Ast, d: i64) -> str {
+    let k = a.k[d]
+    if k == ast.D_FN or k == ast.D_TYPE {
+        return a.t[sl(a, d, 2)]
+    }
+    if k == ast.D_CONST or k == ast.D_EXTERN or k == ast.D_TLS or k == ast.D_PLS or k == ast.D_INTERFACE {
+        return a.t[sl(a, d, 1)]
+    }
+    if k == ast.D_EFFECT {
+        return a.t[sl(a, d, 0)]
+    }
+    if k == ast.D_TEST or k == ast.D_BENCH {
+        return a.t[d]
+    }
+    if k == ast.D_IMPORT {
+        return dotted(a, sl(a, d, 0))
+    }
+    if k == ast.D_IMPL {
+        return dotted(a, sl(a, d, 0)) + " for " + a.t[d]
+    }
+    ""
+}
+
+/// Every example in the program (`docs::examples`): its owner,
+/// `module::item` with ` #N` from the second, and its source.
+fn doc_examples(l: Loaded) -> ([str], [str]) {
+    var owners: [str] = []
+    var sources: [str] = []
+    for f in 0..l.mods.len() {
+        let m = l.mods[f]
+        for d in m.decls {
+            var doc = "\0"
+            for q in 0..m.doc_keys.len() {
+                if m.doc_keys[q] == m.a.s[d] {
+                    doc = m.doc_vals[q]
+                }
+            }
+            if doc == "\0" {
+                continue
+            }
+            let name = decl_name(m.a, d)
+            let blocks = fenced_blocks(doc)
+            for i in 0..blocks.len() {
+                owners.push(if i == 0 { "{l.names[f]}::{name}" } else { "{l.names[f]}::{name} #{i + 1}" })
+                sources.push(blocks[i])
+            }
+        }
+    }
+    (owners, sources)
+}
+
+/// The module before an owner's `::`.
+fn owner_module(owner: str) -> str {
+    match owner.index_of("::") {
+        Some(i) -> owner.substr(0, i)
+        None -> owner
+    }
+}
+
+/// The synthesized program of some examples of one module
+/// (`example_group_program`): the owner's source inlined, its imports as
+/// the loader resolved them, each example a `test` named for it; the
+/// program's entry kept as `__doc_host` when the owner is not it.
+fn group_program(l: Loaded, owners: [str], sources: [str]) -> Loaded {
+    let om = owner_module(owners[0])
+    var oi = 0
+    var found = false
+    for f in 0..l.names.len() {
+        if not found and l.names[f] == om {
+            oi = f
+            found = true
+        }
+    }
+    var entry = str_builder()
+    if l.names.len() > 0 {
+        for line in text_lines(l.srcs[oi].to_str()) {
+            let ts = line.trim_start()
+            if ts.starts_with("import ") {
+                var w = ts
+                while w.starts_with("import ") {
+                    w = w.substr(7, w.len() - 7)
+                }
+                w = w.trim()
+                let ps = w.split(".")
+                let alias = ps[ps.len() - 1]
+                var full = "\0"
+                for j in 0..l.imp_alias[oi].len() {
+                    if l.imp_alias[oi][j] == alias {
+                        full = l.imp_full[oi][j]
+                    }
+                }
+                if full != "\0" {
+                    entry.push_str("import ")
+                    entry.push_str(full)
+                } else {
+                    entry.push_str(line)
+                }
+                entry.push_str("\n")
+                continue
+            }
+            entry.push_str(line)
+            entry.push_str("\n")
+        }
+    }
+    for i in 0..owners.len() {
+        entry.push_str("\ntest \"")
+        entry.push_str(owners[i].replace("\"", "'"))
+        entry.push_str("\" \{\n")
+        for line in text_lines(sources[i]) {
+            entry.push_str("    ")
+            entry.push_str(line)
+            entry.push_str("\n")
+        }
+        entry.push_str("}\n")
+    }
+    var names: [str] = []
+    var srcs: [str] = []
+    var host = "\0"
+    for f in 0..l.names.len() {
+        if l.names[f] == "main" {
+            if host == "\0" {
+                host = l.srcs[f].to_str()
+            }
+        } else {
+            names.push(l.names[f])
+            srcs.push(l.srcs[f].to_str())
+        }
+    }
+    var with_host = ""
+    if host != "\0" and om != "main" {
+        names.push("__doc_host")
+        srcs.push(host)
+        with_host = "import __doc_host\n"
+    }
+    names.push("main")
+    srcs.push(with_host + entry.to_str())
+    var resolved: Map[str, str] = map()
+    for f in 0..l.names.len() {
+        for j in 0..l.imp_alias[f].len() {
+            resolved.set(l.names[f] + "\t" + l.imp_alias[f][j], l.imp_full[f][j])
+        }
+    }
+    loader.load_sources(names, srcs, l.deps, om, resolved)
+}
+
+/// A synthesized program checked: its TIR, or "\0" and the first
+/// diagnostic's message.
+fn checked_group(g: Loaded) -> (str, str) {
+    if g.diags.len() > 0 {
+        return ("\0", g.diags[0])
+    }
+    let p = prog.build(g)
+    let (c, t0) = sema.check_program(p)
+    var t = t0
+    if c.d_msg.len() > 0 {
+        return ("\0", c.d_msg[0])
+    }
+    let (text, holes) = emit.emit(c, t, p)
+    if holes.len() > 0 {
+        return ("\0", "hole {holes[0]}")
+    }
+    (text, "")
+}
+
+/// Runs the examples named `wanted` in a synthesized program, one
+/// interpreter for them all, each's output then its line; whether each
+/// held, and the statement offsets reached.
+fn run_examples(g: Loaded, text: str, wanted: [str], coverage: bool, inout oks: [bool]) -> Map[i64, bool] {
+    var r = runner_of(text, "<doc example>", g)
+    if coverage {
+        r.cx.cov = true
+    }
+    let p = r.prog
+    for name in wanted {
+        let quoted = name.replace("\"", "'")
+        var ti = -1
+        for i in 0..p.test_name.len() {
+            if ti < 0 and p.test_name[i] == quoted and file_at(p, p.test_at[i]) == 0 {
+                ti = i
+            }
+        }
+        var m = "no test"
+        if ti >= 0 {
+            m = try_case(r, p.test_body[ti], p.test_frame[ti], [], [])
+        }
+        if m == "\0" {
+            print("doc example {name} ... ok")
+            oks.push(true)
+        } else {
+            print("doc example {name} ... FAILED: {m}")
+            oks.push(false)
+        }
+    }
+    var out: Map[i64, bool] = map()
+    if coverage {
+        let offs = stmt_offsets(p, g)
+        for node in r.cx.hits.keys() {
+            match offs.get(node) {
+                Some(at) -> out.set(at, true)
+                None -> ()
+            }
+        }
+    }
+    out
+}
+
+/// A synthesized program's coverage read back as `(path, line)` in the
+/// original program (`doc_hits_in_original`).
+fn hits_in_original(g: Loaded, l: Loaded, om: str, offs: Map[i64, bool], inout hits: [(str, i64)]) {
+    if offs.keys().is_empty() {
+        return
+    }
+    var has_main = false
+    var owner_lines = -1
+    var owner_path = "\0"
+    for f in 0..l.names.len() {
+        if l.names[f] == "main" {
+            has_main = true
+        }
+        if l.names[f] == om and owner_path == "\0" {
+            owner_path = l.paths[f]
+            owner_lines = text_lines(l.srcs[f].to_str()).len()
+        }
+    }
+    let prefix = if has_main and om != "main" { 1 } else { 0 }
+    var starts: [[i64]] = []
+    for f in 0..g.srcs.len() {
+        starts.push(line_starts(g.srcs[f]))
+    }
+    for at in offs.keys() {
+        var i = -1
+        for f in 0..g.bases.len() {
+            if at >= g.bases[f] {
+                i = f
+            }
+        }
+        if i < 0 {
+            continue
+        }
+        let line = line_in(starts[i], at - g.bases[i])
+        if g.names[i] == "main" {
+            if line <= prefix {
+                continue
+            }
+            let ol = line - prefix
+            if owner_lines >= 0 and ol > owner_lines {
+                continue
+            }
+            if owner_path != "\0" {
+                hits.push((owner_path, ol))
+            }
+            continue
+        }
+        var name = g.names[i]
+        while name.starts_with("__doc_host") {
+            name = name.substr(10, name.len() - 10)
+        }
+        var orig = "\0"
+        for f in 0..l.names.len() {
+            if orig == "\0" and (l.names[f] == g.names[i] or (name == "" and l.names[f] == "main")) {
+                orig = l.paths[f]
+            }
+        }
+        if orig != "\0" {
+            hits.push((orig, line))
+        }
+    }
+}
+
+/// Every fenced example in the program's `///` comments, run as the Rust
+/// runner runs them (`run_doc_examples`): the examples of one module
+/// together in one synthesized program, or one at a time when that one
+/// does not compile.
+fn run_doc_examples(inout r: TestRunner, filter: str, coverage: bool, inout hits: [(str, i64)]) {
+    let (all_o, all_s) = doc_examples(r.l)
+    var mods: [str] = []
+    var g_o: [[str]] = []
+    var g_s: [[str]] = []
+    for i in 0..all_o.len() {
+        if filter != "" and not all_o[i].contains(filter) {
+            continue
+        }
+        let om = owner_module(all_o[i])
+        var k = -1
+        for j in 0..mods.len() {
+            if mods[j] == om {
+                k = j
+            }
+        }
+        if k < 0 {
+            mods.push(om)
+            g_o.push([all_o[i]])
+            g_s.push([all_s[i]])
+        } else {
+            var xs = g_o[k]
+            xs.push(all_o[i])
+            g_o[k] = xs
+            var ys = g_s[k]
+            ys.push(all_s[i])
+            g_s[k] = ys
+        }
+    }
+    for k in 0..mods.len() {
+        let grp = group_program(r.l, g_o[k], g_s[k])
+        let (text, _why) = checked_group(grp)
+        if text != "\0" {
+            var oks: [bool] = []
+            let offs = run_examples(grp, text, g_o[k], coverage, oks)
+            hits_in_original(grp, r.l, mods[k], offs, hits)
+            for ok in oks {
+                if ok {
+                    r.passed += 1
+                } else {
+                    r.failed += 1
+                }
+            }
+            continue
+        }
+        for i in 0..g_o[k].len() {
+            let one = group_program(r.l, [g_o[k][i]], [g_s[k][i]])
+            let (t1, why) = checked_group(one)
+            if t1 == "\0" {
+                print("doc example {g_o[k][i]} ... FAILED to compile: {why}")
+                r.failed += 1
+                continue
+            }
+            var oks: [bool] = []
+            let offs = run_examples(one, t1, [g_o[k][i]], coverage, oks)
+            hits_in_original(one, r.l, mods[k], offs, hits)
+            if oks.len() > 0 and oks[0] {
+                r.passed += 1
+            } else {
+                r.failed += 1
+            }
+        }
+    }
+}

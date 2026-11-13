@@ -69,6 +69,18 @@ fn main() {
 }
 ```
 
+**The Grasm `grasm test` ends on a panic the runtime's channel operations
+raise -- *open, raised with the coordinator*.** The TIR interpreter's
+channels are the host runtime's, so sending on or closing a closed channel,
+and a channel operation outside every task that would have to wait, panic
+in the host, where the Rust runner reports the test failed and goes on.
+Found by running `spec/conformance/E-CHANNEL.gr` and `E-DEADLOCK.gr` with a
+`test "main" \{ main() }` appended (2026-11-05): `grasm test` says `test
+"main" ... FAILED: send on a closed channel` and `... FAILED: deadlock: every
+task is waiting on a channel, and nothing left can send or receive`; the
+Grasm command `panic: ...` and 101. It is the same cause as the one above --
+the interpreter's channels and tasks are the host's -- and goes with it.
+
 **The Grasm `grasm test` ends when the TIR interpreter's own stack runs out
 -- *open, by decision*.** The interpreter stops a program's recursion at
 100,000 calls with the panic every engine words the same way, and that panic

@@ -1955,6 +1955,114 @@ fn load_bundle(src: str) -> Loaded {
     out
 }
 
+/// `load_with_resolved_imports`: a program whose modules' sources are given
+/// by name -- what `grasm test` makes of a module's doc examples, a
+/// synthesized entry `main` with the program's other modules beside it
+/// (docs/self-hosting.md §6.19). An import is named as the build named it
+/// (`resolved`, keyed "module\talias"), else relative to the package its
+/// module is in; one naming `entry_alias` is the entry. The entry's path is
+/// `<doc example>`, every other module's its name as a path.
+pub fn load_sources(names: [str], srcs: [str], deps: [str], entry_alias: str, resolved: Map[str, str]) -> Loaded {
+    var table: Map[str, str] = map()
+    for i in 0..names.len() {
+        if not table.has(names[i]) {
+            table.set(names[i], srcs[i])
+        }
+    }
+    var out = empty_loaded("")
+    var loaded: Map[str, bool] = map()
+    var q_name: [str] = ["main"]
+    var q_disp: [str] = ["<doc example>"]
+    var q_s: [i64] = [0]
+    var q_e: [i64] = [1]
+    var q_written: [str] = ["main"]
+    var base = 0
+    while q_name.len() > 0 {
+        let name = q_name.pop() ?? ""
+        let display = q_disp.pop() ?? ""
+        let asked_s = q_s.pop() ?? 0
+        let asked_e = q_e.pop() ?? 0
+        let asked_as = q_written.pop() ?? ""
+        if loaded.has(name) {
+            continue
+        }
+        loaded.set(name, true)
+        let msrc = match table.get(name) {
+            Some(x) -> x
+            None -> {
+                load_diag(out, asked_s, asked_e, not_loaded(asked_as, display, []), "")
+                continue
+            }
+        }
+        let sb = msrc.to_bytes()
+        let lx = lex.lex(sb, true)
+        let ps = parse.parse(sb, lx)
+        let c = cst.build(ps)
+        let m = ast.build(c, sb, ps.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+        parse_diags(out, ps, base)
+        let owner = longest_prefix(deps, name)
+        var ia: [str] = []
+        var ifull: [str] = []
+        for d in m.decls {
+            if m.a.k[d] != ast.D_IMPORT {
+                continue
+            }
+            let path = m.a.pool[m.a.off[d]]
+            let sv = m.a.pool[m.a.off[path]]
+            let segs = m.a.pool.slice(m.a.off[sv], m.a.off[sv] + m.a.n[sv])
+            var parts: [str] = []
+            for sg in segs {
+                parts.push(m.a.t[sg])
+            }
+            let written = parts.join(".")
+            var alias = ""
+            if parts.len() > 0 {
+                alias = parts[parts.len() - 1]
+            }
+            var full = written
+            if owner != "\0" {
+                full = owner + "." + written
+            }
+            match resolved.get(name + "\t" + alias) {
+                Some(r) -> full = r
+                None -> ()
+            }
+            if full == entry_alias {
+                full = "main"
+            }
+            var dup = -1
+            for j in 0..ia.len() {
+                if ia[j] == alias {
+                    dup = j
+                }
+            }
+            if dup >= 0 {
+                load_diag(out, m.a.s[d] + base, m.a.e[d] + base, "duplicate import alias `{alias}` in module `{name}`", "")
+                ifull[dup] = full
+            } else {
+                ia.push(alias)
+                ifull.push(full)
+            }
+            q_name.push(full)
+            q_disp.push(dotted_to_path(full) + ".gr")
+            q_s.push(m.a.s[d] + base)
+            q_e.push(m.a.e[d] + base)
+            q_written.push(written)
+        }
+        out.names.push(name)
+        out.aliases.push(last_seg(name))
+        out.paths.push(display)
+        out.srcs.push(sb)
+        out.bases.push(base)
+        out.imp_alias.push(ia)
+        out.imp_full.push(ifull)
+        out.mods.push(m)
+        base += sb.len() + 1
+    }
+    out.deps = deps
+    out
+}
+
 fn sort_prefixes(inout xs: [str]) {
     // Insertion sort by (length, text): the lists are short.
     for i in 1..xs.len() {

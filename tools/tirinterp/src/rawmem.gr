@@ -74,6 +74,9 @@ pub fn mem_op(inout cx: Cx, e: i64) -> Value {
         // expected, compared at the width, and answers what was there.
         13 -> {
             let old = read_at(cx, ty, at, what)
+            if cx.ctl != 0 {
+                return VUnit
+            }
             let m = mask(ty)
             if bits(old).bit_and(m) == bits(vs[1]).bit_and(m) {
                 write_at(cx, ty, at, bits(vs[2]), what)
@@ -84,6 +87,9 @@ pub fn mem_op(inout cx: Cx, e: i64) -> Value {
         // there.
         _ -> {
             let old = read_at(cx, ty, at, what)
+            if cx.ctl != 0 {
+                return VUnit
+            }
             write_at(cx, ty, at, bits(old) + bits(vs[1]), what)
             old
         }
@@ -117,16 +123,16 @@ fn mask(ty: i64) -> i64 {
 
 pub fn alloc(inout cx: Cx, size: i64, align: i64) -> Value {
     if size < 0 {
-        panic("mem_alloc: negative size {size}")
+        return eval.fault(cx, "mem_alloc: negative size {size}")
     }
     if align < 1 or align > 4096 or align.bit_and(align - 1) != 0 {
-        panic("mem_alloc: alignment {align} is not a power of two from 1 to 4096")
+        return eval.fault(cx, "mem_alloc: alignment {align} is not a power of two from 1 to 4096")
     }
     if size > MAX_SIZE {
-        panic("mem_alloc: {size} bytes is more than an allocation can hold")
+        return eval.fault(cx, "mem_alloc: {size} bytes is more than an allocation can hold")
     }
     if size > MAX_HOST {
-        panic("mem_alloc: out of memory")
+        return eval.fault(cx, "mem_alloc: out of memory")
     }
     let step = if align > 16 { align } else { 16 }
     let from = if cx.mem_next > BASE { cx.mem_next } else { BASE }
@@ -166,15 +172,18 @@ fn free(inout cx: Cx, at: i64) {
     // A function's address and a thread-local cell are the sandbox's too
     // ([T-FN-ADDR], [T-TLS]), and neither is the program's to free.
     if cx.fn_at.has(at) {
-        panic("mem_free of the address of a function")
+        eval.fault(cx, "mem_free of the address of a function")
+        return
     }
     if cx.cell_at.has(at) {
-        panic("mem_free of a thread-local cell")
+        eval.fault(cx, "mem_free of a thread-local cell")
+        return
     }
     let k = find(cx, at)
     if k >= 0 and cx.mem_base[k] == at {
         if cx.mem_state[k] != LIVE {
-            panic("mem_free of an allocation already freed")
+            eval.fault(cx, "mem_free of an allocation already freed")
+            return
         }
         cx.mem_state[k] = FREED
         cx.mem_data[k] = bytes_filled(0, 0)
@@ -186,37 +195,45 @@ fn free(inout cx: Cx, at: i64) {
         return
     }
     if at == 0 {
-        panic("mem_free of the null address")
+        eval.fault(cx, "mem_free of the null address")
+        return
     }
     if k >= 0 {
-        panic("mem_free of an address inside an allocation, not its start")
+        eval.fault(cx, "mem_free of an address inside an allocation, not its start")
+        return
     }
-    panic("mem_free of an address no allocation holds")
+    eval.fault(cx, "mem_free of an address no allocation holds")
 }
 
 /// The allocation `n` bytes at `at` lie in, checked: live, in bounds and
 /// aligned.
 fn span(inout cx: Cx, at: i64, n: i64, what: str) -> i64 {
     if at == 0 {
-        panic("{what} through the null address")
+        eval.fault(cx, "{what} through the null address")
+        return -1
     }
     if cx.fn_at.has(at) {
-        panic("{what} through the address of a function")
+        eval.fault(cx, "{what} through the address of a function")
+        return -1
     }
     let k = find(cx, at)
     if k < 0 {
-        panic("{what} through an address no allocation holds")
+        eval.fault(cx, "{what} through an address no allocation holds")
+        return -1
     }
     if cx.mem_state[k] != LIVE {
-        panic("{what} after its allocation was freed")
+        eval.fault(cx, "{what} after its allocation was freed")
+        return -1
     }
     let off = at - cx.mem_base[k]
     let len = cx.mem_len[k]
     if off + n > len {
-        panic("{what} of {n} byte(s) at offset {off} of a {len}-byte allocation")
+        eval.fault(cx, "{what} of {n} byte(s) at offset {off} of a {len}-byte allocation")
+        return -1
     }
     if at % n != 0 {
-        panic("{what} at an address not aligned to {n}")
+        eval.fault(cx, "{what} at an address not aligned to {n}")
+        return -1
     }
     k
 }
@@ -226,6 +243,9 @@ fn span(inout cx: Cx, at: i64, n: i64, what: str) -> i64 {
 fn read_at(inout cx: Cx, ty: i64, at: i64, what: str) -> Value {
     let n = load.layout_size(ty)
     let k = span(cx, at, n, what)
+    if k < 0 {
+        return VUnit
+    }
     let off = at - cx.mem_base[k]
     var raw = 0
     for j in 0..n {
@@ -246,6 +266,9 @@ fn read_at(inout cx: Cx, ty: i64, at: i64, what: str) -> Value {
 fn write_at(inout cx: Cx, ty: i64, at: i64, raw: i64, what: str) {
     let n = load.layout_size(ty)
     let k = span(cx, at, n, what)
+    if k < 0 {
+        return
+    }
     let off = at - cx.mem_base[k]
     var buf = cx.mem_data[k]
     cx.mem_data[k] = bytes_filled(0, 0)

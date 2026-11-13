@@ -303,11 +303,13 @@ fn variant_named(p: TirProg, ty: i64, name: str) -> i64 {
     panic("tirinterp: the program's `{p.ty_name[ty]}` has no variant `{name}`")
 }
 
-fn byte_or_panic(n: i64, op: str) -> i64 {
+/// Whether `n` is a byte; when it is not, the program's panic, and false.
+fn byte_ok(inout cx: Cx, n: i64, op: str) -> bool {
     if n < 0 or n > 255 {
-        panic("{n} is not a byte — {op} takes values in 0..255")
+        eval.fault(cx, "{n} is not a byte — {op} takes values in 0..255")
+        return false
     }
-    n
+    true
 }
 
 fn opt(p: TirProg, o: Option[Value]) -> Value {
@@ -342,7 +344,9 @@ pub fn builtin(inout cx: Cx, e: i64) -> Value {
         3 -> {
             let xs = ints_of(args[0])
             for x in xs {
-                byte_or_panic(x, "bytes_of")
+                if not byte_ok(cx, x, "bytes_of") {
+                    return VUnit
+                }
             }
             VBytes(bytes_of(xs))
         }
@@ -351,18 +355,18 @@ pub fn builtin(inout cx: Cx, e: i64) -> Value {
         // assert_eq
         5 -> {
             if not value.equal(args[0], args[1]) {
-                panic("assertion failed: `{value.show(p, args[0])}` != `{value.show(p, args[1])}`")
+                return eval.fault(cx, "assertion failed: `{value.show(p, args[0])}` != `{value.show(p, args[1])}`")
             }
             VUnit
         }
         // panic
-        6 -> panic(value.show(p, args[0]))
+        6 -> eval.fault(cx, value.show(p, args[0]))
         // ref
         7 -> new_ref(cx, value.take(args[0]))
         // assert
         9 -> {
             if not eval.is_true(args[0]) {
-                panic("assertion failed")
+                return eval.fault(cx, "assertion failed")
             }
             VUnit
         }
@@ -372,12 +376,16 @@ pub fn builtin(inout cx: Cx, e: i64) -> Value {
         11 -> {
             let n = int_of(args[0])
             if n < 0 {
-                panic("bytes_filled: a buffer cannot have {n} bytes")
+                return eval.fault(cx, "bytes_filled: a buffer cannot have {n} bytes")
             }
             if n > MAX_ALLOC {
-                panic("bytes_filled would need more memory than a buffer can hold ({n} bytes)")
+                return eval.fault(cx, "bytes_filled would need more memory than a buffer can hold ({n} bytes)")
             }
-            VBytes(bytes_filled(n, byte_or_panic(int_of(args[1]), "bytes_filled")))
+            let fill = int_of(args[1])
+            if not byte_ok(cx, fill, "bytes_filled") {
+                return VUnit
+            }
+            VBytes(bytes_filled(n, fill))
         }
         // release
         13 -> {
@@ -401,10 +409,7 @@ pub fn builtin(inout cx: Cx, e: i64) -> Value {
             VUnit
         }
         // exit
-        47 -> {
-            exit(int_of(args[0]))
-            VUnit
-        }
+        47 -> eval.exit_with(cx, int_of(args[0]))
         // net_workers
         61 -> run_net_workers(cx, args)
         // str_builder, byte_builder: an empty one of each
@@ -505,7 +510,7 @@ fn release_ref(inout cx: Cx, r: Value) {
 fn run_net_workers(inout cx: Cx, inout args: [Value]) -> Value {
     let n = int_of(args[0])
     if n > 256 {
-        panic("net_workers: at most 256 workers, asked for {n}")
+        return eval.fault(cx, "net_workers: at most 256 workers, asked for {n}")
     }
     var out: [Value] = []
     for i in 0..n.max(0) {
@@ -731,7 +736,7 @@ pub fn method(inout cx: Cx, e: i64) -> Value {
             return VUnit
         }
         if code == 108 {
-            panic(value.show(cx.p, d))
+            return eval.fault(cx, value.show(cx.p, d))
         }
         return d
     }
@@ -812,7 +817,7 @@ fn mutate_value(inout cx: Cx, code: i64, inout cur: Value, inout args: [Value]) 
     }
     if shape == 3 {
         var b = value.bytes_of_value(value.take(cur))
-        let r = bytes_mutation(code, b, args)
+        let r = bytes_mutation(cx, code, b, args)
         cur = VBytes(b)
         return r
     }
@@ -826,7 +831,7 @@ fn mutate_value(inout cx: Cx, code: i64, inout cur: Value, inout args: [Value]) 
     }
     if shape == 6 {
         var bb = byte_builder_of(value.take(cur))
-        byte_builder_mutation(code, bb, args)
+        byte_builder_mutation(cx, code, bb, args)
         cur = VByteB(bb)
         return VUnit
     }
@@ -874,7 +879,7 @@ fn list_mutation(inout cx: Cx, code: i64, inout xs: [Value], inout args: [Value]
             let i = int_of(args[0])
             let n = xs.len()
             if i < 0 or i >= n {
-                panic("remove {i} out of bounds (len {n})")
+                return eval.fault(cx, "remove {i} out of bounds (len {n})")
             }
             xs.remove(i)
         }
@@ -882,18 +887,28 @@ fn list_mutation(inout cx: Cx, code: i64, inout xs: [Value], inout args: [Value]
     }
 }
 
-fn bytes_mutation(code: i64, inout b: bytes, inout args: [Value]) -> Value {
+fn bytes_mutation(inout cx: Cx, code: i64, inout b: bytes, inout args: [Value]) -> Value {
     match code {
         // set
         29 -> {
             let i = int_of(args[0])
             if i < 0 or i >= b.len() {
-                panic("index {i} out of bounds (len {b.len()})")
+                return eval.fault(cx, "index {i} out of bounds (len {b.len()})")
             }
-            b.set(i, byte_or_panic(int_of(args[1]), "set"))
+            let x = int_of(args[1])
+            if not byte_ok(cx, x, "set") {
+                return VUnit
+            }
+            b.set(i, x)
         }
         // fill
-        104 -> b.fill(byte_or_panic(int_of(args[0]), "fill"))
+        104 -> {
+            let x = int_of(args[0])
+            if not byte_ok(cx, x, "fill") {
+                return VUnit
+            }
+            b.fill(x)
+        }
         // copy_from
         82 -> {
             let at = int_of(args[0])
@@ -901,7 +916,7 @@ fn bytes_mutation(code: i64, inout b: bytes, inout args: [Value]) -> Value {
             let m = src.len()
             let n = b.len()
             if at < 0 or at > n or at + m > n {
-                panic("copy_from writes {m} bytes at {at}, past the end (len {n})")
+                return eval.fault(cx, "copy_from writes {m} bytes at {at}, past the end (len {n})")
             }
             b.copy_from(at, src)
         }
@@ -924,7 +939,7 @@ fn byte_builder_of(v: Value) -> ByteBuilder {
     }
 }
 
-fn byte_builder_mutation(code: i64, inout b: ByteBuilder, inout args: [Value]) {
+fn byte_builder_mutation(inout cx: Cx, code: i64, inout b: ByteBuilder, inout args: [Value]) {
     match code {
         // push_str: its UTF-8
         138 -> b.push_str(match args[0] {
@@ -932,16 +947,25 @@ fn byte_builder_mutation(code: i64, inout b: ByteBuilder, inout args: [Value]) {
             _ -> ""
         })
         // push_byte
-        139 -> b.push_byte(byte_or_panic(int_of(args[0]), "push_byte"))
+        139 -> {
+            let x = int_of(args[0])
+            if byte_ok(cx, x, "push_byte") {
+                b.push_byte(x)
+            }
+        }
         // push_bytes
         140 -> b.push_bytes(value.bytes_of_value(args[0]))
         // set
         29 -> {
             let i = int_of(args[0])
+            let x = int_of(args[1])
             if i < 0 or i >= b.len() {
-                panic("index {i} out of bounds (len {b.len()})")
+                eval.fault(cx, "index {i} out of bounds (len {b.len()})")
+                return
             }
-            b.set(i, byte_or_panic(int_of(args[1]), "set"))
+            if byte_ok(cx, x, "set") {
+                b.set(i, x)
+            }
         }
         _ -> panic("no method `{method_names()[code - 1]}` on a ByteBuilder")
     }
@@ -1122,7 +1146,7 @@ fn apply_method(inout cx: Cx, e: i64, code: i64, recv: Value, inout args: [Value
         VBytes(b) -> return bytes_method(cx, code, b, args)
         VU64(u) -> return u64_method(cx, code, u, args)
         VStrB(b) -> return builder_method(code, b)
-        VByteB(b) -> return byte_builder_method(code, b, args)
+        VByteB(b) -> return byte_builder_method(cx, code, b, args)
         VMap(_, _, _, _, _) -> {
             match code {
                 // len
@@ -1212,7 +1236,7 @@ fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
         22 -> {
             let base = int_of(args[0])
             if base < 2 or base > 36 {
-                panic("parse_int_base takes a base in 2..36, not {base}")
+                return eval.fault(cx, "parse_int_base takes a base in 2..36, not {base}")
             }
             match s.parse_int_base(base) {
                 Some(n) -> value.some_v(p, VInt(n))
@@ -1236,7 +1260,7 @@ fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
             let i = int_of(args[0])
             let n = s.len()
             if i < 0 or i >= n {
-                panic("code_at {i} out of bounds (len {n})")
+                return eval.fault(cx, "code_at {i} out of bounds (len {n})")
             }
             VInt(s.code_at(i))
         }
@@ -1244,11 +1268,11 @@ fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
         38 -> {
             let k = int_of(args[0])
             if k < 0 {
-                panic("repeat count must be a non-negative int")
+                return eval.fault(cx, "repeat count must be a non-negative int")
             }
             let bl = s.byte_len()
             if bl > 0 and k > MAX_ALLOC / bl {
-                panic("repeat would need more memory than a string can hold ({k} copies)")
+                return eval.fault(cx, "repeat would need more memory than a string can hold ({k} copies)")
             }
             VStr(s.repeat(k))
         }
@@ -1257,7 +1281,7 @@ fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
         131 -> {
             let base = int_of(args[0])
             if base < 2 or base > 36 {
-                panic("parse_u64_base takes a base in 2..36, not {base}")
+                return eval.fault(cx, "parse_u64_base takes a base in 2..36, not {base}")
             }
             opt_u64(p, s.parse_u64_base(base))
         }
@@ -1269,8 +1293,8 @@ fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
         // cmp
         99 -> VInt(value.compare(VStr(s), args[0]))
         // pad_start / pad_end
-        49 -> VStr(pad(s, args, true))
-        60 -> VStr(pad(s, args, false))
+        49 -> pad(cx, s, args, true)
+        60 -> pad(cx, s, args, false)
         // byte_len
         64 -> VInt(s.byte_len())
         // lines
@@ -1285,22 +1309,22 @@ fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
     }
 }
 
-fn pad(s: str, args: [Value], at_start: bool) -> str {
+fn pad(inout cx: Cx, s: str, args: [Value], at_start: bool) -> Value {
     let width = int_of(args[0]).max(0)
     let fill = match args[1] {
         VStr(f) -> f
         _ -> ""
     }
     if fill == "" {
-        panic("pad fill must not be empty")
+        return eval.fault(cx, "pad fill must not be empty")
     }
     if width > MAX_ALLOC {
-        panic("pad width {width} is larger than a string can hold")
+        return eval.fault(cx, "pad width {width} is larger than a string can hold")
     }
     if at_start {
-        s.pad_start(width, fill)
+        VStr(s.pad_start(width, fill))
     } else {
-        s.pad_end(width, fill)
+        VStr(s.pad_end(width, fill))
     }
 }
 
@@ -1366,7 +1390,7 @@ fn int_method(inout cx: Cx, e: i64, code: i64, n: i64, inout args: [Value]) -> V
         // to_char
         28 -> {
             if n < 0 or n > 1114111 or (n >= 55296 and n <= 57343) {
-                panic("{n} is not a Unicode code point")
+                return eval.fault(cx, "{n} is not a Unicode code point")
             }
             VStr(n.to_char())
         }
@@ -1385,7 +1409,7 @@ fn int_method(inout cx: Cx, e: i64, code: i64, n: i64, inout args: [Value]) -> V
         45 -> {
             let base = int_of(args[0])
             if base < 2 or base > 36 {
-                panic("to_base takes a base in 2..36, not {base}")
+                return eval.fault(cx, "to_base takes a base in 2..36, not {base}")
             }
             VStr(n.to_base(base))
         }
@@ -1501,7 +1525,7 @@ fn u64_method(inout cx: Cx, code: i64, u: u64, inout args: [Value]) -> Value {
         45 -> {
             let base = int_of(args[0])
             if base < 2 or base > 36 {
-                panic("to_base takes a base in 2..36, not {base}")
+                return eval.fault(cx, "to_base takes a base in 2..36, not {base}")
             }
             VStr(u.to_base(base))
         }
@@ -1510,7 +1534,7 @@ fn u64_method(inout cx: Cx, code: i64, u: u64, inout args: [Value]) -> Value {
             let fits_i64 = u.try_i64().is_some()
             let n = u.as_i64()
             if not fits_i64 or n > 1114111 or (n >= 55296 and n <= 57343) {
-                panic("{u} is not a Unicode code point")
+                return eval.fault(cx, "{u} is not a Unicode code point")
             }
             VStr(n.to_char())
         }
@@ -1546,7 +1570,7 @@ fn builder_method(code: i64, b: StrBuilder) -> Value {
 }
 
 /// What a `ByteBuilder` answers without changing.
-fn byte_builder_method(code: i64, b: ByteBuilder, args: [Value]) -> Value {
+fn byte_builder_method(inout cx: Cx, code: i64, b: ByteBuilder, args: [Value]) -> Value {
     match code {
         1 -> VInt(b.len())
         36 -> VBool(b.is_empty())
@@ -1556,7 +1580,7 @@ fn byte_builder_method(code: i64, b: ByteBuilder, args: [Value]) -> Value {
         4 -> {
             let i = int_of(args[0])
             if i < 0 or i >= b.len() {
-                panic("index {i} out of bounds (len {b.len()})")
+                return eval.fault(cx, "index {i} out of bounds (len {b.len()})")
             }
             VInt(b.at(i))
         }
@@ -1629,7 +1653,7 @@ fn float_method(inout cx: Cx, code: i64, x: f64, inout args: [Value]) -> Value {
         86 -> {
             let places = int_of(args[0])
             if places < 0 or places > 17 {
-                panic("to_fixed({places}): places must be 0 to 17")
+                return eval.fault(cx, "to_fixed({places}): places must be 0 to 17")
             }
             VStr(x.to_fixed(places))
         }
@@ -1648,7 +1672,7 @@ fn bytes_method(inout cx: Cx, code: i64, b: bytes, inout args: [Value]) -> Value
         4 -> {
             let i = int_of(args[0])
             if i < 0 or i >= b.len() {
-                panic("index {i} out of bounds (len {b.len()})")
+                return eval.fault(cx, "index {i} out of bounds (len {b.len()})")
             }
             VInt(b.at(i))
         }
@@ -1661,7 +1685,7 @@ fn bytes_method(inout cx: Cx, code: i64, b: bytes, inout args: [Value]) -> Value
             let from = int_of(args[0])
             let end = int_of(args[1])
             if from < 0 or end < from or end > b.len() {
-                panic("slice {from}..{end} out of bounds (len {b.len()})")
+                return eval.fault(cx, "slice {from}..{end} out of bounds (len {b.len()})")
             }
             VBytes(b.slice(from, end))
         }
@@ -1670,7 +1694,7 @@ fn bytes_method(inout cx: Cx, code: i64, b: bytes, inout args: [Value]) -> Value
             let byte = int_of(args[0])
             let from = int_of(args[1])
             if from < 0 or from > b.len() {
-                panic("index_of from {from} out of bounds (len {b.len()})")
+                return eval.fault(cx, "index_of from {from} out of bounds (len {b.len()})")
             }
             if byte < 0 or byte > 255 {
                 return value.none_v(p)

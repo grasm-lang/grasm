@@ -4960,7 +4960,11 @@ and are the one difference between the commands this part allows
 a `concurrent` block (the host's scheduler, which the interpreter's tasks
 run on, cannot abort a task's siblings as [E-TASK-PANIC] requires, so
 `test` ends there with `panic: ...` and 101, where the Rust command reports
-the test failed and goes on), and the host's own stack running out.
+the test failed and goes on), and the host's own stack running out. A
+third of the same cause was found after the decision, and is raised with
+the coordinator: a panic the runtime's channel operations raise (a send on
+or a close of a closed channel, a channel operation outside every task that
+would wait), since the interpreter's channels are the host's too.
 
 **`--schedules` and `--schedule-seed`** (decision (4)). The Rust interpreter
 has its own scheduler, and `--schedules N` reruns a unit test that ran a
@@ -4968,10 +4972,11 @@ has its own scheduler, and `--schedules N` reruns a unit test that ran a
 interpreter's tasks are the host's, scheduled by the runtime by
 [E-SCHEDULE]'s fixed rule, with no seed to give. When no test starts a task
 the flags change nothing, and the Grasm command answers as Rust's does. When
-one does and either flag is given, the Grasm command says "error: `grasm
-test --schedules` is not in the Grasm toolchain yet" (or
-`--schedule-seed`'s) after that test's report line, with part one's help,
-exit 1 -- taken by the agent, accepted by the coordinator because it refuses
+one does and the Rust command would act on the flag -- `--schedule-seed`
+given, or `--schedules N` above 0 and the test passed -- the Grasm command
+says "error: `grasm test --schedules` is not in the Grasm toolchain yet"
+(or `--schedule-seed`'s) in place of that test's report line, with part
+one's help, exit 1 -- taken by the agent, accepted by the coordinator because it refuses
 rather than answering otherwise in silence, the owner's to reverse; the
 alternative is a scheduler of the interpreter's own, which means evaluating
 without the host's stack (every task a state machine), a rewrite of the

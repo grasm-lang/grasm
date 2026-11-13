@@ -21,6 +21,11 @@
 //                          canonical layout                tools/gfmt (§6.19)
 //     lint <file.gr> [--json] [--only RULE] [--rules]
 //                          the rules a line cannot answer  compiler/front's AST
+//     test <file.gr> [--coverage] [--contracts] [--seed N] [--cases N]
+//          [--filter T] [--schedules N] [--schedule-seed S]
+//                          test blocks, unit and property  tools/tirinterp (§6.19)
+//     bench <file.gr> [--filter T]
+//                          bench blocks, time per op       tools/tirinterp (§6.19)
 //
 // Each is the packages' own code, called in this process: nothing here
 // starts a process, and the Rust toolchain is on no path it takes. The other
@@ -36,6 +41,7 @@ import tirinterp.sexp
 import build
 import fmtcmd
 import lint
+import testing
 
 /// The toolchain's version, `grasm --version`'s: the workspace's, which the
 /// Rust command takes from its manifest. `clidiff` holds the two equal.
@@ -63,6 +69,10 @@ fn main() {
         front.cmd_tokens(operand(a, "usage: grasm tokens <file.gr>"))
     } else if cmd == "ast" {
         front.cmd_ast(operand(a, "usage: grasm ast <file.gr>"))
+    } else if cmd == "test" {
+        testing.cmd_test(a)
+    } else if cmd == "bench" {
+        testing.cmd_bench(a)
     } else if cmd == "lint" {
         lint.cmd_lint(a)
     } else if cmd == "fmt" {
@@ -95,7 +105,7 @@ fn operand(a: [str], usage_line: str) -> str {
 /// Whether `cmd` is one of the Rust `grasm`'s subcommands that this one
 /// does not run yet.
 fn elsewhere(cmd: str) -> bool {
-    let them = ["test", "bench", "doc", "api", "deps", "publish", "add", "lsp", "dap", "journal"]
+    let them = ["doc", "api", "deps", "publish", "add", "lsp", "dap", "journal"]
     them.contains(cmd)
 }
 
@@ -103,7 +113,7 @@ fn elsewhere(cmd: str) -> bool {
 /// and exit 1 -- never handed to anything else.
 fn not_here(cmd: str) {
     eprint("error: `grasm {cmd}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links`, `fmt` and `lint`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links`, `fmt`, `lint`, `test` and `bench`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
     exit(1)
 }
 
