@@ -59,19 +59,27 @@ linux_workdir() {
     (cd "$d" && pwd -P)
 }
 
+# Stops the gate as not run when `GRASM_X64_ROOT` does not name the
+# unpacked x86-64 cross packages. A gate that only runs other gates (the
+# controls) calls it too, so a missing root reads as not run there and not
+# as every control missed.
+linux_x64_root_require() {
+    local root=${GRASM_X64_ROOT:-}
+    if [ -z "$root" ] || [ ! -x "$root/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2" ] ||
+        [ ! -x "$root/usr/bin/x86_64-linux-gnu-ld" ]; then
+        echo "not run: GRASM_X64_ROOT does not name the unpacked x86-64 cross packages (make one with \`linux_x64_root_make <dir>\` from scripts/lib/linux.sh; docs/self-hosting.md §6.18)"
+        exit "$LINUX_NOT_RUN"
+    fi
+}
+
 # Stops the gate as not run when the x86-64 root is missing; otherwise sets
 # `X64_ROOT`, `X64_LIB` (its C library's directory, as the machine sees it
 # under the root), `X64_LD` and `X64_RUN` (scripts that run, in the machine,
 # its ld with the root as the system root, and a program through its
 # dynamic loader).
 linux_x64_root() {
-    X64_ROOT=${GRASM_X64_ROOT:-}
-    if [ -z "$X64_ROOT" ] || [ ! -x "$X64_ROOT/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2" ] ||
-        [ ! -x "$X64_ROOT/usr/bin/x86_64-linux-gnu-ld" ]; then
-        echo "not run: GRASM_X64_ROOT does not name the unpacked x86-64 cross packages (make one with \`linux_x64_root_make <dir>\` from scripts/lib/linux.sh; docs/self-hosting.md §6.18)"
-        exit "$LINUX_NOT_RUN"
-    fi
-    X64_ROOT=$(cd "$X64_ROOT" && pwd -P)
+    linux_x64_root_require
+    X64_ROOT=$(cd "$GRASM_X64_ROOT" && pwd -P)
     X64_LIB=/usr/x86_64-linux-gnu/lib
     X64_LD="$WORK/x64-ld"
     X64_RUN="$WORK/x64-run"

@@ -77,12 +77,14 @@
 # The runtime's faults are planted in a copy of `compiler/rt`, which the
 # gates are given as `ELF_RT_SRC`; the linker's in a copy of `compiler/link`,
 # built and given to the gates as `LINK`. Needs what the gates need
-# (scripts/lib/linux.sh); without the machine it does not run (exit 77).
+# (scripts/lib/linux.sh); without the machine or the x86-64 root it does
+# not run (exit 77).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
 . scripts/lib/linux.sh
 linux_require
+linux_x64_root_require
 . scripts/lib/fresh.sh
 fresh_or_stop "./target/release/grasm"
 

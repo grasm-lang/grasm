@@ -92,7 +92,7 @@ control tlv-shared 'FAIL: linked by (link|cc).*tls' aarch64/src/leaves.gr \
     '    try put(l, mach.A_ADDI, 16, 0, -1, 0)'
 control frameless-ret 'FAIL: _g_main_[a-z_]* does not sign its return address' aarch64/src/emit.gr \
     '                // No frame on this path: the return address never left x30.
-                try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)' \
+                try ret(e, linux)' \
     '                // No frame on this path: the return address never left x30.
                 try word(e, mach.A_RET, -1, -1, -1, 0, 0)'
 

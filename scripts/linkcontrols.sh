@@ -58,7 +58,7 @@ declare -a MISSED=()
 copy_source() {
     rm -rf "$WORK/src"
     mkdir -p "$WORK/src/compiler" "$WORK/src/packages"
-    cp -R compiler/link "$WORK/src/compiler/"
+    cp -R compiler/link compiler/elf compiler/macho "$WORK/src/compiler/"
     local p
     for p in codesig exporttrie crypto_hash machoread sha1 sha512; do
         cp -R "packages/$p" "$WORK/src/packages/"
