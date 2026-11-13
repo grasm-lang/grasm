@@ -454,8 +454,23 @@ def rd_day():
     return rng.choice(list(range(1, 32)) * 2 + [-1, -2, -10, -21, -25, -28, -31, -32, 0, 32])
 
 
+def rd_in_reform_gap(y, m, d, start):
+    # Under the earliest reform Ruby takes, day 2298874 (Julian 1581-12-22),
+    # Ruby 2.6 accepts Date.civil(1581, 12, 22..31) as Julian and keeps those
+    # fields, while Date.jd of the same day gives the Gregorian 1582-01-01..10;
+    # `>>`, `<<` and the fields then follow whichever it kept. One day, two
+    # dates: a Ruby inconsistency the package does not copy
+    # (docs/known-issues.md).
+    return start == "2298874" and y == 1581 and m in (12, -1) and (d >= 22 or -10 <= d <= -1)
+
+
 def rd_civil():
-    return f"{rd_year()} {rd_month()} {rd_day() if rng.random() < 0.5 else rng.randint(1, 28)} {rng.choice(RD_STARTS)}"
+    while True:
+        y, m = rd_year(), rd_month()
+        d = rd_day() if rng.random() < 0.5 else rng.randint(1, 28)
+        start = rng.choice(RD_STARTS)
+        if not rd_in_reform_gap(y, m, d, start):
+            return f"{y} {m} {d} {start}"
 
 
 def rubydate_line():

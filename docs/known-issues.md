@@ -22,7 +22,8 @@ from the Rust one, by decision (§6.19): a panic inside a `concurrent` task,
 one the runtime's channel operations raise, and the TIR interpreter's own
 stack running out, each end the command.
 Latent: one, the Rust runtime's region sweep,
-which no compiled program reaches.**
+which no compiled program reaches. Excluded from an oracle, not copied: one,
+Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
 
 ## Found on 2026-11-05 by S8 part two (`fmt`, `lint`, `test` and `bench` in Grasm)
 
@@ -92,6 +93,24 @@ the program's depth does not count (a value nested deep enough to exhaust a
 host walk over it) ends the process on the host's stack, where the Rust
 runner, on its 256 MiB stack, may go on. Accepted with the one above (§6.19,
 decision (3)).
+
+## Found on 2026-11-05 by b62diff (Ruby's Date, against Ruby 2.6)
+
+- **Ruby 2.6's `Date` gives one day two calendar dates in the reform's gap
+  (open, Ruby's; excluded, not copied).** With the reform at the earliest
+  day Ruby takes, 2298874 (Julian 1581-12-22, Gregorian 1582-01-01),
+  `Date.civil(1581, 12, 26, 2298874)` is accepted -- `Date.valid_civil?`
+  says true, since a year before 1582 is always taken as Julian -- and Ruby
+  keeps the fields it was given: `#<Date: 1581-12-26 ((2298878j,...` .
+  `Date.jd(2298878, 2298874)`, the same day, is `1582-01-05`. Whatever reads
+  the kept fields follows the first: `>> -23` gives 1580-01-26 from the
+  civil date and 1580-02-05 from the jd one. `packages/rubydate` derives
+  every field from the day number, so it answers as `Date.jd` does.
+  Reproducer: `ruby -rdate -e 'p Date.civil(1581,12,26,2298874) >> -23,
+  Date.jd(2298878,2298874) >> -23'`. Found once in 72,000 lines
+  (SEED=757648692); `scripts/b62_diff.py` no longer draws a civil date in
+  that window under that reform (1581-12-22 to 31, days -10 to -1 of
+  December).
 
 ## Found on 2026-11-03 by S8 part one (the `grasm` command in Grasm)
 
