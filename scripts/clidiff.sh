@@ -508,11 +508,16 @@ if want test; then
         fi
         for l in "${lines_of[@]}"; do
             test_runs=$((test_runs + 1))
+            # `--contracts` runs every generated input to the end, and one
+            # program's runs for hours under both commands: two minutes is
+            # ample for the others (each takes under a second).
+            limit=$RUN_LIMIT
+            [[ "$l" == --contracts* ]] && [ -n "$RUN_LIMIT" ] && limit="timeout 120"
             # shellcheck disable=SC2086
-            $RUN_LIMIT "$GRASM" test $l >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            $limit "$GRASM" test $l >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
             r_rc=$?
             # shellcheck disable=SC2086
-            $RUN_LIMIT sandbox-exec -p "$NORUST" "$G" test $l >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            $limit sandbox-exec -p "$NORUST" "$G" test $l >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
             g_rc=$?
             if [ "$r_rc" = 124 ] && [ "$g_rc" = 124 ] && [[ "$l" == --contracts* ]]; then
                 # `T-CONTRACT-ENSURES`'s `good_sqrt` counts to the root of
@@ -753,14 +758,17 @@ if [ -n "$whole" ]; then
         echo "too little compared for this to mean anything: $listed programs, $corpus_refused refusals, $tomls manifests, $run_same runs, $ran_same builds run, $target_same of $targets targets"
         exit 1
     fi
-    # The floors of §6.19's sections, below what the corpus holds on
-    # 2026-11-05: 1,737 programs, 43 with a test, 6 with a property test, 3
-    # with a contract, 3 with a benchmark; about 2,000 `.gr` files tracked.
-    if [ "$fmt_files" -lt 1900 ] || [ "$fmt_rewritten" -lt 1900 ] || [ "$fmt_refused" -lt 1 ] ||
-        [ "$lint_files" -lt 1900 ] || [ "$lint_findings" -lt 100 ] ||
-        [ "$test_props" -lt 6 ] || [ "$test_contracts" -lt 3 ] || [ "$test_cov" -lt 200 ] || [ "$test_failed" -lt 3 ] ||
-        [ "$tm_runs" -lt 640 ] || [ "$tm_failed" -lt 10 ] || [ "$tm_host" -gt 10 ] ||
-        [ "$bench_files" -lt 3 ] || [ "$bench_timed" -lt 3 ]; then
+    # The floors of §6.19's sections, a margin below the first whole run
+    # (2026-11-06): 2,007 files tracked, 7,638 rewrites formatted alike and
+    # 385 refused alike; 1,001 findings; 6 programs with a property test, 3
+    # with a contract, 209 with --coverage, 12 with a failing test; 651 mains
+    # as tests, 13 failing and 2 ended by the host's panic (E-CHANNEL,
+    # E-DEADLOCK); 3 programs with a benchmark, 6 timing lines.
+    if [ "$fmt_files" -lt 1900 ] || [ "$fmt_rewritten" -lt 7000 ] || [ "$fmt_refused" -lt 300 ] ||
+        [ "$lint_files" -lt 1900 ] || [ "$lint_findings" -lt 900 ] ||
+        [ "$test_props" -lt 6 ] || [ "$test_contracts" -lt 3 ] || [ "$test_cov" -lt 200 ] || [ "$test_failed" -lt 10 ] ||
+        [ "$tm_runs" -lt 640 ] || [ "$tm_failed" -lt 11 ] || [ "$tm_host" -gt 4 ] ||
+        [ "$bench_files" -lt 3 ] || [ "$bench_timed" -lt 6 ]; then
         echo "too little compared in fmt, lint, test or bench: $fmt_files files, $fmt_rewritten rewritten, $fmt_refused refused; $lint_files linted, $lint_findings findings; $test_props, $test_contracts, $test_cov, $test_failed failing; $tm_runs mains as tests, $tm_failed failing, $tm_host the host's; $bench_files with a benchmark, $bench_timed timing lines"
         exit 1
     fi
