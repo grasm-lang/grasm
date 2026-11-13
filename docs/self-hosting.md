@@ -5009,7 +5009,7 @@ counts asserted:
   commands); `--coverage` on every tenth and every one with a test. Output,
   status. And, so that the panic path is exercised by more than the few
   programs that have failing tests: every corpus program with a `main`,
-  copied with `test "main" \{ main() }` appended -- the whole corpus copied
+  copied with `test "main" { main() }` appended -- the whole corpus copied
   into the work directory, so imports resolve as they do in the tree --
   whose test fails exactly where `run` panics or exits.
 - `bench`: every corpus program. The time and the count are not anyone's
@@ -5068,7 +5068,7 @@ step five's and were not run).
   `--cases 0`, `--contracts` on `T-CONTRACT-REQUIRES` and `-PURE`), 44
   sampled corpus programs under `test` and `bench`, and the 25 sandbox
   panics of `tools/tirinterp/panics`, 14 conformance panics and 38 sampled
-  programs, each with `test "main" \{ main() }` appended. Every one agreed
+  programs, each with `test "main" { main() }` appended. Every one agreed
   but those this section allows: `--schedules` and `--schedule-seed` on a
   test that ran tasks, a panic inside a `concurrent` task, and the two
   channel panics (`E-CHANNEL`, `E-DEADLOCK`) raised above. `exit(-1)` inside

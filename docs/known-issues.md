@@ -75,7 +75,7 @@ channels are the host runtime's, so sending on or closing a closed channel,
 and a channel operation outside every task that would have to wait, panic
 in the host, where the Rust runner reports the test failed and goes on.
 Found by running `spec/conformance/E-CHANNEL.gr` and `E-DEADLOCK.gr` with a
-`test "main" \{ main() }` appended (2026-11-05): `grasm test` says `test
+`test "main" { main() }` appended (2026-11-05): `grasm test` says `test
 "main" ... FAILED: send on a closed channel` and `... FAILED: deadlock: every
 task is waiting on a channel, and nothing left can send or receive`; the
 Grasm command `panic: ...` and 101. It is the same cause as the one above --
