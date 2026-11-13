@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # The `grasm` command in Grasm against the Rust one (docs/self-hosting.md
-# §6.17, S8 part one): the same stdout, stderr, exit status and files.
+# §6.17 and §6.19, S8 parts one and two): the same stdout, stderr, exit
+# status and files.
 #
 # `compiler/grasm` runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`,
-# `run`, `build --native` and `links` with the Grasm toolchain's own code, and
-# reads every command line as the Rust command reads it. Six sections, each
-# both commands on the same input from the same directory:
+# `run`, `build --native`, `links`, `fmt`, `lint`, `test` and `bench` with the
+# Grasm toolchain's own code, and reads every command line as the Rust command
+# reads it. Ten sections, each both commands on the same input from the same
+# directory -- six of part one:
 #
 #   lines   every command line in scripts/lib/clicases.txt, in an empty
 #           directory of each command's own that links to the checkout's
@@ -27,6 +29,27 @@
 #           x86_64-apple-darwin, x86_64-unknown-linux-gnu and
 #           aarch64-unknown-linux-gnu: the same output, an object of the
 #           triple's format (Mach-O, ELF) and machine, made twice the same
+#
+# and four for the subcommands of S8 part two (§6.19):
+#
+#   fmt     every `.gr` file git tracks and four rewrites of it
+#           (scripts/lib/fmtmangle.py), each formatted in a directory of each
+#           command's own: `fmt --check`, `fmt`, and the file left behind
+#   lint    every `.gr` file git tracks, plain and `--json`, every tenth with
+#           `--only` for each rule and for none
+#   test    every corpus program, with a seed, a number of cases and a filter
+#           where it has a property test, `--contracts` where it has a
+#           contract, `--coverage` where it has a test and on every tenth;
+#           then every program with a `main`, from a copy of the corpus,
+#           with `test "main" { main() }` appended, so a test fails wherever
+#           `run` panics or exits. A program with tasks or channels may end
+#           on the host's panic where Rust reports the test failed -- the one
+#           difference §6.19 allows (decision 3) -- and is counted as such
+#   bench   every corpus program, each timing line with its time and count
+#           taken out and held to the format (scripts/lib/benchnorm.py); one
+#           with a benchmark filtered to its first and to none
+#
+# A section's floors hold only on a whole run.
 #
 # The Grasm command never starts another program: nothing in its package
 # calls `proc_run` or `proc_pipeline` (counted here), and every command but
@@ -56,7 +79,7 @@ corpus_require
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-ONLY=${ONLY:-lines,corpus,toml,run,build,target}
+ONLY=${ONLY:-lines,corpus,toml,run,fmt,lint,test,bench,build,target}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
 if ! command -v sandbox-exec >/dev/null 2>&1; then
@@ -323,6 +346,260 @@ if want run; then
 fi
 
 # -------------------------------------------------------------------------
+# fmt, lint, test, bench (docs/self-hosting.md §6.19)
+# -------------------------------------------------------------------------
+
+# Whether the last two runs, $WORK/r.* and $WORK/g.* with the statuses
+# given, are the same bytes.
+same3() { # r_rc g_rc
+    [ "$1" = "$2" ] && cmp -s "$WORK/r.out" "$WORK/g.out" && cmp -s "$WORK/r.err" "$WORK/g.err"
+}
+show3() {
+    diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+    diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+}
+
+# The `.gr` files git tracks, or the programs `FILES=` names.
+tracked_gr() {
+    if [ -n "${FILES:-}" ]; then
+        cat "$WORK/programs"
+    else
+        git ls-files '*.gr'
+    fi
+}
+
+# fmt: every `.gr` file git tracks and four rewrites of it
+# (scripts/lib/fmtmangle.py), each copied into a directory of each
+# command's own as `x.gr`: `fmt --check`, then `fmt`, then the file left.
+fmt_files=0
+fmt_runs=0
+fmt_same=0
+fmt_rewritten=0
+fmt_refused=0
+if want fmt; then
+    while IFS= read -r f; do
+        fmt_files=$((fmt_files + 1))
+        rm -rf "$WORK/fm"
+        python3 scripts/lib/fmtmangle.py "$f" "$WORK/fm" || { fail "fmtmangle could not rewrite $f"; continue; }
+        cp "$f" "$WORK/fm/orig.gr"
+        for v in orig dedent spaced tight crlf; do
+            for side in r g; do
+                rm -rf "$WORK/f$side"
+                mkdir -p "$WORK/f$side"
+                cp "$WORK/fm/$v.gr" "$WORK/f$side/x.gr"
+            done
+            ok=1
+            for step in check write; do
+                fmt_runs=$((fmt_runs + 1))
+                if [ "$step" = check ]; then set -- fmt --check x.gr; else set -- fmt x.gr; fi
+                (cd "$WORK/fr" && "$GRASM" "$@" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null)
+                r_rc=$?
+                (cd "$WORK/fg" && g "$@" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null)
+                g_rc=$?
+                if same3 "$r_rc" "$g_rc"; then
+                    fmt_same=$((fmt_same + 1))
+                else
+                    ok=0
+                    fail "grasm $* -- $f ($v) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                    show3
+                fi
+            done
+            if ! cmp -s "$WORK/fr/x.gr" "$WORK/fg/x.gr"; then
+                fail "grasm fmt -- $f ($v) -- the files left differ"
+                diff "$WORK/fr/x.gr" "$WORK/fg/x.gr" | head -4 | sed 's/^/  /'
+            elif [ "$ok" = 1 ]; then
+                grep -c '^formatted `x.gr`$' "$WORK/r.out" >/dev/null && fmt_rewritten=$((fmt_rewritten + 1))
+                grep -c 'does not parse' "$WORK/r.err" >/dev/null && fmt_refused=$((fmt_refused + 1))
+            fi
+        done
+    done < <(tracked_gr)
+    echo "fmt: $fmt_files files, each and four rewrites, $fmt_runs commands   the same: $fmt_same   rewritten alike: $fmt_rewritten   refused alike: $fmt_refused"
+fi
+
+# lint: every `.gr` file git tracks, plain and `--json`; every tenth with
+# `--only` for each rule and one that is none.
+lint_files=0
+lint_runs=0
+lint_same=0
+lint_findings=0
+lint_only=0
+if want lint; then
+    k=0
+    while IFS= read -r f; do
+        lint_files=$((lint_files + 1))
+        k=$((k + 1))
+        lines_of=("$f" "$f --json")
+        if [ $((k % 10)) = 0 ]; then
+            for rule in unused-binding unused-parameter unused-import shadowing long-function shift-count no-such-rule; do
+                lines_of+=("$f --only $rule")
+            done
+            lint_only=$((lint_only + 7))
+        fi
+        for l in "${lines_of[@]}"; do
+            lint_runs=$((lint_runs + 1))
+            # shellcheck disable=SC2086
+            "$GRASM" lint $l >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            # shellcheck disable=SC2086
+            g lint $l >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            g_rc=$?
+            if same3 "$r_rc" "$g_rc"; then
+                lint_same=$((lint_same + 1))
+                if [ "$l" = "$f" ]; then
+                    n=$(sed -n 's/^findings: //p' "$WORK/r.out")
+                    lint_findings=$((lint_findings + ${n:-0}))
+                fi
+            else
+                fail "grasm lint $l -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                show3
+            fi
+        done
+    done < <(tracked_gr)
+    echo "lint: $lint_files files, $lint_runs commands ($lint_only with --only)   the same: $lint_same   findings: $lint_findings"
+fi
+
+# A difference §6.19 allows (decision 3): the Grasm command ended by the
+# host's panic where the Rust runner reported the test failed -- only in a
+# program that has tasks or channels, and with everything before it the
+# same.
+host_panic() { # src
+    local m
+    [ "$g_rc" = 101 ] || return 1
+    [ "$(grep -c . "$WORK/g.err")" = 1 ] || return 1
+    m=$(sed -n 's/^panic: //p' "$WORK/g.err")
+    [ -n "$m" ] || return 1
+    grep -F -- "... FAILED: $m" "$WORK/r.out" >/dev/null || return 1
+    cmp -s "$WORK/g.out" <(head -c "$(wc -c <"$WORK/g.out")" "$WORK/r.out") || return 1
+    grep -lE '\bconcurrent\b|\bchan_' "$1" >/dev/null
+}
+
+# test: every corpus program; with a property test, again with a seed, a
+# number of cases and a filter; with a contract, `--contracts`; with a test,
+# and every tenth, `--coverage`. Then every program with a `main`, copied
+# with `test "main" { main() }` appended, from a copy of the corpus.
+test_runs=0
+test_same=0
+test_failed=0
+test_props=0
+test_cov=0
+test_contracts=0
+test_timed_out=0
+test_host=0
+tm_runs=0
+tm_same=0
+tm_failed=0
+tm_host=0
+if want test; then
+    k=0
+    while IFS= read -r src; do
+        k=$((k + 1))
+        lines_of=("$src")
+        if grep -cE '^[[:space:]]*test "[^"]*" *\(' "$src" >/dev/null; then
+            lines_of+=("$src --seed 7 --cases 37" "--filter a $src")
+            test_props=$((test_props + 1))
+        fi
+        if grep -cE '^[[:space:]]*(requires|ensures) ' "$src" >/dev/null; then
+            lines_of+=("--contracts $src")
+            test_contracts=$((test_contracts + 1))
+        fi
+        if [ $((k % 10)) = 0 ] || grep -cE '^[[:space:]]*test "' "$src" >/dev/null; then
+            lines_of+=("--coverage $src")
+            test_cov=$((test_cov + 1))
+        fi
+        for l in "${lines_of[@]}"; do
+            test_runs=$((test_runs + 1))
+            # shellcheck disable=SC2086
+            $RUN_LIMIT "$GRASM" test $l >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            # shellcheck disable=SC2086
+            $RUN_LIMIT sandbox-exec -p "$NORUST" "$G" test $l >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            g_rc=$?
+            if [ "$r_rc" = 124 ] && [ "$g_rc" = 124 ] && [[ "$l" == --contracts* ]]; then
+                # `T-CONTRACT-ENSURES`'s `good_sqrt` counts to the root of
+                # `i64::MAX` for one input, under both (§6.19).
+                test_timed_out=$((test_timed_out + 1))
+            elif same3 "$r_rc" "$g_rc"; then
+                test_same=$((test_same + 1))
+                [ "$r_rc" = 1 ] && grep -c ' FAILED' "$WORK/r.out" >/dev/null && test_failed=$((test_failed + 1))
+            elif host_panic "$src"; then
+                test_host=$((test_host + 1))
+                echo "  the host's panic, as §6.19 allows: grasm test $l"
+            else
+                fail "grasm test $l -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                show3
+            fi
+        done
+    done <"$WORK/programs"
+    echo "test: $listed programs, $test_runs commands ($test_props with a property test, $test_contracts with a contract, $test_cov with --coverage)   the same: $test_same, $test_failed of them with a failing test   the host's panic: $test_host   both timed out, --contracts: $test_timed_out"
+
+    mkdir -p "$WORK/tm"
+    for d in $CORPUS_DIRS; do
+        mkdir -p "$WORK/tm/$(dirname "$d")"
+        cp -R "$d" "$WORK/tm/$d"
+    done
+    while IFS= read -r src; do
+        printf '\ntest "main" {\n    main()\n}\n' >>"$WORK/tm/$src"
+        tm_runs=$((tm_runs + 1))
+        (cd "$WORK/tm" && $RUN_LIMIT "$GRASM" test "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null)
+        r_rc=$?
+        (cd "$WORK/tm" && $RUN_LIMIT sandbox-exec -p "$NORUST" "$G" test "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null)
+        g_rc=$?
+        if same3 "$r_rc" "$g_rc"; then
+            tm_same=$((tm_same + 1))
+            grep -c '^test "main" \.\.\. FAILED' "$WORK/r.out" >/dev/null && tm_failed=$((tm_failed + 1))
+        elif host_panic "$WORK/tm/$src"; then
+            tm_host=$((tm_host + 1))
+            echo "  the host's panic, as §6.19 allows: grasm test $src, main as a test"
+        else
+            fail "grasm test $src, main as a test -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+        fi
+    done <"$WORK/mains"
+    rm -rf "$WORK/tm"
+    echo "test, main as a test: $tm_runs programs   the same: $tm_same, $tm_failed of them failing   the host's panic: $tm_host"
+fi
+
+# bench: every corpus program, its timing lines compared with the time and
+# the count taken out and each held to the format (scripts/lib/benchnorm.py);
+# a program with a benchmark again filtered to its first and to none.
+bench_runs=0
+bench_same=0
+bench_timed=0
+bench_files=0
+if want bench; then
+    while IFS= read -r src; do
+        lines_of=("$src")
+        first=$(sed -nE 's/^[[:space:]]*bench "([^"]*)".*/\1/p' "$src" | head -1)
+        if [ -n "$first" ]; then
+            bench_files=$((bench_files + 1))
+            lines_of+=("$src --filter $first" "$src --filter no-such-benchmark")
+        fi
+        for l in "${lines_of[@]}"; do
+            bench_runs=$((bench_runs + 1))
+            # shellcheck disable=SC2086
+            $RUN_LIMIT "$GRASM" bench $l >"$WORK/r.raw" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            # shellcheck disable=SC2086
+            $RUN_LIMIT sandbox-exec -p "$NORUST" "$G" bench $l >"$WORK/g.raw" 2>"$WORK/g.err" </dev/null
+            g_rc=$?
+            python3 scripts/lib/benchnorm.py "$WORK/r.raw" >"$WORK/r.out" 2>/dev/null
+            if ! python3 scripts/lib/benchnorm.py "$WORK/g.raw" >"$WORK/g.out" 2>"$WORK/g.bad"; then
+                fail "grasm bench $l -- a timing line not in the format: $(head -1 "$WORK/g.bad")"
+                continue
+            fi
+            if same3 "$r_rc" "$g_rc"; then
+                bench_same=$((bench_same + 1))
+                bench_timed=$((bench_timed + $(grep -c ' iterations)$' "$WORK/g.raw")))
+            else
+                fail "grasm bench $l -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                show3
+            fi
+        done
+    done <"$WORK/programs"
+    echo "bench: $listed programs, $bench_runs commands ($bench_files with a benchmark, each filtered twice)   the same: $bench_same   timing lines in the format: $bench_timed"
+fi
+
+# -------------------------------------------------------------------------
 # build, target
 # -------------------------------------------------------------------------
 builds=0
@@ -432,12 +709,12 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 fi
 
 # The counts add up, and a whole run compared enough to mean something.
-whole=$([ -z "${FILES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,build,target ] && echo 1)
+whole=$([ -z "${FILES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,fmt,lint,test,bench,build,target ] && echo 1)
 if want lines && [ $((lines_same + lines_elsewhere + lines_runtime + lines_target)) -ne "$lines" ]; then
     echo "lines: the counts do not add up to $lines"
     exit 1
 fi
-if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 15 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
+if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 10 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
     echo "lines: too few compared ($lines, $lines_elsewhere not here, $lines_runtime runtime, $lines_target target)"
     exit 1
 fi
@@ -449,6 +726,22 @@ if want run && [ "$run_same" -ne "$mains" ]; then
     echo "run: $run_same of $mains programs compared"
     exit 1
 fi
+if want fmt && { [ "$fmt_same" -ne "$fmt_runs" ] || [ "$fmt_runs" -ne $((10 * fmt_files)) ]; }; then
+    echo "fmt: the counts do not add up ($fmt_same of $fmt_runs, $fmt_files files)"
+    exit 1
+fi
+if want lint && { [ "$lint_same" -ne "$lint_runs" ] || [ "$lint_runs" -ne $((2 * lint_files + lint_only)) ]; }; then
+    echo "lint: the counts do not add up ($lint_same of $lint_runs, $lint_files files, $lint_only with --only)"
+    exit 1
+fi
+if want test && { [ $((test_same + test_host + test_timed_out)) -ne "$test_runs" ] || [ $((tm_same + tm_host)) -ne "$tm_runs" ] || [ "$tm_runs" -ne "$mains" ]; }; then
+    echo "test: the counts do not add up ($test_same + $test_host + $test_timed_out of $test_runs; $tm_same + $tm_host of $tm_runs, $mains with a main)"
+    exit 1
+fi
+if want bench && [ "$bench_same" -ne "$bench_runs" ]; then
+    echo "bench: $bench_same of $bench_runs commands compared"
+    exit 1
+fi
 if want build && { [ "$built_same" -ne "$builds" ] || [ "$ran_same" -ne $((builds - build_refused)) ] || [ "$repro" -ne "$ran_same" ] ||
     [ $((builds + external)) -ne "$mains" ]; }; then
     echo "build: the counts do not add up ($built_same, $ran_same, $repro of $builds; $external external of $mains)"
@@ -458,6 +751,17 @@ if [ -n "$whole" ]; then
     if [ "$listed" -lt 1700 ] || [ "$corpus_refused" -lt 120 ] || [ "$tomls" -lt 600 ] ||
         [ "$run_same" -lt 640 ] || [ "$ran_same" -lt 640 ] || [ "$targets" -lt 60 ] || [ "$target_same" -ne $((3 * targets)) ]; then
         echo "too little compared for this to mean anything: $listed programs, $corpus_refused refusals, $tomls manifests, $run_same runs, $ran_same builds run, $target_same of $targets targets"
+        exit 1
+    fi
+    # The floors of §6.19's sections, below what the corpus holds on
+    # 2026-11-05: 1,737 programs, 43 with a test, 6 with a property test, 3
+    # with a contract, 3 with a benchmark; about 2,000 `.gr` files tracked.
+    if [ "$fmt_files" -lt 1900 ] || [ "$fmt_rewritten" -lt 1900 ] || [ "$fmt_refused" -lt 1 ] ||
+        [ "$lint_files" -lt 1900 ] || [ "$lint_findings" -lt 100 ] ||
+        [ "$test_props" -lt 6 ] || [ "$test_contracts" -lt 3 ] || [ "$test_cov" -lt 200 ] || [ "$test_failed" -lt 3 ] ||
+        [ "$tm_runs" -lt 640 ] || [ "$tm_failed" -lt 10 ] || [ "$tm_host" -gt 10 ] ||
+        [ "$bench_files" -lt 3 ] || [ "$bench_timed" -lt 3 ]; then
+        echo "too little compared in fmt, lint, test or bench: $fmt_files files, $fmt_rewritten rewritten, $fmt_refused refused; $lint_files linted, $lint_findings findings; $test_props, $test_contracts, $test_cov, $test_failed failing; $tm_runs mains as tests, $tm_failed failing, $tm_host the host's; $bench_files with a benchmark, $bench_timed timing lines"
         exit 1
     fi
 fi

@@ -18,6 +18,14 @@
 #   wrong-target   `build --native` compiles for x86-64            a build differs
 #   linux-refused  the Linux triples refused as before §6.18        a line differs
 #   linux-macho    `--target <linux>` writes a Mach-O object        a target differs
+#   fmt-spacing    the formatter puts a space before a comma        a format differs
+#   lint-dropped   the linter drops its shadowing finding           a lint differs
+#   test-inverted  a unit test that holds reported failed, and back a test differs
+#   test-no-trap   a test's panic ends the command (no `trap`)      a test differs
+#   bench-filter   `bench --filter` ignored                         a bench differs
+#
+# `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
+# 14 holds only on a whole run.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -86,6 +94,9 @@ EOF
 control() {
     local name=$1 why=$2 envs=$3 file=$4 rc
     shift 4
+    if [ -n "${CONTROLS:-}" ] && [[ ",$CONTROLS," != *",$name,"* ]]; then
+        return 0
+    fi
     ran=$((ran + 1))
     if ! plant "$name" "$file" "$@" >"$WORK/$name.plant" 2>&1; then
         missed=$((missed + 1))
@@ -167,10 +178,48 @@ control linux-macho '^DIFF: grasm build --native --target aarch64-unknown-linux-
     '        let bytes = compile(tir_of(f), path, false, x64, linux)' \
     '        let bytes = compile(tir_of(f), path, false, x64, false)'
 
+# S8 part two (§6.19): one fault in each of the four subcommands, and the
+# runner's trap taken away.
+printf '%s\n' examples/testing_tour.gr >"$WORK/tour"
+printf '%s\n' spec/conformance/E-LOOP-RANGE.gr >"$WORK/shadow"
+printf '%s\n' spec/conformance/E-TEST-SHRINK.gr >"$WORK/shrink"
+printf '%s\n' spec/conformance/E-BENCH-WARMUP.gr >"$WORK/warm"
+FMT=tools/gfmt/src/fmt.gr
+LINT=compiler/grasm/src/lint.gr
+TESTING=compiler/grasm/src/testing.gr
+
+control fmt-spacing '^DIFF: grasm fmt ' "ONLY=fmt FILES=$WORK/tour" "$FMT" \
+    'if n_op and [",", ";", ")",' \
+    'if n_op and [";", ")",'
+
+control lint-dropped '^DIFF: grasm lint spec/conformance/E-LOOP-RANGE.gr ' "ONLY=lint FILES=$WORK/shadow" "$LINT" \
+    '            report(l, l.a.s[id], "shadowing", "`{name}` hides the one bound on line {line}")' \
+    ''
+
+control test-inverted '^DIFF: grasm test examples/testing_tour.gr ' "ONLY=test FILES=$WORK/tour" "$TESTING" \
+    '            if m == "\0" {
+                print("test \"{label}\" ... ok")' \
+    '            if m != "\0" {
+                print("test \"{label}\" ... ok")'
+
+control test-no-trap '^DIFF: grasm test spec/conformance/E-TEST-SHRINK.gr ' "ONLY=test FILES=$WORK/shrink" "$TESTING" \
+    '                cx.trap = true' \
+    '                cx.trap = false'
+
+control bench-filter '^DIFF: grasm bench spec/conformance/E-BENCH-WARMUP.gr --filter no-such-benchmark ' "ONLY=bench FILES=$WORK/warm" "$TESTING" \
+    '        if filter != "" and not p.bench_name[b].contains(filter) {' \
+    '        if false and filter != "" and not p.bench_name[b].contains(filter) {'
+
 echo
 echo "controls: $ran   caught: $caught   missed: $missed"
 if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-[ "$ran" -ge 9 ] && [ "$caught" = "$ran" ]
+# `CONTROLS=a,b` runs those alone, for trying one; the floor holds only on
+# a whole run.
+if [ -n "${CONTROLS:-}" ]; then
+    [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
+    exit
+fi
+[ "$ran" -ge 14 ] && [ "$caught" = "$ran" ]

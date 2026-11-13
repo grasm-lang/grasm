@@ -5041,6 +5041,59 @@ to the longest name's length in bytes, counted by `format!` in characters,
 so a non-ASCII name widens the column by its extra bytes; the Grasm command
 pads the same way (docs/known-issues.md, with a reproducer).
 
+**Steps two to four, as built** (2026-11-05, while the main checkout's
+full suite was running, so with light checks only; the corpus-wide gates are
+step five's and were not run).
+
+- `fmt`: `tools/gfmt/src/fmt.gr` is the whole formatter, `respace` with it,
+  and `gfmt` and the command both import it. `compiler/grasm/src/fmtcmd.gr`
+  is the arm. `scripts/lib/fmtmangle.py` writes four rewrites of a file:
+  dedented, spaces doubled, spaces beside punctuation removed, and CR LF --
+  four, not the three planned, because a CR before a newline is the one
+  thing `gfmt` got wrong. Held to the Rust command on 28 tracked files and
+  their rewrites (137 formatted alike, 3 refused by Rust), 10 hand-written
+  edge files, and 18 command lines; no difference.
+- `lint`: `compiler/grasm/src/lint.gr`. Held on 79 tracked files, plain
+  and `--json` (51 findings), three files written to have findings (97,
+  among them every rule and the type-only imports, a missing import
+  included), and 19 command lines; no difference.
+- `test` and `bench`: `compiler/grasm/src/testing.gr`, on the changed
+  `tools/tirinterp` (`eval.fault`, `eval.exit_with`, `run_body`, tests and
+  benches loaded) and `front`'s `load_sources`. Held on the 42 corpus files
+  with a test the Rust command finishes, plain and with `--coverage` (43
+  with a test, less `T-CONTRACT-ENSURES`), every documented example
+  (`examples/documented.gr`, and three files written for doc examples: one
+  in an imported module, one that does not compile, a `text` fence, `# `
+  lines, prints), the flags (`--seed` at `u64`'s maximum and past it, `+5`,
+  `--cases 0`, `--contracts` on `T-CONTRACT-REQUIRES` and `-PURE`), 44
+  sampled corpus programs under `test` and `bench`, and the 25 sandbox
+  panics of `tools/tirinterp/panics`, 14 conformance panics and 38 sampled
+  programs, each with `test "main" \{ main() }` appended. Every one agreed
+  but those this section allows: `--schedules` and `--schedule-seed` on a
+  test that ran tasks, a panic inside a `concurrent` task, and the two
+  channel panics (`E-CHANNEL`, `E-DEADLOCK`) raised above. `exit(-1)` inside
+  a test first said `exit(-1)` where Rust says `exit(255)`: the reference
+  carries the low eight bits, and so does `exit_with` now. `run` was held on
+  57 programs, 39 of them panicking, after the change; the same bytes.
+- The gates: `clidiff` gains the four sections (`fmt`, `lint`, `test`,
+  `bench`), each with counts that must add up and floors on a whole run,
+  and `scripts/lib/benchnorm.py`; with `FILES=` the `fmt` and `lint`
+  sections take its list rather than every tracked file. On 12 programs:
+  "fmt: 12 files, each and four rewrites, 120 commands the same: 120
+  rewritten alike: 44 refused alike: 5", "lint: 12 files, 31 commands (7
+  with --only) the same: 31 findings: 2", "test: 12 programs, 23 commands
+  (3 with a property test, 1 with a contract, 4 with --coverage) the same:
+  23, 4 of them with a failing test the host's panic: 0", "test, main as a
+  test: 11 programs the same: 10, 2 of them failing the host's panic: 1"
+  (`E-CHANNEL`), "bench: 12 programs, 18 commands (3 with a benchmark, each
+  filtered twice) the same: 18 timing lines in the format: 6".
+  `clicontrols` gains five controls, and `CONTROLS=` to run some: on their
+  own, "controls: 5 caught: 5 missed: 0" -- a space before a comma (fmt), the
+  shadowing finding dropped (lint), a passing unit test reported failed
+  (test), the runner's trap taken away (test), `--filter` ignored (bench).
+  The floors on fmt's rewrites, lint's findings, failing tests and mains
+  as tests are estimates until a whole run measures them.
+
 **What is left for S8 after this part.** `doc`, `api`, `deps`, `publish`,
 `add`, `lsp`, `dap`, `journal`, and `build` without `--native` and with
 `--source`; `test --schedules` and `--schedule-seed` for a test that starts
