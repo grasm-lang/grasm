@@ -4961,8 +4961,8 @@ a `concurrent` block (the host's scheduler, which the interpreter's tasks
 run on, cannot abort a task's siblings as [E-TASK-PANIC] requires, so
 `test` ends there with `panic: ...` and 101, where the Rust command reports
 the test failed and goes on), and the host's own stack running out. A
-third of the same cause was found after the decision, and is raised with
-the coordinator: a panic the runtime's channel operations raise (a send on
+third of the same cause was found after the decision, and accepted with it
+by the coordinator (2026-11-05): a panic the runtime's channel operations raise (a send on
 or a close of a closed channel, a channel operation outside every task that
 would wait), since the interpreter's channels are the host's too.
 
@@ -5071,7 +5071,7 @@ step five's and were not run).
   programs, each with `test "main" { main() }` appended. Every one agreed
   but those this section allows: `--schedules` and `--schedule-seed` on a
   test that ran tasks, a panic inside a `concurrent` task, and the two
-  channel panics (`E-CHANNEL`, `E-DEADLOCK`) raised above. `exit(-1)` inside
+  channel panics (`E-CHANNEL`, `E-DEADLOCK`) accepted above. `exit(-1)` inside
   a test first said `exit(-1)` where Rust says `exit(255)`: the reference
   carries the low eight bits, and so does `exit_with` now. `run` was held on
   57 programs, 39 of them panicking, after the change; the same bytes.
@@ -5098,8 +5098,9 @@ step five's and were not run).
 `add`, `lsp`, `dap`, `journal`, and `build` without `--native` and with
 `--source`; `test --schedules` and `--schedule-seed` for a test that starts
 tasks, which need a scheduler of the TIR interpreter's own (decision (4));
-a panic inside a `concurrent` task under `test`, for the same reason, and
-the interpreter's own stack (decision (3)); the LSP on the query engine,
+a panic inside a `concurrent` task under `test`, and one the runtime's
+channel operations raise, for the same reason, and the interpreter's own
+stack (decision (3)); the LSP on the query engine,
 DAP, packages, journal and replay, the wasm32 backend and one TOML reader,
 as §6.17 left them.
 

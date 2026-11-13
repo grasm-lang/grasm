@@ -17,9 +17,10 @@ check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
 a type shown as `_`, a contract's row breach reported twice, a ceiling
 refusal without its reason, and a `match`'s names unbound after an error;
 and one in `compiler/s3`, which no release ships yet, an object naming the
-directory it was compiled in. Two differences the Grasm `grasm test` keeps
+directory it was compiled in. Three differences the Grasm `grasm test` keeps
 from the Rust one, by decision (§6.19): a panic inside a `concurrent` task,
-and the TIR interpreter's own stack running out, each end the command.
+one the runtime's channel operations raise, and the TIR interpreter's own
+stack running out, each end the command.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches.**
 
@@ -70,7 +71,7 @@ fn main() {
 ```
 
 **The Grasm `grasm test` ends on a panic the runtime's channel operations
-raise -- *open, raised with the coordinator*.** The TIR interpreter's
+raise -- *open, by decision*.** The TIR interpreter's
 channels are the host runtime's, so sending on or closing a closed channel,
 and a channel operation outside every task that would have to wait, panic
 in the host, where the Rust runner reports the test failed and goes on.
@@ -79,7 +80,9 @@ Found by running `spec/conformance/E-CHANNEL.gr` and `E-DEADLOCK.gr` with a
 "main" ... FAILED: send on a closed channel` and `... FAILED: deadlock: every
 task is waiting on a channel, and nothing left can send or receive`; the
 Grasm command `panic: ...` and 101. It is the same cause as the one above --
-the interpreter's channels and tasks are the host's -- and goes with it.
+the interpreter's channels and tasks are the host's -- and goes with it:
+accepted as a difference by the coordinator (2026-11-05, §6.19, with
+decision (3)); its fix is a scheduler of the TIR interpreter's own.
 
 **The Grasm `grasm test` ends when the TIR interpreter's own stack runs out
 -- *open, by decision*.** The interpreter stops a program's recursion at
