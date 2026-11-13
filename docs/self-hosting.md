@@ -4802,9 +4802,9 @@ This part takes four of them -- `fmt`, `lint`, `test` and `bench` -- into
 reading of the command line, the same stdout and stderr, the same exit
 status, the same files written. The Rust toolchain stays stage 0 and the
 oracle and is not changed; where its behaviour is wrong it is reproduced and
-recorded in docs/known-issues.md. Every decision below was taken by the
-agent implementing this part unless it says otherwise; the owner may reverse
-any of it.
+recorded in docs/known-issues.md. The decisions below are numbered (1)
+to (5); each was taken by the agent implementing this part and accepted by
+the coordinator on 2026-11-05, and the owner may reverse any of it.
 
 **What the Rust arms do** (`crates/grasm/src/main.rs`; the command line is
 read first by the check every subcommand shares, which part one already
@@ -4925,7 +4925,8 @@ every `test` (name, parameters with their resolved types, body) and `bench`
   measured on the corpus, not assumed.
 
 **How `test` and `bench` run programs: the TIR interpreter, in this
-process.** Taken by the agent, for three reasons. It is the engine the Rust
+process.** Decision (1), taken by the agent and accepted by the
+coordinator, for three reasons. It is the engine the Rust
 `grasm test` and `grasm bench` run on, and §6.17 put `run` on it for the
 same reason: a test's prints share the command's stdout with the report
 lines, in order, and a runtime package is refused in the same words. A
@@ -4939,8 +4940,9 @@ What it costs: the TIR interpreter takes 0.8 to 2.9 times the Rust
 interpreter's time (§6.17), and `bench`'s numbers become the TIR
 interpreter's.
 
-So **a panic in `tirinterp` becomes a way out of an evaluation, not the end
-of the process.** Beside `break`, `continue`, `return` and an error, a
+So, decision (2), **a panic in `tirinterp` becomes a way out of an
+evaluation, not the end of the process** (taken by the agent, accepted by
+the coordinator on the condition that `run` stays the same bytes). Beside `break`, `continue`, `return` and an error, a
 context gains two more reasons to unwind: a panic, carrying its message, and
 an `exit`, carrying its status. Every panic the interpreter words for the
 program (about 120 sites in `eval`, `builtins`, `rawmem` and `cabi`) and
@@ -4952,27 +4954,31 @@ program's fault to the host's own operation (a `substr` out of range, an
 empty fill), the host would still end the process, so each of the Rust
 interpreter's panic sites (163 in `interp.rs`, 12 in `tasks.rs`) is checked
 against the TIR interpreter's and the missing ones are tested for before
-the operation, in its words. Two places stay the host's, and are the one
-difference between the commands this part allows: a panic inside a task of
+the operation, in its words. Decision (3): two places stay the host's,
+and are the one difference between the commands this part allows
+(docs/known-issues.md records both): a panic inside a task of
 a `concurrent` block (the host's scheduler, which the interpreter's tasks
 run on, cannot abort a task's siblings as [E-TASK-PANIC] requires, so
 `test` ends there with `panic: ...` and 101, where the Rust command reports
 the test failed and goes on), and the host's own stack running out.
 
-**`--schedules` and `--schedule-seed`.** The Rust interpreter has its own
-scheduler, and `--schedules N` reruns a unit test that ran a `concurrent`
-block under N task orders drawn from seeds; the TIR interpreter's tasks are
-the host's, scheduled by the runtime by [E-SCHEDULE]'s fixed rule, with no
-seed to give. When no test starts a task the flags change nothing, and the
-Grasm command answers as Rust's does. When one does and either flag is
-given, the Grasm command says "error: `grasm test --schedules` is not in the
-Grasm toolchain yet" (or `--schedule-seed`'s) after that test's report
-line, with part one's help, exit 1 -- taken by the agent, the owner's to
-reverse; the alternative is a scheduler of the interpreter's own, which
-means evaluating without the host's stack (every task a state machine), a
-rewrite of the interpreter's task model.
+**`--schedules` and `--schedule-seed`** (decision (4)). The Rust interpreter
+has its own scheduler, and `--schedules N` reruns a unit test that ran a
+`concurrent` block under N task orders drawn from seeds; the TIR
+interpreter's tasks are the host's, scheduled by the runtime by
+[E-SCHEDULE]'s fixed rule, with no seed to give. When no test starts a task
+the flags change nothing, and the Grasm command answers as Rust's does. When
+one does and either flag is given, the Grasm command says "error: `grasm
+test --schedules` is not in the Grasm toolchain yet" (or
+`--schedule-seed`'s) after that test's report line, with part one's help,
+exit 1 -- taken by the agent, accepted by the coordinator because it refuses
+rather than answering otherwise in silence, the owner's to reverse; the
+alternative is a scheduler of the interpreter's own, which means evaluating
+without the host's stack (every task a state machine), a rewrite of the
+interpreter's task model.
 
-**How the output is held to Rust's, byte for byte.** `clidiff` gains four
+**How the output is held to Rust's, byte for byte** (decision (5), taken
+by the agent and accepted by the coordinator). `clidiff` gains four
 sections, each both commands on the same input from the same directory, the
 counts asserted:
 
@@ -5024,6 +5030,20 @@ runner; `fixpoint` builds it as before and must still find stage 3 its
 stage 2, and `clidiff` runs again with stage 2's command. `tirinterp`
 changes too, so `tirinterp`, `frontsmoke` and `clidiff`'s `run` section
 hold its `run` to what it was.
+
+**Copied from Rust, and recorded as Rust's defect.** `bench` pads each name
+to the longest name's length in bytes, counted by `format!` in characters,
+so a non-ASCII name widens the column by its extra bytes; the Grasm command
+pads the same way (docs/known-issues.md, with a reproducer).
+
+**What is left for S8 after this part.** `doc`, `api`, `deps`, `publish`,
+`add`, `lsp`, `dap`, `journal`, and `build` without `--native` and with
+`--source`; `test --schedules` and `--schedule-seed` for a test that starts
+tasks, which need a scheduler of the TIR interpreter's own (decision (4));
+a panic inside a `concurrent` task under `test`, for the same reason, and
+the interpreter's own stack (decision (3)); the LSP on the query engine,
+DAP, packages, journal and replay, the wasm32 backend and one TOML reader,
+as §6.17 left them.
 
 ## 8. Gates this adds
 

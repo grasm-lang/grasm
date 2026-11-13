@@ -10,15 +10,73 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
 two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: ten, a nested
+branches' values differ, refused natively. Open S4: eleven, a nested
 interpolation's spans, a backslash at the end of a file, a space `grasm fmt`
-drops before a brace, six in `grasm
+drops before a brace, `grasm bench`'s name column padded by bytes, six in `grasm
 check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
 a type shown as `_`, a contract's row breach reported twice, a ceiling
 refusal without its reason, and a `match`'s names unbound after an error;
 and one in `compiler/s3`, which no release ships yet, an object naming the
-directory it was compiled in. Latent: one, the Rust runtime's region sweep,
+directory it was compiled in. Two differences the Grasm `grasm test` keeps
+from the Rust one, by decision (§6.19): a panic inside a `concurrent` task,
+and the TIR interpreter's own stack running out, each end the command.
+Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches.**
+
+## Found on 2026-11-05 by S8 part two (`fmt`, `lint`, `test` and `bench` in Grasm)
+
+**`grasm bench` pads the name column by bytes -- *open, S4*.** The width is
+the longest name's length in bytes (`r.name.len()`), and `format!`'s `{:<w$}`
+pads to that many characters, so a name with non-ASCII characters widens the
+column by its extra bytes. Nothing is misaligned -- every name is padded to
+the same width -- but the column is wider than the longest name:
+
+```
+bench "été" { let x = 1 }
+bench "ab" { let y = 2 }
+
+fn main() {
+}
+```
+
+`grasm bench` prints `été` and `ab` each followed by five columns' worth of
+name and padding (`été  ` and `ab   `) before the two separating spaces,
+where three would hold the longest name. The Grasm command (§6.19) pads the
+same way, so the two stay comparable and are fixed together; the fix is to
+count `r.name.chars()`.
+
+**The Grasm `grasm test` ends on a panic inside a `concurrent` task -- *open,
+by decision*.** The Rust runner reports a test whose task panics as failed
+and goes on to the next; the TIR interpreter runs a program's tasks as the
+host's own tasks, whose scheduler cannot abort a task's siblings as
+[E-TASK-PANIC] asks, so there the panic stays the host's: `panic: <message>`
+on stderr and exit 101, the tests after it not run. Accepted as a
+difference by the coordinator (§6.19, decision (3)); it goes with a
+scheduler of the interpreter's own, which `--schedules` needs too.
+
+```
+test "a task panics" {
+    concurrent {
+        go { panic("boom") }
+    }
+}
+
+test "after" {
+    assert(true)
+}
+
+fn main() {
+}
+```
+
+**The Grasm `grasm test` ends when the TIR interpreter's own stack runs out
+-- *open, by decision*.** The interpreter stops a program's recursion at
+100,000 calls with the panic every engine words the same way, and that panic
+is a test's failure under `test`; but a recursion of the interpreter's that
+the program's depth does not count (a value nested deep enough to exhaust a
+host walk over it) ends the process on the host's stack, where the Rust
+runner, on its 256 MiB stack, may go on. Accepted with the one above (§6.19,
+decision (3)).
 
 ## Found on 2026-11-03 by S8 part one (the `grasm` command in Grasm)
 
