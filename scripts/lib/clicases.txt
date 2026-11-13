@@ -171,7 +171,6 @@ elsewhere doc examples/hello.gr
 doc -o
 elsewhere api examples/hello.gr
 api x.gr --against
-elsewhere fmt examples/hello.gr --check
 fmt --check --x
 elsewhere lint --rules
 lint --only
@@ -188,3 +187,20 @@ elsewhere journal x
 journal --full --x
 elsewhere build examples/hello.gr -o h
 elsewhere build examples/hello.gr --source -o h.bundle.gr
+
+# `fmt` (docs/self-hosting.md §6.19): the operand is the first argument not
+# starting with `--`, after a `--` too; `--check` counts anywhere. Only
+# formatted files and refusals here, since a file `fmt` rewrites would be the
+# checkout's own through the link; `clidiff`'s `fmt` section formats copies.
+fmt examples/hello.gr
+fmt examples/hello.gr --check
+fmt --check examples/hello.gr
+fmt -- examples/hello.gr
+fmt -- --check examples/hello.gr
+fmt
+fmt --check
+fmt nosuch.gr
+fmt -
+fmt examples
+fmt spec/conformance/G-STMT-TERM.gr
+fmt spec/conformance/G-STMT-TERM.gr --check

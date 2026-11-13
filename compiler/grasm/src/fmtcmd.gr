@@ -1,0 +1,76 @@
+// `grasm fmt` (docs/self-hosting.md §6.19): the file read and parsed as the
+// Rust command reads and parses it, refused if the parser has anything to
+// say, then formatted by `tools/gfmt`'s formatter -- the Rust one
+// (`crates/grasm_syntax/src/fmt.rs`) ported line for line -- and checked or
+// rewritten, in the Rust arm's words.
+import front
+import front.loader
+import front.lex
+import front.parse
+import gfmt.fmt
+
+/// The parser's diagnostics of `src`, as `grasm_syntax::parse` makes them,
+/// worded; none for a file that parses.
+pub fn parse_errors(src: bytes) -> [str] {
+    let lx = lex.lex(src, true)
+    let p = parse.parse(src, lx)
+    p.d_msg
+}
+
+/// A file that does not parse: said with its first three diagnostics, and
+/// exit 1. `what` is what there is nothing to do (`format`, `lint`).
+pub fn refuse_unparsed(path: str, errors: [str], what: str) {
+    eprint("error: `{path}` does not parse, so there is nothing to {what}")
+    var k = 0
+    while k < errors.len() and k < 3 {
+        eprint("  {errors[k]}")
+        k += 1
+    }
+    exit(1)
+}
+
+/// `grasm fmt <file.gr> [--check]`. The file is the first argument after
+/// the subcommand that does not start with `--`, wherever it is -- after a
+/// `--` too, and a lone `-` is one -- and `--check` counts wherever it is,
+/// as the Rust arm reads them.
+pub fn cmd_fmt(a: [str]) {
+    var path = ""
+    var found = false
+    for i in 1..a.len() {
+        if not found and not a[i].starts_with("--") {
+            path = a[i]
+            found = true
+        }
+    }
+    if not found {
+        eprint("usage: grasm fmt <file.gr> [--check]")
+        exit(1)
+    }
+    let src = front.read_source(path)
+    let errors = parse_errors(src)
+    if errors.len() > 0 {
+        refuse_unparsed(path, errors, "format")
+    }
+    let text = src.to_str()
+    let formatted = fmt.format_src(text)
+    if a.contains("--check") {
+        if formatted == text {
+            print("ok: `{path}` is formatted")
+        } else {
+            eprint("`{path}` is not canonically formatted (run `grasm fmt {path}`)")
+            exit(1)
+        }
+        return
+    }
+    if formatted == text {
+        print("`{path}` already formatted")
+        return
+    }
+    match write_file(path, formatted) {
+        Ok(_) -> print("formatted `{path}`")
+        Err(e) -> {
+            eprint("error: cannot write `{path}`: {loader.io_error_text(e)}")
+            exit(1)
+        }
+    }
+}

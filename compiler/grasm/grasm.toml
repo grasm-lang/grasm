@@ -25,3 +25,6 @@ path = "../link"
 
 [dependencies.tirinterp]
 path = "../../tools/tirinterp"
+
+[dependencies.gfmt]
+path = "../../tools/gfmt"

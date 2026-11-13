@@ -1,0 +1,790 @@
+// The formatter: `grasm_syntax::fmt::format_src`, ported line for line.
+//
+// Two halves, as in the Rust one. `format_src` re-indents: a line at a time,
+// a state machine over the line's characters keeps the bracket depth and
+// what the line is inside of (a string, an interpolation, a raw string, a
+// block comment), and each line is indented by the levels still open.
+// `respace` re-spaces: the line is split into words, operators and opaque
+// pieces (strings and comments, copied through), and the pieces are joined
+// by rule, so the output depends on the line's tokens and not on how they
+// were spaced.
+//
+// Everything works on the source's bytes. Every character the state machine
+// and the splitter act on is ASCII, and no byte of a multi-byte UTF-8
+// character is one, so walking bytes decides what walking characters does.
+// Two things are not ASCII and are done as Rust does them: the whitespace
+// `trim_start` and `trim` remove is Unicode's (`ws_len`), and a line is what
+// `split_inclusive('\n')` makes, with a `\r` before its `\n` dropped.
+//
+// Held to `grasm fmt` byte for byte: by `scripts/gfmttest.sh` over the
+// corpus, and by `scripts/clidiff.sh` (docs/self-hosting.md §6.19) over the
+// corpus and three rewrites of every file.
+
+// Modes of the state machine.
+let M_CODE = 0
+let M_STR = 1
+let M_INTERP = 2
+let M_LINE = 3
+let M_BLOCK = 4
+let M_RAW = 5
+
+// Kinds of piece.
+let P_WORD = 0
+let P_OP = 1
+let P_OPAQUE = 2
+
+// Kinds of brace.
+let B_STRUCT = 0
+let B_EFFECT = 1
+let B_MAP = 2
+let B_BLOCK = 3
+
+/// The length of the Unicode whitespace character at `i`, or 0: what Rust's
+/// `char::is_whitespace` takes, which `trim_start` and `trim` remove.
+fn ws_len(b: bytes, i: i64, end: i64) -> i64 {
+    let c = b.at(i)
+    if c == 32 or (c >= 9 and c <= 13) {
+        return 1
+    }
+    if c == 194 and i + 1 < end {
+        let d = b.at(i + 1)
+        if d == 133 or d == 160 {
+            return 2
+        }
+        return 0
+    }
+    if i + 2 >= end {
+        return 0
+    }
+    let d = b.at(i + 1)
+    let e = b.at(i + 2)
+    if c == 225 and d == 154 and e == 128 {
+        return 3
+    }
+    if c == 226 and d == 128 and ((e >= 128 and e <= 138) or e == 168 or e == 169 or e == 175) {
+        return 3
+    }
+    if c == 226 and d == 129 and e == 159 {
+        return 3
+    }
+    if c == 227 and d == 128 and e == 128 {
+        return 3
+    }
+    0
+}
+
+/// The first byte of `b[s..e]` past its leading whitespace.
+fn skip_ws(b: bytes, s: i64, e: i64) -> i64 {
+    var i = s
+    while i < e {
+        let n = ws_len(b, i, e)
+        if n == 0 {
+            return i
+        }
+        i += n
+    }
+    e
+}
+
+/// The end of `b[s..e]` before its trailing whitespace.
+fn back_ws(b: bytes, s: i64, e: i64) -> i64 {
+    var j = e
+    while j > s {
+        // The character ending at `j`: back over continuation bytes.
+        var k = j - 1
+        while k > s and b.at(k) >= 128 and b.at(k) < 192 {
+            k -= 1
+        }
+        if ws_len(b, k, j) != j - k {
+            return j
+        }
+        j = k
+    }
+    s
+}
+
+/// Whether `b[s..e]` starts with `lit`.
+fn starts(b: bytes, s: i64, e: i64, lit: str) -> bool {
+    let l = lit.to_bytes()
+    if e - s < l.len() {
+        return false
+    }
+    for k in 0..l.len() {
+        if b.at(s + k) != l.at(k) {
+            return false
+        }
+    }
+    true
+}
+
+/// A line that is a contract clause rather than a statement about a variable
+/// that happens to be called `requires` or `ensures`.
+fn contract_clause(b: bytes, s: i64, e: i64) -> bool {
+    for kw in ["requires ", "ensures "] {
+        if starts(b, s, e, kw) {
+            let r = skip_ws(b, s + kw.to_bytes().len(), e)
+            let assign = starts(b, r, e, "=") and not starts(b, r, e, "==")
+            let compound = starts(b, r, e, "+=") or starts(b, r, e, "-=") or starts(b, r, e, "*=") or starts(b, r, e, "/=")
+            if not assign and not compound {
+                return true
+            }
+        }
+    }
+    false
+}
+
+/// A line that continues the one above it sits one level deeper: a `|`, a
+/// `.` or a contract clause.
+fn continues(b: bytes, s: i64, e: i64) -> bool {
+    if s < e and (b.at(s) == 124 or b.at(s) == 46) {
+        return true
+    }
+    contract_clause(b, s, e)
+}
+
+/// Whether `b[i..e]` opens with `"""`.
+fn triple(b: bytes, i: i64, e: i64) -> bool {
+    i + 2 < e and b.at(i) == 34 and b.at(i + 1) == 34 and b.at(i + 2) == 34
+}
+
+pub fn format_src(src: str) -> str {
+    let b = src.to_bytes()
+    let n = b.len()
+    // The lines as `split_inclusive('\n')` makes them: each with its `\n`,
+    // the last without one if the source does not end in one.
+    var ls: [i64] = []
+    var le: [i64] = []
+    var at = 0
+    while at < n {
+        var j = at
+        while j < n and b.at(j) != 10 {
+            j += 1
+        }
+        let end = if j < n { j + 1 } else { n }
+        ls.push(at)
+        le.push(end)
+        at = end
+    }
+    var out = byte_builder()
+    var depth = 0
+    var levels: [i64] = []
+    var mk = [M_CODE]
+    var mn = [0]
+    for index in 0..ls.len() {
+        let s = ls[index]
+        let e = le[index]
+        let has_nl = e > s and b.at(e - 1) == 10
+        var ce = e
+        if has_nl {
+            ce = e - 1
+            if ce > s and b.at(ce - 1) == 13 {
+                ce -= 1
+            }
+        }
+        let ts = skip_ws(b, s, ce)
+        let top = mk[mk.len() - 1]
+        let in_block = top == M_BLOCK or top == M_RAW
+
+        var lead = 0
+        if not in_block {
+            var k = ts
+            while k < ce and (b.at(k) == 125 or b.at(k) == 41 or b.at(k) == 93) {
+                lead += 1
+                k += 1
+            }
+        }
+
+        if ts == ce and top != M_RAW {
+            if has_nl {
+                out.push_byte(10)
+            }
+        } else if in_block {
+            out.push_bytes(b.slice(s, ce))
+            if has_nl {
+                out.push_byte(10)
+            }
+        } else {
+            var extra = 0
+            if starts(b, ts, ce, "//") {
+                // The next line that is neither blank nor a comment.
+                var j = index + 1
+                var found = false
+                while j < ls.len() and not found {
+                    let a = skip_ws(b, ls[j], le[j])
+                    let z = back_ws(b, a, le[j])
+                    if a < z and not starts(b, a, z, "//") {
+                        found = true
+                        if continues(b, a, z) {
+                            extra = 1
+                        }
+                    }
+                    j += 1
+                }
+            } else if continues(b, ts, ce) {
+                extra = 1
+            }
+            let after = depth - lead
+            var open = 0
+            for d in levels {
+                if d <= after {
+                    open += 1
+                }
+            }
+            var indent = open + extra
+            if indent < 0 {
+                indent = 0
+            }
+            for _ in 0..indent {
+                out.push_str("    ")
+            }
+            out.push_str(respace(b, ts, ce))
+            if has_nl {
+                out.push_byte(10)
+            }
+        }
+
+        // The line's characters, for the depth and the modes.
+        var i = ts
+        while i < ce {
+            let ch = b.at(i)
+            let t = mk.len() - 1
+            let mode = mk[t]
+            if mode == M_CODE {
+                if ch == 34 and triple(b, i, ce) {
+                    i += 2
+                    mk.push(M_RAW)
+                    mn.push(0)
+                } else if ch == 34 {
+                    mk.push(M_STR)
+                    mn.push(0)
+                } else if ch == 47 and i + 1 < ce and b.at(i + 1) == 47 {
+                    mk.push(M_LINE)
+                    mn.push(0)
+                    i += 1
+                } else if ch == 47 and i + 1 < ce and b.at(i + 1) == 42 {
+                    mk.push(M_BLOCK)
+                    mn.push(1)
+                    i += 1
+                } else if ch == 123 or ch == 40 or ch == 91 {
+                    depth += 1
+                } else if ch == 125 or ch == 41 or ch == 93 {
+                    depth -= 1
+                }
+            } else if mode == M_INTERP {
+                if ch == 34 and triple(b, i, ce) {
+                    i += 2
+                    mk.push(M_RAW)
+                    mn.push(0)
+                } else if ch == 34 {
+                    mk.push(M_STR)
+                    mn.push(0)
+                } else if ch == 123 {
+                    mn[t] = mn[t] + 1
+                } else if ch == 125 {
+                    if mn[t] == 0 {
+                        mk.pop()
+                        mn.pop()
+                    } else {
+                        mn[t] = mn[t] - 1
+                    }
+                }
+            } else if mode == M_STR {
+                if ch == 92 {
+                    i += 1
+                } else if ch == 34 {
+                    mk.pop()
+                    mn.pop()
+                } else if ch == 123 {
+                    mk.push(M_INTERP)
+                    mn.push(0)
+                }
+            } else if mode == M_RAW {
+                if ch == 34 and triple(b, i, ce) {
+                    i += 2
+                    mk.pop()
+                    mn.pop()
+                }
+            } else if mode == M_BLOCK {
+                if ch == 42 and i + 1 < ce and b.at(i + 1) == 47 {
+                    i += 1
+                    if mn[t] == 1 {
+                        mk.pop()
+                        mn.pop()
+                    } else {
+                        mn[t] = mn[t] - 1
+                    }
+                } else if ch == 47 and i + 1 < ce and b.at(i + 1) == 42 {
+                    i += 1
+                    mn[t] = mn[t] + 1
+                }
+            }
+            i += 1
+        }
+        // A line comment, a string and an interpolation end with the line.
+        var popping = true
+        while popping {
+            let m = mk[mk.len() - 1]
+            if m == M_LINE or m == M_STR or m == M_INTERP {
+                mk.pop()
+                mn.pop()
+            } else {
+                popping = false
+            }
+        }
+        if not in_block {
+            var trimming = true
+            while trimming and levels.len() > 0 {
+                if levels[levels.len() - 1] > depth {
+                    levels.pop()
+                } else {
+                    trimming = false
+                }
+            }
+            let last = if levels.len() > 0 { levels[levels.len() - 1] } else { 0 }
+            if last < depth {
+                levels.push(depth)
+            }
+        }
+        if depth < 0 {
+            depth = 0
+        }
+    }
+    out.to_bytes().to_str()
+}
+
+// ---------------------------------------------------------------------------
+// Spacing
+// ---------------------------------------------------------------------------
+
+/// A line split into pieces: each one's kind, its text, and where it starts
+/// in the line. `ok` is false when the line holds something the splitter has
+/// no rule for, and the line is then left as it is.
+type Pieces = {
+    ok: bool,
+    kind: [i64],
+    text: [str],
+    at: [i64],
+}
+
+fn is_ident_start(c: i64) -> bool {
+    (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95
+}
+
+fn is_ident_cont(c: i64) -> bool {
+    is_ident_start(c) or (c >= 48 and c <= 57)
+}
+
+fn is_digit(c: i64) -> bool {
+    c >= 48 and c <= 57
+}
+
+fn is_upper(c: i64) -> bool {
+    c >= 65 and c <= 90
+}
+
+fn is_ascii_ws(c: i64) -> bool {
+    c == 32 or c == 9 or c == 10 or c == 12 or c == 13
+}
+
+fn is_punct(c: i64) -> bool {
+    (c >= 33 and c <= 47) or (c >= 58 and c <= 64) or (c >= 91 and c <= 96) or (c >= 123 and c <= 126)
+}
+
+/// The multi-character operators, longest first, as `OPS` lists them.
+fn op_at(b: bytes, i: i64, e: i64) -> i64 {
+    for op in ["..=", "?.", "??", "|>", "->", "=>", "::", "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "&&", "||", ".."] {
+        if starts(b, i, e, op) {
+            return op.to_bytes().len()
+        }
+    }
+    0
+}
+
+/// Byte index just past the string literal starting at `i`, following
+/// escapes and `\{...}` interpolation; -1 if it does not end on the line.
+fn scan_string(b: bytes, i: i64, e: i64) -> i64 {
+    var j = i + 1
+    while j < e {
+        let c = b.at(j)
+        if c == 92 {
+            j += 2
+        } else if c == 34 {
+            return j + 1
+        } else if c == 123 {
+            var depth = 0
+            j += 1
+            var inner = true
+            while inner and j < e {
+                let d = b.at(j)
+                if d == 34 {
+                    j = scan_string(b, j, e)
+                    if j < 0 {
+                        return -1
+                    }
+                } else if d == 123 {
+                    depth += 1
+                    j += 1
+                } else if d == 125 {
+                    j += 1
+                    if depth == 0 {
+                        inner = false
+                    } else {
+                        depth -= 1
+                    }
+                } else if d == 92 {
+                    j += 2
+                } else {
+                    j += 1
+                }
+            }
+        } else {
+            j += 1
+        }
+    }
+    -1
+}
+
+fn split_pieces(b: bytes, s: i64, e: i64) -> Pieces {
+    var kind: [i64] = []
+    var text: [str] = []
+    var at: [i64] = []
+    var i = s
+    while i < e {
+        let c = b.at(i)
+        if is_ascii_ws(c) {
+            i += 1
+            continue
+        }
+        // A line comment: the rest of the line.
+        if c == 47 and i + 1 < e and b.at(i + 1) == 47 {
+            kind.push(P_OPAQUE)
+            text.push(b.slice(i, e).to_str())
+            at.push(i - s)
+            return Pieces{ ok: true, kind: kind, text: text, at: at }
+        }
+        // A block comment that closes on this line; nested ones count.
+        if c == 47 and i + 1 < e and b.at(i + 1) == 42 {
+            var j = i + 2
+            var depth = 1
+            var closed = false
+            while j + 1 < e and not closed {
+                if b.at(j) == 47 and b.at(j + 1) == 42 {
+                    depth += 1
+                    j += 2
+                } else if b.at(j) == 42 and b.at(j + 1) == 47 {
+                    depth -= 1
+                    j += 2
+                    if depth == 0 {
+                        closed = true
+                    }
+                } else {
+                    j += 1
+                }
+            }
+            if depth != 0 {
+                return Pieces{ ok: false, kind: [], text: [], at: [] }
+            }
+            kind.push(P_OPAQUE)
+            text.push(b.slice(i, j).to_str())
+            at.push(i - s)
+            i = j
+            continue
+        }
+        // A raw string; if it does not close on this line the rest is data.
+        if triple(b, i, e) {
+            var k = i + 3
+            var stop = -1
+            while k + 2 < e and stop < 0 {
+                if triple(b, k, e) {
+                    stop = k + 3
+                }
+                k += 1
+            }
+            if stop < 0 {
+                kind.push(P_OPAQUE)
+                text.push(b.slice(i, e).to_str())
+                at.push(i - s)
+                return Pieces{ ok: true, kind: kind, text: text, at: at }
+            }
+            kind.push(P_OPAQUE)
+            text.push(b.slice(i, stop).to_str())
+            at.push(i - s)
+            i = stop
+            continue
+        }
+        if c == 34 {
+            let stop = scan_string(b, i, e)
+            if stop < 0 {
+                return Pieces{ ok: false, kind: [], text: [], at: [] }
+            }
+            kind.push(P_OPAQUE)
+            text.push(b.slice(i, stop).to_str())
+            at.push(i - s)
+            i = stop
+            continue
+        }
+        if is_ident_start(c) {
+            let start = i
+            while i < e and is_ident_cont(b.at(i)) {
+                i += 1
+            }
+            kind.push(P_WORD)
+            text.push(b.slice(start, i).to_str())
+            at.push(start - s)
+            continue
+        }
+        if is_digit(c) {
+            let start = i
+            let hex = starts(b, i, e, "0x") or starts(b, i, e, "0X")
+            var going = true
+            while going and i < e {
+                let d = b.at(i)
+                if is_ident_cont(d) {
+                    let expo = not hex and (d == 101 or d == 69)
+                    i += 1
+                    if expo and i < e and (b.at(i) == 45 or b.at(i) == 43) {
+                        i += 1
+                    }
+                } else if d == 46 and i + 1 < e and is_digit(b.at(i + 1)) {
+                    i += 1
+                } else {
+                    going = false
+                }
+            }
+            kind.push(P_WORD)
+            text.push(b.slice(start, i).to_str())
+            at.push(start - s)
+            continue
+        }
+        let ol = op_at(b, i, e)
+        if ol > 0 {
+            kind.push(P_OP)
+            text.push(b.slice(i, i + ol).to_str())
+            at.push(i - s)
+            i += ol
+            continue
+        }
+        if is_punct(c) {
+            kind.push(P_OP)
+            text.push(b.slice(i, i + 1).to_str())
+            at.push(i - s)
+            i += 1
+            continue
+        }
+        // A byte the splitter has no rule for: leave the line alone.
+        return Pieces{ ok: false, kind: [], text: [], at: [] }
+    }
+    Pieces{ ok: true, kind: kind, text: text, at: at }
+}
+
+fn is_keyword(s: str) -> bool {
+    let them = [
+        "fn", "pub", "let", "var", "own", "inout", "type", "interface", "impl", "effect", "with", "handled_by", "match",
+        "if", "else", "for", "while", "unsafe", "ref", "in", "return", "try", "true", "false", "break", "continue",
+        "and", "or", "not", "import", "test",
+    ]
+    them.contains(s)
+}
+
+fn upper_start(s: str) -> bool {
+    let b = s.to_bytes()
+    b.len() > 0 and is_upper(b.at(0))
+}
+
+fn is_comment(s: str) -> bool {
+    s.starts_with("//") or s.starts_with("/*")
+}
+
+/// The line `b[s..e]` re-spaced; as it is when the splitter refuses it.
+fn respace(b: bytes, s: i64, e: i64) -> str {
+    let ps = split_pieces(b, s, e)
+    if not ps.ok or ps.kind.is_empty() {
+        return b.slice(s, e).to_str()
+    }
+    let kind = ps.kind
+    let text = ps.text
+    let n = kind.len()
+    let t0 = text[0]
+    let variant_line = (kind[0] == P_WORD and t0 == "type") or
+    (t0 == "|" and n > 1 and kind[1] == P_WORD and upper_start(text[1]))
+    let body_words = ["fn", "pub", "type", "effect", "interface", "impl", "actor", "test", "for", "while", "if", "else", "match", "unsafe"]
+    let body_line = t0 == "}" or (kind[0] == P_WORD and body_words.contains(t0))
+    var type_marker = false
+    var td = 0
+    for q in 0..n {
+        if kind[q] != P_OP {
+            continue
+        }
+        let x = text[q]
+        if x == "(" or x == "[" or x == "\{" {
+            td += 1
+        } else if x == ")" or x == "]" or x == "}" {
+            if td > 0 {
+                td -= 1
+            }
+        } else if (x == "->" or x == "!" or x == "/") and td == 0 {
+            type_marker = true
+        }
+    }
+
+    var out = byte_builder()
+    var closure_open = false
+    var braces: [i64] = []
+    var depth = 0
+    var prev_ends_value = false
+    var prev_was_unary = false
+    var prev_was_open_pipe = false
+    for k in 0..n {
+        let kk = kind[k]
+        let tt = text[k]
+        let unary = kk == P_OP and (tt == "-" or tt == "+") and not prev_ends_value and k + 1 < n and
+        (kind[k + 1] == P_WORD or (kind[k + 1] == P_OP and text[k + 1] == "("))
+        let pipe = kk == P_OP and tt == "|" and not variant_line
+        let pipe_open = pipe and not closure_open and not prev_ends_value
+        let pipe_close = pipe and closure_open
+        var this_brace = -1
+        if kk == P_OP and tt == "\{" {
+            this_brace = brace_kind(ps, k, body_line, depth, type_marker)
+        }
+        var aligned = false
+        var gap = 0
+        if k > 0 and k + 1 == n and kk == P_OPAQUE and is_comment(tt) {
+            let a = ps.at[k]
+            var j = s + a
+            while j > s and is_ascii_ws(b.at(j - 1)) {
+                j -= 1
+            }
+            gap = s + a - j
+            aligned = gap > 1
+        }
+        if aligned {
+            for _ in 0..gap {
+                out.push_byte(32)
+            }
+        } else if k > 0 and not prev_was_unary and not prev_was_open_pipe and not pipe_close and
+        needs_space(ps, k - 1, k, braces, this_brace) {
+            out.push_byte(32)
+        }
+        out.push_str(tt)
+
+        if kk == P_OP {
+            if tt == "\{" {
+                braces.push(if this_brace < 0 { B_BLOCK } else { this_brace })
+                depth += 1
+            } else if tt == "}" {
+                if braces.len() > 0 {
+                    braces.pop()
+                }
+                if depth > 0 {
+                    depth -= 1
+                }
+            } else if tt == "(" or tt == "[" {
+                depth += 1
+            } else if tt == ")" or tt == "]" {
+                if depth > 0 {
+                    depth -= 1
+                }
+            } else if tt == "|" and pipe_open {
+                closure_open = true
+            } else if tt == "|" and pipe_close {
+                closure_open = false
+            }
+        }
+        if kk == P_WORD {
+            let closers = ["return", "in", "and", "or", "not", "else", "requires", "ensures"]
+            prev_ends_value = not closers.contains(tt)
+        } else if kk == P_OPAQUE {
+            prev_ends_value = not is_comment(tt)
+        } else {
+            prev_ends_value = tt == ")" or tt == "]" or tt == "}" or tt == "?"
+        }
+        if unary {
+            prev_ends_value = false
+        }
+        prev_was_unary = unary
+        prev_was_open_pipe = pipe_open
+    }
+    out.to_bytes().to_str()
+}
+
+/// What the brace at piece `k` is: a body, a constructor, an effect row or
+/// a map literal (`brace_kind`).
+fn brace_kind(ps: Pieces, k: i64, body_line: bool, depth: i64, type_marker: bool) -> i64 {
+    let n = ps.kind.len()
+    if k > 0 and ps.kind[k - 1] == P_OP and ps.text[k - 1] == "/" {
+        return B_EFFECT
+    }
+    if k + 1 == n {
+        if depth > 0 {
+            return B_STRUCT
+        }
+        if body_line or type_marker {
+            return B_BLOCK
+        }
+        if k > 0 and ps.kind[k - 1] == P_WORD and upper_start(ps.text[k - 1]) {
+            return B_STRUCT
+        }
+        return B_BLOCK
+    }
+    if ps.kind[k + 1] == P_OP and ps.text[k + 1] == ".." {
+        return B_STRUCT
+    }
+    if k + 2 < n and ps.kind[k + 2] == P_OP and ps.text[k + 2] == ":" {
+        if ps.kind[k + 1] == P_OPAQUE and ps.text[k + 1].starts_with("\"") {
+            return B_MAP
+        }
+        if ps.kind[k + 1] == P_WORD {
+            return B_STRUCT
+        }
+        return B_BLOCK
+    }
+    B_BLOCK
+}
+
+/// Whether a space goes between pieces `a` and `z` (`needs_space`).
+fn needs_space(ps: Pieces, a: i64, z: i64, braces: [i64], this_brace: i64) -> bool {
+    let p = ps.text[a]
+    let nx = ps.text[z]
+    let p_op = ps.kind[a] == P_OP
+    let n_op = ps.kind[z] == P_OP
+    if ps.kind[z] == P_OPAQUE and is_comment(nx) {
+        return true
+    }
+    if p_op and n_op and p == "\{" and nx == "}" {
+        return false
+    }
+    let spaced = braces.is_empty() or braces[braces.len() - 1] == B_STRUCT or braces[braces.len() - 1] == B_BLOCK
+    if p_op and p == "\{" {
+        return spaced
+    }
+    if n_op and nx == "}" {
+        return spaced
+    }
+    if n_op and [",", ";", ")", "]", "?", ":", ".", "..", "..=", "?.", "::"].contains(nx) {
+        return false
+    }
+    if p_op and ["(", "[", ".", "..", "..=", "?.", "::", "@"].contains(p) {
+        return false
+    }
+    if n_op and nx == "(" and ps.kind[a] == P_WORD and (p == "fn" or p == "ref") {
+        return false
+    }
+    if n_op and nx == "[" and ps.kind[a] == P_WORD and p == "impl" {
+        return false
+    }
+    if n_op and (nx == "(" or nx == "[") {
+        var callee = false
+        if ps.kind[a] == P_WORD {
+            callee = not is_keyword(p)
+        } else if ps.kind[a] == P_OP {
+            callee = p == ")" or p == "]"
+        }
+        if callee {
+            return false
+        }
+    }
+    if n_op and nx == "\{" and this_brace == B_STRUCT and ps.kind[a] == P_WORD and upper_start(p) {
+        return false
+    }
+    true
+}
