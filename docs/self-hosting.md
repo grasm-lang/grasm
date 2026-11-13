@@ -5094,6 +5094,68 @@ step five's and were not run).
   The floors on fmt's rewrites, lint's findings, failing tests and mains
   as tests are estimates until a whole run measures them.
 
+**Step five: the gates** (2026-11-05 to 13, this branch's tree; the
+first runs beside the main checkout's full suite, at loads of 3 to 17, so
+their times are not to be quoted; then rebased on `112239a9`, whose three
+commits touch only other gates' scripts, and the stage-1 gates rerun):
+
+- `fixpoint`, on the rebased tree: "programs: 6 and the grasm command
+  artifacts per stage: 16 and 2 compared: 54 ... identical: 54 differ: 0";
+  "stage 2's TIR the same as grasm tir's: 6 of 6"; "the command's build the
+  stage pipeline's (its rt.o and the 4 programs): 5 of 5". The command's
+  stage 3 is its stage 2: `grasm` 4,322,680 bytes (4,025,208 at §6.17),
+  SHA-256 `2071d6931e8ba31c2d5e6ee4d579b4a5b354f542f10fb3f9a97a0aa148123d85`,
+  and `rt.o` 555,224 bytes, the compiler's stage-3 `rt.o` to the byte. The
+  same lines and digests on the tree before the rebase.
+- `clidiff`, with the command stage 1 is, and again with stage 2's
+  (`fixpoint`'s kept stage, before the rebase), the same lines both times:
+  "lines: 195 the same: 179 not here, as §6.17 says: 11 the runtime built: 1
+  a target refused: 4"; "corpus: 1737 programs, 8685 commands ... the same:
+  8685, 138 of them refusals"; "toml: 1474 files the same: 1474, 19 of them
+  refused by both"; "run: 651 programs with a main the same: 651 timed out:
+  0"; "fmt: 2007 files, each and four rewrites, 20070 commands the same:
+  20070 rewritten alike: 7638 refused alike: 385"; "lint: 2007 files, 5414
+  commands (1400 with --only) the same: 5414 findings: 1001"; "test: 1737
+  programs, 1961 commands (6 with a property test, 3 with a contract, 209
+  with --coverage) the same: 1960, 12 of them with a failing test the host's
+  panic: 0 both timed out, --contracts: 1" (`T-CONTRACT-ENSURES`); "test,
+  main as a test: 651 programs the same: 649, 13 of them failing the host's
+  panic: 2" (`E-CHANNEL`, `E-DEADLOCK`, as accepted above); "bench: 1737
+  programs, 1743 commands (3 with a benchmark, each filtered twice) the
+  same: 1743 timing lines in the format: 6"; "build: 648 programs with a
+  main (3 link a system library) the same output: 648 ... run alike: 648
+  built twice the same: 648"; "target: 65 programs ... 195 of 195"; no
+  `proc_run`. 281 minutes with stage 1's command, of which an hour was
+  `T-CONTRACT-ENSURES` under `--contracts` running into the 30-minute limit
+  under each command; `--contracts` now has two minutes, as the stage-2
+  run had (246 minutes). The floors were then set a margin below these
+  counts (the agent's, at the coordinator's request): rewrites 7,000,
+  refusals 300, findings 900, failing tests 10, mains failing as tests 11,
+  the host's panics at most 4, timing lines 6.
+- `clicontrols`: "controls: 14 caught: 14 missed: 0" -- part one's nine and
+  this part's five. 47 minutes.
+- `tirinterp` "identical: 651 mismatched: 0 timed out: 0 skipped: 0",
+  "round trip: 1671 identical, 0 not", "panics: 25 identical, 0 not";
+  `frontsmoke` "programs: 47 through tirinterp as grasm run: 47 compiled by
+  s3, linked by grasm-link, as grasm run: 47"; `tirdiff` "files: 2007 TIR
+  identical: 1940 both refuse: 67 disagree: 0 holes: 0", "emitted twice:
+  194 unstable: 0"; `loaddiff` "programs: 1737 same modules: 1671 ...
+  disagree: 0"; `diagdiff` "programs: 4277 ... refused with the same output:
+  1437 (conformance: 66) accepted by both: 2840 differ: 0 Rust panics: 0";
+  `tircontrols` "controls: 8 caught: 8 missed: 0" -- all before the rebase.
+- On the rebased tree: `fmttest` "formatted: 2001 unformatted: 0 does not
+  parse: 5 exempt: 1"; `gfmttest` "checked: 1533 disagreeing: 0"; `linttest`
+  "linted: 2002 findings: 1001 does not parse: 5 broke: 0"; `gatecheck` "gate
+  helpers checked: 587 undefined: 0 ..."; the litter check (the files git
+  does not track, and the checkout's top level, against a list taken before
+  the first gate) "new untracked files: 0". The conformance programs the
+  gates run left a `target/` in the worktree (`demo-out`,
+  `grasm_bytes_conformance`, `grasm_fs_conformance`), which git ignores and
+  which was removed.
+
+Not run on this branch: the rest of `allgates.sh`. The gates of §6.14's
+last list that run through the `grasm` command still take the Rust one.
+
 **What is left for S8 after this part.** `doc`, `api`, `deps`, `publish`,
 `add`, `lsp`, `dap`, `journal`, and `build` without `--native` and with
 `--source`; `test --schedules` and `--schedule-seed` for a test that starts
