@@ -5054,9 +5054,9 @@ step five's and were not run).
   their rewrites (137 formatted alike, 3 refused by Rust), 10 hand-written
   edge files, and 18 command lines; no difference.
 - `lint`: `compiler/grasm/src/lint.gr`. Held on 79 tracked files, plain
-  and `--json` (51 findings), three files written to have findings (97,
-  among them every rule and the type-only imports, a missing import
-  included), and 19 command lines; no difference.
+  and `--json` (51 findings), six files written to have findings (101:
+  every rule, and imports used only through a type, a missing import
+  among them), and 19 command lines; no difference.
 - `test` and `bench`: `compiler/grasm/src/testing.gr`, on the changed
   `tools/tirinterp` (`eval.fault`, `eval.exit_with`, `run_body`, tests and
   benches loaded) and `front`'s `load_sources`. Held on the 42 corpus files
