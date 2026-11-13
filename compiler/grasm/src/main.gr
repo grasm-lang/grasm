@@ -19,6 +19,8 @@
 //     links <file.gr>      the system libraries a program's packages declare
 //     fmt <file.gr> [--check]
 //                          canonical layout                tools/gfmt (§6.19)
+//     lint <file.gr> [--json] [--only RULE] [--rules]
+//                          the rules a line cannot answer  compiler/front's AST
 //
 // Each is the packages' own code, called in this process: nothing here
 // starts a process, and the Rust toolchain is on no path it takes. The other
@@ -33,6 +35,7 @@ import tirinterp
 import tirinterp.sexp
 import build
 import fmtcmd
+import lint
 
 /// The toolchain's version, `grasm --version`'s: the workspace's, which the
 /// Rust command takes from its manifest. `clidiff` holds the two equal.
@@ -60,6 +63,8 @@ fn main() {
         front.cmd_tokens(operand(a, "usage: grasm tokens <file.gr>"))
     } else if cmd == "ast" {
         front.cmd_ast(operand(a, "usage: grasm ast <file.gr>"))
+    } else if cmd == "lint" {
+        lint.cmd_lint(a)
     } else if cmd == "fmt" {
         fmtcmd.cmd_fmt(a)
     } else if cmd == "toml" {
@@ -90,7 +95,7 @@ fn operand(a: [str], usage_line: str) -> str {
 /// Whether `cmd` is one of the Rust `grasm`'s subcommands that this one
 /// does not run yet.
 fn elsewhere(cmd: str) -> bool {
-    let them = ["test", "bench", "doc", "api", "lint", "deps", "publish", "add", "lsp", "dap", "journal"]
+    let them = ["test", "bench", "doc", "api", "deps", "publish", "add", "lsp", "dap", "journal"]
     them.contains(cmd)
 }
 
@@ -98,7 +103,7 @@ fn elsewhere(cmd: str) -> bool {
 /// and exit 1 -- never handed to anything else.
 fn not_here(cmd: str) {
     eprint("error: `grasm {cmd}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links` and `fmt`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links`, `fmt` and `lint`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
     exit(1)
 }
 

@@ -172,7 +172,6 @@ doc -o
 elsewhere api examples/hello.gr
 api x.gr --against
 fmt --check --x
-elsewhere lint --rules
 lint --only
 elsewhere deps
 deps --locked --x
@@ -204,3 +203,21 @@ fmt -
 fmt examples
 fmt spec/conformance/G-STMT-TERM.gr
 fmt spec/conformance/G-STMT-TERM.gr --check
+
+# `lint` (§6.19): `--rules` anywhere, before the operand is looked for;
+# `--only` checked after the file parses; `--json` anywhere.
+lint --rules
+lint examples/hello.gr --rules
+lint examples/hello.gr -- --rules
+lint
+lint --json
+lint nosuch.gr
+lint -
+lint examples
+lint spec/conformance/G-STMT-TERM.gr
+lint examples/hello.gr --only shadowing
+lint examples/hello.gr --only nosuch
+lint --only unused-binding examples/hello.gr --json
+lint examples/hello.gr -- --only nosuch
+lint -- examples/hello.gr
+lint compiler/grasm/src/main.gr --json

@@ -1,0 +1,730 @@
+// `grasm lint` (docs/self-hosting.md §6.19): the rules a line cannot
+// answer, over the syntax tree -- `crates/grasm/src/lint.rs` ported rule for
+// rule, over `compiler/front`'s AST, which `asttest` holds to the Rust
+// parser's node for node.
+//
+// Scope is tracked as the language nests it, and a name is used only when
+// it is read: `var n = 0` then `n = 1` and nothing else is unused. A name a
+// writer opened with `_`, and the parser's U+0001 name for `let _ = ...`, are
+// left alone. Findings are sorted by line and byte column, stably, as the
+// Rust linter sorts them.
+import front
+import front.loader
+import front.lex
+import front.parse
+import front.cst
+import front.ast
+import fmtcmd
+
+/// Statements a function may hold before it is called long.
+let LONG_FN = 60
+
+/// What the walk carries: the tree, the source for line numbers, the
+/// bindings of every open scope (flat, a scope from `sc_at` on), the
+/// findings, and the one rule `--only` keeps ("" for all).
+type Linter = {
+    a: Ast,
+    starts: [i64],
+    srclen: i64,
+    b_name: [str],
+    b_start: [i64],
+    b_read: [bool],
+    b_what: [str],
+    b_exempt: [bool],
+    sc_at: [i64],
+    f_line: [i64],
+    f_col: [i64],
+    f_rule: [str],
+    f_msg: [str],
+    only: str,
+}
+
+/// Every rule, with the reason it needs the tree (`RULES`).
+fn rule_names() -> [str] {
+    ["unused-binding", "unused-parameter", "unused-import", "shadowing", "long-function", "shift-count"]
+}
+
+fn rule_whys() -> [str] {
+    [
+        "a `let` or `var` that is never read — needs scope",
+        "a parameter that is never read — needs scope",
+        "an import nothing in the file names",
+        "a name that hides one already in scope — needs scope",
+        "more statements than the limit — a line is not a statement",
+        "a literal shift count outside 0..63 — masked, never an error",
+    ]
+}
+
+fn sl(a: Ast, id: i64, i: i64) -> i64 {
+    a.pool[a.off[id] + i]
+}
+
+/// The items of a vector node.
+fn items(a: Ast, v: i64) -> [i64] {
+    a.pool.slice(a.off[v], a.off[v] + a.n[v])
+}
+
+/// Line (1-based) of byte offset `at`, clamped to the source.
+fn line_of(l: Linter, at: i64) -> i64 {
+    let (line, _c) = line_col(l, at)
+    line
+}
+
+/// Line and byte column, both 1-based, of byte offset `at` (`line_col`).
+fn line_col(l: Linter, at0: i64) -> (i64, i64) {
+    let at = if at0 > l.srclen { l.srclen } else { at0 }
+    // The last line start at or before `at`.
+    var lo = 0
+    var hi = l.starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if l.starts[mid] <= at {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    (lo + 1, at - l.starts[lo] + 1)
+}
+
+fn report(inout l: Linter, at: i64, rule: str, msg: str) {
+    if l.only != "" and l.only != rule {
+        return
+    }
+    let (line, col) = line_col(l, at)
+    l.f_line.push(line)
+    l.f_col.push(col)
+    l.f_rule.push(rule)
+    l.f_msg.push(msg)
+}
+
+/// The innermost binding of `name`, or -1.
+fn lookup(l: Linter, name: str) -> i64 {
+    var i = l.b_name.len() - 1
+    while i >= 0 {
+        if l.b_name[i] == name {
+            return i
+        }
+        i -= 1
+    }
+    -1
+}
+
+fn declare(inout l: Linter, id: i64, what: str) {
+    let name = l.a.t[id]
+    let nb = name.to_bytes()
+    let exempt = name.starts_with("_") or (nb.len() > 0 and nb.at(0) == 1)
+    if not exempt and what != "import" {
+        let prev = lookup(l, name)
+        if prev >= 0 {
+            let line = line_of(l, l.b_start[prev])
+            report(l, l.a.s[id], "shadowing", "`{name}` hides the one bound on line {line}")
+        }
+    }
+    if l.sc_at.len() > 0 {
+        l.b_name.push(name)
+        l.b_start.push(l.a.s[id])
+        l.b_read.push(false)
+        l.b_what.push(what)
+        l.b_exempt.push(exempt)
+    }
+}
+
+/// A name that cannot be an unused binding but can be the one a later
+/// binding hides: an `inout` or `own` parameter.
+fn declare_used(inout l: Linter, id: i64) {
+    if l.sc_at.len() > 0 {
+        l.b_name.push(l.a.t[id])
+        l.b_start.push(l.a.s[id])
+        l.b_read.push(true)
+        l.b_what.push("parameter")
+        l.b_exempt.push(true)
+    }
+}
+
+fn read(inout l: Linter, name: str) {
+    let i = lookup(l, name)
+    if i >= 0 {
+        l.b_read[i] = true
+    }
+}
+
+fn push_scope(inout l: Linter) {
+    l.sc_at.push(l.b_name.len())
+}
+
+/// Closes a scope, reporting every binding in it that was never read.
+fn pop_scope(inout l: Linter) {
+    if l.sc_at.is_empty() {
+        return
+    }
+    let from = l.sc_at[l.sc_at.len() - 1]
+    l.sc_at.pop()
+    let to = l.b_name.len()
+    for i in from..to {
+        if l.b_read[i] or l.b_exempt[i] {
+            continue
+        }
+        let what = l.b_what[i]
+        let rule = if what == "parameter" { "unused-parameter" } else if what == "import" { "unused-import" } else { "unused-binding" }
+        report(l, l.b_start[i], rule, "{what} `{l.b_name[i]}` is never read")
+    }
+    while l.b_name.len() > from {
+        l.b_name.pop()
+        l.b_start.pop()
+        l.b_read.pop()
+        l.b_what.pop()
+        l.b_exempt.pop()
+    }
+}
+
+// -- walking ------------------------------------------------------------
+
+fn module(inout l: Linter, decls: [i64], type_imports: [str]) {
+    push_scope(l)
+    for d in decls {
+        if l.a.k[d] == ast.D_IMPORT {
+            let segs = items(l.a, sl(l.a, sl(l.a, d, 0), 0))
+            if segs.len() > 0 {
+                declare(l, segs[segs.len() - 1], "import")
+            }
+        }
+    }
+    for name in type_imports {
+        read(l, name)
+    }
+    for d in decls {
+        decl(l, d)
+    }
+    pop_scope(l)
+}
+
+fn decl(inout l: Linter, d: i64) {
+    let k = l.a.k[d]
+    if k == ast.D_FN {
+        function(l, d)
+    } else if k == ast.D_TEST {
+        push_scope(l)
+        for p in items(l.a, sl(l.a, d, 0)) {
+            declare(l, sl(l.a, p, 1), "parameter")
+        }
+        block(l, sl(l.a, d, 1))
+        pop_scope(l)
+    } else if k == ast.D_BENCH {
+        push_scope(l)
+        block(l, sl(l.a, d, 0))
+        pop_scope(l)
+    } else if k == ast.D_CONST {
+        expr(l, sl(l.a, d, 3))
+    }
+}
+
+fn function(inout l: Linter, f: i64) {
+    let body = sl(l.a, f, 9)
+    let n = count_stmts(l.a, body)
+    if n > LONG_FN {
+        let name = l.a.t[sl(l.a, f, 2)]
+        report(l, l.a.s[f], "long-function", "`{name}` is {n} statements; the limit is {LONG_FN}")
+    }
+    push_scope(l)
+    for p in items(l.a, sl(l.a, f, 5)) {
+        // An `inout` or `own` parameter exists to be written or consumed.
+        if sl(l.a, p, 0) == 0 {
+            declare(l, sl(l.a, p, 1), "parameter")
+        } else {
+            declare_used(l, sl(l.a, p, 1))
+        }
+    }
+    block(l, body)
+    pop_scope(l)
+}
+
+fn block(inout l: Linter, b: i64) {
+    push_scope(l)
+    for s in items(l.a, sl(l.a, b, 0)) {
+        stmt(l, s)
+    }
+    pop_scope(l)
+}
+
+fn stmt(inout l: Linter, s: i64) {
+    let k = l.a.k[s]
+    if k == ast.S_LET {
+        expr(l, sl(l.a, s, 3))
+        declare(l, sl(l.a, s, 1), if sl(l.a, s, 0) != 0 { "var" } else { "let" })
+    } else if k == ast.S_LET_TUPLE {
+        expr(l, sl(l.a, s, 2))
+        let what = if sl(l.a, s, 0) != 0 { "var" } else { "let" }
+        for n in items(l.a, sl(l.a, s, 1)) {
+            declare(l, n, what)
+        }
+    } else if k == ast.S_ASSIGN {
+        expr(l, sl(l.a, s, 2))
+        // `x = v` writes; `x += v` reads first; a field or index target
+        // reads what it reaches into.
+        let target = sl(l.a, s, 0)
+        if not (l.a.k[target] == ast.E_IDENT and sl(l.a, s, 1) == 0) {
+            expr(l, target)
+        }
+    } else if k == ast.S_EXPR {
+        expr(l, sl(l.a, s, 0))
+    } else if k == ast.S_RETURN {
+        let e = sl(l.a, s, 0)
+        if e >= 0 {
+            expr(l, e)
+        }
+    } else if k == ast.S_WHILE {
+        expr(l, sl(l.a, s, 0))
+        block(l, sl(l.a, s, 1))
+    } else if k == ast.S_FOR {
+        expr(l, sl(l.a, s, 1))
+        push_scope(l)
+        declare(l, sl(l.a, s, 0), "let")
+        block(l, sl(l.a, s, 2))
+        pop_scope(l)
+    } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+        block(l, sl(l.a, s, 0))
+    } else if k == ast.S_WITH {
+        expr(l, sl(l.a, s, 1))
+        block(l, sl(l.a, s, 2))
+    }
+}
+
+fn expr(inout l: Linter, e: i64) {
+    let k = l.a.k[e]
+    if k == ast.E_IDENT {
+        read(l, l.a.t[sl(l.a, e, 0)])
+    } else if k == ast.E_STR {
+        for p in items(l.a, sl(l.a, e, 0)) {
+            if l.a.k[p] == ast.PC_EXPR {
+                expr(l, sl(l.a, p, 0))
+            }
+        }
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for x in items(l.a, sl(l.a, e, 0)) {
+            expr(l, x)
+        }
+    } else if k == ast.E_MAP {
+        for kv in items(l.a, sl(l.a, e, 0)) {
+            expr(l, sl(l.a, kv, 0))
+            expr(l, sl(l.a, kv, 1))
+        }
+    } else if k == ast.E_STRUCT {
+        // A constructor names its type, and a type can come from an import.
+        let segs = items(l.a, sl(l.a, sl(l.a, e, 0), 0))
+        if segs.len() > 0 {
+            read(l, l.a.t[segs[0]])
+        }
+        let base = sl(l.a, e, 1)
+        if base >= 0 {
+            expr(l, base)
+        }
+        for f in items(l.a, sl(l.a, e, 2)) {
+            expr(l, sl(l.a, f, 1))
+        }
+    } else if k == ast.E_CALL {
+        expr(l, sl(l.a, e, 0))
+        for x in items(l.a, sl(l.a, e, 1)) {
+            expr(l, x)
+        }
+    } else if k == ast.E_METHOD {
+        shift_count(l, sl(l.a, e, 1), sl(l.a, e, 2))
+        expr(l, sl(l.a, e, 0))
+        for x in items(l.a, sl(l.a, e, 2)) {
+            expr(l, x)
+        }
+    } else if k == ast.E_FIELD {
+        expr(l, sl(l.a, e, 0))
+    } else if k == ast.E_INDEX {
+        expr(l, sl(l.a, e, 0))
+        expr(l, sl(l.a, e, 1))
+    } else if k == ast.E_UNARY {
+        expr(l, sl(l.a, e, 1))
+    } else if k == ast.E_TRY {
+        expr(l, sl(l.a, e, 0))
+    } else if k == ast.E_BINARY {
+        expr(l, sl(l.a, e, 1))
+        expr(l, sl(l.a, e, 2))
+    } else if k == ast.E_RANGE {
+        expr(l, sl(l.a, e, 0))
+        expr(l, sl(l.a, e, 1))
+    } else if k == ast.E_IF {
+        expr(l, sl(l.a, e, 0))
+        block(l, sl(l.a, e, 1))
+        let eb = sl(l.a, e, 2)
+        if eb >= 0 {
+            if l.a.k[eb] == ast.EB_ELSE {
+                block(l, sl(l.a, eb, 0))
+            } else {
+                expr(l, sl(l.a, eb, 0))
+            }
+        }
+    } else if k == ast.E_MATCH {
+        expr(l, sl(l.a, e, 0))
+        for arm in items(l.a, sl(l.a, e, 1)) {
+            push_scope(l)
+            pattern(l, sl(l.a, arm, 0))
+            let g = sl(l.a, arm, 1)
+            if g >= 0 {
+                expr(l, g)
+            }
+            expr(l, sl(l.a, arm, 2))
+            pop_scope(l)
+        }
+    } else if k == ast.E_BLOCK or k == ast.E_REGION or k == ast.E_UNSAFE {
+        block(l, sl(l.a, e, 0))
+    } else if k == ast.E_CLOSURE {
+        push_scope(l)
+        for p in items(l.a, sl(l.a, e, 0)) {
+            declare(l, p, "parameter")
+        }
+        expr(l, sl(l.a, e, 1))
+        pop_scope(l)
+    }
+}
+
+/// A pattern binds names; a capitalised one is a nullary variant, which
+/// the checker settles, so it is read rather than bound.
+fn pattern(inout l: Linter, p: i64) {
+    let k = l.a.k[p]
+    if k == ast.P_BIND {
+        let id = sl(l.a, p, 0)
+        let nb = l.a.t[id].to_bytes()
+        if nb.len() > 0 and nb.at(0) >= 65 and nb.at(0) <= 90 {
+            read(l, l.a.t[id])
+        } else {
+            declare(l, id, "let")
+        }
+    } else if k == ast.P_VARIANT {
+        let segs = items(l.a, sl(l.a, sl(l.a, p, 0), 0))
+        if segs.len() > 0 {
+            read(l, l.a.t[segs[0]])
+        }
+        for f in items(l.a, sl(l.a, p, 1)) {
+            pattern(l, f)
+        }
+    } else if k == ast.P_TUPLE or k == ast.P_OR {
+        for q in items(l.a, sl(l.a, p, 0)) {
+            pattern(l, q)
+        }
+    }
+}
+
+/// A shift by a literal count the hardware will mask away ([L-LIB-BITS]).
+fn shift_count(inout l: Linter, name: i64, args: i64) {
+    let m = l.a.t[name]
+    if m != "shl" and m != "shr" and m != "ushr" {
+        return
+    }
+    let xs = items(l.a, args)
+    if xs.len() != 1 {
+        return
+    }
+    let x = xs[0]
+    var n = 0
+    if l.a.k[x] == ast.E_INT {
+        n = sl(l.a, x, 0)
+    } else if l.a.k[x] == ast.E_UNARY and sl(l.a, x, 0) == 0 and l.a.k[sl(l.a, x, 1)] == ast.E_INT {
+        // Wrapping: `-9223372036854775808` is a literal ([T-U64]).
+        n = 0 - sl(l.a, sl(l.a, x, 1), 0)
+    } else {
+        return
+    }
+    if n >= 0 and n <= 63 {
+        return
+    }
+    let masked = (n % 64 + 64) % 64
+    report(l, l.a.s[x], "shift-count", "shift count {n} is masked to {masked}, so this shifts by {masked} rather than {n} ([L-LIB-BITS])")
+}
+
+fn count_stmts(a: Ast, b: i64) -> i64 {
+    var n = 0
+    for s in items(a, sl(a, b, 0)) {
+        n += count_stmt(a, s)
+    }
+    n
+}
+
+fn count_stmt(a: Ast, s: i64) -> i64 {
+    let k = a.k[s]
+    if k == ast.S_WHILE {
+        return 1 + count_stmts(a, sl(a, s, 1))
+    }
+    if k == ast.S_FOR or k == ast.S_WITH {
+        return 1 + count_stmts(a, sl(a, s, 2))
+    }
+    if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+        return 1 + count_stmts(a, sl(a, s, 0))
+    }
+    if k == ast.S_LET {
+        return 1 + count_expr(a, sl(a, s, 3))
+    }
+    if k == ast.S_LET_TUPLE or k == ast.S_ASSIGN {
+        return 1 + count_expr(a, sl(a, s, 2))
+    }
+    if k == ast.S_EXPR {
+        return 1 + count_expr(a, sl(a, s, 0))
+    }
+    if k == ast.S_RETURN and sl(a, s, 0) >= 0 {
+        return 1 + count_expr(a, sl(a, s, 0))
+    }
+    1
+}
+
+/// Statements hiding inside an expression: a block, a match arm, an `if`.
+fn count_expr(a: Ast, e: i64) -> i64 {
+    let k = a.k[e]
+    if k == ast.E_BLOCK or k == ast.E_REGION or k == ast.E_UNSAFE {
+        return count_stmts(a, sl(a, e, 0))
+    }
+    if k == ast.E_IF {
+        var n = count_stmts(a, sl(a, e, 1))
+        let eb = sl(a, e, 2)
+        if eb >= 0 {
+            if a.k[eb] == ast.EB_ELSE {
+                n += count_stmts(a, sl(a, eb, 0))
+            } else {
+                n += count_expr(a, sl(a, eb, 0))
+            }
+        }
+        return n
+    }
+    if k == ast.E_MATCH {
+        var n = 0
+        for arm in items(a, sl(a, e, 1)) {
+            n += count_expr(a, sl(a, arm, 2))
+        }
+        return n
+    }
+    if k == ast.E_CLOSURE {
+        return count_expr(a, sl(a, e, 1))
+    }
+    0
+}
+
+/// The findings' order, by line then column, stably (`sort_by_key`): a
+/// merge sort of their indexes.
+fn sorted_order(l: Linter) -> [i64] {
+    var idx: [i64] = []
+    for i in 0..l.f_line.len() {
+        idx.push(i)
+    }
+    var tmp = idx
+    var width = 1
+    let n = idx.len()
+    while width < n {
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n { lo + width } else { n }
+            let hi = if lo + 2 * width < n { lo + 2 * width } else { n }
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid or j < hi {
+                var take_left = false
+                if j >= hi {
+                    take_left = true
+                } else if i < mid {
+                    let x = idx[i]
+                    let y = idx[j]
+                    take_left = l.f_line[x] < l.f_line[y] or (l.f_line[x] == l.f_line[y] and l.f_col[x] <= l.f_col[y])
+                }
+                if take_left {
+                    tmp[k] = idx[i]
+                    i += 1
+                } else {
+                    tmp[k] = idx[j]
+                    j += 1
+                }
+                k += 1
+            }
+            lo = hi
+        }
+        let t = idx
+        idx = tmp
+        tmp = t
+        width = width * 2
+    }
+    idx
+}
+
+/// The imports the entry uses only through a type or variant they declare
+/// (`imports_used_for_types`): the program loaded, and each import whose
+/// module declares a type, or a variant of one, that the file names as an
+/// identifier. A program that cannot be loaded gives none.
+fn type_imports(path: str, src: bytes) -> [str] {
+    let ld = loader.load(path)
+    if ld.fatal != "" or ld.names.is_empty() {
+        return []
+    }
+    let lx = lex.lex(src, false)
+    var mentioned: Map[str, bool] = map()
+    for i in 0..lx.kind.len() {
+        if lx.kind[i] == lex.T_IDENT {
+            mentioned.set(lx.text[lx.ival[i]], true)
+        }
+    }
+    var used: [str] = []
+    let aliases = ld.imp_alias[0]
+    let fulls = ld.imp_full[0]
+    for i in 0..aliases.len() {
+        var f = -1
+        for j in 0..ld.names.len() {
+            if f < 0 and ld.names[j] == fulls[i] {
+                f = j
+            }
+        }
+        if f < 0 {
+            continue
+        }
+        let m = ld.mods[f]
+        let a = m.a
+        var declares = false
+        for d in m.decls {
+            if a.k[d] == ast.D_TYPE and not declares {
+                if mentioned.has(a.t[sl(a, d, 2)]) {
+                    declares = true
+                } else {
+                    let body = sl(a, d, 4)
+                    if a.k[body] == ast.B_SUM {
+                        for v in items(a, sl(a, body, 0)) {
+                            if mentioned.has(a.t[sl(a, v, 0)]) {
+                                declares = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if declares {
+            used.push(aliases[i])
+        }
+    }
+    used
+}
+
+/// A JSON string literal: the six escapes JSON requires, and `\u00XX` for
+/// the other control characters (`json_str`).
+fn json_str(s: str) -> str {
+    let b = s.to_bytes()
+    var out = byte_builder()
+    out.push_byte(34)
+    let hex = "0123456789abcdef".to_bytes()
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c == 34 {
+            out.push_str("\\\"")
+        } else if c == 92 {
+            out.push_str("\\\\")
+        } else if c == 10 {
+            out.push_str("\\n")
+        } else if c == 13 {
+            out.push_str("\\r")
+        } else if c == 9 {
+            out.push_str("\\t")
+        } else if c < 32 {
+            out.push_str("\\u00")
+            out.push_byte(hex.at(c / 16))
+            out.push_byte(hex.at(c % 16))
+        } else {
+            out.push_byte(c)
+        }
+    }
+    out.push_byte(34)
+    out.to_bytes().to_str()
+}
+
+/// The value after the first `flag` among `a`, or "\0" (`flag_value`).
+fn flag_value(a: [str], flag: str) -> str {
+    for i in 0..a.len() {
+        if a[i] == flag {
+            if i + 1 < a.len() {
+                return a[i + 1]
+            }
+            return "\0"
+        }
+    }
+    "\0"
+}
+
+/// `grasm lint <file.gr> [--json] [--only RULE] [--rules]`.
+pub fn cmd_lint(a: [str]) {
+    let names = rule_names()
+    if a.contains("--rules") {
+        let whys = rule_whys()
+        for i in 0..names.len() {
+            var pad = names[i]
+            while pad.len() < 18 {
+                pad = pad + " "
+            }
+            print("{pad} {whys[i]}")
+        }
+        return
+    }
+    let rest = a.slice(1, a.len())
+    let path = build_first_operand(rest)
+    if path == "\0" {
+        eprint("usage: grasm lint <file.gr> [--json] [--only RULE] [--rules]")
+        exit(1)
+    }
+    let src = front.read_source(path)
+    let errors = fmtcmd.parse_errors(src)
+    if errors.len() > 0 {
+        fmtcmd.refuse_unparsed(path, errors, "lint")
+    }
+    let only = flag_value(rest, "--only")
+    if only != "\0" and not names.contains(only) {
+        eprint("error: no rule called `{only}` (see `grasm lint --rules`)")
+        exit(1)
+    }
+    let tys = type_imports(path, src)
+    let lx = lex.lex(src, true)
+    let p = parse.parse(src, lx)
+    let c = cst.build(p)
+    let m = ast.build(c, src, p.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+    var starts = [0]
+    for i in 0..src.len() {
+        if src.at(i) == 10 {
+            starts.push(i + 1)
+        }
+    }
+    var l = Linter{ a: m.a, starts: starts, srclen: src.len(), b_name: [], b_start: [], b_read: [], b_what: [], b_exempt: [], sc_at: [], f_line: [], f_col: [], f_rule: [], f_msg: [], only: if only == "\0" { "" } else { only } }
+    module(l, m.decls, tys)
+    let order = sorted_order(l)
+    var out = byte_builder()
+    if a.contains("--json") {
+        out.push_str("[\n")
+        for i in 0..order.len() {
+            let f = order[i]
+            let comma = if i + 1 == order.len() { "" } else { "," }
+            out.push_str("  \{\"file\": {json_str(path)}, \"line\": {l.f_line[f]}, \"col\": {l.f_col[f]}, \"rule\": {json_str(l.f_rule[f])}, \"message\": {json_str(l.f_msg[f])}}{comma}\n")
+        }
+        out.push_str("]\n")
+    } else {
+        for f in order {
+            out.push_str("{path}:{l.f_line[f]}:{l.f_col[f]}: {l.f_rule[f]}: {l.f_msg[f]}\n")
+        }
+        out.push_str("findings: {order.len()}\n")
+    }
+    front.write_stdout(out)
+    if order.len() > 0 {
+        exit(1)
+    }
+}
+
+/// `first_operand` with `--only` taking a value.
+fn build_first_operand(rest: [str]) -> str {
+    var i = 0
+    while i < rest.len() {
+        let x = rest[i]
+        if x == "--" {
+            return "\0"
+        }
+        if x.starts_with("-") and x.to_bytes().len() > 1 {
+            i += if x == "--only" { 2 } else { 1 }
+            continue
+        }
+        return x
+    }
+    "\0"
+}
