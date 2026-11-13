@@ -4793,6 +4793,23 @@ tables, section groups and exports (decisions 11 to 13), which the Rust
 runtime's archive would need. A runtime package's Linux object from `grasm
 build`, and a `grasm` command that runs on Linux, are S8's.
 
+**S7's Linux CI run, 2026-11-13.** The owner's `ubuntu` machine was gone by
+then; on the owner's word a scratch machine, `grasm-linux` (Ubuntu 25.10,
+arm64, glibc 2.42, gcc 15.2, GNU ld 2.45 -- the versions this part was built
+against, with `gcc`, `binutils` and `libc6-dev` installed), ran the five
+Linux gates through `allgates.sh` with `GRASM_LINUX_MACHINE=grasm-linux` and
+`GRASM_X64_ROOT` set, and was deleted after. All five passed:
+`objtest_elf`; `elfsubset` -- on each triple 647 of 648 identical, 0
+mismatched, 0 timed out, the one listed (`T-EXTERN-POINTER`, §6.18);
+`elfrtswap` -- on each triple 648 of 648 from the Grasm backend's objects;
+`linkdiff_elf` -- 324 links per triple, each made twice the same and GNU
+ld's bytes, newest glibc required 2.38 as listed; and `elfcontrols`, 24 of
+24 caught. The rest of the suite passed on master the week before but for
+three controls S7 had broken (`linkcontrols`, `rtdialectcontrols`,
+`elfcontrols`, fixed in "Three controls S7 left behind run again") and gates
+whose oracles had gone (Go's module cache, again), each passing on its
+rerun. With `crosstest` (x86-64 Mach-O, part one), that is S7's exit.
+
 ### 6.19 S8 part two: `fmt`, `lint`, `test` and `bench` in the `grasm` command
 
 Written 2026-11-05, before any code, as the design to build to. Part one
@@ -5522,10 +5539,12 @@ Measured, not estimated; each line is a gate's result on master.
   stage 2's, the command executing nothing but itself; `clicontrols` 7 of
   7. Built by itself, its stage 3 is its stage 2 (`fixpoint`, 54 of 54), and
   its build of the compiler's programs is the stage pipeline's to the byte.
-- **S7 part two** (Linux ELF, §6.18): the design, with the owner's decisions;
-  the ELF object writer and the backend and runtime for arm64 and x86-64
-  Linux, the corpus agreeing with the Cranelift build for each triple and
-  with the interpreter, linked by GNU ld until `compiler/link` links ELF.
+- **S7 done** (Linux ELF, §6.18): the ELF object writer, the backend and
+  runtime for arm64 and x86-64 Linux, and `compiler/link` linking ELF
+  against glibc to GNU ld's bytes; the corpus agreeing with the Cranelift
+  build for each triple and with the interpreter. Its exit, `crosstest` and
+  a Linux CI run, held on 2026-11-13: the five Linux gates passed in a
+  scratch OrbStack machine.
 - **Not started:** the rest of S8, and S9.
 
 S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
