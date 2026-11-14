@@ -5496,9 +5496,117 @@ step five's and were not run).
   no-break space too). Starting the command costs the tail read only: ten
   `grasm version` in 0.026 s.
 
-Not run yet: every corpus-wide section, `fixpoint`, the stage-2 `clidiff`,
-the whole `clicontrols`, `fmttest`, `gfmttest`, `linttest`, `gatecheck` and
-the litter check; the floors of the four sections wait for a whole run.
+**Step five: the gates** (2026-11-13 and 14, this branch's tree, beside the
+main checkout's Linux gates in the OrbStack machine, at one-minute loads of
+4 to 32, so no time here is to be quoted).
+
+- `clidiff` with the command stage 1 is, in three runs. The first whole run
+  was stopped in its `api` section when free disk fell to 4.6 GB (swap had
+  grown to 18 GB under the Linux gates; the run's own work directory held
+  26 MB); its ten finished sections, every one the same: "lines: 237 the
+  same: 226 not here, as §6.17 says: 6 the runtime built: 1 a target
+  refused: 4"; "corpus: 1737 programs, 8685 commands ... the same: 8685,
+  138 of them refusals"; "toml: 1474 files the same: 1474, 19 of them
+  refused by both"; "run: 651 programs with a main the same: 651 timed
+  out: 0"; "fmt: 2010 files, each and four rewrites, 20100 commands the
+  same: 20100 rewritten alike: 7649 refused alike: 386"; "lint: 2010
+  files, 5427 commands (1407 with --only) the same: 5427 findings: 1001";
+  "test: 1737 programs, 1961 commands (6 with a property test, 3 with a
+  contract, 209 with --coverage) the same: 1960, 12 of them with a failing
+  test the host's panic: 0 both timed out, --contracts: 1"; "test, main as
+  a test: 651 programs the same: 649, 13 of them failing the host's panic:
+  2"; "bench: 1737 programs, 1743 commands ... the same: 1743 timing lines
+  in the format: 6"; "doc: 1737 programs, 3168 commands (1426 written with
+  -o, 66515 items) the same: 3168, 71 of them refusals". The second, `ONLY=
+  api,bundle,source,build,target`: "api: 1737 programs, 10793 commands
+  (1132 with a surface) the same: 10793, 66 of them refusals against its
+  own surface, a patch: 1132 against a rewritten baseline: 4528 an item
+  added: 1132, removed: 1132, changed: 1132"; it was stopped in `bundle`,
+  which ran each bundle with arguments from the checkout: a program that
+  takes an argument for a path to write wrote `a/`, `b c/` and a file
+  `--` into the worktree (removed; the main checkout gained nothing), and
+  `projects/intermediate/03_kv_store.gr`, given the directory `a` as its
+  store, met the `IoFailed` wording the engines disagree on
+  (docs/known-issues.md, open S1, §6.17). So a bundle now runs as `run`
+  runs, from the checkout with no argument, and then with arguments from
+  an empty directory of each command's own, whose files are compared; and
+  a run differing only in that wording is counted as such, never hidden.
+  The third, `ONLY=bundle,source,build,target`, 159 minutes: "bundle: 651
+  programs with a main the same output: 651, 0 of them refusals the
+  command and Rust's payload: 651 run alike, plain and with arguments: 651
+  (0 run(s) differing only in the IoFailed wording) built twice the same:
+  651"; "source: 1737 programs the same output and file: 1737, 1086 of them
+  refusals run from the file alike: 66 written beside the source alike: 2
+  of 2"; "build: 648 programs with a main (3 link a system library) the
+  same output: 648, 0 of them refusals run alike: 648 built twice the same:
+  648"; "target: 65 programs ... 195 of 195".
+- The floors of the four sections, set from those runs a margin below
+  (the agent's, at the coordinator's request): `doc` 1,300 documents
+  written, 60,000 items, 60 refusals (first run); `api` 1,050 surfaces and
+  1,050 each of items added, removed and changed, 55 refusals (second
+  run); `bundle` 640 run alike and none in the `IoFailed` wording (third
+  run); `source` 1,000 refusals and 60 run from the file (third run).
+- `clicontrols`: "controls: 18 caught: 18 missed: 0", 76 minutes.
+- `fixpoint`: "programs: 6 and the grasm command artifacts per stage: 16
+  and 2 compared: 54 ... identical: 54 differ: 0"; "stage 2's TIR the same
+  as grasm tir's: 6 of 6"; "the command's build the stage pipeline's (its
+  rt.o and the 4 programs): 5 of 5". The command's stage 3 is its stage 2:
+  `grasm` 4,372,312 bytes (4,322,680 at §6.19), SHA-256
+  `a6b22601d1c528557baec54a253c61c8f5a8f36761553514e6c4d3138f9c757a`, and
+  `rt.o` 555,224 bytes, the compiler's stage-3 `rt.o` to the byte. 23
+  minutes.
+- `clidiff` with stage 2's command (`fixpoint`'s kept stage, built by stage
+  1's command alone), the whole run with every floor in force, passing, 7
+  hours 25 minutes: the same lines as the stage-1 runs, section for
+  section -- "lines: 237 the same: 226 not here, as §6.17 says: 6 the
+  runtime built: 1 a target refused: 4"; "corpus: 1737 programs, 8685
+  commands ... the same: 8685, 138 of them refusals"; "toml: 1474 files the
+  same: 1474, 19 of them refused by both"; "run: 651 programs with a main
+  the same: 651 timed out: 0"; "fmt: 2010 files, ... 20100 commands the
+  same: 20100 rewritten alike: 7649 refused alike: 386"; "lint: 2010 files,
+  5427 commands (1407 with --only) the same: 5427 findings: 1001"; "test:
+  1737 programs, 1961 commands ... the same: 1960, 12 of them with a
+  failing test the host's panic: 0 both timed out, --contracts: 1"; "test,
+  main as a test: 651 programs the same: 649, 13 of them failing the
+  host's panic: 2"; "bench: ... the same: 1743 timing lines in the format:
+  6"; "doc: 1737 programs, 3168 commands (1426 written with -o, 66515
+  items) the same: 3168, 71 of them refusals"; "api: 1737 programs, 10793
+  commands (1132 with a surface) the same: 10793, 66 of them refusals ...
+  a patch: 1132 against a rewritten baseline: 4528 an item added: 1132,
+  removed: 1132, changed: 1132"; "bundle: 651 programs with a main the same
+  output: 651, 0 of them refusals the command and Rust's payload: 651 run
+  alike, plain and with arguments: 651 (0 run(s) differing only in the
+  IoFailed wording) built twice the same: 651"; "source: 1737 programs the
+  same output and file: 1737, 1086 of them refusals run from the file
+  alike: 66 written beside the source alike: 2 of 2"; "build: 648 ... run
+  alike: 648 built twice the same: 648"; "target: 65 programs ... 195 of
+  195"; "the Grasm command's package calls proc_run or proc_pipeline: 0
+  time(s)". Its bundles carry stage 2 itself.
+- `gatecheck` "gate helpers checked: 587 undefined: 0 corpus copied: 0 grep
+  -q under pipefail: 0 gates not executable: 0"; `fmttest` "formatted: 2004
+  unformatted: 0 does not parse: 5 exempt: 1"; `linttest` "linted: 2005
+  findings: 1001 does not parse: 5 broke: 0"; `gfmttest` "checked: 1533
+  disagreeing: 0". `fmttest` and `linttest` read `GRASM_BIN`, not `GRASM`:
+  run first without it, each built a Rust `grasm` into the worktree's
+  `target/` with cargo and used that; the `target/` was removed and both
+  were run again with `GRASM_BIN` naming stage 0, with the same lines.
+- The litter check, against lists taken before the first gate: the
+  worktree's files git does not track and its top level, "new untracked
+  files: 0", new top-level entries 0; the main checkout's, the same, 0 and
+  0. The `run` and `bundle` sections' conformance programs and demos leave
+  a git-ignored `target/` (`demo-out`, `grasm_bytes_conformance`,
+  `grasm_fs_conformance`) in the worktree each time, as §6.19 found; it was
+  removed after each run.
+
+**What is left for S8 after this part.** `deps`, `publish`, `add`, `lsp`,
+`dap` and `journal`; `test --schedules` and `--schedule-seed` for a test
+that starts tasks, a panic inside a `concurrent` task under `test`, one the
+runtime's channel operations raise, and the interpreter's own stack, as
+§6.19 left them; the `IoFailed` wording the engines disagree on, which a
+bundle shows as `run` does; the LSP on the query engine, DAP, packages,
+journal and replay, the wasm32 backend and one TOML reader. The gates of
+§6.14's last list that run through the `grasm` command still take the Rust
+one.
 
 ## 8. Gates this adds
 
