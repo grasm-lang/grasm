@@ -5183,6 +5183,251 @@ stack (decision (3)); the LSP on the query engine,
 DAP, packages, journal and replay, the wasm32 backend and one TOML reader,
 as §6.17 left them.
 
+### 6.20 S8 part three: `doc`, `api`, and `build` without `--native`
+
+Written 2026-11-13, before any code, as the design to build to. Parts one
+and two (§6.17, §6.19) left eight subcommands answering "not in the Grasm
+toolchain yet", and `build` without `--native` and with `--source`. This
+part takes `doc`, `api` and those two forms of `build` into
+`compiler/grasm`, held to the Rust command as the others are: the same
+reading of the command line (`prevalidate` already reads all four), the
+same stdout and stderr, the same exit status, the same files written. The
+Rust toolchain stays stage 0 and the oracle and is not changed; where its
+behaviour is wrong it is reproduced and recorded in docs/known-issues.md.
+The decisions are numbered (1) to (4); each was taken by the agent
+implementing this part, and is the coordinator's to accept and the owner's
+to reverse.
+
+**What the Rust arms do** (`crates/grasm/src/main.rs`, `grasm_sema::docs`,
+`grasm_sema::loader::to_source_bundle`):
+
+- `doc <file> [-o out.md]`. The operand is `first_operand` after `doc`
+  (`-o`'s value skipped, `--` ends the search, a lone `-` is an operand);
+  none is "usage: grasm doc <file.gr> [-o out.md]", exit 1. The program is
+  loaded and checked as `check` does (`load_and_check`, which every arm
+  here shares, and which part one reproduces as `front.checked`). Then
+  `docs::collect`: for each module in load order, its declarations in
+  order -- in the entry module (the first) every `fn`, `type`, `let` and
+  `extern fn`, in the others only the `pub` ones; every `effect` in any
+  module; never a test, bench, import, interface, `impl`, thread- or
+  process-local. The declarations are the AST's, so the parser's
+  desugarings are documented as it leaves them (an `impl`'s methods as
+  `name@Type`, an actor's state type and handle, a contract's wrapper and
+  clauses). Each item is a kind, a name, its signature written back from
+  the AST without a body (`fn_signature`, `type_signature`,
+  `effect_signature`, `const_signature`, `extern_signature`, all over
+  `type_text`), and the `///` text filed under the declaration's start.
+  `render_markdown`: `# <title>`, then per module with an item `## Module
+  `m``, per item `### `kind` name`, the signature in a fence, and the doc
+  text with the `# ` setup lines of its fenced blocks dropped
+  (`without_hidden_lines`: `str::lines`, `trim_start` by Unicode
+  whitespace, rejoined with `\n`, so a trailing newline and any `\r` go).
+  The title is the name in the manifest of the package the file is in:
+  `enclosing_package` walks up from `Path::parent` of the operand -- for a
+  bare `x.gr` that is the empty path, so the working directory's
+  `grasm.toml` -- to the first directory whose `grasm.toml` is a regular
+  file, and takes `Manifest::load` of it; a manifest that does not load
+  ends the walk with no name. Without a name, the file's stem; without a
+  stem, `API`. With `-o` (its value from the first `-o` anywhere after
+  `doc`, after a `--` too) the text is written there and `wrote <out> (N
+  item(s))` printed; a write that fails is `error: cannot write <out>:
+  <io error>` -- the one message in the command that does not quote its
+  path in backticks -- exit 1. Without `-o` the text goes to stdout as it
+  is (`print!`: it ends in one newline, and no other is added).
+- `api <file> [--against F]`. The operand is the argument after `api`
+  alone, unless it starts with `--` (not `first_operand`: `api --against
+  b x.gr` is the usage, `usage: grasm api <file.gr> [--against
+  <saved.api>]`). Loaded and checked as above. `api_surface`: for every
+  module whose name's first dotted segment is not a dependency package's,
+  each `pub fn`, `pub extern fn` and `pub let`, and every `type` and
+  `effect` (one namespace program-wide, [T-MODULE-NS]), as `module \t name
+  \t signature`. A `pub let`'s signature is `pub let N: T` with `T` the
+  checker's type of it as `TypeDisplay` shows the type resolved when the
+  constant was collected (`Analysis::const_types`), else the written one;
+  in every signature but a type's own, each word that names a type alias
+  without generics is replaced by the alias's written target, eight rounds
+  at most (`expand_aliases`: a word is a run of alphanumeric characters and
+  `_`). The lines are sorted, duplicates dropped, each ends in a newline,
+  and without `--against` they are the output as they are (`print!`;
+  nothing at all for a program with no surface). `--against`'s value is
+  the argument after its first occurrence anywhere on the line, after a
+  `--` too. That file is read as UTF-8 (`error: cannot read `F`: <io
+  error>`); a baseline in which no line splits into exactly three by tab,
+  while the surface is not empty, is refused in two lines naming it.
+  `report_api_change`: both sides read line by line (`str::lines`), a
+  line of at least three tab-separated fields keyed `module::name` (the
+  last of a key wins); `REMOVED  k` for each key gone, `CHANGED  k` with
+  `    was  ` and `    now  ` lines for each signature that differs,
+  `ADDED    k` for each new one, each group in key order; a blank line; and
+  `breaking: R removed, C changed, A added — this is a MAJOR release` (exit
+  1), `compatible: A added — this is a MINOR release` (exit 0) or `no
+  change to the public surface — this is a PATCH release` (exit 0).
+- `build <file> [-o out]` without `--native`. Every check part one
+  reproduces, in order (§6.17: the operand, the links, the output, not a
+  regular file, its directory, the source itself, a `.gr` name, `--target`
+  without `--native`), then the check path, `no `main` function`, and a
+  runtime package refused naming "the interpreter". Then `--source` if it
+  is anywhere on the line, whether or not `--native` is (below). Otherwise
+  `write_bundle`: the Rust command's own executable (`current_exe`, read
+  whole, any bundle already on it cut off) followed by a payload, the
+  payload's length as a little-endian `u64`, and the eight bytes
+  `GRASMBDL`. The payload is the program's modules in load order (each a
+  `u32` length and the name, a `u32` length and the source), the
+  dependency packages' names in byte order, every module's imports as
+  (module, alias, the module it resolved to) sorted, and the entry file's
+  name without its directory -- every count and length a little-endian
+  `u32`. Written in place by `fs::write`, given mode 0755; `built `out` (N
+  bytes, M module(s))`, or `error: <io error>` and exit 1.
+  Every start of the Rust `grasm` reads its own executable whole first, and
+  if it ends in `GRASMBDL` it is that program and never reads its command
+  line: the modules are loaded from the payload (`load_with_resolved_
+  imports`, the entry `main` shown under the recorded file name, the
+  imports as recorded, the dependency set), checked (the loader's and the
+  checker's diagnostics, rendered as `check` renders them; no capability
+  ceiling), and run by the interpreter with every argument as the
+  program's, the exit status its low eight bits, a panic's stack trace on
+  stderr.
+- `build <file> --source [-o out]`: the same checks, then
+  `to_source_bundle` -- each module in load order as a line `//!module
+  <name>`, then its source, then a newline if it lacks one -- written to
+  `-o`'s path, or, if that is empty, to the operand with every trailing
+  `.gr` taken off and `.bundle.gr` added; `wrote `dest`: M module(s), N
+  bytes`, or `error: cannot write `dest`: <io error>`. The loader reads such
+  a file back as the program (`load_from_source_bundle`), which `front`'s
+  `load_bundle` already ports.
+
+**What Grasm already has.** `front.checked` is `load_and_check` with
+Rust's diagnostics (`diagdiff`); front's AST is Rust's node for node, its
+`///` map included (`asttest`); its loader has the module order, each
+module's resolved imports and the dependency set (`loaddiff`), and
+`load_manifest`, `Manifest::load` in Rust's words (`tomldiff`, and the
+loader's own manifest errors in `diagdiff`); its checker keeps each
+constant's type as resolved when collected, in `Ck.consts`, and `tys`
+writes a type as `TypeDisplay` does (the checker's diagnostics depend on
+it). `compiler/grasm/src/testing.gr` already ports `str::lines`,
+`decl_name` and the doc-comment walk for `grasm test`'s doc examples, and
+`front`'s `load_sources` is `load_with_resolved_imports` (§6.19), which
+the bundle's start needs. `tools/gfmt/src/fmt.gr` has Rust's
+`char::is_whitespace` as bytes. The command finds its own path
+(`_NSGetExecutablePath(3)`, part one) and has the TIR interpreter linked in.
+What it lacks: the signature writer and the Markdown renderer, the API
+surface, alias expansion and the comparison, the payload writer and
+reader, and the start that checks for a payload.
+
+**What has to be written**, and where:
+
+- `compiler/grasm/src/docgen.gr`: `type_text` and the signature writers
+  over front's AST; `collect` and `render_markdown`; `cmd_doc`. Trims by
+  gfmt's whitespace rule rather than the language's `trim_start`, whose
+  set is not held to Rust's anywhere for non-ASCII spaces.
+- `compiler/grasm/src/api.gr`: `api_surface` (with `expand_aliases`: a
+  word is ASCII alphanumerics and `_` -- exact, because identifiers are
+  ASCII and the only other characters a signature can hold, the parser's
+  `\u{1}` and `§` in desugared names, are not alphanumeric),
+  `report_api_change`, `cmd_api`.
+- `compiler/grasm/src/bundle.gr`: the payload written and read, `--source`,
+  and the bundled program's start: called first in `main`, it asks the
+  size of its own executable and reads the last sixteen bytes
+  (`read_bytes_at`), and only when they end in the magic reads the
+  payload, loads the modules from memory (`load_sources`, given the entry's
+  shown name), checks them, emits TIR and runs it with `tirinterp.run_tree`
+  and every argument. Rust's reads the whole 11 MB file on every start;
+  reading the tail answers the same question.
+- `compiler/front`: `load_sources` takes the entry's shown name (now fixed
+  as `<doc example>`); a public check of an already loaded program that
+  renders its diagnostics as `checked` does (the bundle's start); a public
+  `enclosing_package` name (the walk, `load_manifest`); `tys` writes a type
+  without resolving it again (`const_types` is the type as resolved at
+  collection, and a variable bound afterwards still shows as `_`).
+- `build.gr`: the "not in the Grasm toolchain yet" refusals for `--source`
+  and for `build` without `--native` replaced by the two; `main.gr`: `doc`
+  and `api` out of `elsewhere`, into the dispatch and the help line.
+
+**The bundle: the Grasm command and Rust's payload** (decision (1)). The
+bundle `build` writes without `--native` is the toolchain's own executable
+-- the interpreter -- carrying the program. The Grasm command is, since
+part one, an executable with the TIR interpreter compiled in, so its
+bundle is the same construction: its own executable, read through
+`_NSGetExecutablePath(3)`, followed by the payload in the Rust command's
+format, byte for byte; and the Grasm command, started as such a file, runs
+the program on the TIR interpreter, the engine its `grasm run` runs. For
+three reasons. Nothing starts a process, and nothing but the command's own
+bytes goes into the file, so no Rust code is on the path. The payload being
+Rust's to the byte, the gate compares the written file exactly beyond the
+executable at its front, which it checks is the command itself -- where any
+other payload could be compared only by what the bundle does when run. And
+a bundle runs as `grasm run` runs, which is what it is for: stdin, stdout
+and stderr the program's own, a runtime package refused in the
+interpreter's words, `--target` refused because "a bundled build carries
+the interpreter, which is this machine's" -- all still true. Not taken: a
+payload of the program's TIR, which would start without loading and
+checking again but could not be compared to Rust's except by running; and
+a native executable through `s3` and `link`, which is `--native`, would
+need `rt.o` where the Rust bundle needs nothing beside it, and would make
+those two refusals' words false. What it costs: a bundle is about 4.3 MB of
+command and the program's sources, where Rust's is about 11.5 MB; the
+success line's size is the Grasm command's, so it differs, as `--native`'s
+does. The executable before the payload keeps its ad hoc signature, which
+covers the code alone: the bundle runs (`codesign -v` fails strict
+validation on it, as on the Rust command's bundles), and writing a new
+bundle over an old one in place, as `fs::write` does, is safe, because the
+signed part is the same bytes.
+
+Decision (2): **the bundled program's stack trace.** The bundle prints
+what `grasm run` under the Grasm command prints, which leaves out a
+panic's stack trace ([E-PANIC-TRACE]); `clidiff` strips it from the Rust
+bundle's stderr as it does from `run`'s, and that is the one difference in
+what the two bundles do.
+
+Decision (3): **`--source` with `--native` on a runtime package.** Part one
+made `build <runtime package> --native` write the runtime's object; it
+answered before `--source`, so `build <runtime package> --native --source`
+wrote an object where Rust says `no `main` function` (no case tried
+it). `--source` is read first, so that line now
+answers as Rust's does; `--native` without `--source` still builds the
+runtime.
+
+**How the output is held to Rust's** (decision (4)). `clidiff` gains four
+sections, each both commands on the same input from the same directory,
+counts asserted:
+
+- `doc`: every corpus program, `doc P` -- stdout, stderr, status; every
+  tenth, and every package's entry, also `doc P -o out.md` in a directory of
+  each command's own: the line, the status, the file's bytes.
+- `api`: every corpus program, `api P`; where that succeeds,
+  `api P --against` its own surface (a PATCH under both); and, from a copy
+  of the corpus, three changed copies against baselines the Rust command
+  makes: `pub fn api_probe() -> i64` appended (against the original's
+  surface, an addition), the original against the appended copy's surface
+  (a removal), and `pub fn api_probe(n: i64) -> i64` appended against the
+  first copy's surface (a change). Report, status, stderr.
+- `bundle`: every corpus program with a `main`, `build P -o prog`: the
+  output with the size taken out, stderr, status; the Grasm bundle must be
+  the command's own executable followed by exactly the bytes that follow
+  the Rust command's executable in the Rust bundle; both run, stdin closed,
+  with arguments, and the same stdout and status, stderr the same less the
+  Rust trace; the Grasm build made twice, the same bytes.
+- `source`: every corpus program, `build P --source -o x.bundle.gr`: the
+  output, the status and the file, byte for byte; every tenth file written
+  also run by both commands.
+
+The command-line cases lose the `elsewhere` tags of `doc`, `api` and the
+two `build`s, and gain lines that reach each arm's own checks: `doc` with
+no operand, with `-o` before the file, after `--`, into a directory that
+does not exist; `api` with the operand after `--against`, `--against`
+after `--`, a baseline that is missing, empty, not UTF-8, with CR LF line
+ends, and one with no tab-separated line; `build` without `--native` into
+a directory that does not exist, over a directory, on a program with no
+`main` and on a runtime package; `--source` with `-o ""` and with no `-o`.
+`clicontrols` gains a control for each: a doc line dropped (the doc text
+of each item), an API change missed (a changed signature not reported), a
+wrong bundle (the dependency list unsorted, or the entry's name with its
+directory), and `--source` without the newline it adds.
+
+**Self-hosting.** The command grows by the renderer, the surface and the
+bundle; `fixpoint` must still find its stage 3 its stage 2, and `clidiff`
+runs again with stage 2's command, its bundles then carrying stage 2.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
