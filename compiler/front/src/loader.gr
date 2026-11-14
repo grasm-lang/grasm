@@ -797,6 +797,27 @@ fn is_grasm_source(p: str) -> bool {
     dot > 0 and b.slice(dot + 1, b.len()).to_str().to_lower() == "gr"
 }
 
+/// The name in the manifest of the package `path` is in, as `grasm doc`
+/// titles a document (`enclosing_package`): from `Path::parent` of the
+/// path upward -- for a bare name the empty path, so the working
+/// directory's -- the first directory whose `grasm.toml` is a file, and
+/// its manifest's name; "\0" when there is none, or that manifest does not
+/// load.
+pub fn enclosing_package_name(path: str) -> str {
+    var here = parent(path)
+    while here != "\0" {
+        if is_file(join(here, "grasm.toml")) {
+            let m = load_manifest(here)
+            if not m.ok {
+                return "\0"
+            }
+            return m.name
+        }
+        here = parent(here)
+    }
+    "\0"
+}
+
 /// `Manifest::load`: the manifest in `dir`, read by the Rust toolchain's
 /// own reader (rtoml.gr) and checked as `Manifest::parse` checks it, in its
 /// order and its words.
@@ -1963,6 +1984,12 @@ fn load_bundle(src: str) -> Loaded {
 /// module is in; one naming `entry_alias` is the entry. The entry's path is
 /// `<doc example>`, every other module's its name as a path.
 pub fn load_sources(names: [str], srcs: [str], deps: [str], entry_alias: str, resolved: Map[str, str]) -> Loaded {
+    load_sources_shown(names, srcs, deps, entry_alias, resolved, "<doc example>")
+}
+
+/// `load_sources` with the entry shown as `shown`: a bundled program's
+/// entry file name (`run_bundle`).
+pub fn load_sources_shown(names: [str], srcs: [str], deps: [str], entry_alias: str, resolved: Map[str, str], shown: str) -> Loaded {
     var table: Map[str, str] = map()
     for i in 0..names.len() {
         if not table.has(names[i]) {
@@ -1972,7 +1999,7 @@ pub fn load_sources(names: [str], srcs: [str], deps: [str], entry_alias: str, re
     var out = empty_loaded("")
     var loaded: Map[str, bool] = map()
     var q_name: [str] = ["main"]
-    var q_disp: [str] = ["<doc example>"]
+    var q_disp: [str] = [shown]
     var q_s: [i64] = [0]
     var q_e: [i64] = [1]
     var q_written: [str] = ["main"]

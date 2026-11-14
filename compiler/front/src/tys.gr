@@ -613,6 +613,15 @@ pub fn show_shallow(t: Tys, x: i64) -> str {
     b.to_str()
 }
 
+/// A type as `TypeDisplay` shows it as it stands, no variable followed: a
+/// type the checker stored once resolved (a constant's, `const_types`)
+/// shows a variable bound only afterwards as `_`, as Rust's does.
+pub fn show_written(t: Tys, x: i64) -> str {
+    var b = str_builder()
+    write_ty(t, x, b)
+    b.to_str()
+}
+
 pub fn show(inout t: Tys, x: i64) -> str {
     let r = resolve(t, x)
     var b = str_builder()

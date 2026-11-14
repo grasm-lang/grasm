@@ -720,7 +720,7 @@ fn file_at(p: TirProg, at: i64) -> i64 {
 fn schedules_not_here(o: TestOpts) {
     let flag = if o.has_schedule_seed { "--schedule-seed" } else { "--schedules" }
     eprint("error: `grasm test {flag}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links`, `fmt`, `lint`, `test` and `bench`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc` and `api`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20)")
     exit(1)
 }
 
@@ -1365,7 +1365,7 @@ pub fn cmd_bench(a: [str]) {
 
 /// `str::lines`: split at `\n`, a `\r` before it dropped, no last empty
 /// line for a text that ends in one.
-fn text_lines(s: str) -> [str] {
+pub fn text_lines(s: str) -> [str] {
     var out: [str] = []
     if s == "" {
         return out

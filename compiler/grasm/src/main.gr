@@ -16,6 +16,11 @@
 //                          an executable                compiler/front, compiler/s3,
 //                                                       compiler/link, and the runtime
 //                                                       object beside this program
+//     build <file.gr> [-o out]
+//                          this executable carrying the program, run by
+//                          tools/tirinterp when started (§6.20)
+//     build <file.gr> --source [-o out]
+//                          the program as one .gr file   compiler/front (§6.20)
 //     links <file.gr>      the system libraries a program's packages declare
 //     fmt <file.gr> [--check]
 //                          canonical layout                tools/gfmt (§6.19)
@@ -26,6 +31,10 @@
 //                          test blocks, unit and property  tools/tirinterp (§6.19)
 //     bench <file.gr> [--filter T]
 //                          bench blocks, time per op       tools/tirinterp (§6.19)
+//     doc <file.gr> [-o out.md]
+//                          documentation from `///`        compiler/front's AST (§6.20)
+//     api <file.gr> [--against F]
+//                          the public surface, and what changed in it (§6.20)
 //
 // Each is the packages' own code, called in this process: nothing here
 // starts a process, and the Rust toolchain is on no path it takes. The other
@@ -42,12 +51,20 @@ import build
 import fmtcmd
 import lint
 import testing
+import docgen
+import api
+import bundle
 
 /// The toolchain's version, `grasm --version`'s: the workspace's, which the
 /// Rust command takes from its manifest. `clidiff` holds the two equal.
 let VERSION = "1.1.0"
 
 fn main() {
+    // Started as a bundle (`grasm build` without `--native`): the program
+    // it carries is all there is, and the command line is its.
+    if bundle.run_if_bundle() {
+        return
+    }
     let a = args()
     prevalidate(a)
     if a.len() == 0 {
@@ -77,6 +94,10 @@ fn main() {
         lint.cmd_lint(a)
     } else if cmd == "fmt" {
         fmtcmd.cmd_fmt(a)
+    } else if cmd == "doc" {
+        docgen.cmd_doc(a)
+    } else if cmd == "api" {
+        api.cmd_api(a)
     } else if cmd == "toml" {
         cmd_toml(operand(a, "usage: grasm toml <file.toml>"))
     } else if cmd == "version" or cmd == "--version" {
@@ -105,7 +126,7 @@ fn operand(a: [str], usage_line: str) -> str {
 /// Whether `cmd` is one of the Rust `grasm`'s subcommands that this one
 /// does not run yet.
 fn elsewhere(cmd: str) -> bool {
-    let them = ["doc", "api", "deps", "publish", "add", "lsp", "dap", "journal"]
+    let them = ["deps", "publish", "add", "lsp", "dap", "journal"]
     them.contains(cmd)
 }
 
@@ -113,7 +134,7 @@ fn elsewhere(cmd: str) -> bool {
 /// and exit 1 -- never handed to anything else.
 fn not_here(cmd: str) {
     eprint("error: `grasm {cmd}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build --native`, `links`, `fmt`, `lint`, `test` and `bench`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19)")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc` and `api`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20)")
     exit(1)
 }
 

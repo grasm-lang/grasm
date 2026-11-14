@@ -5195,8 +5195,8 @@ same stdout and stderr, the same exit status, the same files written. The
 Rust toolchain stays stage 0 and the oracle and is not changed; where its
 behaviour is wrong it is reproduced and recorded in docs/known-issues.md.
 The decisions are numbered (1) to (4); each was taken by the agent
-implementing this part, and is the coordinator's to accept and the owner's
-to reverse.
+implementing this part and accepted by the coordinator on 2026-11-13, and
+the owner may reverse any of it.
 
 **What the Rust arms do** (`crates/grasm/src/main.rs`, `grasm_sema::docs`,
 `grasm_sema::loader::to_source_bundle`):
@@ -5319,7 +5319,11 @@ reader, and the start that checks for a payload.
 - `compiler/grasm/src/docgen.gr`: `type_text` and the signature writers
   over front's AST; `collect` and `render_markdown`; `cmd_doc`. Trims by
   gfmt's whitespace rule rather than the language's `trim_start`, whose
-  set is not held to Rust's anywhere for non-ASCII spaces.
+  set is not held to Rust's anywhere for non-ASCII spaces. Rust's rule
+  takes a fence or a hidden line behind any amount of any Unicode
+  whitespace -- a no-break space, an em space, five spaces -- where
+  CommonMark takes at most three spaces (checked 2026-11-13 with `grasm
+  doc`); it is copied, and recorded in docs/known-issues.md.
 - `compiler/grasm/src/api.gr`: `api_surface` (with `expand_aliases`: a
   word is ASCII alphanumerics and `_` -- exact, because identifiers are
   ASCII and the only other characters a signature can hold, the parser's
@@ -5367,11 +5371,23 @@ need `rt.o` where the Rust bundle needs nothing beside it, and would make
 those two refusals' words false. What it costs: a bundle is about 4.3 MB of
 command and the program's sources, where Rust's is about 11.5 MB; the
 success line's size is the Grasm command's, so it differs, as `--native`'s
-does. The executable before the payload keeps its ad hoc signature, which
-covers the code alone: the bundle runs (`codesign -v` fails strict
-validation on it, as on the Rust command's bundles), and writing a new
-bundle over an old one in place, as `fs::write` does, is safe, because the
-signed part is the same bytes.
+does. The executable before the payload keeps the linker's ad hoc
+signature, which covers the code alone. A payload appended after a signed
+arm64 executable breaks strict validation: `codesign -v` says "main
+executable failed strict validation" of a Rust bundle, as it will of a
+Grasm one. The bundle still runs, started from a shell (tried 2026-11-13:
+a Rust bundle, and a Grasm-linked `tirinterp` with bytes appended), and
+writing a new bundle over an old one in place, as `fs::write` does, is safe,
+because the signed part is the same bytes. Where Gatekeeper applies,
+`spctl --assess --type execute` rejects a Rust bundle -- and a Grasm-linked
+executable with nothing appended alike, since an ad hoc signature is not a
+notarized one -- so a bundle downloaded with the quarantine attribute would
+not open from Finder; launching a quarantined bundle was not tried. A
+hardened runtime cannot be given to one: `codesign -s - -f --options
+runtime` on a Rust bundle refuses ("main executable failed strict
+validation") and leaves the linker's signature, flags `adhoc,linker-signed`,
+and the copy still runs. Neither is new with the Grasm command; both are
+the bundle's as the Rust command makes it.
 
 Decision (2): **the bundled program's stack trace.** The bundle prints
 what `grasm run` under the Grasm command prints, which leaves out a
@@ -5394,8 +5410,10 @@ counts asserted:
 - `doc`: every corpus program, `doc P` -- stdout, stderr, status; every
   tenth, and every package's entry, also `doc P -o out.md` in a directory of
   each command's own: the line, the status, the file's bytes.
-- `api`: every corpus program, `api P`; where that succeeds,
-  `api P --against` its own surface (a PATCH under both); and, from a copy
+- `api`: every corpus program, `api P`; where that succeeds with a
+  surface, `api P --against` that surface (a PATCH under both) and four
+  baselines rewritten from it -- CR LF line ends, every tab a space, empty,
+  a byte that is not UTF-8 before it; and, from a copy
   of the corpus, three changed copies against baselines the Rust command
   makes: `pub fn api_probe() -> i64` appended (against the original's
   surface, an addition), the original against the appended copy's surface
@@ -5421,12 +5439,66 @@ a directory that does not exist, over a directory, on a program with no
 `main` and on a runtime package; `--source` with `-o ""` and with no `-o`.
 `clicontrols` gains a control for each: a doc line dropped (the doc text
 of each item), an API change missed (a changed signature not reported), a
-wrong bundle (the dependency list unsorted, or the entry's name with its
-directory), and `--source` without the newline it adds.
+wrong bundle (the entry's name with its directory), and `--source`
+writing the modules last first. (`--source` without the newline it adds
+after a module was the plan; no corpus file lacks a final newline, so it
+could not be caught.)
 
 **Self-hosting.** The command grows by the renderer, the surface and the
 bundle; `fixpoint` must still find its stage 3 its stage 2, and `clidiff`
 runs again with stage 2's command, its bundles then carrying stage 2.
+
+**Steps two to four, as built** (2026-11-13, while the main checkout ran
+five Linux gates, so with light checks only; the corpus-wide gates are
+step five's and were not run).
+
+- `doc`: `compiler/grasm/src/docgen.gr`, the signature writers over front's
+  AST, `collect`, `render_markdown` and the arm; `front`'s loader gains
+  `enclosing_package_name`; gfmt's `ws_len` is public for the trim.
+- `api`: `compiler/grasm/src/api.gr`; `front`'s `tys` gains
+  `show_written`, a type written as it stands.
+- `build` without `--native`, and `--source`: `compiler/grasm/src/bundle.gr`;
+  `front` gains `checked_loaded` and `load_sources_shown` (the entry's
+  shown name, `<doc example>` for `load_sources`); `build.gr` hands the two
+  forms to it, and reads `--source` before building a runtime package.
+  `main` asks `bundle.run_if_bundle` first. The executable's path moved
+  from `build.gr` to `bundle.gr` (`own_exe`), which both use.
+- `clidiff` gains the four sections (`doc`, `api`, `bundle`, `source`), with
+  counts that must add up; their floors wait for a whole run. `--source`
+  with an empty `-o` writes beside the source -- through the `lines`
+  section's links that is the checkout itself, which a first trial did (a
+  stray `examples/hello.bundle.gr`, removed) -- so that case, and the one
+  without `-o`, are tried on a copy in the `source` section instead.
+  `clicases.txt` goes from 195 cases to 237: four `elsewhere` lines of
+  these subcommands dropped, a fifth kept without its tag, 46 added.
+  `clicontrols` gains four controls: `doc-dropped` (each doc comment's
+  last line dropped), `api-missed` (a changed signature not reported),
+  `bundle-entry` (the entry named with its directory) and `source-order`
+  (the modules written last first).
+- Light checks, the command built by the Rust `grasm` (4,902,008 bytes; its
+  `rt.o` 555,224 bytes, part two's): `clidiff` with `ONLY=lines,doc,api,
+  bundle,source` on 21 programs (13 chosen for a `pub let`, an alias, an
+  effect, an `impl`, an actor, a contract, an `extern fn`, a package with
+  dependencies; and `hello`, `documented`, `testing_tour`, `fib`, two
+  packages, a refused program, `E-PANIC-TRACE`) -- "lines: 237 the same:
+  226 not here, as §6.17 says: 6 the runtime built: 1 a target refused:
+  4"; "doc: 21 programs, 27 commands (6 written with -o, 379 items) the
+  same: 27, 2 of them refusals"; "api: 21 programs, 125 commands (13 with a
+  surface) the same: 125, 2 of them refusals against its own surface, a
+  patch: 13 against a rewritten baseline: 52 an item added: 13, removed:
+  13, changed: 13"; "bundle: 15 programs with a main the same output: 15
+  ... the command and Rust's payload: 15 run alike: 15 built twice the
+  same: 15"; "source: 21 programs the same output and file: 21, 6 of them
+  refusals run from the file alike: 2 written beside the source alike: 2
+  of 2". `clicontrols` with `CONTROLS=` the four: "controls: 4 caught: 4
+  missed: 0". `grasm test` of the file in docs/known-issues.md's entry
+  agrees under both commands (the TIR interpreter's `trim_start` takes the
+  no-break space too). Starting the command costs the tail read only: ten
+  `grasm version` in 0.026 s.
+
+Not run yet: every corpus-wide section, `fixpoint`, the stage-2 `clidiff`,
+the whole `clicontrols`, `fmttest`, `gfmttest`, `linttest`, `gatecheck` and
+the litter check; the floors of the four sections wait for a whole run.
 
 ## 8. Gates this adds
 

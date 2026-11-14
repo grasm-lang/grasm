@@ -1,0 +1,257 @@
+// `grasm api` (docs/self-hosting.md §6.20): a program's public surface, one
+// line per item, and with `--against` what changed in it since a saved
+// surface and what kind of release that makes -- the Rust arm's
+// `api_surface`, `expand_aliases` and `report_api_change`
+// (crates/grasm/src/main.rs) ported over front's AST and checker, with
+// docgen.gr's signature writers.
+import front
+import front.ast
+import front.loader
+import front.tys
+import build
+import docgen
+import testing
+
+fn sl(a: Ast, id: i64, i: i64) -> i64 {
+    a.pool[a.off[id] + i]
+}
+
+/// Whether byte `c` continues a word in `expand_aliases`: ASCII letters,
+/// digits and `_`. Rust asks `char::is_alphanumeric`; the only characters
+/// past ASCII a signature can hold are the parser's `\u{1}` and `§` in
+/// desugared names, and neither is alphanumeric.
+fn word_byte(c: i64) -> bool {
+    (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+}
+
+/// `expand_aliases`: every word that names an alias replaced by what it
+/// stands for, until nothing changes or eight rounds have.
+fn expand_aliases(sig: str, aliases: Map[str, str], none: bool) -> str {
+    if none {
+        return sig
+    }
+    var out = sig
+    for _round in 0..8 {
+        let b = out.to_bytes()
+        var next = byte_builder()
+        var changed = false
+        var i = 0
+        while i <= b.len() {
+            var j = i
+            while j < b.len() and word_byte(b.at(j)) {
+                j += 1
+            }
+            if j > i {
+                let word = b.slice(i, j).to_str()
+                match aliases.get(word) {
+                    Some(target) -> {
+                        next.push_str(target)
+                        changed = true
+                    }
+                    None -> next.push_str(word)
+                }
+            }
+            if j < b.len() {
+                next.push_byte(b.at(j))
+            }
+            i = j + 1
+        }
+        out = next.to_str()
+        if not changed {
+            break
+        }
+    }
+    out
+}
+
+/// `api_surface`: `module \t name \t signature` for every `pub fn`, `pub
+/// extern fn` and `pub let`, and every type and effect, of every module
+/// that is not a dependency package's; sorted, each once, each ending in a
+/// newline.
+fn api_surface(l: Loaded, c: Ck, t: Tys) -> str {
+    var aliases: Map[str, str] = map()
+    var any_alias = false
+    for f in 0..l.mods.len() {
+        let a = l.mods[f].a
+        for d in l.mods[f].decls {
+            if a.k[d] == ast.D_TYPE and a.n[sl(a, d, 3)] == 0 {
+                let body = sl(a, d, 4)
+                if a.k[body] == ast.B_ALIAS {
+                    aliases.set(a.t[sl(a, d, 2)], docgen.type_text(a, sl(a, body, 0)))
+                    any_alias = true
+                }
+            }
+        }
+    }
+    var lines: [str] = []
+    for f in 0..l.mods.len() {
+        let module = l.names[f]
+        let root = match module.index_of(".") {
+            Some(i) -> module.substr(0, i)
+            None -> module
+        }
+        if l.deps.contains(root) {
+            continue
+        }
+        let a = l.mods[f].a
+        for d in l.mods[f].decls {
+            let k = a.k[d]
+            var name = ""
+            var sig = ""
+            if k == ast.D_FN and sl(a, d, 0) != 0 {
+                name = a.t[sl(a, d, 2)]
+                sig = docgen.fn_signature(a, d)
+            } else if k == ast.D_EXTERN and sl(a, d, 0) != 0 {
+                name = a.t[sl(a, d, 1)]
+                sig = docgen.extern_signature(a, d)
+            } else if k == ast.D_CONST and sl(a, d, 0) != 0 {
+                name = a.t[sl(a, d, 1)]
+                // The checker's type of it, as resolved when collected.
+                let key = module + "::" + name
+                sig = docgen.const_signature(a, d)
+                match c.consts.get(key) {
+                    Some(ty) -> {
+                        if c.const_pub.get(key) ?? false {
+                            sig = "pub let {name}: {tys.show_written(t, ty)}"
+                        }
+                    }
+                    None -> ()
+                }
+            } else if k == ast.D_TYPE {
+                name = a.t[sl(a, d, 2)]
+                sig = docgen.type_signature(a, d)
+            } else if k == ast.D_EFFECT {
+                name = a.t[sl(a, d, 0)]
+                sig = docgen.effect_signature(a, d)
+            } else {
+                continue
+            }
+            if k != ast.D_TYPE {
+                sig = expand_aliases(sig, aliases, not any_alias)
+            }
+            lines.push(module + "\t" + name + "\t" + sig)
+        }
+    }
+    lines.sort()
+    var out = str_builder()
+    var prev = "\0"
+    var first = true
+    for x in lines {
+        if first or x != prev {
+            out.push_str(x)
+            out.push_str("\n")
+        }
+        prev = x
+        first = false
+    }
+    out.to_str()
+}
+
+/// A surface read back: each line of at least three tab-separated fields,
+/// keyed `module::name`, the last of a key winning; the keys in order.
+fn parse_surface(text: str) -> (Map[str, str], [str]) {
+    var m: Map[str, str] = map()
+    var keys: [str] = []
+    for line in testing.text_lines(text) {
+        let t1 = match line.index_of("\t") {
+            Some(i) -> i
+            None -> -1
+        }
+        if t1 < 0 {
+            continue
+        }
+        let after = line.substr(t1 + 1, line.len() - t1 - 1)
+        let t2 = match after.index_of("\t") {
+            Some(i) -> i
+            None -> -1
+        }
+        if t2 < 0 {
+            continue
+        }
+        let key = line.substr(0, t1) + "::" + after.substr(0, t2)
+        let sig = after.substr(t2 + 1, after.len() - t2 - 1)
+        if not m.has(key) {
+            keys.push(key)
+        }
+        m.set(key, sig)
+    }
+    keys.sort()
+    (m, keys)
+}
+
+/// `report_api_change`: what was removed, changed and added, and the kind
+/// of release; exit 1 for a breaking one.
+fn report_api_change(old: str, new: str) {
+    let (before, bkeys) = parse_surface(old)
+    let (after, akeys) = parse_surface(new)
+    var removed: [str] = []
+    var changed: [str] = []
+    for k in bkeys {
+        let was = before.get(k) ?? ""
+        match after.get(k) {
+            None -> removed.push(k)
+            Some(now) -> {
+                if now != was {
+                    changed.push(k)
+                }
+            }
+        }
+    }
+    var added: [str] = []
+    for k in akeys {
+        if not before.has(k) {
+            added.push(k)
+        }
+    }
+    for k in removed {
+        print("REMOVED  {k}")
+    }
+    for k in changed {
+        print("CHANGED  {k}")
+        print("    was  {before.get(k) ?? ""}")
+        print("    now  {after.get(k) ?? ""}")
+    }
+    for k in added {
+        print("ADDED    {k}")
+    }
+    print("")
+    if removed.len() > 0 or changed.len() > 0 {
+        print("breaking: {removed.len()} removed, {changed.len()} changed, {added.len()} added — this is a MAJOR release")
+        exit(1)
+    }
+    if added.len() > 0 {
+        print("compatible: {added.len()} added — this is a MINOR release")
+        return
+    }
+    print("no change to the public surface — this is a PATCH release")
+}
+
+/// `grasm api <file> [--against <saved.api>]`, in the Rust arm's order and
+/// words.
+pub fn cmd_api(a: [str]) {
+    if a.len() < 2 or a[1].starts_with("--") {
+        eprint("usage: grasm api <file.gr> [--against <saved.api>]")
+        exit(1)
+    }
+    let path = a[1]
+    let (l, _p, c, t) = front.checked(path)
+    let surface = api_surface(l, c, t)
+    let saved = build.value_after(a, "--against")
+    if saved == "\0" {
+        docgen.print_raw(surface)
+        return
+    }
+    let old = front.read_source(saved).to_str()
+    var entries = 0
+    for line in testing.text_lines(old) {
+        if line.split("\t").len() == 3 {
+            entries += 1
+        }
+    }
+    if entries == 0 and surface != "" {
+        eprint("error: `{saved}` has no API entries — a baseline that says nothing would report every export as added")
+        eprint("  help: regenerate it with `grasm api <the previous version> > {saved}`")
+        exit(1)
+    }
+    report_api_change(old, surface)
+}

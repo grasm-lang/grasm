@@ -8,9 +8,10 @@
 #
 #   (none)      the same stdout, stderr, exit status and files written; a
 #               `build --native` success line may differ only in the size and
-#               in naming the backend (Cranelift, Grasm)
-#   elsewhere   a subcommand part one does not cover: the Grasm command says
-#               it is not here, on stderr, and exits 1 (docs/self-hosting.md
+#               in naming the backend (Cranelift, Grasm), and a bundle's
+#               (`build` without `--native`) only in the size
+#   elsewhere   a subcommand the Grasm command does not cover: it says it
+#               is not here, on stderr, and exits 1 (docs/self-hosting.md
 #               §6.17); the Rust one does whatever it does
 #   runtime     a runtime package built `--native`: the Grasm command writes
 #               the runtime's object; the Rust one says there is no `main`
@@ -133,7 +134,7 @@ build examples/hello.gr --native -o h --no-incremental
 build examples/hello.gr --native -o sub/h
 build examples/hello.gr -o examples/hello.gr
 build examples/hello.gr -o out.gr --native
-elsewhere build examples/hello.gr -o out.gr --native --source
+build examples/hello.gr -o out.gr --native --source
 build examples/hello.gr -o /dev/null --native
 build examples/hello.gr -o examples --native
 build examples/hello.gr -o /nonexistent/dir/x --native
@@ -167,9 +168,7 @@ test --seed
 test --bogus
 bench examples/hello.gr
 bench --filter
-elsewhere doc examples/hello.gr
 doc -o
-elsewhere api examples/hello.gr
 api x.gr --against
 fmt --check --x
 lint --only
@@ -184,8 +183,6 @@ lsp --x
 elsewhere dap a b c
 elsewhere journal x
 journal --full --x
-elsewhere build examples/hello.gr -o h
-elsewhere build examples/hello.gr --source -o h.bundle.gr
 
 # `fmt` (docs/self-hosting.md §6.19): the operand is the first argument not
 # starting with `--`, after a `--` too; `--check` counts anywhere. Only
@@ -245,3 +242,60 @@ bench
 bench nosuch.gr
 bench examples/hello.gr --filter x
 bench spec/conformance/E-BENCH-WARMUP.gr --filter nosuch
+
+# `doc` (docs/self-hosting.md §6.20): the operand past `-o`'s value, `-o`'s
+# value anywhere after `doc`, after `--` too; the title the package's name.
+doc
+doc examples/documented.gr
+doc examples/documented.gr -o d.md
+doc -o d.md examples/documented.gr
+doc -- examples/documented.gr
+doc examples/documented.gr -- -o d.md
+doc examples/documented.gr -o sub/d.md
+doc examples/documented.gr -o examples
+doc /nonexistent.gr
+doc -
+doc examples
+doc spec/conformance/G-STMT-TERM.gr
+doc packages/b39-demo/src/main.gr
+doc compiler/rt/src/main.gr -o rt.md
+doc examples/hello.gr --x
+
+# `api` (§6.20): the operand is the argument after `api`, unless it starts
+# with `--`; `--against`'s value from its first occurrence, after `--` too.
+api
+api --against x.api examples/documented.gr
+api examples/documented.gr
+api examples/hello.gr
+api examples/documented.gr --against /nonexistent.api
+api examples/documented.gr --against examples
+api examples/documented.gr --against /dev/null
+api examples/hello.gr --against /dev/null
+api examples/documented.gr -- --against /dev/null
+api examples/documented.gr --against examples/documented.gr
+api /nonexistent.gr
+api spec/conformance/G-STMT-TERM.gr
+api packages/b39-demo/src/main.gr
+api packages/pbes/src/main.gr
+api - --against /dev/null
+
+# `build` without `--native` and with `--source` (§6.20): every check
+# before the program's, then a bundle, or one `.gr`. `--source` with an
+# empty `-o` writes beside the source -- here the checkout's own, through
+# the link -- so `clidiff`'s `source` section tries it on a copy.
+build examples/hello.gr -o h
+build examples/hello.gr
+build -o h examples/hello.gr
+build examples/hello.gr -o sub/h
+build examples/hello.gr -o examples
+build examples/hello.gr -o /dev/null
+build spec/conformance/G-STMT-TERM.gr -o h
+build examples/hello.gr --source
+build examples/hello.gr --source -o h.bundle.gr
+build examples/hello.gr --source -o sub/h.gr
+build examples/hello.gr --source --native -o h.gr
+build examples/hello.gr --source --target x86_64-apple-darwin
+build compiler/rt/src/main.gr --source -o rt.gr
+build compiler/rt/src/main.gr --native --source -o rt.gr
+build packages/b39-demo/src/main.gr --source -o t.gr
+build packages/b39-demo/src/main.gr -o t

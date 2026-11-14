@@ -10,9 +10,11 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
 two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: eleven, a nested
+branches' values differ, refused natively. Open S4: twelve, a nested
 interpolation's spans, a backslash at the end of a file, a space `grasm fmt`
-drops before a brace, `grasm bench`'s name column padded by bytes, six in `grasm
+drops before a brace, `grasm bench`'s name column padded by bytes, `grasm
+doc` and the doc-example runner taking a fence or a hidden line behind any
+whitespace, six in `grasm
 check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
 a type shown as `_`, a contract's row breach reported twice, a ceiling
 refusal without its reason, and a `match`'s names unbound after an error;
@@ -24,6 +26,45 @@ stack running out, each end the command.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
+
+## Found on 2026-11-13 by S8 part three (`doc`, `api` and the bundle in Grasm)
+
+**`grasm doc` takes a fence or a hidden line behind any whitespace -- *open,
+S4*.** `without_hidden_lines` and `fenced_blocks` (`grasm_sema::docs`) ask
+`line.trim_start()` whether a doc line starts a fence (```` ``` ````) or is
+a hidden setup line (`# `), and Rust's `trim_start` takes any amount of any
+Unicode whitespace -- a no-break space (U+00A0), an em space (U+2003), five
+spaces. CommonMark opens a fence behind at most three spaces (U+0020), and
+reads a line behind four as an indented code block. So `grasm doc` hides
+lines a Markdown reader sees as prose or as an indented block, and `grasm
+test` runs as an example what a reader does not see as code:
+
+```
+/// Adds.
+///
+/// \u{a0}```
+/// \u{a0}# let hidden = 1
+/// shown()
+/// \u{2003}```
+///
+///      ```
+///      # also hidden
+///      ```
+pub fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+fn main() {
+    print("{add(1, 2)}")
+}
+```
+
+(`\u{a0}` and `\u{2003}` stand for the characters themselves.) `grasm doc`
+keeps the fence lines and drops `let hidden = 1` and `# also hidden`. The
+Grasm `grasm doc` (§6.20) trims as Rust's does (gfmt's `ws_len`, Rust's
+`char::is_whitespace`), so the two stay comparable and are fixed together;
+the fix is to take a fence and a hidden line behind at most three spaces,
+in the renderer and in the example runner alike.
 
 ## Found on 2026-11-05 by S8 part two (`fmt`, `lint`, `test` and `bench` in Grasm)
 

@@ -619,6 +619,24 @@ pub fn checked(path: str) -> (Loaded, Prog, Ck, Tys) {
     (l, p, c, t)
 }
 
+/// A program already loaded -- a bundled one's, from memory -- checked as
+/// `run_bundle` checks it: the loader's and the parser's diagnostics, else
+/// the checker's, rendered, and exit 1; no capability ceiling, since a
+/// bundle carries no manifest.
+pub fn checked_loaded(l: Loaded) -> (Prog, Ck, Tys) {
+    if l.diags.len() > 0 {
+        render_all(l.paths, l.srcs, l.bases, l.d_s, l.d_e, l.diags, l.d_help)
+        exit(1)
+    }
+    let p = prog.build(l)
+    let (c, t) = sema.check_program(p)
+    if c.d_s.len() > 0 {
+        render_all(p.m_path, p.m_src, p.m_base, c.d_s, c.d_e, c.d_msg, c.d_help)
+        exit(1)
+    }
+    (p, c, t)
+}
+
 /// What `grasm` says of `check`'s arguments before it reads any: it takes
 /// no option and one file; after `--` nothing is its own.
 fn check_args(a: [str]) {

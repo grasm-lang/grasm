@@ -23,9 +23,13 @@
 #   test-inverted  a unit test that holds reported failed, and back a test differs
 #   test-no-trap   a test's panic ends the command (no `trap`)      a test differs
 #   bench-filter   `bench --filter` ignored                         a bench differs
+#   doc-dropped    each doc comment's last line dropped             a doc differs
+#   api-missed     a changed signature not reported                 an api differs
+#   bundle-entry   the bundle names its entry with its directory    a bundle differs
+#   source-order   `--source` writes the modules last first          a source differs
 #
 # `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
-# 14 holds only on a whole run.
+# 18 holds only on a whole run.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -210,6 +214,42 @@ control bench-filter '^DIFF: grasm bench spec/conformance/E-BENCH-WARMUP.gr --fi
     '        if filter != "" and not p.bench_name[b].contains(filter) {' \
     '        if false and filter != "" and not p.bench_name[b].contains(filter) {'
 
+# S8 part three (§6.20): one fault in each of `doc`, `api`, the bundle and
+# `--source`.
+printf '%s\n' examples/documented.gr >"$WORK/documented"
+printf '%s\n' packages/b39-demo/src/main.gr >"$WORK/b39"
+DOCGEN=compiler/grasm/src/docgen.gr
+API=compiler/grasm/src/api.gr
+BUNDLE=compiler/grasm/src/bundle.gr
+
+control doc-dropped '^DIFF: grasm doc examples/documented.gr ' "ONLY=doc FILES=$WORK/documented" "$DOCGEN" \
+    '    out.join("\n")
+}
+
+/// `render_markdown`.' \
+    '    if out.len() > 1 {
+        let _gone = out.pop()
+    }
+    out.join("\n")
+}
+
+/// `render_markdown`.'
+
+control api-missed '^DIFF: grasm api examples/documented.gr --against, an item changed ' "ONLY=api FILES=$WORK/documented" "$API" \
+    '                if now != was {' \
+    '                if false and now != was {'
+
+control bundle-entry '^DIFF: grasm build examples/hello.gr \(a bundle\) -- not the command followed by' "ONLY=bundle FILES=$WORK/two" "$BUNDLE" \
+    '    let entry = if l.paths.len() > 0 { file_name(l.paths[0]) } else { "" }' \
+    '    let entry = if l.paths.len() > 0 { l.paths[0] } else { "" }'
+
+control source-order '^DIFF: grasm build packages/b39-demo/src/main.gr --source ' "ONLY=source FILES=$WORK/b39" "$BUNDLE" \
+    '    for i in 0..l.names.len() {
+        text.push_str("//!module ")' \
+    '    for j in 0..l.names.len() {
+        let i = l.names.len() - 1 - j
+        text.push_str("//!module ")'
+
 echo
 echo "controls: $ran   caught: $caught   missed: $missed"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -222,4 +262,4 @@ if [ -n "${CONTROLS:-}" ]; then
     [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
     exit
 fi
-[ "$ran" -ge 14 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 18 ] && [ "$caught" = "$ran" ]

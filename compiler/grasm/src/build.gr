@@ -15,12 +15,14 @@ import front.sema
 import front.emit
 import s3
 import link
+import bundle
 
 /// A program checked as `grasm check` checks it, with what the commands
 /// after the check ask of it: the runtime package it belongs to ("" for
 /// none) and whether its entry is one, its `export fn`s' names, and whether
 /// its entry module has a `main`.
 type Checked = {
+    l: Loaded,
     p: Prog,
     c: Ck,
     t: Tys,
@@ -44,7 +46,7 @@ pub fn checked(path: str) -> Checked {
         exports.push(k)
     }
     exports.sort()
-    Checked{ p: p, c: c, t: t, runtime: runtime, entry_is_runtime: l.runtime.has("main"), exports: exports, has_main: sema.fn_of(c, "main::main") >= 0 }
+    Checked{ l: l, p: p, c: c, t: t, runtime: runtime, entry_is_runtime: l.runtime.has("main"), exports: exports, has_main: sema.fn_of(c, "main::main") >= 0 }
 }
 
 /// The checked program's TIR. A hole the checker left is said on stderr,
@@ -97,7 +99,7 @@ pub fn first_operand(args: [str], valued: [str]) -> str {
 }
 
 /// The value after the first `flag` anywhere on the line, or "\0".
-fn value_after(a: [str], flag: str) -> str {
+pub fn value_after(a: [str], flag: str) -> str {
     for i in 0..a.len() {
         if a[i] == flag {
             if i + 1 < a.len() {
@@ -141,7 +143,7 @@ fn file_kind(p: str) -> i64 {
 
 /// `Path::file_stem`: the last component's name before its last `.`, unless
 /// that `.` is its first character; "\0" when there is no last component.
-fn file_stem(p: str) -> str {
+pub fn file_stem(p: str) -> str {
     var b = p.to_bytes()
     var n = b.len()
     while n > 1 and b.at(n - 1) == 47 {
@@ -165,23 +167,13 @@ fn file_stem(p: str) -> str {
     name.slice(0, dot).to_str()
 }
 
-/// `_NSGetExecutablePath(3)`: this program's own path.
-extern fn _NSGetExecutablePath(buf: bytes, size: bytes) -> i64
-
 /// The directory this program runs from, its links resolved; "" when it
 /// cannot be found.
 fn own_dir() -> str {
-    let buf = bytes_filled(4096, 0)
-    let size = bytes_of([0, 16, 0, 0])
-    let rc = unsafe { _NSGetExecutablePath(buf, size) }
-    if rc != 0 {
+    let exe = bundle.own_exe()
+    if exe == "" {
         return ""
     }
-    var n = 0
-    while n < buf.len() and buf.at(n) != 0 {
-        n += 1
-    }
-    let exe = buf.slice(0, n).to_str()
     let real = loader.canonicalize(exe)
     let d = loader.parent(if real == "\0" { exe } else { real })
     if d == "\0" { "" } else { d }
@@ -285,7 +277,7 @@ pub fn cmd_build(a: [str]) {
     // as `s3 --runtime` makes it -- the one way a toolchain without the
     // stage scripts makes the `rt.o` it links. The Rust command refuses
     // here (no `main`); the Grasm backend is what the refusal names.
-    if native and f.entry_is_runtime {
+    if native and not want_source and f.entry_is_runtime {
         build_runtime(f, out, target)
         return
     }
@@ -296,15 +288,16 @@ pub fn cmd_build(a: [str]) {
     if f.runtime != "" {
         refuse_runtime(f.runtime, engine)
     }
+    // One `.gr` holding the whole program, whether or not `--native` is
+    // given too; else, without `--native`, this executable carrying the
+    // program (bundle.gr, docs/self-hosting.md §6.20).
     if want_source {
-        eprint("error: `grasm build --source` is not in the Grasm toolchain yet")
-        eprint("  help: it builds with `--native`; the rest of `build` is S8's to come (docs/self-hosting.md §6.17)")
-        exit(1)
+        bundle.cmd_source(f.l, path, out)
+        return
     }
     if not native {
-        eprint("error: `grasm build` without `--native` is not in the Grasm toolchain yet")
-        eprint("  help: it builds with `--native`; the rest of `build` is S8's to come (docs/self-hosting.md §6.17)")
-        exit(1)
+        bundle.cmd_bundle(f.l, out)
+        return
     }
     if target != "\0" {
         let (x64, linux) = target_of(target)

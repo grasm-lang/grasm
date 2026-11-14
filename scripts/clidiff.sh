@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # The `grasm` command in Grasm against the Rust one (docs/self-hosting.md
-# §6.17 and §6.19, S8 parts one and two): the same stdout, stderr, exit
-# status and files.
+# §6.17, §6.19 and §6.20, S8 parts one to three): the same stdout, stderr,
+# exit status and files.
 #
 # `compiler/grasm` runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`,
-# `run`, `build --native`, `links`, `fmt`, `lint`, `test` and `bench` with the
-# Grasm toolchain's own code, and reads every command line as the Rust command
-# reads it. Ten sections, each both commands on the same input from the same
-# directory -- six of part one:
+# `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc` and `api` with
+# the Grasm toolchain's own code, and reads every command line as the Rust
+# command reads it. Fourteen sections, each both commands on the same input
+# from the same directory -- six of part one:
 #
 #   lines   every command line in scripts/lib/clicases.txt, in an empty
 #           directory of each command's own that links to the checkout's
@@ -49,6 +49,25 @@
 #           taken out and held to the format (scripts/lib/benchnorm.py); one
 #           with a benchmark filtered to its first and to none
 #
+# and four for the subcommands of S8 part three (§6.20):
+#
+#   doc     every corpus program, `doc P`; every tenth and every package's
+#           entry also `doc P -o F`, the file compared
+#   api     every corpus program, `api P`; where it has a surface, `api P
+#           --against` that surface and four baselines rewritten from it (CR
+#           LF, no tabs, empty, not UTF-8); then, in a copy of the corpus, an
+#           added, a removed and a changed public item (`api_probe`
+#           appended), each against a baseline the Rust command made
+#   bundle  every program with a `main`, `build P -o prog` without
+#           `--native`: the output (the size aside), the Grasm bundle the
+#           command's own executable followed by exactly the bytes that follow
+#           the Rust command's executable in the Rust bundle, both bundles
+#           run with arguments (the Rust trace stripped), the Grasm one made
+#           twice the same
+#   source  every corpus program, `build P --source -o F`: the output and
+#           the file; every tenth with a `main` also run from that file by
+#           both commands
+#
 # A section's floors hold only on a whole run.
 #
 # The Grasm command never starts another program: nothing in its package
@@ -79,7 +98,7 @@ corpus_require
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-ONLY=${ONLY:-lines,corpus,toml,run,fmt,lint,test,bench,build,target}
+ONLY=${ONLY:-lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
 if ! command -v sandbox-exec >/dev/null 2>&1; then
@@ -142,9 +161,11 @@ fail() {
 # The `build --native` success line with the size and the backend taken out:
 # the two commands' code is two compilers', so neither can be the other's.
 # Only the backend the command is: a Grasm command that names Cranelift has
-# been routed elsewhere, and its line stays as it is.
+# been routed elsewhere, and its line stays as it is. And a bundle's line
+# with its size taken out: each bundle starts with its own command.
 norm_built() { # file backend
-    sed -E "s/^(built \`.*\` natively \\()[0-9]+ bytes, $2\\)\$/\\1N bytes)/" "$1"
+    sed -E -e "s/^(built \`.*\` natively \\()[0-9]+ bytes, $2\\)\$/\\1N bytes)/" \
+        -e "s/^(built \`.*\` \\()[0-9]+ bytes, ([0-9]+ module\\(s\\))\\)\$/\\1N bytes, \\2)/" "$1"
 }
 
 # Every file and directory under `$1` but the links to the checkout and the
@@ -605,6 +626,308 @@ if want bench; then
 fi
 
 # -------------------------------------------------------------------------
+# doc, api, bundle, source (docs/self-hosting.md §6.20)
+# -------------------------------------------------------------------------
+
+# doc: every corpus program, `doc P`; every tenth and every package's
+# entry also with `-o`, into a directory of each command's own.
+doc_runs=0
+doc_same=0
+doc_refused=0
+doc_written=0
+doc_items=0
+if want doc; then
+    mkdir -p "$WORK/d/r" "$WORK/d/g"
+    k=0
+    while IFS= read -r src; do
+        k=$((k + 1))
+        doc_runs=$((doc_runs + 1))
+        "$GRASM" doc "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        g doc "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        if same3 "$r_rc" "$g_rc"; then
+            doc_same=$((doc_same + 1))
+            [ "$r_rc" != 0 ] && doc_refused=$((doc_refused + 1))
+        else
+            fail "grasm doc $src -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+        fi
+        if [ $((k % 10)) = 0 ] || [[ "$src" == packages/*/src/main.gr ]]; then
+            doc_runs=$((doc_runs + 1))
+            rm -f "$WORK/d/r/out.md" "$WORK/d/g/out.md"
+            "$GRASM" doc "$src" -o "$WORK/d/r/out.md" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            g doc "$src" -o "$WORK/d/g/out.md" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            g_rc=$?
+            sed -i '' "s|$WORK/d/r/|$WORK/d/g/|g" "$WORK/r.out" "$WORK/r.err"
+            if same3 "$r_rc" "$g_rc" &&
+                { { [ ! -e "$WORK/d/r/out.md" ] && [ ! -e "$WORK/d/g/out.md" ]; } || cmp -s "$WORK/d/r/out.md" "$WORK/d/g/out.md"; } &&
+                { [ "$g_rc" != 0 ] || [ -s "$WORK/d/g/out.md" ]; }; then
+                doc_same=$((doc_same + 1))
+                if [ "$r_rc" = 0 ]; then
+                    doc_written=$((doc_written + 1))
+                    n=$(sed -nE 's/^wrote .* \(([0-9]+) item\(s\)\)$/\1/p' "$WORK/g.out")
+                    doc_items=$((doc_items + ${n:-0}))
+                else
+                    doc_refused=$((doc_refused + 1))
+                fi
+            else
+                fail "grasm doc $src -o F -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                show3
+                diff "$WORK/d/r/out.md" "$WORK/d/g/out.md" | head -4 | sed 's/^/  /'
+            fi
+        fi
+    done <"$WORK/programs"
+    echo "doc: $listed programs, $doc_runs commands ($doc_written written with -o, $doc_items items)   the same: $doc_same, $doc_refused of them refusals"
+fi
+
+# api: every corpus program; where it has a surface, against that surface
+# and four baselines rewritten from it; then an added, a removed and a
+# changed public item in a copy of the corpus.
+api_runs=0
+api_same=0
+api_refused=0
+api_surfaces=0
+api_patch=0
+api_baselines=0
+api_added=0
+api_removed=0
+api_changed=0
+if want api; then
+    : >"$WORK/with_surface"
+    while IFS= read -r src; do
+        api_runs=$((api_runs + 1))
+        "$GRASM" api "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        g api "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        if ! same3 "$r_rc" "$g_rc"; then
+            fail "grasm api $src -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+            continue
+        fi
+        api_same=$((api_same + 1))
+        if [ "$r_rc" != 0 ]; then
+            api_refused=$((api_refused + 1))
+            continue
+        fi
+        [ -s "$WORK/r.out" ] || continue
+        api_surfaces=$((api_surfaces + 1))
+        echo "$src" >>"$WORK/with_surface"
+        cp "$WORK/r.out" "$WORK/base.api"
+        # The surface itself, then CR LF line ends, every tab a space, no
+        # line at all, and a byte that is not UTF-8.
+        sed 's/$/\r/' "$WORK/base.api" >"$WORK/crlf.api"
+        tr '\t' ' ' <"$WORK/base.api" >"$WORK/notabs.api"
+        : >"$WORK/empty.api"
+        { printf '\377'; cat "$WORK/base.api"; } >"$WORK/binary.api"
+        for b in base crlf notabs empty binary; do
+            api_runs=$((api_runs + 1))
+            "$GRASM" api "$src" --against "$WORK/$b.api" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            g api "$src" --against "$WORK/$b.api" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            g_rc=$?
+            if same3 "$r_rc" "$g_rc"; then
+                api_same=$((api_same + 1))
+                if [ "$b" = base ]; then
+                    grep -c 'this is a PATCH release$' "$WORK/r.out" >/dev/null && api_patch=$((api_patch + 1))
+                else
+                    api_baselines=$((api_baselines + 1))
+                fi
+            else
+                fail "grasm api $src --against ($b) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                show3
+            fi
+        done
+    done <"$WORK/programs"
+
+    mkdir -p "$WORK/ac"
+    for d in $CORPUS_DIRS; do
+        mkdir -p "$WORK/ac/$(dirname "$d")"
+        cp -R "$d" "$WORK/ac/$d"
+    done
+    # api_against SRC BASELINE KIND: both commands, from the copy.
+    api_against() {
+        api_runs=$((api_runs + 1))
+        (cd "$WORK/ac" && "$GRASM" api "$1" --against "$2" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null)
+        r_rc=$?
+        (cd "$WORK/ac" && g api "$1" --against "$2" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null)
+        g_rc=$?
+        if same3 "$r_rc" "$g_rc"; then
+            api_same=$((api_same + 1))
+            case "$3" in
+            added) grep -c '^ADDED    .*::api_probe$' "$WORK/r.out" >/dev/null && api_added=$((api_added + 1)) ;;
+            removed) grep -c '^REMOVED  .*::api_probe$' "$WORK/r.out" >/dev/null && api_removed=$((api_removed + 1)) ;;
+            changed) grep -c '^CHANGED  .*::api_probe$' "$WORK/r.out" >/dev/null && api_changed=$((api_changed + 1)) ;;
+            esac
+        else
+            fail "grasm api $1 --against, an item $3 -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+        fi
+    }
+    while IFS= read -r src; do
+        f="$WORK/ac/$src"
+        cp "$f" "$WORK/orig.gr"
+        (cd "$WORK/ac" && "$GRASM" api "$src" >"$WORK/b0.api" 2>/dev/null </dev/null)
+        printf '\npub fn api_probe() -> i64 {\n    1\n}\n' >>"$f"
+        (cd "$WORK/ac" && "$GRASM" api "$src" >"$WORK/b1.api" 2>/dev/null </dev/null)
+        api_against "$src" "$WORK/b0.api" added
+        cp "$WORK/orig.gr" "$f"
+        api_against "$src" "$WORK/b1.api" removed
+        printf '\npub fn api_probe(n: i64) -> i64 {\n    n\n}\n' >>"$f"
+        api_against "$src" "$WORK/b1.api" changed
+        cp "$WORK/orig.gr" "$f"
+    done <"$WORK/with_surface"
+    rm -rf "$WORK/ac"
+    echo "api: $listed programs, $api_runs commands ($api_surfaces with a surface)   the same: $api_same, $api_refused of them refusals   against its own surface, a patch: $api_patch   against a rewritten baseline: $api_baselines   an item added: $api_added, removed: $api_removed, changed: $api_changed"
+fi
+
+# bundle: every program with a `main`, built without `--native`; the Grasm
+# bundle is the command followed by the Rust bundle's payload, byte for
+# byte; both run; the Grasm one made twice.
+bundles=0
+bundle_same=0
+bundle_refused=0
+bundle_payload=0
+bundle_ran=0
+bundle_repro=0
+if want bundle; then
+    mkdir -p "$WORK/u/r" "$WORK/u/g" "$WORK/u/g2"
+    r_exe=$(wc -c <"$GRASM" | tr -d ' ')
+    g_exe=$(wc -c <"$G" | tr -d ' ')
+    while IFS= read -r src; do
+        bundles=$((bundles + 1))
+        rm -f "$WORK/u/r/prog" "$WORK/u/g/prog" "$WORK/u/g2/prog"
+        "$GRASM" build "$src" -o "$WORK/u/r/prog" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        g build "$src" -o "$WORK/u/g/prog" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        sed "s|$WORK/u/r/|$WORK/u/g/|g" "$WORK/r.out" >"$WORK/r.norm"
+        sed "s|$WORK/u/r/|$WORK/u/g/|g" "$WORK/r.err" >"$WORK/r.enorm"
+        size=$(wc -c <"$WORK/u/g/prog" 2>/dev/null | tr -d ' ')
+        if ! cmp -s <(norm_built "$WORK/r.norm" Cranelift) <(norm_built "$WORK/g.out" Grasm) ||
+            ! cmp -s "$WORK/r.enorm" "$WORK/g.err" || [ "$r_rc" != "$g_rc" ] ||
+            { [ "$g_rc" = 0 ] && ! grep -c "^built \`$WORK/u/g/prog\` ($size bytes, [0-9]* module(s))\$" "$WORK/g.out" >/dev/null; }; then
+            fail "grasm build $src (a bundle) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            diff "$WORK/r.norm" "$WORK/g.out" | head -4 | sed 's/^/  /'
+            diff "$WORK/r.enorm" "$WORK/g.err" | head -4 | sed 's/^/  /'
+            continue
+        fi
+        bundle_same=$((bundle_same + 1))
+        if [ "$r_rc" != 0 ]; then
+            bundle_refused=$((bundle_refused + 1))
+            continue
+        fi
+        r_size=$(wc -c <"$WORK/u/r/prog" | tr -d ' ')
+        if [ -x "$WORK/u/g/prog" ] && [ $((size - g_exe)) = $((r_size - r_exe)) ] &&
+            cmp -s <(head -c "$g_exe" "$WORK/u/g/prog") "$G" &&
+            cmp -s <(tail -c "+$((r_exe + 1))" "$WORK/u/r/prog") <(tail -c "+$((g_exe + 1))" "$WORK/u/g/prog"); then
+            bundle_payload=$((bundle_payload + 1))
+        else
+            fail "grasm build $src (a bundle) -- not the command followed by the Rust bundle's payload ($size and $r_size bytes)"
+            continue
+        fi
+        $RUN_LIMIT "$WORK/u/r/prog" a "b c" -- -d >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        $RUN_LIMIT sandbox-exec -p "$NORUST" "$WORK/u/g/prog" a "b c" -- -d >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        if cmp -s "$WORK/r.out" "$WORK/g.out" && [ "$r_rc" = "$g_rc" ] && [ "$r_rc" != 124 ] &&
+            [ "$(strip_trace "$(cat "$WORK/r.err")")" == "$(cat "$WORK/g.err")" ]; then
+            bundle_ran=$((bundle_ran + 1))
+        else
+            fail "$src bundled by each runs otherwise -- exit $r_rc (Rust's bundle) and $g_rc (Grasm's)"
+            diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+            diff <(strip_trace "$(cat "$WORK/r.err")") "$WORK/g.err" | head -4 | sed 's/^/  /'
+        fi
+        if g build "$src" -o "$WORK/u/g2/prog" >/dev/null 2>&1 </dev/null && cmp -s "$WORK/u/g/prog" "$WORK/u/g2/prog"; then
+            bundle_repro=$((bundle_repro + 1))
+        else
+            fail "grasm build $src (a bundle) -- built twice, two bundles"
+        fi
+    done <"$WORK/mains"
+    rm -rf "$WORK/u"
+    echo "bundle: $bundles programs with a main   the same output: $bundle_same, $bundle_refused of them refusals   the command and Rust's payload: $bundle_payload   run alike: $bundle_ran   built twice the same: $bundle_repro"
+fi
+
+# source: every corpus program, `--source`; every tenth with a `main` run
+# from the file the Grasm command wrote, by both.
+sources=0
+sources_beside=0
+source_beside=0
+source_same=0
+source_refused=0
+source_ran=0
+if want source; then
+    mkdir -p "$WORK/s/r" "$WORK/s/g"
+    # Without `-o` the file is the source's stem, here; with an empty one it
+    # goes beside the source, every trailing `.gr` taken off: tried on a
+    # copy in each directory, every file left compared.
+    for o in none empty; do
+        sources_beside=$((sources_beside + 1))
+        for side in r g; do
+            rm -rf "$WORK/s/$side"/*
+            cp examples/hello.gr "$WORK/s/$side/x.gr.gr"
+        done
+        if [ "$o" = none ]; then set -- build x.gr.gr --source; else set -- build x.gr.gr --source -o ""; fi
+        (cd "$WORK/s/r" && "$GRASM" "$@" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null)
+        r_rc=$?
+        (cd "$WORK/s/g" && g "$@" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null)
+        g_rc=$?
+        if same3 "$r_rc" "$g_rc" && [ "$r_rc" = 0 ] && [ "$(listing "$WORK/s/r")" = "$(listing "$WORK/s/g")" ] &&
+            [ "$(cd "$WORK/s/r" && find . -type f | sort | xargs cat | cksum)" = "$(cd "$WORK/s/g" && find . -type f | sort | xargs cat | cksum)" ] &&
+            [ "$(find "$WORK/s/g" -type f | grep -c .)" = 2 ]; then
+            source_beside=$((source_beside + 1))
+        else
+            fail "grasm $* -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+        fi
+    done
+    rm -rf "$WORK/s/r"/* "$WORK/s/g"/*
+    k=0
+    while IFS= read -r src; do
+        sources=$((sources + 1))
+        rm -f "$WORK/s/r/x.bundle.gr" "$WORK/s/g/x.bundle.gr"
+        "$GRASM" build "$src" --source -o "$WORK/s/r/x.bundle.gr" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        g build "$src" --source -o "$WORK/s/g/x.bundle.gr" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        sed -i '' "s|$WORK/s/r/|$WORK/s/g/|g" "$WORK/r.out" "$WORK/r.err"
+        if ! same3 "$r_rc" "$g_rc" ||
+            { { [ -e "$WORK/s/r/x.bundle.gr" ] || [ -e "$WORK/s/g/x.bundle.gr" ]; } &&
+                ! cmp -s "$WORK/s/r/x.bundle.gr" "$WORK/s/g/x.bundle.gr"; } ||
+            { [ "$g_rc" = 0 ] && [ ! -s "$WORK/s/g/x.bundle.gr" ]; }; then
+            fail "grasm build $src --source -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+            diff "$WORK/s/r/x.bundle.gr" "$WORK/s/g/x.bundle.gr" | head -4 | sed 's/^/  /'
+            continue
+        fi
+        source_same=$((source_same + 1))
+        if [ "$r_rc" != 0 ]; then
+            source_refused=$((source_refused + 1))
+            continue
+        fi
+        grep -qxF "$src" "$WORK/mains" || continue
+        k=$((k + 1))
+        [ $((k % 10)) = 1 ] || continue
+        $RUN_LIMIT "$GRASM" run "$WORK/s/g/x.bundle.gr" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        $RUN_LIMIT sandbox-exec -p "$NORUST" "$G" run "$WORK/s/g/x.bundle.gr" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        if cmp -s "$WORK/r.out" "$WORK/g.out" && [ "$r_rc" = "$g_rc" ] && [ "$r_rc" != 124 ] &&
+            [ "$(strip_trace "$(cat "$WORK/r.err")")" == "$(cat "$WORK/g.err")" ]; then
+            source_ran=$((source_ran + 1))
+        else
+            fail "grasm run on $src's --source file -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+            diff <(strip_trace "$(cat "$WORK/r.err")") "$WORK/g.err" | head -4 | sed 's/^/  /'
+        fi
+    done <"$WORK/programs"
+    rm -rf "$WORK/s"
+    echo "source: $sources programs   the same output and file: $source_same, $source_refused of them refusals   run from the file alike: $source_ran   written beside the source alike: $source_beside of $sources_beside"
+fi
+
+# -------------------------------------------------------------------------
 # build, target
 # -------------------------------------------------------------------------
 builds=0
@@ -714,12 +1037,12 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 fi
 
 # The counts add up, and a whole run compared enough to mean something.
-whole=$([ -z "${FILES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,fmt,lint,test,bench,build,target ] && echo 1)
+whole=$([ -z "${FILES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target ] && echo 1)
 if want lines && [ $((lines_same + lines_elsewhere + lines_runtime + lines_target)) -ne "$lines" ]; then
     echo "lines: the counts do not add up to $lines"
     exit 1
 fi
-if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 10 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
+if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 6 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
     echo "lines: too few compared ($lines, $lines_elsewhere not here, $lines_runtime runtime, $lines_target target)"
     exit 1
 fi
@@ -745,6 +1068,24 @@ if want test && { [ $((test_same + test_host + test_timed_out)) -ne "$test_runs"
 fi
 if want bench && [ "$bench_same" -ne "$bench_runs" ]; then
     echo "bench: $bench_same of $bench_runs commands compared"
+    exit 1
+fi
+if want doc && [ "$doc_same" -ne "$doc_runs" ]; then
+    echo "doc: $doc_same of $doc_runs commands compared"
+    exit 1
+fi
+if want api && { [ "$api_same" -ne "$api_runs" ] || [ "$api_patch" -ne "$api_surfaces" ] ||
+    [ "$api_baselines" -ne $((4 * api_surfaces)) ] || [ "$api_runs" -ne $((listed + 8 * api_surfaces)) ]; }; then
+    echo "api: the counts do not add up ($api_same of $api_runs, $listed programs, $api_surfaces with a surface, $api_patch patches, $api_baselines rewritten baselines)"
+    exit 1
+fi
+if want bundle && { [ "$bundle_same" -ne "$bundles" ] || [ "$bundle_payload" -ne $((bundles - bundle_refused)) ] ||
+    [ "$bundle_ran" -ne "$bundle_payload" ] || [ "$bundle_repro" -ne "$bundle_payload" ] || [ "$bundles" -ne "$mains" ]; }; then
+    echo "bundle: the counts do not add up ($bundle_same, $bundle_payload, $bundle_ran, $bundle_repro of $bundles; $bundle_refused refused; $mains with a main)"
+    exit 1
+fi
+if want source && { [ "$source_same" -ne "$sources" ] || [ "$sources" -ne "$listed" ] || [ "$source_beside" != 2 ]; }; then
+    echo "source: $source_same of $sources programs compared ($listed listed)"
     exit 1
 fi
 if want build && { [ "$built_same" -ne "$builds" ] || [ "$ran_same" -ne $((builds - build_refused)) ] || [ "$repro" -ne "$ran_same" ] ||

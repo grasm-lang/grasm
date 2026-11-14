@@ -1,0 +1,405 @@
+// `grasm build` without `--native`, and with `--source` (docs/self-hosting.md
+// §6.20).
+//
+// A bundle is the toolchain's own executable carrying a program: this
+// command's executable -- which has the TIR interpreter in it -- followed by
+// the payload the Rust command writes (`write_bundle` in
+// crates/grasm/src/main.rs), in its format to the byte: the modules and
+// their sources, the dependency packages, where each import resolved to,
+// the entry file's name; then the payload's length and `GRASMBDL`. Started
+// as such a file, the command never reads its command line: it loads the
+// program from the payload, checks it, and runs it on the TIR interpreter,
+// as `grasm run` would (`run_if_bundle`, `run_bundle`'s port).
+//
+// `--source` writes the program as one `.gr` file instead, each module after
+// a `//!module` line (`to_source_bundle`), which the loader reads back.
+import front
+import front.loader
+import front.emit
+import tirinterp
+import tirinterp.sexp
+
+let MAGIC = "GRASMBDL"
+
+/// `_NSGetExecutablePath(3)`: this program's own path.
+extern fn _NSGetExecutablePath(buf: bytes, size: bytes) -> i64
+
+/// This program's own path, as `_NSGetExecutablePath(3)` gives it (what
+/// Rust's `current_exe` asks); "" when it cannot be found.
+pub fn own_exe() -> str {
+    let buf = bytes_filled(4096, 0)
+    let size = bytes_of([0, 16, 0, 0])
+    let rc = unsafe { _NSGetExecutablePath(buf, size) }
+    if rc != 0 {
+        return ""
+    }
+    var n = 0
+    while n < buf.len() and buf.at(n) != 0 {
+        n += 1
+    }
+    buf.slice(0, n).to_str()
+}
+
+/// chmod(2): the bundle is an executable, mode 0755, as Rust sets it.
+extern fn chmod(path: str, mode: i64) -> i64
+
+// ---------------------------------------------------------------------
+// The payload
+// ---------------------------------------------------------------------
+
+fn push_u32(inout b: ByteBuilder, n: i64) {
+    b.push_byte(n.bit_and(255))
+    b.push_byte(n.ushr(8).bit_and(255))
+    b.push_byte(n.ushr(16).bit_and(255))
+    b.push_byte(n.ushr(24).bit_and(255))
+}
+
+fn push_part(inout b: ByteBuilder, s: bytes) {
+    push_u32(b, s.len())
+    b.push_bytes(s)
+}
+
+/// `Path::file_name` of the entry's path: its last component; the whole
+/// path when that is `..` or there is none.
+fn file_name(p: str) -> str {
+    var b = p.to_bytes()
+    var n = b.len()
+    while n > 1 and b.at(n - 1) == 47 {
+        n -= 1
+    }
+    var s = n
+    while s > 0 and b.at(s - 1) != 47 {
+        s -= 1
+    }
+    let name = b.slice(s, n).to_str()
+    if name == "" or name == ".." or name == "/" {
+        return p
+    }
+    name
+}
+
+/// The payload `write_bundle` appends for a loaded program.
+fn payload_of(l: Loaded) -> bytes {
+    var b = byte_builder()
+    push_u32(b, l.names.len())
+    for i in 0..l.names.len() {
+        push_part(b, l.names[i].to_bytes())
+        push_part(b, l.srcs[i])
+    }
+    var deps: [str] = []
+    for d in l.deps {
+        if not deps.contains(d) {
+            deps.push(d)
+        }
+    }
+    deps.sort()
+    push_u32(b, deps.len())
+    for d in deps {
+        push_part(b, d.to_bytes())
+    }
+    var imports: [(str, str, str)] = []
+    for i in 0..l.names.len() {
+        for j in 0..l.imp_alias[i].len() {
+            imports.push((l.names[i], l.imp_alias[i][j], l.imp_full[i][j]))
+        }
+    }
+    imports.sort()
+    push_u32(b, imports.len())
+    for x in imports {
+        let (m, a, t) = x
+        push_part(b, m.to_bytes())
+        push_part(b, a.to_bytes())
+        push_part(b, t.to_bytes())
+    }
+    let entry = if l.paths.len() > 0 { file_name(l.paths[0]) } else { "" }
+    push_part(b, entry.to_bytes())
+    b.to_bytes()
+}
+
+/// A payload read back (`parse_bundle`): whether it is one, and what it
+/// holds. A failure where Rust's `?` gives up is no bundle; the imports and
+/// the entry, which older payloads lack, are read as far as they go.
+type Bundle = {
+    ok: bool,
+    names: [str],
+    srcs: [str],
+    deps: [str],
+    imp_m: [str],
+    imp_a: [str],
+    imp_t: [str],
+    has_entry: bool,
+    entry: str,
+    /// Where the payload starts in the data read.
+    start: i64,
+}
+
+type Reader = { p: bytes, pos: i64 }
+
+fn read_u32(inout r: Reader) -> i64 {
+    if r.pos + 4 > r.p.len() {
+        return -1
+    }
+    let b = r.p
+    let n = b.at(r.pos) + 256 * b.at(r.pos + 1) + 65536 * b.at(r.pos + 2) + 16777216 * b.at(r.pos + 3)
+    r.pos += 4
+    n
+}
+
+/// A length and that many bytes as UTF-8, or "\0" (and `ok` false) where
+/// Rust's reader gives up -- after the length is read, as Rust's does.
+fn read_part(inout r: Reader) -> (bool, str) {
+    let len = read_u32(r)
+    if len < 0 or r.pos + len > r.p.len() {
+        return (false, "")
+    }
+    let s = r.p.slice(r.pos, r.pos + len)
+    if not loader.utf8_ok(s) {
+        return (false, "")
+    }
+    r.pos += len
+    (true, s.to_str())
+}
+
+fn no_bundle() -> Bundle {
+    Bundle{ ok: false, names: [], srcs: [], deps: [], imp_m: [], imp_a: [], imp_t: [], has_entry: false, entry: "", start: 0 }
+}
+
+/// `parse_bundle` on `data`, which ends where the file does.
+fn parse(data: bytes) -> Bundle {
+    let n = data.len()
+    if n < 16 or data.slice(n - 8, n).to_str() != MAGIC {
+        return no_bundle()
+    }
+    let lb = data.slice(n - 16, n - 8)
+    if lb.at(7) >= 128 {
+        return no_bundle()
+    }
+    var plen = 0
+    var i = 7
+    while i >= 0 {
+        plen = plen * 256 + lb.at(i)
+        i -= 1
+    }
+    if plen + 16 > n {
+        return no_bundle()
+    }
+    let start = n - 16 - plen
+    var r = Reader{ p: data.slice(start, n - 16), pos: 0 }
+    var out = no_bundle()
+    out.start = start
+    let count = read_u32(r)
+    if count < 0 {
+        return no_bundle()
+    }
+    for _k in 0..count {
+        let (ok1, name) = read_part(r)
+        if not ok1 {
+            return no_bundle()
+        }
+        let (ok2, src) = read_part(r)
+        if not ok2 {
+            return no_bundle()
+        }
+        out.names.push(name)
+        out.srcs.push(src)
+    }
+    let nd = read_u32(r)
+    if nd >= 0 {
+        for _k in 0..nd {
+            let (ok, d) = read_part(r)
+            if not ok {
+                return no_bundle()
+            }
+            out.deps.push(d)
+        }
+    }
+    let ni = read_u32(r)
+    if ni >= 0 {
+        for _k in 0..ni {
+            // All three read, as Rust's tuple reads them, before any is
+            // asked whether it was there.
+            let (o1, m) = read_part(r)
+            let (o2, a) = read_part(r)
+            let (o3, t) = read_part(r)
+            if not (o1 and o2 and o3) {
+                break
+            }
+            out.imp_m.push(m)
+            out.imp_a.push(a)
+            out.imp_t.push(t)
+        }
+    }
+    let (oe, e) = read_part(r)
+    out.has_entry = oe
+    out.entry = e
+    out.ok = true
+    out
+}
+
+// ---------------------------------------------------------------------
+// Writing: `build` without `--native`, and `--source`
+// ---------------------------------------------------------------------
+
+/// `write_bundle`: this executable, any payload already on it cut off, the
+/// program's payload, its length and the magic, written to `out` and made
+/// executable. Answers the size; or says why not and exits 1.
+pub fn write_bundle(l: Loaded, out: str) -> i64 {
+    let exe = own_exe()
+    if exe == "" {
+        eprint("error: cannot locate the grasm binary")
+        exit(1)
+    }
+    var data = match read_bytes(exe) {
+        Ok(b) -> b
+        Err(e) -> {
+            eprint("error: {loader.io_error_text(e)}")
+            exit(1)
+            bytes_of([])
+        }
+    }
+    var b = parse(data)
+    while b.ok {
+        data = data.slice(0, b.start)
+        b = parse(data)
+    }
+    let payload = payload_of(l)
+    var all = byte_builder()
+    all.push_bytes(data)
+    all.push_bytes(payload)
+    var len = payload.len()
+    for _k in 0..8 {
+        all.push_byte(len.bit_and(255))
+        len = len.ushr(8)
+    }
+    all.push_str(MAGIC)
+    let whole = all.to_bytes()
+    match write_bytes(out, whole) {
+        Ok(_) -> ()
+        Err(e) -> {
+            eprint("error: {loader.io_error_text(e)}")
+            exit(1)
+        }
+    }
+    let rc = unsafe { chmod(out, 493) }
+    if rc != 0 {
+        eprint("error: cannot make `{out}` executable")
+        exit(1)
+    }
+    whole.len()
+}
+
+/// `build` without `--native`: the bundle, and Rust's line.
+pub fn cmd_bundle(l: Loaded, out: str) {
+    let size = write_bundle(l, out)
+    print("built `{out}` ({size} bytes, {l.names.len()} module(s))")
+}
+
+/// `build --source`: `to_source_bundle` written to `-o`'s path, or beside
+/// the source as `<stem>.bundle.gr` when that is empty.
+pub fn cmd_source(l: Loaded, path: str, out: str) {
+    var text = byte_builder()
+    for i in 0..l.names.len() {
+        text.push_str("//!module ")
+        text.push_str(l.names[i])
+        text.push_str("\n")
+        let s = l.srcs[i]
+        text.push_bytes(s)
+        if s.len() == 0 or s.at(s.len() - 1) != 10 {
+            text.push_str("\n")
+        }
+    }
+    var dest = out
+    if dest == "" {
+        var stem = path
+        while stem.ends_with(".gr") {
+            stem = stem.substr(0, stem.len() - 3)
+        }
+        dest = stem + ".bundle.gr"
+    }
+    let bytes = text.to_bytes()
+    match write_bytes(dest, bytes) {
+        Ok(_) -> ()
+        Err(e) -> {
+            eprint("error: cannot write `{dest}`: {loader.io_error_text(e)}")
+            exit(1)
+        }
+    }
+    print("wrote `{dest}`: {l.names.len()} module(s), {bytes.len()} bytes")
+}
+
+// ---------------------------------------------------------------------
+// Running: this command started as a bundle
+// ---------------------------------------------------------------------
+
+/// If this executable carries a program, runs it and answers true, the
+/// command then to end as the program did; otherwise false, and the
+/// command reads its command line. Only the last sixteen bytes are read to
+/// tell, then the payload.
+pub fn run_if_bundle() -> bool {
+    let exe = own_exe()
+    if exe == "" {
+        return false
+    }
+    let size = match file_size(exe) {
+        Ok(n) -> n
+        Err(_) -> return false
+    }
+    if size < 16 {
+        return false
+    }
+    let tail = match read_bytes_at(exe, size - 16, 16) {
+        Ok(t) -> t
+        Err(_) -> return false
+    }
+    if tail.len() != 16 or tail.slice(8, 16).to_str() != MAGIC or tail.at(7) >= 128 {
+        return false
+    }
+    var plen = 0
+    var i = 7
+    while i >= 0 {
+        plen = plen * 256 + tail.at(i)
+        i -= 1
+    }
+    if plen + 16 > size {
+        return false
+    }
+    let data = match read_bytes_at(exe, size - 16 - plen, plen + 16) {
+        Ok(d) -> d
+        Err(_) -> return false
+    }
+    let b = parse(data)
+    if not b.ok {
+        return false
+    }
+    run_bundle(b)
+    true
+}
+
+/// `run_bundle`: the program loaded from the payload -- the entry `main`
+/// shown under the recorded file name, each import as recorded, the
+/// dependency packages -- checked, and run with every argument as its own.
+fn run_bundle(b: Bundle) {
+    var resolved: Map[str, str] = map()
+    for k in 0..b.imp_m.len() {
+        resolved.set(b.imp_m[k] + "\t" + b.imp_a[k], b.imp_t[k])
+    }
+    let shown = if b.has_entry { b.entry } else { "main.gr" }
+    let l = loader.load_sources_shown(b.names, b.srcs, b.deps, "\0", resolved, shown)
+    let (p, c, t0) = front.checked_loaded(l)
+    var t = t0
+    let (text, holes) = emit.emit(c, t, p)
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+    match sexp.read(text.to_bytes()) {
+        Ok(tree) -> tirinterp.run_tree(tree, shown, args())
+        Err(msg) -> {
+            eprint("error: the TIR of `{shown}` does not read back: {msg}")
+            exit(1)
+        }
+    }
+}

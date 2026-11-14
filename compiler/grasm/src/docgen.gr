@@ -1,0 +1,427 @@
+// `grasm doc` (docs/self-hosting.md §6.20): the program checked as `grasm
+// check` checks it, then the Rust generator (`crates/grasm_sema/src/docs.rs`,
+// `collect` and `render_markdown`) ported over front's AST, which is the
+// Rust one node for node, its `///` text included: each documented item's
+// signature written back from the tree without a body, and its doc comment
+// with the hidden `# ` lines of its examples dropped. The signature writers
+// are `grasm api`'s too (api.gr).
+import front
+import front.ast
+import front.loader
+import gfmt.fmt
+import build
+import testing
+
+// ---------------------------------------------------------------------
+// The AST
+// ---------------------------------------------------------------------
+
+fn sl(a: Ast, id: i64, i: i64) -> i64 {
+    a.pool[a.off[id] + i]
+}
+
+fn items(a: Ast, v: i64) -> [i64] {
+    a.pool.slice(a.off[v], a.off[v] + a.n[v])
+}
+
+/// `Path::dotted`: the segments joined with `.`.
+fn dotted(a: Ast, path: i64) -> str {
+    var parts: [str] = []
+    for s in items(a, sl(a, path, 0)) {
+        parts.push(a.t[s])
+    }
+    parts.join(".")
+}
+
+/// The names of a list of identifiers (generics), joined with `, `.
+fn names_of(a: Ast, v: i64) -> str {
+    var parts: [str] = []
+    for g in items(a, v) {
+        parts.push(a.t[g])
+    }
+    parts.join(", ")
+}
+
+/// A list of paths (an effect row), each dotted, joined with `, `.
+fn paths_of(a: Ast, v: i64) -> str {
+    var parts: [str] = []
+    for p in items(a, v) {
+        parts.push(dotted(a, p))
+    }
+    parts.join(", ")
+}
+
+// ---------------------------------------------------------------------
+// Signatures (`docs::type_text` and the `*_signature`s)
+// ---------------------------------------------------------------------
+
+/// `type_text`: a written type as source text.
+pub fn type_text(a: Ast, te: i64) -> str {
+    let k = a.k[te]
+    if k == ast.Y_REF {
+        return "ref " + type_text(a, sl(a, te, 0))
+    }
+    if k == ast.Y_NAME {
+        let path = dotted(a, sl(a, te, 0))
+        let args = items(a, sl(a, te, 1))
+        if args.len() == 0 {
+            return path
+        }
+        var parts: [str] = []
+        for x in args {
+            parts.push(type_text(a, x))
+        }
+        return path + "[" + parts.join(", ") + "]"
+    }
+    if k == ast.Y_FN {
+        var ps: [str] = []
+        for x in items(a, sl(a, te, 0)) {
+            ps.push(type_text(a, x))
+        }
+        let effs = sl(a, te, 2)
+        var row = ""
+        if a.n[effs] > 0 {
+            row = " / \{" + paths_of(a, effs) + "}"
+        }
+        return "fn(" + ps.join(", ") + ") -> " + type_text(a, sl(a, te, 1)) + row
+    }
+    if k == ast.Y_LIST {
+        return "[" + type_text(a, sl(a, te, 0)) + "]"
+    }
+    if k == ast.Y_FALLIBLE {
+        return type_text(a, sl(a, te, 0)) + " ! " + type_text(a, sl(a, te, 1))
+    }
+    if k == ast.Y_TUPLE or k == ast.Y_UNION {
+        var parts: [str] = []
+        for x in items(a, sl(a, te, 0)) {
+            parts.push(type_text(a, x))
+        }
+        let sep = if k == ast.Y_TUPLE { ", " } else { " | " }
+        return "(" + parts.join(sep) + ")"
+    }
+    ""
+}
+
+/// `param_text`: `inout ` or `own ` before the name, then its type.
+fn param_text(a: Ast, p: i64) -> str {
+    let mode = sl(a, p, 0)
+    let m = if mode == 1 { "inout " } else if mode == 2 { "own " } else { "" }
+    m + a.t[sl(a, p, 1)] + ": " + type_text(a, sl(a, p, 2))
+}
+
+fn params_text(a: Ast, v: i64) -> str {
+    var parts: [str] = []
+    for p in items(a, v) {
+        parts.push(param_text(a, p))
+    }
+    parts.join(", ")
+}
+
+/// `fn_signature`.
+pub fn fn_signature(a: Ast, d: i64) -> str {
+    var s = str_builder()
+    if sl(a, d, 0) != 0 {
+        s.push_str("pub ")
+    }
+    s.push_str("fn ")
+    s.push_str(a.t[sl(a, d, 2)])
+    let gens = sl(a, d, 3)
+    if a.n[gens] > 0 {
+        s.push_str("[" + names_of(a, gens) + "]")
+    }
+    s.push_str("(" + params_text(a, sl(a, d, 5)) + ")")
+    let ret = sl(a, d, 6)
+    if ret >= 0 {
+        s.push_str(" -> " + type_text(a, ret))
+    }
+    let err = sl(a, d, 7)
+    if err >= 0 {
+        s.push_str(" ! " + type_text(a, err))
+    }
+    let row = sl(a, d, 8)
+    if row >= 0 {
+        s.push_str(" / \{" + paths_of(a, row) + "}")
+    }
+    s.to_str()
+}
+
+/// A field list as `name: type`, joined with `, `.
+fn fields_text(a: Ast, v: i64) -> str {
+    var parts: [str] = []
+    for f in items(a, v) {
+        parts.push(a.t[sl(a, f, 0)] + ": " + type_text(a, sl(a, f, 1)))
+    }
+    parts.join(", ")
+}
+
+/// `type_signature`.
+pub fn type_signature(a: Ast, d: i64) -> str {
+    var s = str_builder()
+    if sl(a, d, 0) != 0 {
+        s.push_str("pub ")
+    }
+    s.push_str("type ")
+    s.push_str(a.t[sl(a, d, 2)])
+    let gens = sl(a, d, 3)
+    if a.n[gens] > 0 {
+        s.push_str("[" + names_of(a, gens) + "]")
+    }
+    s.push_str(" = ")
+    let body = sl(a, d, 4)
+    let k = a.k[body]
+    if k == ast.B_STRUCT {
+        s.push_str("\{ " + fields_text(a, sl(a, body, 0)) + " }")
+    } else if k == ast.B_SUM {
+        var vs: [str] = []
+        for v in items(a, sl(a, body, 0)) {
+            let fs = sl(a, v, 1)
+            if a.n[fs] == 0 {
+                vs.push(a.t[sl(a, v, 0)])
+            } else {
+                vs.push(a.t[sl(a, v, 0)] + "(" + fields_text(a, fs) + ")")
+            }
+        }
+        s.push_str("| ")
+        s.push_str(vs.join(" | "))
+    } else {
+        s.push_str(type_text(a, sl(a, body, 0)))
+    }
+    s.to_str()
+}
+
+/// `fn_sig_text`: an effect's operation, its `-> T` and `! E`.
+fn fn_sig_text(a: Ast, op: i64) -> str {
+    var s = "fn " + a.t[sl(a, op, 0)] + "(" + params_text(a, sl(a, op, 1)) + ")"
+    let ret = sl(a, op, 2)
+    if ret >= 0 {
+        s = s + " -> " + type_text(a, ret)
+    }
+    let err = sl(a, op, 3)
+    if err >= 0 {
+        s = s + " ! " + type_text(a, err)
+    }
+    s
+}
+
+/// `effect_signature`.
+pub fn effect_signature(a: Ast, d: i64) -> str {
+    var ops: [str] = []
+    for op in items(a, sl(a, d, 1)) {
+        ops.push(fn_sig_text(a, op))
+    }
+    "effect " + a.t[sl(a, d, 0)] + " \{ " + ops.join("; ") + " }"
+}
+
+/// `const_signature`: `let NAME: T`, `pub ` before it when it is.
+pub fn const_signature(a: Ast, d: i64) -> str {
+    let vis = if sl(a, d, 0) != 0 { "pub " } else { "" }
+    let te = sl(a, d, 2)
+    if te >= 0 {
+        return vis + "let " + a.t[sl(a, d, 1)] + ": " + type_text(a, te)
+    }
+    vis + "let " + a.t[sl(a, d, 1)]
+}
+
+/// `extern_signature`: never `pub`, as Rust's writes it.
+pub fn extern_signature(a: Ast, d: i64) -> str {
+    let ret = sl(a, d, 3)
+    let r = if ret >= 0 { " -> " + type_text(a, ret) } else { "" }
+    "extern fn " + a.t[sl(a, d, 1)] + "(" + params_text(a, sl(a, d, 2)) + ")" + r
+}
+
+// ---------------------------------------------------------------------
+// Collecting and rendering
+// ---------------------------------------------------------------------
+
+/// The documented items of a program, in order (`docs::collect`), each
+/// with the index of its module.
+type DocItems = {
+    module: [i64],
+    kind: [str],
+    name: [str],
+    sig: [str],
+    has_doc: [bool],
+    doc: [str],
+}
+
+/// `collect`: in the entry module every `fn`, `type`, `let` and `extern
+/// fn`, in the others the `pub` ones; every `effect`.
+fn collect(l: Loaded) -> DocItems {
+    var out = DocItems{ module: [], kind: [], name: [], sig: [], has_doc: [], doc: [] }
+    for f in 0..l.mods.len() {
+        let m = l.mods[f]
+        let a = m.a
+        let entry = f == 0
+        var docs: Map[i64, str] = map()
+        for q in 0..m.doc_keys.len() {
+            docs.set(m.doc_keys[q], m.doc_vals[q])
+        }
+        for d in m.decls {
+            let k = a.k[d]
+            var kind = ""
+            var name = ""
+            var sig = ""
+            if k == ast.D_FN {
+                if sl(a, d, 0) == 0 and not entry {
+                    continue
+                }
+                kind = "fn"
+                name = a.t[sl(a, d, 2)]
+                sig = fn_signature(a, d)
+            } else if k == ast.D_TYPE {
+                if sl(a, d, 0) == 0 and not entry {
+                    continue
+                }
+                kind = "type"
+                name = a.t[sl(a, d, 2)]
+                sig = type_signature(a, d)
+            } else if k == ast.D_EFFECT {
+                kind = "effect"
+                name = a.t[sl(a, d, 0)]
+                sig = effect_signature(a, d)
+            } else if k == ast.D_CONST {
+                if sl(a, d, 0) == 0 and not entry {
+                    continue
+                }
+                kind = "let"
+                name = a.t[sl(a, d, 1)]
+                sig = const_signature(a, d)
+            } else if k == ast.D_EXTERN {
+                if sl(a, d, 0) == 0 and not entry {
+                    continue
+                }
+                kind = "extern fn"
+                name = a.t[sl(a, d, 1)]
+                sig = extern_signature(a, d)
+            } else {
+                continue
+            }
+            out.module.push(f)
+            out.kind.push(kind)
+            out.name.push(name)
+            out.sig.push(sig)
+            match docs.get(a.s[d]) {
+                Some(text) -> {
+                    out.has_doc.push(true)
+                    out.doc.push(text)
+                }
+                None -> {
+                    out.has_doc.push(false)
+                    out.doc.push("")
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `trim_start` as Rust's `str` does it: Unicode whitespace
+/// (`char::is_whitespace`, gfmt's `ws_len`), not the language's own set.
+pub fn trim_start_ws(s: str) -> str {
+    let b = s.to_bytes()
+    var i = 0
+    while i < b.len() {
+        let n = fmt.ws_len(b, i, b.len())
+        if n == 0 {
+            break
+        }
+        i += n
+    }
+    if i == 0 {
+        return s
+    }
+    b.slice(i, b.len()).to_str()
+}
+
+/// `without_hidden_lines`: a doc comment with the `# ` lines inside its
+/// fenced blocks left out, its lines rejoined with `\n`.
+fn without_hidden_lines(doc: str) -> str {
+    var out: [str] = []
+    var in_block = false
+    for line in testing.text_lines(doc) {
+        let trimmed = trim_start_ws(line)
+        if trimmed.starts_with("```") {
+            in_block = not in_block
+            out.push(line)
+            continue
+        }
+        if in_block and trimmed.starts_with("# ") {
+            continue
+        }
+        out.push(line)
+    }
+    out.join("\n")
+}
+
+/// `render_markdown`.
+fn render_markdown(title: str, l: Loaded, it: DocItems) -> str {
+    var out = str_builder()
+    out.push_str("# {title}\n")
+    var last = -1
+    for i in 0..it.kind.len() {
+        if it.module[i] != last {
+            last = it.module[i]
+            out.push_str("\n## Module `{l.names[last]}`\n")
+        }
+        out.push_str("\n### `{it.kind[i]}` {it.name[i]}\n\n")
+        out.push_str("```\n")
+        out.push_str(it.sig[i])
+        out.push_str("\n```\n")
+        if it.has_doc[i] {
+            out.push_str("\n")
+            out.push_str(without_hidden_lines(it.doc[i]))
+            out.push_str("\n")
+        }
+    }
+    out.to_str()
+}
+
+/// What `print!` writes: `text` as it is, which `print` would end with a
+/// newline of its own.
+pub fn print_raw(text: str) {
+    let b = text.to_bytes()
+    if b.len() == 0 {
+        return
+    }
+    if b.at(b.len() - 1) == 10 {
+        print(b.slice(0, b.len() - 1).to_str())
+    } else {
+        // Every text this command prints raw ends in a newline; one that
+        // did not would gain one here.
+        print(text)
+    }
+}
+
+// ---------------------------------------------------------------------
+// `grasm doc`
+// ---------------------------------------------------------------------
+
+/// `grasm doc <file> [-o out.md]`, in the Rust arm's order and words.
+pub fn cmd_doc(a: [str]) {
+    let rest = a.slice(1, a.len())
+    let path = build.first_operand(rest, ["-o"])
+    if path == "\0" {
+        eprint("usage: grasm doc <file.gr> [-o out.md]")
+        exit(1)
+    }
+    let (l, _p, _c, _t) = front.checked(path)
+    let it = collect(l)
+    var title = loader.enclosing_package_name(path)
+    if title == "\0" {
+        let stem = build.file_stem(path)
+        title = if stem == "\0" { "API" } else { stem }
+    }
+    let text = render_markdown(title, l, it)
+    let out = build.value_after(rest, "-o")
+    if out == "\0" {
+        print_raw(text)
+        return
+    }
+    match write_file(out, text) {
+        Ok(_) -> print("wrote {out} ({it.kind.len()} item(s))")
+        Err(e) -> {
+            eprint("error: cannot write {out}: {loader.io_error_text(e)}")
+            exit(1)
+        }
+    }
+}

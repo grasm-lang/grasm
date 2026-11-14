@@ -41,7 +41,7 @@ let B_BLOCK = 3
 
 /// The length of the Unicode whitespace character at `i`, or 0: what Rust's
 /// `char::is_whitespace` takes, which `trim_start` and `trim` remove.
-fn ws_len(b: bytes, i: i64, end: i64) -> i64 {
+pub fn ws_len(b: bytes, i: i64, end: i64) -> i64 {
     let c = b.at(i)
     if c == 32 or (c >= 9 and c <= 13) {
         return 1
