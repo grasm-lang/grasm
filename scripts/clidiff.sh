@@ -62,8 +62,10 @@
 #           `--native`: the output (the size aside), the Grasm bundle the
 #           command's own executable followed by exactly the bytes that follow
 #           the Rust command's executable in the Rust bundle, both bundles
-#           run with arguments (the Rust trace stripped), the Grasm one made
-#           twice the same
+#           run from the checkout with no argument and from empty
+#           directories with arguments (the Rust trace stripped, the files
+#           they leave compared; the `IoFailed` wording of
+#           docs/known-issues.md counted), the Grasm one made twice the same
 #   source  every corpus program, `build P --source -o F`: the output and
 #           the file; every tenth with a `main` also run from that file by
 #           both commands
@@ -791,6 +793,7 @@ bundle_same=0
 bundle_refused=0
 bundle_payload=0
 bundle_ran=0
+bundle_iofailed=0
 bundle_repro=0
 if want bundle; then
     mkdir -p "$WORK/u/r" "$WORK/u/g" "$WORK/u/g2"
@@ -828,18 +831,47 @@ if want bundle; then
             fail "grasm build $src (a bundle) -- not the command followed by the Rust bundle's payload ($size and $r_size bytes)"
             continue
         fi
-        $RUN_LIMIT "$WORK/u/r/prog" a "b c" -- -d >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
-        r_rc=$?
-        $RUN_LIMIT sandbox-exec -p "$NORUST" "$WORK/u/g/prog" a "b c" -- -d >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
-        g_rc=$?
-        if cmp -s "$WORK/r.out" "$WORK/g.out" && [ "$r_rc" = "$g_rc" ] && [ "$r_rc" != 124 ] &&
-            [ "$(strip_trace "$(cat "$WORK/r.err")")" == "$(cat "$WORK/g.err")" ]; then
-            bundle_ran=$((bundle_ran + 1))
-        else
-            fail "$src bundled by each runs otherwise -- exit $r_rc (Rust's bundle) and $g_rc (Grasm's)"
-            diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
-            diff <(strip_trace "$(cat "$WORK/r.err")") "$WORK/g.err" | head -4 | sed 's/^/  /'
-        fi
+        # Run as `run` runs them, from the checkout with no argument; then
+        # with arguments, each from an empty directory of its own, whose
+        # files are compared too -- a program may take an argument for a
+        # path to write, which from the checkout would be litter.
+        ran_ok=1
+        for how in plain args; do
+            rm -rf "$WORK/u/rd" "$WORK/u/gd"
+            mkdir -p "$WORK/u/rd" "$WORK/u/gd"
+            if [ "$how" = plain ]; then
+                $RUN_LIMIT "$WORK/u/r/prog" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+                r_rc=$?
+                $RUN_LIMIT sandbox-exec -p "$NORUST" "$WORK/u/g/prog" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+                g_rc=$?
+            else
+                (cd "$WORK/u/rd" && $RUN_LIMIT "$WORK/u/r/prog" a "b c" -- -d >"$WORK/r.out" 2>"$WORK/r.err" </dev/null)
+                r_rc=$?
+                (cd "$WORK/u/gd" && $RUN_LIMIT sandbox-exec -p "$NORUST" "$WORK/u/g/prog" a "b c" -- -d >"$WORK/g.out" 2>"$WORK/g.err" </dev/null)
+                g_rc=$?
+            fi
+            strip_trace "$(cat "$WORK/r.err")" >"$WORK/r.strip"
+            if cmp -s "$WORK/r.out" "$WORK/g.out" && [ "$r_rc" = "$g_rc" ] && [ "$r_rc" != 124 ] &&
+                [ "$(cat "$WORK/r.strip")" == "$(cat "$WORK/g.err")" ] &&
+                [ "$(listing "$WORK/u/rd")" = "$(listing "$WORK/u/gd")" ]; then
+                :
+            elif cmp -s "$WORK/r.out" "$WORK/g.out" && [ "$r_rc" = "$g_rc" ] &&
+                [ "$(listing "$WORK/u/rd")" = "$(listing "$WORK/u/gd")" ] &&
+                [ "$(sed -E 's/(IoFailed\(.*) \(os error [0-9]+\)\)/\1)/' "$WORK/r.strip")" == "$(cat "$WORK/g.err")" ]; then
+                # The `IoFailed` text the engines word differently, an open
+                # S1 in docs/known-issues.md (§6.17): counted, not hidden.
+                bundle_iofailed=$((bundle_iofailed + 1))
+                echo "  the IoFailed wording, docs/known-issues.md: $src ($how)"
+            else
+                ran_ok=0
+                fail "$src bundled by each runs otherwise ($how) -- exit $r_rc (Rust's bundle) and $g_rc (Grasm's)"
+                diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+                diff "$WORK/r.strip" "$WORK/g.err" | head -4 | sed 's/^/  /'
+                diff <(listing "$WORK/u/rd") <(listing "$WORK/u/gd") | head -4 | sed 's/^/  /'
+            fi
+        done
+        rm -rf "$WORK/u/rd" "$WORK/u/gd"
+        [ "$ran_ok" = 1 ] && bundle_ran=$((bundle_ran + 1))
         if g build "$src" -o "$WORK/u/g2/prog" >/dev/null 2>&1 </dev/null && cmp -s "$WORK/u/g/prog" "$WORK/u/g2/prog"; then
             bundle_repro=$((bundle_repro + 1))
         else
@@ -847,7 +879,7 @@ if want bundle; then
         fi
     done <"$WORK/mains"
     rm -rf "$WORK/u"
-    echo "bundle: $bundles programs with a main   the same output: $bundle_same, $bundle_refused of them refusals   the command and Rust's payload: $bundle_payload   run alike: $bundle_ran   built twice the same: $bundle_repro"
+    echo "bundle: $bundles programs with a main   the same output: $bundle_same, $bundle_refused of them refusals   the command and Rust's payload: $bundle_payload   run alike, plain and with arguments: $bundle_ran ($bundle_iofailed run(s) differing only in the IoFailed wording)   built twice the same: $bundle_repro"
 fi
 
 # source: every corpus program, `--source`; every tenth with a `main` run
