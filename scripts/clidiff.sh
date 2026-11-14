@@ -1145,5 +1145,19 @@ if [ -n "$whole" ]; then
         echo "too little compared in fmt, lint, test or bench: $fmt_files files, $fmt_rewritten rewritten, $fmt_refused refused; $lint_files linted, $lint_findings findings; $test_props, $test_contracts, $test_cov, $test_failed failing; $tm_runs mains as tests, $tm_failed failing, $tm_host the host's; $bench_files with a benchmark, $bench_timed timing lines"
         exit 1
     fi
+    # The floors of §6.20's sections, a margin below the first runs of the
+    # whole corpus (2026-11-13 and 14, the stage-1 command): `doc` 1,426
+    # documents written and 66,515 items, 71 refusals; `api` 1,132 programs
+    # with a surface, each an item added, removed and changed, 66 refusals;
+    # `bundle` 651 run alike, none differing in the `IoFailed` wording;
+    # `source` 1,086 refusals (no `main`) and 66 run from the file.
+    if [ "$doc_written" -lt 1300 ] || [ "$doc_items" -lt 60000 ] || [ "$doc_refused" -lt 60 ] ||
+        [ "$api_surfaces" -lt 1050 ] || [ "$api_added" -lt 1050 ] || [ "$api_removed" -lt 1050 ] ||
+        [ "$api_changed" -lt 1050 ] || [ "$api_refused" -lt 55 ] ||
+        [ "$bundle_ran" -lt 640 ] || [ "$bundle_iofailed" -gt 0 ] ||
+        [ "$source_refused" -lt 1000 ] || [ "$source_ran" -lt 60 ]; then
+        echo "too little compared in doc, api, bundle or source: $doc_written documents, $doc_items items, $doc_refused refused; $api_surfaces surfaces, $api_added added, $api_removed removed, $api_changed changed, $api_refused refused; $bundle_ran bundles run alike, $bundle_iofailed in the IoFailed wording; $source_refused refused, $source_ran run"
+        exit 1
+    fi
 fi
 exit 0
