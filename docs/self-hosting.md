@@ -5608,6 +5608,296 @@ journal and replay, the wasm32 backend and one TOML reader. The gates of
 §6.14's last list that run through the `grasm` command still take the Rust
 one.
 
+### 6.21 S8 part four: `deps`, `add`, `publish`, and one TOML reader
+
+Written 2026-11-14, before any code, as the design to build to. Parts one to
+three (§6.17, §6.19, §6.20) left `deps`, `add`, `publish`, `lsp`, `dap` and
+`journal` answering "not in the Grasm toolchain yet", and two TOML readers
+in the Grasm toolchain where S8 is to leave one (§6, S8). This part takes the
+three package subcommands into `compiler/grasm`, held to the Rust command as
+the others are -- the same reading of the command line (`prevalidate`
+already reads all three), stdout, stderr, exit status, and every file
+written, the lockfile and a registry's contents among them -- and settles
+the reader. The Rust toolchain stays stage 0 and the oracle and is not
+changed; where its behaviour is wrong it is reproduced and recorded in
+docs/known-issues.md.
+
+**What a registry is, and what touches the network.** Nothing.
+`grasm_pkg` depends on `grasm_sema` and `grasm_syntax` alone and opens no
+socket; a registry is a directory, `<root>/<name>/<version>/grasm.toml` and
+the package's sources beside it ("deliberately a directory rather than a
+service"). Its root is `--registry <dir>` (publish only), else
+`GRASM_REGISTRY`, else the nearest `.grasm/registry` found walking up from
+the package's canonical directory (`Registry::discover`). So the gates need
+no network and no mirror: they use registries in scratch, made by `publish`
+itself and by `scripts/lib/regcases.py` (to be written), and a copy of the
+tracked `examples/registry/.grasm/registry`; they name the root with
+`--registry` or `GRASM_REGISTRY`, and assert before they run that no
+`.grasm/registry` exists above their work directory and that
+`GRASM_REGISTRY` is unset in the environment they inherit (on this machine
+neither exists, checked 2026-11-14), so the walk cannot find a registry the
+gate did not make.
+
+**What the Rust arms do** (`crates/grasm/src/main.rs` `cmd_deps`,
+`cmd_add`, `cmd_publish`; `crates/grasm_pkg`):
+
+- `deps [dir] [--locked]`. The directory is `first_operand` (else `.`),
+  `--locked` anywhere. `resolve(dir)`: the root's manifest
+  (`Manifest::load`, its errors prefixed with the tidied path), minimal
+  version selection over the registry (each name gets the lowest version it
+  holds at or above the highest floor anyone states, then every requirement
+  checked, a conflict naming each requirer), then a depth-first walk giving
+  the packages dependencies first, refusing a cycle, a missing manifest, a
+  dependency whose manifest names another package, a version a requirement
+  refuses, and one name reached at two directories. Then on stdout `<root>
+  <version> — N package(s) in the graph`, and per package `  {name:<16}
+  performs [..]  permits [..]` -- what its own sources perform
+  (`effects_of_package`: the entry and every other `.gr` file under the
+  package, each loaded and checked as a program; a failure is `  {name:<16}
+  CANNOT ANALYZE`, worded by `first_failure`, "(reached through a
+  dependency)" when the failing file is a dependency's) together with what
+  it performs in the root's whole program (`effects_by_package`), and the
+  ceiling or `(unrestricted)`. Then, in this order, each a reason to stop
+  with exit 1 and the lockfile untouched: packages that could not be
+  analysed (`error: cannot analyze ...` and a two-line help), capability
+  names that are no effect (`check_capability_names`, the nearest real name
+  by edit distance within `max(2, len/3)` as "did you mean"), and ceilings
+  exceeded (`CapabilityViolation` and `ceiling_help`'s `performed: ... at
+  ...`), the last line `error: N package(s) ...` from `main`. Then the
+  lock: per package its name, version, SHA-256 over `grasm.toml\0<manifest>\0`
+  and every `.gr` file under the package as `<relative path>\0<bytes>\0`,
+  sorted as `PathBuf` sorts (by component, not by byte: `a/b.gr` before
+  `a-b.gr`), and its ceiling; rendered as `[[package]]` tables under a
+  two-line header, strings quoted by `toml::quote`. Against an existing
+  `grasm.lock` (read by the same TOML reader, `parse_lock`; a file it
+  refuses is one change, "unreadable"): per package in the graph's order,
+  not in the lockfile, or its version, its contents (the two checksums'
+  first twelve bytes) and its capabilities changed; then each package the
+  lockfile has and the graph does not. `--locked`: no lockfile is an
+  error; any change is `error: <change>` per change, a help, and `N
+  change(s) since grasm.lock`; none is `grasm.lock is up to date` with
+  nothing written. Without it each change is `  note: <change>` and the
+  lockfile is written whole (`fs::write`, so its mode is the umask's) and
+  `wrote <dir>/grasm.lock` printed (`./grasm.lock` for `.`).
+- `add <name> <version> [dir]`. Name and version are the two arguments
+  after `add` whatever they are (`grasm add --registry r x` takes
+  `--registry` as the name); the directory is the third unless it starts
+  with `--`. `--registry` passes the command-line check and is never read:
+  `add` touches no registry. `VersionReq::parse` (trimmed; `=` exact, `^` or bare
+  compatible), the name an identifier, the manifest read
+  (`cannot read <dir>/grasm.toml: <io error>`) and parsed -- its errors
+  *without* the path prefix `Manifest::load` adds -- and a dependency of
+  that name refused ("already a dependency, at ^1.0.0" or "by path"). Then
+  the text appended as written: a newline if the file lacks one, a blank
+  line, `[dependencies.<name>]`, `version = "<req as displayed>"`
+  (`+01.2.3` becomes `^1.2.3`). Prints `added `<name>` <req> to <package>`
+  and `  run `grasm deps` to resolve it`.
+- `publish [dir] [--registry R]`. The registry first (missing: "no
+  registry found" and how to make one). Then `Manifest::load`, the version,
+  the entry file existing, `capabilities` present (publish is the one place
+  it is required), the package within its own ceiling (`effects_of_package`
+  against it, "refusing to publish a package that exceeds its own
+  ceiling"), no `path` dependency, and the version not already there
+  ("a published version is immutable -- publish x.y.(z+1) instead"). Then
+  `create_dir_all(<root>/<name>/<version>)`, the manifest and every `.gr`
+  file under the package copied into it with their relative paths
+  (`fs::copy`, which keeps each file's permission bits), and `published
+  <name> <version> — N file(s) to <dir>`.
+
+**What Grasm already has.** `front`'s loader reads and checks a manifest as
+`Manifest::load` does (`load_manifest`, held by `diagdiff`'s 67 package
+cases), and resolves the graph as `resolve` does, the registry with it
+(`resolve_graph`, `select_versions`, `visit`, `discover_registry`,
+`registry_versions`); `ceiling.gr` has `effects_of_package`,
+`effects_by_package` and `effect_sites_of_package` for the capability
+ceilings `check` enforces, and `source_files`; `crypto_hash.sha256_of`
+(which `compiler/link` already uses for code signatures) is SHA-256;
+`bundle.gr` calls `chmod(2)` and `build.gr` `stat(2)`.
+
+**What has to be written**, and where:
+
+- `compiler/grasm/src/pkg.gr`: `cmd_deps`, `cmd_add`, `cmd_publish`; the
+  lockfile (`build_lock`, `render_lock`, `parse_lock`, `diff_lock` and the
+  changes' wording); the checksum; `effect_vocabulary`,
+  `check_capability_names` and the edit distance over characters; the copy
+  into a registry, each file's mode carried over by `stat` and `chmod`, as
+  `fs::copy` carries it.
+- `compiler/front`: `ceiling.gr`'s three functions public, and
+  `effects_of_package`'s reason worded as `first_failure` words it (`check`
+  prints none of it, so it was never needed: §6.13); `source_files` sorted
+  by component and its walk deduplicated by canonical directory, as
+  `collect_sources` is (it now uses the path as written, which a symbolic
+  link loop would defeat); `Manifest` and `resolve_graph` public to the
+  command.
+- `main.gr`: the three out of `elsewhere`, into the dispatch and the help
+  line. `lsp`, `dap` and `journal` stay there.
+
+What will differ, before a line is written: nothing intended. The two places
+to measure rather than assume are the ones where `deps` runs code the
+command has not run before on the whole corpus -- `effects_of_package` on
+every package in a graph (the `check` path calls it only for packages with
+a ceiling) and `effects_by_package` on a root that does not check (the
+Rust one analyses the parsed program; the Grasm one needs the checker's
+rows) -- and the time: the Rust `deps compiler/grasm`, 19 packages, took
+1 minute 49 seconds (once, 2026-11-14, nothing else running; it loads and
+checks every source file of every package as a program of its own).
+
+**The TOML decision, measured.** Three readers of manifests are in the Grasm
+toolchain today: `rtoml.gr`, the port of `grasm_pkg::toml` the loader reads
+manifests with and `grasm toml` prints; the loader's own line-by-line
+questions (a dependency's path, the entry, `runtime`), ports of the Rust
+loader's (`loader.rs` reads a manifest a second way, line by line); and
+`packages/toml`, which reads TOML itself and serves `front toml`. Both
+candidates were run, with the Rust reader (`grasm toml`) and `tomllib`
+(`scripts/lib/tomldump.py`), over every `.toml` file git tracks, the 102
+manifests `diagcases.py` writes, and 1,500 manifests from a new generator,
+`scripts/lib/tomlfuzz.py` (seed 1): a third in the dialect the Rust reader
+documents, a third valid TOML outside it (floats, inline tables, arrays
+across lines, literal and multi-line strings, `\u` escapes, hex and `_`
+integers, dates, dotted and quoted keys and headers), a third broken.
+`=` is the same bytes; `~` the same with a refusal's words taken out, as
+`tomldiff` compares.
+
+| input | files | Rust ~ tomllib | rtoml = Rust | rtoml ~ tomllib | packages/toml ~ tomllib | packages/toml ~ Rust |
+|---|---:|---:|---:|---:|---:|---:|
+| tracked `.toml` | 1,474 | 1,455 | 1,474 | 1,455 | 1,473 | 1,456 |
+| `diagcases.py` manifests | 102 | 100 | 102 | 100 | 97 | 97 |
+| fuzzed, dialect | 500 | 481 | 500 | 481 | 347 | 365 |
+| fuzzed, valid TOML | 500 | 267 | 500 | 267 | 203 | 215 |
+| fuzzed, broken | 500 | 382 | 500 | 382 | 293 | 347 |
+| fuzzed, all | 1,500 | 1,130 | 1,500 | 1,130 | 843 | 927 |
+
+What it says:
+
+- `rtoml.gr` is the Rust reader on every file, refusals' words included
+  (3,076 of 3,076). It agrees with `tomllib` exactly where the Rust reader
+  does.
+- `packages/toml` is no TOML reader to hold anything to: on the fuzzed
+  manifests it accepts 482 files `tomllib` refuses (a key or a table twice,
+  an array item that is a bare word, `[[bin]`), refuses 102 it accepts
+  (74 arrays across lines, 24 multi-line strings, four `\b` or `\f`
+  escapes) and reads 73 otherwise. It agrees on the tracked
+  manifests only because they are tame.
+- **The Rust reader is not TOML either, and that is the decision.** It
+  disagrees with `tomllib` on 370 of the 1,500 fuzzed manifests: it
+  refuses 203 that are valid TOML outside its dialect (by design: "anything
+  outside that is a clear error"), and it misreads 167 -- 119 that are not
+  TOML it accepts, 48 that are TOML it reads to other values. Each class,
+  reproduced 2026-11-14: `k = "A"` is `A`, not `A` (no `\u`,
+  `\U`, `\b`, `\f` or `\r`); `k = "a\"#b"` is `a\` -- the escaped quote
+  ends the string for the comment cut, so a valid string is silently
+  truncated -- and `k = ["a\", \"b"]` is refused for the same reason;
+  `k = "a" "b"` is `a" "b`; `a key = 1` is a key `a key`; `k = 007` is 7;
+  `[dependencies.]` is a table; `[a."b.c"]` is the table `a."b.c"` and
+  `'lit' = 1` the key `'lit'`; `k = """x"""` is `""x""`. In the
+  repository only the 19 `Cargo.toml` files fall outside (valid TOML, an
+  inline table or an array across lines, refused); among `diagdiff`'s cases,
+  `dep-empty-name` (`[dependencies.]`, accepted, then refused as an unknown
+  table) and `toml-float`.
+
+So no reader can be both what S8 asks of the one that stays -- "every
+manifest in the repository, and fuzzed ones, read by it and by `tomllib`,
+agreeing" -- and what every gate that runs the Grasm command asks of it --
+the Rust command's bytes, `grasm toml`, `check`'s manifest diagnostics,
+`deps` -- because on a quarter of the fuzzed manifests those two answers
+differ. One of them gives way on exactly those files:
+
+- **(A) `rtoml.gr` promoted into `packages/toml`.** The package's reader
+  becomes the Rust reader, line for line, with an accessor API for a
+  program's configuration over it; `rtoml.gr` and the reader `packages/toml`
+  has now are deleted; the loader, `grasm toml`, `front toml` and the
+  lockfile read through it. Every gate holds Rust's bytes as now, and
+  `diagdiff`, `loaddiff` and `clidiff`'s `toml` are unchanged by
+  construction. `tomldiff` keeps the tracked manifests three ways (all
+  agree), and over the fuzzed ones holds the reader to the Rust reader byte
+  for byte, refusals included, and to `tomllib` wherever the Rust reader
+  agrees with it; the rest it counts by class -- refused valid TOML,
+  accepted non-TOML, read otherwise -- and the misreadings go into
+  docs/known-issues.md as the Rust reader's, reproduced, to be fixed in the
+  one reader when the oracle is gone (S9), as §6.13 does with the checker's.
+  Costs: `packages/toml` stops reading floats, inline tables, arrays across
+  lines, literal strings, dates and `\u` escapes -- its only users are
+  `front toml` and `packages/toml-demo`, whose program is rewritten to the
+  dialect -- and S8's sentence holds on the fuzzed manifests only where the
+  Rust reader is right.
+- **(B) `packages/toml`, made a TOML reader, in the loader.** It is
+  rewritten to agree with `tomllib` on every fuzzed file, and the manifest
+  layer refuses what the dialect leaves out in the Rust reader's words
+  (`line N: cannot parse value `...``, `unterminated array`), from each
+  value's line and written text. S8's sentence holds to the letter. Costs:
+  where the Rust reader misreads (167 of the 1,500), the Grasm command
+  answers as TOML does and not as Rust does, which the owner's rule --
+  reproduce Rust's wrong behaviour and record it -- forbids unless waived
+  for manifests; `diagdiff`'s `dep-empty-name` changes; and reproducing
+  the Rust reader's *refusal* of a valid file exactly needs its line
+  algorithm (the `"a\"#b"` case is a refusal of a valid file decided by
+  the comment cut), so either some refusals' words differ too or that
+  algorithm survives as a check, which is a second reader by another name.
+
+Recommended: **(A)**, by the agent, for two reasons. It is the only one
+that keeps the owner's rule that the Rust toolchain's wrong behaviour is
+reproduced while it is the oracle, and with it every gate unchanged; and
+the thing (B) would gain -- a reader that agrees with `tomllib` -- is worth
+having only once nothing holds the toolchain to a reader that does not,
+which is S9: (A) leaves one reader whose every departure from TOML is
+counted by `tomldiff` and recorded, to be fixed in one place on the day the
+Rust reader goes. **This needs a decision** (the coordinator's, and the
+owner's to reverse): (A) or (B), and under (A), that S8's "agreeing" holds
+over the fuzzed manifests where the Rust reader agrees with `tomllib`.
+
+One more reader goes under either: the loader's line-by-line questions read
+a manifest as the Rust loader does, which is not as `grasm_pkg::toml` does
+(a `#` inside a quoted path cuts it; no escape is undone; the first `entry =`
+anywhere is the entry, an `[[bin]]` entry included). Routed through the one
+reader, they answer as the Rust command's other reader answers: the same on
+every manifest both readers read alike, and on the rest the Rust toolchain
+disagrees with itself. To be measured by `loaddiff` and `diagdiff`, not
+assumed; if one of their programs moves, it is reported, not hidden.
+
+**How the output is held to Rust's.** `clidiff` gains three sections, each
+both commands on the same input from directories of their own, the counts
+asserted and floors set from a first whole run:
+
+- `deps`: every package in the repository, in a copy of the checkout's
+  packages (a lockfile is written into each): `deps P` with no lockfile,
+  again over the lockfile it wrote, `deps --locked P`, then with the
+  lockfile edited each way `diff_lock` names -- a package's checksum, its
+  version, its capabilities (to none and to `[]`), an entry removed, one
+  added, a file the reader refuses -- and with a source byte changed, each
+  plain and `--locked`. stdout, stderr, status and the lockfile's bytes.
+  The tracked lockfiles (`apps/apigateway`, `examples/jsonlib`,
+  `examples/registry`, `examples/workspace`) as they are.
+- `add`: in copies of a sample of manifests and of `regcases.py`'s: a new
+  dependency, one already there by version and by path, a name that is not
+  an identifier and a keyword, versions bare, `^`, `=`, `+01.2.3` and
+  malformed, a missing manifest, a manifest that does not parse, one with no
+  final newline, one with CR LF. The output and the manifest's bytes.
+- `publish`: every package in the copy, into an empty registry by
+  `--registry`, by `GRASM_REGISTRY` and by a `.grasm/registry` above it,
+  then again (immutable); and `regcases.py`'s packages for each refusal (no
+  capabilities, over its ceiling, a path dependency, no entry file, a
+  version not `MAJOR.MINOR.PATCH`, no registry). The output, and the two
+  registries' trees: every path, every file's bytes and mode.
+- Resolution against a registry: `regcases.py` writes package graphs over
+  registries in scratch -- the lowest version above the highest floor, a
+  conflict, a version missing, a name missing, a dependency of a registry
+  package, exact requirements, `0.0.x` and `0.x` ranges, a version
+  directory that is not a version, a `README` beside the versions -- and
+  `deps` runs over each, so the registry's reading is held too, not only
+  `publish`'s writing.
+
+`tomldiff` gains the fuzzed manifests (`tomlfuzz.py`, its counts asserted)
+as the decision says. `clicases.txt` loses the `elsewhere` tags of the three
+and gains lines reaching each arm's checks. `clicontrols` gains four: a
+lockfile's entries written in another order (`deps`), a package dropped
+from the graph without a word (`deps`), `publish` writing into
+`<root>/<version>/<name>`, and for the reader, a key set twice keeping the
+first value (under (A); under (B) an escape decoded otherwise).
+
+**Self-hosting.** The command grows by the lockfile and the registry;
+`fixpoint` must still find its stage 3 its stage 2, and `clidiff` runs again
+with stage 2's command.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
