@@ -44,7 +44,6 @@
 import front
 import front.loader
 import front.emit
-import front.rtoml
 import tirinterp
 import tirinterp.sexp
 import build
@@ -99,7 +98,7 @@ fn main() {
     } else if cmd == "api" {
         api.cmd_api(a)
     } else if cmd == "toml" {
-        cmd_toml(operand(a, "usage: grasm toml <file.toml>"))
+        front.cmd_toml(operand(a, "usage: grasm toml <file.toml>"))
     } else if cmd == "version" or cmd == "--version" {
         print("grasm {VERSION}")
     } else if elsewhere(cmd) {
@@ -366,71 +365,3 @@ fn cmd_links(a: [str]) {
     }
 }
 
-/// `grasm toml`: a manifest as the toolchain's own reader reads it
-/// (`compiler/front/src/rtoml.gr`, the port of `grasm_pkg::toml` the loader
-/// reads manifests with): every key of every table as a dotted path, in byte
-/// order, a tab, its kind and value; then each entry of each array of
-/// tables, the arrays by name, the entries numbered in the file's order, the
-/// keys sorted within one. A file the reader refuses prints `refused` and
-/// why, and is no failure.
-fn cmd_toml(path: str) {
-    let text = front.read_source(path).to_str()
-    let doc = rtoml.parse(text)
-    if not doc.ok {
-        print("refused {doc.why}")
-        return
-    }
-    var lines: [str] = []
-    for ti in 0..doc.t_names.len() {
-        let table = doc.t_names[ti]
-        for ki in 0..doc.t_keys[ti].len() {
-            let k = doc.t_keys[ti][ki]
-            let at = if table == "" { k } else { table + "." + k }
-            lines.push(at + "\t" + toml_value(doc, doc.t_vals[ti][ki]))
-        }
-    }
-    lines.sort()
-    var arrays: [str] = []
-    for n in doc.a_names {
-        if not arrays.contains(n) {
-            arrays.push(n)
-        }
-    }
-    arrays.sort()
-    for n in arrays {
-        var i = 0
-        for ai in 0..doc.a_names.len() {
-            if doc.a_names[ai] != n {
-                continue
-            }
-            for ki in 0..doc.a_keys[ai].len() {
-                lines.push("{n}[{i}].{doc.a_keys[ai][ki]}\t" + toml_value(doc, doc.a_vals[ai][ki]))
-            }
-            i += 1
-        }
-    }
-    for l in lines {
-        print(l)
-    }
-}
-
-/// One value as `grasm toml` prints it: `str` and the string quoted as TIR
-/// quotes it, `int N`, `bool true`, `array [...]`.
-fn toml_value(doc: RDoc, v: i64) -> str {
-    let k = doc.v_kind[v]
-    if k == rtoml.V_STR {
-        return "str " + loader.quote(doc.v_str[v])
-    }
-    if k == rtoml.V_INT {
-        let n = doc.v_str[v].parse_int() ?? 0
-        return "int {n}"
-    }
-    if k == rtoml.V_BOOL {
-        return "bool " + doc.v_str[v]
-    }
-    var parts: [str] = []
-    for item in doc.v_items[v] {
-        parts.push(toml_value(doc, item))
-    }
-    "array [" + parts.join(", ") + "]"
-}

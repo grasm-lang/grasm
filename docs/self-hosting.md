@@ -5762,10 +5762,10 @@ integers, dates, dotted and quoted keys and headers), a third broken.
 |---|---:|---:|---:|---:|---:|---:|
 | tracked `.toml` | 1,474 | 1,455 | 1,474 | 1,455 | 1,473 | 1,456 |
 | `diagcases.py` manifests | 102 | 100 | 102 | 100 | 97 | 97 |
-| fuzzed, dialect | 500 | 481 | 500 | 481 | 347 | 365 |
-| fuzzed, valid TOML | 500 | 267 | 500 | 267 | 203 | 215 |
-| fuzzed, broken | 500 | 382 | 500 | 382 | 293 | 347 |
-| fuzzed, all | 1,500 | 1,130 | 1,500 | 1,130 | 843 | 927 |
+| fuzzed, dialect | 500 | 478 | 500 | 478 | 434 | 455 |
+| fuzzed, valid TOML | 500 | 229 | 500 | 229 | 215 | 186 |
+| fuzzed, broken | 500 | 344 | 500 | 344 | 278 | 386 |
+| fuzzed, all | 1,500 | 1,051 | 1,500 | 1,051 | 927 | 1,027 |
 
 What it says:
 
@@ -5773,16 +5773,17 @@ What it says:
   (3,076 of 3,076). It agrees with `tomllib` exactly where the Rust reader
   does.
 - `packages/toml` is no TOML reader to hold anything to: on the fuzzed
-  manifests it accepts 482 files `tomllib` refuses (a key or a table twice,
-  an array item that is a bare word, `[[bin]`), refuses 102 it accepts
-  (74 arrays across lines, 24 multi-line strings, four `\b` or `\f`
-  escapes) and reads 73 otherwise. It agrees on the tracked
+  manifests it accepts 388 files `tomllib` refuses (a key or a table twice,
+  an array item that is a bare word, `[[bin]`), refuses 92 it accepts
+  (55 arrays across lines, 31 multi-line strings, five `\b`, `\f` or `\U`
+  escapes, an inline table across lines) and reads 93 otherwise. It agrees on the tracked
   manifests only because they are tame.
 - **The Rust reader is not TOML either, and that is the decision.** It
-  disagrees with `tomllib` on 370 of the 1,500 fuzzed manifests: it
-  refuses 203 that are valid TOML outside its dialect (by design: "anything
-  outside that is a clear error"), and it misreads 167 -- 119 that are not
-  TOML it accepts, 48 that are TOML it reads to other values. Each class,
+  disagrees with `tomllib` on 449 of the 1,500 fuzzed manifests: it
+  refuses 216 that are valid TOML (206 outside its dialect, by design --
+  "anything outside that is a clear error" -- and 10 strings with an
+  escaped quote, below), and it misreads 233 -- 156 that are not TOML it
+  accepts, 77 that are TOML it reads to other values. Each class,
   reproduced 2026-11-14: `k = "A"` is `A`, not `A` (no `\u`,
   `\U`, `\b`, `\f` or `\r`); `k = "a\"#b"` is `a\` -- the escaped quote
   ends the string for the comment cut, so a valid string is silently
@@ -5799,7 +5800,7 @@ So no reader can be both what S8 asks of the one that stays -- "every
 manifest in the repository, and fuzzed ones, read by it and by `tomllib`,
 agreeing" -- and what every gate that runs the Grasm command asks of it --
 the Rust command's bytes, `grasm toml`, `check`'s manifest diagnostics,
-`deps` -- because on a quarter of the fuzzed manifests those two answers
+`deps` -- because on almost a third of the fuzzed manifests those two answers
 differ. One of them gives way on exactly those files:
 
 - **(A) `rtoml.gr` promoted into `packages/toml`.** The package's reader
@@ -5825,7 +5826,7 @@ differ. One of them gives way on exactly those files:
   layer refuses what the dialect leaves out in the Rust reader's words
   (`line N: cannot parse value `...``, `unterminated array`), from each
   value's line and written text. S8's sentence holds to the letter. Costs:
-  where the Rust reader misreads (167 of the 1,500), the Grasm command
+  where the Rust reader misreads (233 of the 1,500), the Grasm command
   answers as TOML does and not as Rust does, which the owner's rule --
   reproduce Rust's wrong behaviour and record it -- forbids unless waived
   for manifests; `diagdiff`'s `dep-empty-name` changes; and reproducing
@@ -5834,16 +5835,27 @@ differ. One of them gives way on exactly those files:
   the comment cut), so either some refusals' words differ too or that
   algorithm survives as a check, which is a second reader by another name.
 
-Recommended: **(A)**, by the agent, for two reasons. It is the only one
+**Decided: (A)**, by the owner, 2026-11-14 (recommended by the agent).
+`tomldiff` holds the one reader to the Rust reader byte for byte on every
+file and to `tomllib` wherever the Rust reader agrees with `tomllib`, and
+counts the rest by how they disagree and by a recorded cause
+(`scripts/lib/tomlclass.py`), asserting the counts at the default size and
+seed so that a new way to disagree fails the gate; each of the Rust
+reader's misreadings is in docs/known-issues.md with its reproducer and
+severity, to be fixed at the S9 cutover. The loader's line-by-line
+questions go through the one reader, and a program whose answer changes is
+reported. The measurements above are the generator as committed with the
+reader (one key in ten set twice in the dialect's third, where the first
+draft set every fourth or so twice and saw fewer files read).
+
+The agent's reasons, as given before the decision: It is the only one
 that keeps the owner's rule that the Rust toolchain's wrong behaviour is
 reproduced while it is the oracle, and with it every gate unchanged; and
 the thing (B) would gain -- a reader that agrees with `tomllib` -- is worth
 having only once nothing holds the toolchain to a reader that does not,
 which is S9: (A) leaves one reader whose every departure from TOML is
 counted by `tomldiff` and recorded, to be fixed in one place on the day the
-Rust reader goes. **This needs a decision** (the coordinator's, and the
-owner's to reverse): (A) or (B), and under (A), that S8's "agreeing" holds
-over the fuzzed manifests where the Rust reader agrees with `tomllib`.
+Rust reader goes.
 
 One more reader goes under either: the loader's line-by-line questions read
 a manifest as the Rust loader does, which is not as `grasm_pkg::toml` does

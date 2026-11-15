@@ -45,7 +45,8 @@ ls "$WORK"/ctl/*.gr >>"$WORK/files"
 
 # plant NAME FILE OLD NEW [OLD NEW...]: a copy of compiler/front (beside the
 # packages/toml it depends on) with each OLD replaced by NEW (each exactly
-# once), built to $WORK/NAME. FILE is in compiler/front/src.
+# once), built to $WORK/NAME. FILE is in compiler/front/src, or a path from
+# the checkout's root.
 plant() {
     local name=$1 file=$2
     shift 2
@@ -53,7 +54,10 @@ plant() {
     mkdir -p "$WORK/$name.src/compiler" "$WORK/$name.src/packages"
     cp -R compiler/front "$WORK/$name.src/compiler/front"
     cp -R packages/toml "$WORK/$name.src/packages/toml"
-    file="$WORK/$name.src/compiler/front/src/$file"
+    case $file in
+        */*) file="$WORK/$name.src/$file" ;;
+        *) file="$WORK/$name.src/compiler/front/src/$file" ;;
+    esac
     if ! python3 - "$file" "$@" <<'EOF'; then
 import sys
 path = sys.argv[1]
@@ -117,7 +121,7 @@ control added 'front: .*error: `(nope|also_nope)` is not declared' sema.gr \
 control sites-dropped 'rust: +performed: `' ceiling.gr \
     '                help = help + "\n  performed: " + where_at.join(", ")' \
     '                help = help'
-control manifest-words 'front: .*grasm\.toml: line 2: expected a key' rtoml.gr \
+control manifest-words 'front: .*grasm\.toml: line 2: expected a key' packages/toml/src/main.gr \
     'return refused("{at}: expected `key = value`")' \
     'return refused("{at}: expected a key")'
 

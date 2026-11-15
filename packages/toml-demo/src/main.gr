@@ -1,4 +1,10 @@
 // The `toml` package, reading a manifest shaped like this repository's own.
+//
+// `toml` is the toolchain's own reader of manifests (docs/self-hosting.md
+// §6.21): strings, integers, booleans and one-line arrays of them, in tables
+// and arrays of tables. A float, an inline table, an array across lines, a
+// literal string or a date is refused with the line it is on, rather than
+// read wrongly -- the last section shows each.
 import toml
 
 fn main() {
@@ -6,68 +12,78 @@ fn main() {
     "[package]\n" +
     "name = \"http_server\"   # the socket half\n" +
     "version = \"1.0.0\"\n" +
-    "entry = 'src/main.gr'\n" +
+    "entry = \"src/main.gr\"\n" +
     "capabilities = [\"io\", \"net\"]\n" +
     "workers = 4\n" +
-    "ratio = 1.5\n" +
     "strict = true\n" +
-    "big = 1_000_000\n" +
-    "escaped = \"line\\nbreak\\ttab \\\"quoted\\\" \\u00fc\"\n" +
-    "literal = 'no \\n escapes here'\n" +
-    "released = 2026-08-27\n" +
+    "big = -9223372036854775808\n" +
+    "escaped = \"line\\nbreak\\ttab \\\"quoted\\\"\"\n" +
     "empty_list = []\n" +
-    "nested = [[1, 2], [3]]\n" +
-    "inline = \{ a = 1, b = \"two\", c = [true, false] }\n" +
     "\n" +
     "[dependencies.json]\n" +
     "path = \"../json\"\n" +
     "version = \"^1.0.0\"\n" +
     "\n" +
     "[[bin]]\n" +
-    "name = \"serve\"\n"
+    "name = \"serve\"\n" +
+    "\n" +
+    "[[bin]]\n" +
+    "name = \"admin\"\n" +
+    "args = [\"--port\", \"8081\"]\n"
 
     let d = toml.parse(src)
     if not d.ok {
-        print("refused: {d.why} at line {d.line}")
+        print("refused: {d.why}")
         return
     }
-    print("-- every key, flattened")
-    for i in 0..d.keys.len() {
-        print("  {d.keys[i].pad_end(28, " ")} {toml.kind(d.values[i]).pad_end(9, " ")} {toml.render_value(d.values[i])}")
+    print("-- every table and key")
+    for ti in 0..d.t_names.len() {
+        for ki in 0..d.t_keys[ti].len() {
+            let v = d.t_vals[ti][ki]
+            let at = if d.t_names[ti] == "" { d.t_keys[ti][ki] } else { d.t_names[ti] + "." + d.t_keys[ti][ki] }
+            print("  {at.pad_end(28, " ")} {toml.kind(d, v).pad_end(9, " ")} {toml.render_value(d, v)}")
+        }
+    }
+    print("-- the arrays of tables, in the file's order")
+    var i = 0
+    for e in toml.entries(d, "bin") {
+        let name = toml.as_str(d, toml.entry_get(d, e, "name"))
+        let a = toml.entry_get(d, e, "args")
+        let args = if a >= 0 { toml.render_value(d, a) } else { "(none)" }
+        print("  bin[{i}]: {name} {args}")
+        i += 1
     }
 
     print("-- reading it")
     print("  name: {toml.text_of(d, "package.name", "(none)")}")
     print("  workers: {toml.int_of(d, "package.workers", 0)}")
-    print("  ratio: {toml.float_of(d, "package.ratio", 0.0)}")
-    print("  workers as a float: {toml.float_of(d, "package.workers", 0.0)}")
     print("  strict: {toml.bool_of(d, "package.strict", false)}")
     print("  big: {toml.int_of(d, "package.big", 0)}")
+    print("  escaped: {toml.text_of(d, "package.escaped", "(none)")}")
     print("  capabilities: {toml.texts_of(d, "package.capabilities")}")
-    print("  inline.b: {toml.text_of(d, "package.inline.b", "(none)")}")
     print("  dependency version: {toml.text_of(d, "dependencies.json.version", "(none)")}")
     print("  a key that is not there: {toml.text_of(d, "package.nope", "(the default)")}")
     print("  a key of the wrong type: {toml.int_of(d, "package.name", 0 - 1)}")
     print("  keys under package: {toml.keys_under(d, "package")}")
     print("  keys under dependencies: {toml.keys_under(d, "dependencies")}")
-    print("  keys under dependencies.json: {toml.keys_under(d, "dependencies.json")}")
+    print("  written back: {toml.quote("say \"hi\"\nC:\\dir")}")
 
     print("-- refused")
-    for bad in ["[package\n", "[]\n", "name\n", "name =\n",
-        "name = \"unterminated\n", "name = \"bad \\q escape\"\n",
-        "name = \"short \\u12\"\n", "items = [1, 2\n",
-        "inline = \{ a = 1\n", "inline = \{ a }\n"] {
+    for bad in ["[package\n", "[]\n", "name\n", "= \"x\"\n",
+        "name = \"unterminated\n", "items = [1, 2\n", "[t]\nk = 1\n[t]\n",
+        "[t]\nk = 1\nk = 2\n", "ratio = 1.5\n", "inline = \{ a = 1 }\n",
+        "literal = 'text'\n", "released = 2026-08-27\n", "big = 1_000_000\n",
+        "list = [\n  1,\n]\n", "nested = [[1, 2], [3]]\n"] {
         let r = toml.parse(bad)
         let shown = bad.replace("\n", "\\n")
         if r.ok {
-            print("  \"{shown}\" -> accepted, {r.keys.len()} key(s)")
+            print("  \"{shown}\" -> accepted")
         } else {
-            print("  \"{shown}\" -> refused: {r.why} at line {r.line}")
+            print("  \"{shown}\" -> refused: {r.why}")
         }
     }
 
     print("-- a comment character inside a string is not a comment")
-    let c = toml.parse("a = \"has # inside\"\nb = 'also # here'  # this one is\n")
+    let c = toml.parse("a = \"has # inside\"  # this one is\n")
     print("  a: {toml.text_of(c, "a", "(none)")}")
-    print("  b: {toml.text_of(c, "b", "(none)")}")
 }

@@ -1,475 +1,674 @@
-// TOML.
+// TOML, as the Grasm toolchain reads its manifests and lockfiles.
 //
-// Grasm's own manifests are TOML, so a Grasm program reading configuration
-// should not need a second format to learn. This is the subset a manifest and
-// a configuration file use: tables, arrays of tables, inline tables, arrays,
-// strings, integers, floats, booleans and dates-as-text.
+// This is the toolchain's one TOML reader (docs/self-hosting.md §6.21): the
+// Rust toolchain's own reader, `crates/grasm_pkg/src/toml.rs`, line for
+// line, so that every manifest the Grasm toolchain reads it reads as the
+// Rust one does, refusals and their words included, while the Rust
+// toolchain is the oracle. It reads line by line: `[table]` and `[[array]]`
+// headers, `key = value` with a basic string (escapes `\n`, `\t`, `\"` and
+// `\\`; any other kept as written), a decimal integer, a boolean or a
+// one-line array of those, and a comment cut at the first `#` outside
+// quotes. Anything else -- a float, an inline table, an array across lines,
+// a literal or multi-line string, a date -- is refused with the line and
+// why, rather than read wrongly.
 //
-// What it does not do: multi-line basic strings' line-ending backslash,
-// literal multi-line strings, and offset datetimes as a *type* — a datetime
-// comes back as the text it was written as, and `time.parse` is next door.
-// Each of those is stated rather than silently mis-parsed.
+// It is not all of TOML, and where it is not, it says so or answers as the
+// Rust reader does: `tomldiff` holds it to the Rust reader on every file and
+// to Python's `tomllib` wherever the Rust reader agrees with `tomllib`, and
+// counts the rest by class; the places the two readers misread TOML are in
+// docs/known-issues.md, to be fixed here at the cutover (S9).
 //
-// A value is reached by its dotted path, because that is how a configuration
-// file is read: `package.name`, `dependencies.json.version`. Building the
-// nested map a caller would otherwise walk is work the caller then repeats.
+// A document is its tables (the root is ""), each with its keys and values
+// in byte order, and the entries of its arrays of tables in the file's
+// order. A program reads it by index (`table`, `get`, `as_str`, ...) or by
+// dotted path (`text_of`, `int_of`, `bool_of`, `texts_of`, `keys_under`).
 
-type TomlValue =
-    | Text(s: str)
-    | Int(n: i64)
-    | Float(x: f64)
-    | Bool(b: bool)
-    | Array(items: [ref TomlValue])
-    | Table(keys: [str], values: [ref TomlValue])
+pub let V_STR = 0
+pub let V_INT = 1
+pub let V_BOOL = 2
+pub let V_ARR = 3
 
-type TomlError = { why: str, line: i64 }
-
-/// `keys[i]` is the dotted path of `values[i]`. `entries[i]` is the same path
-/// with the entry of an array of tables it was written in: after the second
-/// `[[bin]]`, `name = "b"` is `bin.name` in `keys` and `bin[1].name` here, so
-/// a reader that needs to know which entry a key belongs to can.
-type Doc = { keys: [str], values: [ref TomlValue], entries: [str], ok: bool, why: str, line: i64 }
-
-fn refused(why: str, line: i64) -> Doc {
-    Doc{ keys: [], values: [], entries: [], ok: false, why: why, line: line }
+/// A parsed document: its tables by name (the root is ""), each with its
+/// keys and their values, the names and keys in byte order as a `BTreeMap`
+/// keeps them; or why it was refused.
+type TomlDoc = {
+    ok: bool,
+    why: str,
+    t_names: [str],
+    t_keys: [[str]],
+    t_vals: [[i64]],
+    // Values, by id: the kind, a string's text, an array's items.
+    v_kind: [i64],
+    v_str: [str],
+    v_items: [[i64]],
+    // The entries of the arrays of tables, in the file's order: each one's
+    // array name, and its keys in byte order with their values, a key set
+    // twice keeping the later value, as the Rust reader's `BTreeMap::insert`
+    // does. Nothing the loader checks reads them; `grasm toml` prints them.
+    a_names: [str],
+    a_keys: [[str]],
+    a_vals: [[i64]],
 }
 
-/// Every key in the document, flattened to a dotted path.
-///
-/// `[package]` then `name = "x"` is the one entry `package.name`. A reader
-/// wanting the tree can still have it — `get_table` answers one — but the flat
-/// form is what a configuration file is actually asked for.
-pub fn parse(text: str) -> Doc {
-    var keys: [str] = []
-    var values: [ref TomlValue] = []
-    var entries: [str] = []
-    var prefix = ""
-    // The same prefix with the entry of an array of tables, and how many
-    // entries each array has had so far.
-    var entry_prefix = ""
-    var array_names: [str] = []
-    var array_counts: [i64] = []
-    var line_no = 0
-    for raw in text.lines() {
-        line_no = line_no + 1
-        let line = strip_comment(raw).trim()
-        if line.is_empty() {
+fn refused(why: str) -> TomlDoc {
+    TomlDoc{ ok: false, why: why, t_names: [], t_keys: [], t_vals: [], v_kind: [], v_str: [], v_items: [], a_names: [], a_keys: [], a_vals: [] }
+}
+
+/// `toml::parse`.
+pub fn parse(src: str) -> TomlDoc {
+    var t_names: [str] = [""]
+    var t_keys: [[str]] = [[]]
+    var t_vals: [[i64]] = [[]]
+    var t_index: Map[str, i64] = map()
+    t_index.set("", 0)
+    var v_kind: [i64] = []
+    var v_str: [str] = []
+    var v_items: [[i64]] = []
+    var a_names: [str] = []
+    var a_keys: [[str]] = []
+    var a_vals: [[i64]] = []
+    // Where `key = value` lines go: a table's index, or -1 for the last
+    // entry of an array of tables.
+    var current = 0
+    var lineno = 0
+    for raw0 in rust_lines(src) {
+        lineno += 1
+        let line = rust_trim(strip_comment(raw0))
+        if line == "" {
+            continue
+        }
+        let at = "line {lineno}"
+        if line.starts_with("[[") {
+            let rest = line.substr(2, line.len() - 2)
+            if not rest.ends_with("]]") {
+                return refused("{at}: unclosed array-of-tables header")
+            }
+            let name = rust_trim(rest.substr(0, rest.len() - 2))
+            if name == "" {
+                return refused("{at}: empty table name")
+            }
+            current = -1
+            a_names.push(name)
+            a_keys.push([])
+            a_vals.push([])
             continue
         }
         if line.starts_with("[") {
-            if not line.ends_with("]") {
-                return refused("a table header with no closing bracket", line_no)
+            let rest = line.substr(1, line.len() - 1)
+            if not rest.ends_with("]") {
+                return refused("{at}: unclosed table header")
             }
-            var inner = line.substr(1, line.len() - 2)
-            // `[[a.b]]` is an array of tables. Every entry after it belongs to
-            // the same path in `keys`, which is what a flat reader asks for;
-            // `entries` says which entry.
-            var array = false
-            if inner.starts_with("[") and inner.ends_with("]") {
-                inner = inner.substr(1, inner.len() - 2)
-                array = true
+            let name = rust_trim(rest.substr(0, rest.len() - 1))
+            if name == "" {
+                return refused("{at}: empty table name")
             }
-            let name = unquote_path(inner.trim())
-            if name.is_empty() {
-                return refused("a table header with no name", line_no)
+            if t_index.has(name) {
+                return refused("{at}: table `{name}` is defined twice")
             }
-            prefix = name
-            entry_prefix = name
-            if array {
-                var at = -1
-                for i in 0..array_names.len() {
-                    if array_names[i] == name {
-                        at = i
-                    }
-                }
-                if at < 0 {
-                    array_names.push(name)
-                    array_counts.push(0)
-                    at = array_names.len() - 1
-                }
-                entry_prefix = name + "[{array_counts[at]}]"
-                array_counts[at] = array_counts[at] + 1
-            }
+            t_index.set(name, t_names.len())
+            current = t_names.len()
+            t_names.push(name)
+            t_keys.push([])
+            t_vals.push([])
             continue
         }
-        match line.index_of("=") {
-            None -> return refused("a line that is neither a header nor an assignment", line_no)
-            Some(at) -> {
-                let key = unquote_path(line.substr(0, at).trim())
-                let rest = line.substr(at + 1, line.len() - at - 1).trim()
-                if key.is_empty() {
-                    return refused("an assignment with no key", line_no)
-                }
-                match read_value(rest, line_no) {
-                    Err(e) -> return refused(e.why, e.line)
-                    Ok(v) -> {
-                        let full = if prefix.is_empty() { key } else { prefix + "." + key }
-                        let placed = if entry_prefix.is_empty() { key } else { entry_prefix + "." + key }
-                        keys.push(full)
-                        values.push(v)
-                        entries.push(placed)
-                        // An inline table is also reachable by its members'
-                        // dotted paths, which is what makes
-                        // `dependencies.json.version` work whether the file
-                        // wrote it inline or as a header.
-                        flatten_into(full, placed, v, keys, values, entries)
-                    }
+        let eq = match line.index_of("=") {
+            Some(i) -> i
+            None -> return refused("{at}: expected `key = value`")
+        }
+        let key = trim_quotes(rust_trim(line.substr(0, eq)))
+        if key == "" {
+            return refused("{at}: empty key")
+        }
+        let vtext = rust_trim(line.substr(eq + 1, line.len() - eq - 1))
+        let (vok, vwhy, vid) = parse_value(vtext, v_kind, v_str, v_items)
+        if not vok {
+            return refused("{at}: {vwhy}")
+        }
+        if current >= 0 {
+            var keys = t_keys[current]
+            if keys.contains(key) {
+                return refused("{at}: key `{key}` is set twice")
+            }
+            keys.push(key)
+            var vals = t_vals[current]
+            vals.push(vid)
+            t_keys[current] = keys
+            t_vals[current] = vals
+        } else {
+            let ai = a_names.len() - 1
+            var keys = a_keys[ai]
+            var vals = a_vals[ai]
+            var at_key = -1
+            for j in 0..keys.len() {
+                if keys[j] == key {
+                    at_key = j
                 }
             }
+            if at_key >= 0 {
+                vals[at_key] = vid
+            } else {
+                keys.push(key)
+                vals.push(vid)
+            }
+            a_keys[ai] = keys
+            a_vals[ai] = vals
         }
     }
-    Doc{ keys: keys, values: values, entries: entries, ok: true, why: "", line: 0 }
-}
-
-fn flatten_into(prefix: str, placed: str, v: ref TomlValue, inout keys: [str], inout values: [ref TomlValue], inout entries: [str]) {
-    match v {
-        Table(ks, vs) -> {
-            for i in 0..ks.len() {
-                let full = prefix + "." + ks[i]
-                keys.push(full)
-                values.push(vs[i])
-                entries.push(placed + "." + ks[i])
-                flatten_into(full, placed + "." + ks[i], vs[i], keys, values, entries)
+    // Each entry's keys in byte order.
+    for ai in 0..a_names.len() {
+        var ks = a_keys[ai]
+        ks.sort()
+        var vs: [i64] = []
+        for k in ks {
+            for j in 0..a_keys[ai].len() {
+                if a_keys[ai][j] == k {
+                    vs.push(a_vals[ai][j])
+                }
             }
         }
-        _ -> {}
+        a_keys[ai] = ks
+        a_vals[ai] = vs
     }
+    // In byte order, as the Rust reader's maps hold them.
+    var order: [str] = t_names
+    order.sort()
+    var names: [str] = []
+    var keys_out: [[str]] = []
+    var vals_out: [[i64]] = []
+    for nm in order {
+        let ti = t_index.get(nm) ?? 0
+        var ks = t_keys[ti]
+        ks.sort()
+        var vs: [i64] = []
+        for k in ks {
+            for j in 0..t_keys[ti].len() {
+                if t_keys[ti][j] == k {
+                    vs.push(t_vals[ti][j])
+                }
+            }
+        }
+        names.push(nm)
+        keys_out.push(ks)
+        vals_out.push(vs)
+    }
+    TomlDoc{ ok: true, why: "", t_names: names, t_keys: keys_out, t_vals: vals_out, v_kind: v_kind, v_str: v_str, v_items: v_items, a_names: a_names, a_keys: a_keys, a_vals: a_vals }
 }
 
-fn strip_comment(line: str) -> str {
-    var out = ""
-    var quoted = false
-    var quote = ""
-    for c in line.chars() {
-        if quoted {
-            out = out + c
-            if c == quote {
-                quoted = false
+/// `str::lines`: split at `\n`, a `\r` before it dropped, no last empty line.
+pub fn rust_lines(s: str) -> [str] {
+    var out: [str] = []
+    let b = s.to_bytes()
+    var start = 0
+    for i in 0..b.len() {
+        if b.at(i) == 10 {
+            var end = i
+            if end > start and b.at(end - 1) == 13 {
+                end -= 1
             }
-            continue
+            out.push(b.slice(start, end).to_str())
+            start = i + 1
         }
-        if c == "\"" or c == "'" {
-            quoted = true
-            quote = c
-            out = out + c
-            continue
+    }
+    if start < b.len() {
+        var end = b.len()
+        if end > start and b.at(end - 1) == 13 {
+            end -= 1
         }
-        if c == "#" {
-            return out
-        }
-        out = out + c
+        out.push(b.slice(start, end).to_str())
     }
     out
 }
 
-fn unquote_path(s: str) -> str {
-    var parts: [str] = []
-    for p in s.split(".") {
-        var t = p.trim()
-        if (t.starts_with("\"") and t.ends_with("\"") and t.len() >= 2) or
-        (t.starts_with("'") and t.ends_with("'") and t.len() >= 2) {
-            t = t.substr(1, t.len() - 2)
+/// `str::trim`: the whitespace Rust's `char::is_whitespace` names, at both
+/// ends.
+pub fn rust_trim(s: str) -> str {
+    let cs = s.chars()
+    var a = 0
+    var b = cs.len()
+    while a < b and is_ws(cs[a]) {
+        a += 1
+    }
+    while b > a and is_ws(cs[b - 1]) {
+        b -= 1
+    }
+    cs.slice(a, b).join("")
+}
+
+fn is_ws(c: str) -> bool {
+    let n = c.code_at(0)
+    (n >= 9 and n <= 13) or n == 32 or n == 133 or n == 160 or n == 5760 or (n >= 8192 and n <= 8202) or n == 8232 or n == 8233 or n == 8239 or n == 8287 or n == 12288
+}
+
+/// `strip_comment`: everything before a `#` outside quotes; a quote turns
+/// the string on and off whatever precedes it.
+fn strip_comment(line: str) -> str {
+    let b = line.to_bytes()
+    var in_string = false
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c == 34 {
+            in_string = not in_string
+        } else if c == 35 and not in_string {
+            return b.slice(0, i).to_str()
         }
-        parts.push(t)
     }
-    parts.join(".")
+    line
 }
 
-fn read_value(text: str, line_no: i64) -> ref TomlValue ! TomlError {
-    let t = text.trim()
-    if t.is_empty() {
-        fail(TomlError{ why: "an assignment with no value", line: line_no })
+/// `trim_matches('"')`: every quote at either end.
+fn trim_quotes(s: str) -> str {
+    let b = s.to_bytes()
+    var a = 0
+    var e = b.len()
+    while a < e and b.at(a) == 34 {
+        a += 1
     }
-    if t == "true" {
-        return ref(Bool(true))
+    while e > a and b.at(e - 1) == 34 {
+        e -= 1
     }
-    if t == "false" {
-        return ref(Bool(false))
-    }
-    if t.starts_with("\"") or t.starts_with("'") {
-        return ref(Text(try read_string(t, line_no)))
-    }
-    if t.starts_with("[") {
-        return try read_array(t, line_no)
-    }
-    if t.starts_with("\{") {
-        return try read_inline_table(t, line_no)
-    }
-    let plain = t.replace("_", "")
-    match plain.parse_int() {
-        Some(n) -> return ref(Int(n))
-        None -> {}
-    }
-    match plain.parse_float() {
-        Some(x) -> return ref(Float(x))
-        None -> {}
-    }
-    // A bare date, a bare time, or anything else unquoted: kept as the text it
-    // was written as. Guessing at a datetime type here would answer confidently
-    // for input this package has not been taught to read.
-    ref(Text(t))
+    b.slice(a, e).to_str()
 }
 
-fn read_string(t: str, line_no: i64) -> str ! TomlError {
-    let quote = t.substr(0, 1)
-    if t.len() < 2 or not t.ends_with(quote) {
-        fail(TomlError{ why: "a string with no closing quote", line: line_no })
+fn parse_value(text: str, inout v_kind: [i64], inout v_str: [str], inout v_items: [[i64]]) -> (bool, str, i64) {
+    if text == "true" or text == "false" {
+        return (true, "", new_value(v_kind, v_str, v_items, V_BOOL, text, []))
     }
-    let body = t.substr(1, t.len() - 2)
-    if quote == "'" {
-        // A literal string: no escapes at all, which is the point of it.
-        return body
+    if text.starts_with("\"") {
+        let rest = text.substr(1, text.len() - 1)
+        if not rest.ends_with("\"") {
+            return (false, "unterminated string value", -1)
+        }
+        let body = rest.substr(0, rest.len() - 1)
+        return (true, "", new_value(v_kind, v_str, v_items, V_STR, unescape(body), []))
     }
-    var out = ""
-    let cs = body.chars()
+    if text.starts_with("[") {
+        let rest = text.substr(1, text.len() - 1)
+        if not rest.ends_with("]") {
+            return (false, "unterminated array", -1)
+        }
+        let body = rest.substr(0, rest.len() - 1)
+        var items: [i64] = []
+        for part0 in split_top_level(body) {
+            let part = rust_trim(part0)
+            if part == "" {
+                continue
+            }
+            let (ok, why, id) = parse_value(part, v_kind, v_str, v_items)
+            if not ok {
+                return (false, why, -1)
+            }
+            items.push(id)
+        }
+        return (true, "", new_value(v_kind, v_str, v_items, V_ARR, "", items))
+    }
+    if is_i64(text) {
+        return (true, "", new_value(v_kind, v_str, v_items, V_INT, text, []))
+    }
+    (false, "cannot parse value `{text}`", -1)
+}
+
+fn new_value(inout v_kind: [i64], inout v_str: [str], inout v_items: [[i64]], k: i64, s: str, items: [i64]) -> i64 {
+    v_kind.push(k)
+    v_str.push(s)
+    v_items.push(items)
+    v_kind.len() - 1
+}
+
+/// `str::parse::<i64>`: an optional sign, then decimal digits, in range.
+fn is_i64(t: str) -> bool {
+    let b = t.to_bytes()
+    var i = 0
+    var neg = false
+    if b.len() > 0 and (b.at(0) == 43 or b.at(0) == 45) {
+        neg = b.at(0) == 45
+        i = 1
+    }
+    if i >= b.len() {
+        return false
+    }
+    // The magnitude, held as a negative so `-9223372036854775808` fits.
+    var v = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 48 or c > 57 {
+            return false
+        }
+        let d = c - 48
+        if v < (-9223372036854775807 - 1 + d) / 10 {
+            return false
+        }
+        v = v * 10 - d
+        i += 1
+    }
+    if not neg and v == -9223372036854775807 - 1 {
+        return false
+    }
+    true
+}
+
+/// `split_top_level`: at each comma outside quotes.
+fn split_top_level(body: str) -> [str] {
+    var out: [str] = []
+    let b = body.to_bytes()
+    var start = 0
+    var in_string = false
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c == 34 {
+            in_string = not in_string
+        } else if c == 44 and not in_string {
+            out.push(b.slice(start, i).to_str())
+            start = i + 1
+        }
+    }
+    out.push(b.slice(start, b.len()).to_str())
+    out
+}
+
+/// `unescape`: `\n`, `\t`, `\"` and `\\`; any other escape kept as written.
+fn unescape(s: str) -> str {
+    var out = str_builder()
+    let cs = s.chars()
     var i = 0
     while i < cs.len() {
-        if cs[i] != "\\" {
-            out = out + cs[i]
-            i = i + 1
+        let c = cs[i]
+        if c != "\\" {
+            out.push_str(c)
+            i += 1
             continue
         }
         if i + 1 >= cs.len() {
-            fail(TomlError{ why: "a string ending in a backslash", line: line_no })
-        }
-        let c = cs[i + 1]
-        i = i + 2
-        if c == "n" { out = out + "\n" }
-        else if c == "t" { out = out + "\t" }
-        else if c == "r" { out = out + "\r" }
-        else if c == "\"" { out = out + "\"" }
-        else if c == "\\" { out = out + "\\" }
-        else if c == "0" { out = out + "\{0.to_char()}" }
-        else if c == "u" {
-            var n = 0
-            var read = 0
-            while read < 4 and i < cs.len() {
-                let d = cs[i].to_lower().parse_int_base(16) ?? -1
-                if d < 0 {
-                    fail(TomlError{ why: "a \\u escape with fewer than four hex digits", line: line_no })
-                }
-                n = n * 16 + d
-                read = read + 1
-                i = i + 1
-            }
-            if read < 4 {
-                fail(TomlError{ why: "a \\u escape with fewer than four hex digits", line: line_no })
-            }
-            out = out + n.to_char()
-        }
-        else {
-            fail(TomlError{ why: "an unknown escape \\{c}", line: line_no })
-        }
-    }
-    out
-}
-
-// Splitting on the separator at depth zero, so a comma inside a nested array
-// or an inline table does not end the element.
-fn split_top(body: str) -> [str] {
-    var parts: [str] = []
-    var depth = 0
-    var quoted = false
-    var quote = ""
-    var current = ""
-    for c in body.chars() {
-        if quoted {
-            current = current + c
-            if c == quote {
-                quoted = false
-            }
+            out.push_str("\\")
+            i += 1
             continue
         }
-        if c == "\"" or c == "'" {
-            quoted = true
-            quote = c
-            current = current + c
-            continue
+        let n = cs[i + 1]
+        if n == "n" {
+            out.push_str("\n")
+        } else if n == "t" {
+            out.push_str("\t")
+        } else if n == "\"" {
+            out.push_str("\"")
+        } else if n == "\\" {
+            out.push_str("\\")
+        } else {
+            out.push_str("\\")
+            out.push_str(n)
         }
-        if c == "[" or c == "\{" {
-            depth = depth + 1
-        } else if c == "]" or c == "}" {
-            depth = depth - 1
-        }
-        if c == "," and depth == 0 {
-            parts.push(current)
-            current = ""
-            continue
-        }
-        current = current + c
+        i += 2
     }
-    if not current.trim().is_empty() {
-        parts.push(current)
-    }
-    parts
+    out.to_str()
 }
 
-fn read_array(t: str, line_no: i64) -> ref TomlValue ! TomlError {
-    if not t.ends_with("]") {
-        fail(TomlError{ why: "an array with no closing bracket", line: line_no })
-    }
-    let body = t.substr(1, t.len() - 2).trim()
-    var items: [ref TomlValue] = []
-    if body.is_empty() {
-        return ref(Array(items))
-    }
-    for part in split_top(body) {
-        items.push(try read_value(part.trim(), line_no))
-    }
-    ref(Array(items))
-}
+// ---------------------------------------------------------------------
+// Reading a document, as `Doc`'s accessors do
+// ---------------------------------------------------------------------
 
-fn read_inline_table(t: str, line_no: i64) -> ref TomlValue ! TomlError {
-    if not t.ends_with("}") {
-        fail(TomlError{ why: "an inline table with no closing brace", line: line_no })
-    }
-    let body = t.substr(1, t.len() - 2).trim()
-    var keys: [str] = []
-    var values: [ref TomlValue] = []
-    if body.is_empty() {
-        return ref(Table(keys, values))
-    }
-    for part in split_top(body) {
-        let p = part.trim()
-        match p.index_of("=") {
-            None -> fail(TomlError{ why: "an inline table entry with no `=`", line: line_no })
-            Some(at) -> {
-                keys.push(unquote_path(p.substr(0, at).trim()))
-                values.push(try read_value(p.substr(at + 1, p.len() - at - 1).trim(), line_no))
-            }
+/// The index of table `name`, or -1.
+pub fn table(d: TomlDoc, name: str) -> i64 {
+    for i in 0..d.t_names.len() {
+        if d.t_names[i] == name {
+            return i
         }
     }
-    ref(Table(keys, values))
+    -1
 }
 
-// --- reading a document ----------------------------------------------------
-
-pub fn get(d: Doc, path: str) -> Option[ref TomlValue] {
-    for i in 0..d.keys.len() {
-        if d.keys[i] == path {
-            return Some(d.values[i])
+/// The value of `key` in table `ti`, or -1.
+pub fn get(d: TomlDoc, ti: i64, key: str) -> i64 {
+    if ti < 0 {
+        return -1
+    }
+    for j in 0..d.t_keys[ti].len() {
+        if d.t_keys[ti][j] == key {
+            return d.t_vals[ti][j]
         }
     }
-    None
+    -1
 }
 
-pub fn text_of(d: Doc, path: str, fallback: str) -> str {
-    match get(d, path) {
-        Some(v) -> match v {
-            Text(s) -> s
-            _ -> fallback
-        }
-        None -> fallback
+/// `as_str`: the text of a string value, or "\0".
+pub fn as_str(d: TomlDoc, v: i64) -> str {
+    if v < 0 or d.v_kind[v] != V_STR {
+        return "\0"
     }
+    d.v_str[v]
 }
 
-pub fn int_of(d: Doc, path: str, fallback: i64) -> i64 {
-    match get(d, path) {
-        Some(v) -> match v {
-            Int(n) -> n
-            _ -> fallback
-        }
-        None -> fallback
+/// `as_str_array`: whether `v` is an array of strings only.
+pub fn is_str_array(d: TomlDoc, v: i64) -> bool {
+    if v < 0 or d.v_kind[v] != V_ARR {
+        return false
     }
-}
-
-pub fn float_of(d: Doc, path: str, fallback: f64) -> f64 {
-    match get(d, path) {
-        Some(v) -> match v {
-            Float(x) -> x
-            Int(n) -> n.as_f64()
-            _ -> fallback
+    for x in d.v_items[v] {
+        if d.v_kind[x] != V_STR {
+            return false
         }
-        None -> fallback
     }
+    true
 }
 
-pub fn bool_of(d: Doc, path: str, fallback: bool) -> bool {
-    match get(d, path) {
-        Some(v) -> match v {
-            Bool(b) -> b
-            _ -> fallback
-        }
-        None -> fallback
-    }
-}
-
-/// The strings in an array, skipping anything that is not one.
-pub fn texts_of(d: Doc, path: str) -> [str] {
+/// The strings of an array of strings.
+pub fn str_array(d: TomlDoc, v: i64) -> [str] {
     var out: [str] = []
-    match get(d, path) {
-        Some(v) -> match v {
-            Array(items) -> {
-                for it in items {
-                    match it {
-                        Text(s) -> out.push(s)
-                        _ -> {}
-                    }
-                }
-            }
-            _ -> {}
-        }
-        None -> {}
+    for x in d.v_items[v] {
+        out.push(d.v_str[x])
     }
     out
 }
 
-/// The names one level under a path.
-///
-/// The *first segment* of each deeper key, not only the keys that stop there:
-/// `[dependencies.json]` writes `dependencies.json.path` and nothing named
-/// `dependencies.json`, so skipping tails that contain a dot answered "no
-/// members" for a table that plainly has one.
-pub fn keys_under(d: Doc, path: str) -> [str] {
+/// `subtables(prefix)`: the tables named `prefix.<leaf>`, as table indexes,
+/// in byte order of their names.
+pub fn subtables(d: TomlDoc, prefix: str) -> [i64] {
+    var out: [i64] = []
+    let want = prefix + "."
+    for i in 0..d.t_names.len() {
+        if d.t_names[i].starts_with(want) {
+            out.push(i)
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Arrays of tables, and values by dotted path
+// ---------------------------------------------------------------------
+
+/// The entries of the array of tables `name`, in the file's order, as
+/// indexes for `entry_get`.
+pub fn entries(d: TomlDoc, name: str) -> [i64] {
+    var out: [i64] = []
+    for i in 0..d.a_names.len() {
+        if d.a_names[i] == name {
+            out.push(i)
+        }
+    }
+    out
+}
+
+/// The value of `key` in entry `ai` of an array of tables, or -1.
+pub fn entry_get(d: TomlDoc, ai: i64, key: str) -> i64 {
+    if ai < 0 {
+        return -1
+    }
+    for j in 0..d.a_keys[ai].len() {
+        if d.a_keys[ai][j] == key {
+            return d.a_vals[ai][j]
+        }
+    }
+    -1
+}
+
+/// The value at a dotted path -- a table's name, a dot, a key (`package.name`,
+/// `dependencies.json.version`), or a key of the root table alone -- or -1.
+/// A table's name and a key may both hold dots, so every split is tried,
+/// the longest table name first.
+pub fn at_path(d: TomlDoc, path: str) -> i64 {
+    let b = path.to_bytes()
+    var i = b.len() - 1
+    while i > 0 {
+        if b.at(i) == 46 {
+            let v = get(d, table(d, b.slice(0, i).to_str()), b.slice(i + 1, b.len()).to_str())
+            if v >= 0 {
+                return v
+            }
+        }
+        i -= 1
+    }
+    get(d, table(d, ""), path)
+}
+
+/// The kind of a value: "string", "integer", "bool" or "array".
+pub fn kind(d: TomlDoc, v: i64) -> str {
+    let k = d.v_kind[v]
+    if k == V_STR {
+        "string"
+    } else if k == V_INT {
+        "integer"
+    } else if k == V_BOOL {
+        "bool"
+    } else {
+        "array"
+    }
+}
+
+/// The text at a path, or `fallback` when there is none or it is not a
+/// string.
+pub fn text_of(d: TomlDoc, path: str, fallback: str) -> str {
+    let v = at_path(d, path)
+    if v < 0 or d.v_kind[v] != V_STR {
+        return fallback
+    }
+    d.v_str[v]
+}
+
+/// The integer at a path, or `fallback`.
+pub fn int_of(d: TomlDoc, path: str, fallback: i64) -> i64 {
+    let v = at_path(d, path)
+    if v < 0 or d.v_kind[v] != V_INT {
+        return fallback
+    }
+    int_value(d, v)
+}
+
+/// An integer value's number (the reader keeps its text, which `is_i64`
+/// has already checked).
+pub fn int_value(d: TomlDoc, v: i64) -> i64 {
+    let b = d.v_str[v].to_bytes()
+    var i = 0
+    var neg = false
+    if b.at(0) == 43 or b.at(0) == 45 {
+        neg = b.at(0) == 45
+        i = 1
+    }
+    // Accumulated negative, so the least i64 fits.
+    var n = 0
+    while i < b.len() {
+        n = n * 10 - (b.at(i) - 48)
+        i += 1
+    }
+    if neg { n } else { 0 - n }
+}
+
+/// The boolean at a path, or `fallback`.
+pub fn bool_of(d: TomlDoc, path: str, fallback: bool) -> bool {
+    let v = at_path(d, path)
+    if v < 0 or d.v_kind[v] != V_BOOL {
+        return fallback
+    }
+    d.v_str[v] == "true"
+}
+
+/// The strings of the array at a path, skipping anything that is not one;
+/// none when there is no array there.
+pub fn texts_of(d: TomlDoc, path: str) -> [str] {
+    var out: [str] = []
+    let v = at_path(d, path)
+    if v < 0 or d.v_kind[v] != V_ARR {
+        return out
+    }
+    for x in d.v_items[v] {
+        if d.v_kind[x] == V_STR {
+            out.push(d.v_str[x])
+        }
+    }
+    out
+}
+
+/// The names one level under a path: a table's keys, and the next segment
+/// of every table named under it (`keys_under(d, "dependencies")` is the
+/// dependencies' names), each once, in byte order.
+pub fn keys_under(d: TomlDoc, path: str) -> [str] {
+    var out: [str] = []
+    let ti = table(d, path)
+    if ti >= 0 {
+        for k in d.t_keys[ti] {
+            if not out.contains(k) {
+                out.push(k)
+            }
+        }
+    }
     let want = path + "."
-    var out: [str] = []
-    for k in d.keys {
-        if not k.starts_with(want) {
-            continue
-        }
-        let tail = k.substr(want.len(), k.len() - want.len())
-        let head = match tail.index_of(".") {
-            Some(at) -> tail.substr(0, at)
-            None -> tail
-        }
-        if not head.is_empty() and not out.contains(head) {
-            out.push(head)
+    for n in d.t_names {
+        if n.starts_with(want) {
+            let tail = n.substr(want.len(), n.len() - want.len())
+            let head = match tail.index_of(".") {
+                Some(at) -> tail.substr(0, at)
+                None -> tail
+            }
+            if head != "" and not out.contains(head) {
+                out.push(head)
+            }
         }
     }
+    out.sort()
     out
 }
 
-pub fn kind(v: ref TomlValue) -> str {
-    match v {
-        Text(s) -> "string"
-        Int(n) -> "integer"
-        Float(x) -> "float"
-        Bool(b) -> "bool"
-        Array(items) -> "array"
-        Table(ks, vs) -> "table"
+/// A value written back as the reader would read it: a string quoted as
+/// `quote` quotes it, an integer as its number, a boolean, an array's
+/// items in brackets.
+pub fn render_value(d: TomlDoc, v: i64) -> str {
+    let k = d.v_kind[v]
+    if k == V_STR {
+        return quote(d.v_str[v])
     }
+    if k == V_INT {
+        return "{int_value(d, v)}"
+    }
+    if k == V_BOOL {
+        return d.v_str[v]
+    }
+    var parts: [str] = []
+    for x in d.v_items[v] {
+        parts.push(render_value(d, x))
+    }
+    "[" + parts.join(", ") + "]"
 }
 
-pub fn render_value(v: ref TomlValue) -> str {
-    match v {
-        Text(s) -> "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
-            .replace("\n", "\\n").replace("\t", "\\t") + "\""
-        Int(n) -> "{n}"
-        Float(x) -> "{x}"
-        Bool(b) -> if b { "true" } else { "false" }
-        Array(items) -> {
-            var parts: [str] = []
-            for it in items {
-                parts.push(render_value(it))
+/// `toml::quote`: a string written for this reader -- `"`, `\` and a
+/// newline escaped, everything else as it is.
+pub fn quote(s: str) -> str {
+    var out = str_builder()
+    out.push_str("\"")
+    let b = s.to_bytes()
+    var start = 0
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c == 34 or c == 92 or c == 10 {
+            out.push_str(b.slice(start, i).to_str())
+            if c == 34 {
+                out.push_str("\\\"")
+            } else if c == 92 {
+                out.push_str("\\\\")
+            } else {
+                out.push_str("\\n")
             }
-            "[" + parts.join(", ") + "]"
-        }
-        Table(ks, vs) -> {
-            var parts: [str] = []
-            for i in 0..ks.len() {
-                parts.push(ks[i] + " = " + render_value(vs[i]))
-            }
-            "\{ " + parts.join(", ") + " }"
+            start = i + 1
         }
     }
+    out.push_str(b.slice(start, b.len()).to_str())
+    out.push_str("\"")
+    out.to_str()
 }

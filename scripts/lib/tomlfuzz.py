@@ -141,8 +141,14 @@ def manifest(r):
         lines.append(assign(r, "links", "[" + ", ".join(f'"{x}"' for x in r.sample(["m", "SDL2", "-lm", "z"], 2)) + "]"))
     if r.random() < 0.1:
         lines.append(assign(r, "runtime", r.choice(["true", "false", '"yes"'])))
+    used = {"name", "version", "capabilities", "entry", "links", "runtime"}
     for _ in range(r.randint(0, 2)):
-        lines.append(assign(r, key(r), plain_value(r)))
+        k = key(r)
+        # A key set twice is refused by every reader; one in ten is enough.
+        while k.strip('"') in used and r.random() < 0.9:
+            k = key(r)
+        used.add(k.strip('"'))
+        lines.append(assign(r, k, plain_value(r)))
     for d in r.sample(["json", "util", "x", "far"], r.randint(0, 3)):
         lines.append("")
         lines.append(f"[dependencies.{d}]")

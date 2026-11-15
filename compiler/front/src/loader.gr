@@ -10,7 +10,7 @@
 // previous file's ended, plus one.
 //
 // Manifests are read twice over, as the Rust toolchain reads them: the
-// package graph through the Rust toolchain's own TOML reader (rtoml.gr; the
+// package graph through the Rust toolchain's own TOML reader (toml.gr; the
 // root's manifest checked as `grasm_pkg::Manifest` checks it, then every
 // path dependency), and the loader's own questions -- a package's
 // dependencies and their paths, its entry file, whether it is a runtime
@@ -19,7 +19,7 @@ import lex
 import parse
 import cst
 import ast
-import rtoml
+import toml
 
 let MAX_PACKAGE_DEPTH = 64
 
@@ -192,8 +192,13 @@ pub fn same_dir(a: str, b: str) -> bool {
     components(a) == components(b)
 }
 
+/// Whether two paths are equal as `Path`s are: component by component.
+pub fn same_path(a: str, b: str) -> bool {
+    components(a) == components(b)
+}
+
 /// `Path::components`, as text: `.` inside a path and repeated `/` dropped.
-fn components(p: str) -> [str] {
+pub fn components(p: str) -> [str] {
     var out: [str] = []
     let segs = p.split("/")
     for i in 0..segs.len() {
@@ -235,7 +240,7 @@ fn last_seg(name: str) -> str {
     parts[parts.len() - 1]
 }
 
-fn read_text(path: str) -> Option[str] {
+pub fn read_text(path: str) -> Option[str] {
     match read_bytes(path) {
         Ok(b) -> {
             if utf8_ok(b) {
@@ -299,119 +304,73 @@ pub fn utf8_ok(b: bytes) -> bool {
 }
 
 // ---------------------------------------------------------------------
-// Manifests, line by line, as loader.rs reads them
+// The loader's questions of a manifest, read by the toolchain's one TOML
+// reader (packages/toml)
 // ---------------------------------------------------------------------
+//
+// The Rust loader (loader.rs) asks these line by line, a second reading of
+// the manifest beside `grasm_pkg::toml`'s: a `#` inside a quoted path cuts
+// it there, no escape is undone, and the first `entry =` on any line is the
+// entry. Here they read the document the one reader makes, as S8 leaves the
+// toolchain one reader (docs/self-hosting.md §6.21): the same answers on
+// every manifest the two Rust readings agree on, and on the rest the answer
+// `grasm_pkg::toml` gives. A manifest the reader refuses answers nothing --
+// no dependencies, the default entry, not a runtime package -- and the
+// graph's own reading of it is the one that reports why.
 
-/// The text before the first `#`, trimmed.
-fn uncomment(raw: str) -> str {
-    match raw.index_of("#") {
-        Some(i) -> raw.substr(0, i).trim()
-        None -> raw.trim()
-    }
-}
-
-fn split_eq(line: str) -> Option[(str, str)] {
-    match line.index_of("=") {
-        Some(i) -> Some((line.substr(0, i), line.substr(i + 1, line.len() - i - 1)))
-        None -> None
-    }
-}
-
-/// `trim_matches('"')`.
-fn trim_quotes(s: str) -> str {
-    var a = 0
-    var b = s.len()
-    let bs = s.to_bytes()
-    while a < b and bs.at(a) == 34 {
-        a += 1
-    }
-    while b > a and bs.at(b - 1) == 34 {
-        b -= 1
-    }
-    bs.slice(a, b).to_str()
-}
-
-/// `trim_end_matches(']')`.
-fn trim_end_brackets(s: str) -> str {
-    var b = s.len()
-    let bs = s.to_bytes()
-    while b > 0 and bs.at(b - 1) == 93 {
-        b -= 1
-    }
-    bs.slice(0, b).to_str()
-}
-
-fn manifest_text(dir: str) -> Option[str] {
+fn manifest_doc(dir: str) -> Option[TomlDoc] {
     let p = join(dir, "grasm.toml")
     if not file_exists(p) {
         return None
     }
-    read_text(p)
+    match read_text(p) {
+        Some(text) -> Some(toml.parse(text))
+        None -> None
+    }
 }
 
 /// The directory holding the nearest `grasm.toml` at or above `dir`, and
-/// its text; ("\0", "") when there is none.
-fn find_manifest(dir: str) -> (str, str) {
+/// its document; "\0" when there is none.
+fn find_manifest(dir: str) -> (str, TomlDoc) {
     var here = dir
     while here != "\0" {
-        match manifest_text(here) {
-            Some(text) -> return (here, text)
+        match manifest_doc(here) {
+            Some(d) -> return (here, d)
             None -> ()
         }
         here = parent(here)
     }
-    ("\0", "")
+    ("\0", toml.parse(""))
 }
 
 /// A package's dependencies that have a path: name -> directory.
 fn package_dependencies(dir: str) -> Map[str, str] {
     var out: Map[str, str] = map()
-    let (root, text) = find_manifest(dir)
-    if root == "\0" {
+    let (root, d) = find_manifest(dir)
+    if root == "\0" or not d.ok {
         return out
     }
-    var current = "\0"
-    for raw in text.lines() {
-        let line = uncomment(raw)
-        if line.starts_with("[") {
-            let name = trim_end_brackets(line.substr(1, line.len() - 1)).trim()
-            if name.starts_with("dependencies.") {
-                current = name.substr(13, name.len() - 13).trim()
-            } else {
-                current = "\0"
-            }
-            continue
-        }
-        if current == "\0" {
-            continue
-        }
-        match split_eq(line) {
-            Some((k, v)) -> {
-                if k.trim() == "path" {
-                    out.set(current, join(root, trim_quotes(v.trim())))
-                }
-            }
-            None -> ()
+    for ti in toml.subtables(d, "dependencies") {
+        let full = d.t_names[ti]
+        let name = full.substr(13, full.len() - 13)
+        let pth = toml.as_str(d, toml.get(d, ti, "path"))
+        if pth != "\0" {
+            out.set(name, join(root, pth))
         }
     }
     out
 }
 
-/// Every dependency name a package declares, path or not, in order.
+/// Every dependency name a package declares, path or not.
 fn dependency_names(dir: str) -> [str] {
     var out: [str] = []
-    let (root, text) = find_manifest(dir)
-    if root == "\0" {
+    let (root, d) = find_manifest(dir)
+    if root == "\0" or not d.ok {
         return out
     }
-    for raw in text.lines() {
-        let line = uncomment(raw)
-        if line.starts_with("[") {
-            let name = trim_end_brackets(line.substr(1, line.len() - 1)).trim()
-            if name.starts_with("dependencies.") {
-                out.push(name.substr(13, name.len() - 13).trim())
-            }
-        }
+    for ti in toml.subtables(d, "dependencies") {
+        let full = d.t_names[ti]
+        out.push(full.substr(13, full.len() - 13))
     }
     out
 }
@@ -419,55 +378,31 @@ fn dependency_names(dir: str) -> [str] {
 /// The package holding `dir`, if its `[package]` says `runtime = true`;
 /// "\0" otherwise.
 fn runtime_package(dir: str) -> str {
-    let (root, text) = find_manifest(dir)
-    if root == "\0" {
+    let (root, d) = find_manifest(dir)
+    if root == "\0" or not d.ok {
         return "\0"
     }
-    var in_package = false
-    var name = ""
-    var runtime = false
-    for raw in text.lines() {
-        let line = uncomment(raw)
-        if line.starts_with("[") {
-            in_package = trim_end_brackets(line.substr(1, line.len() - 1)).trim() == "package"
-            continue
-        }
-        if in_package {
-            match split_eq(line) {
-                Some((k, v)) -> {
-                    let key = k.trim()
-                    if key == "runtime" {
-                        runtime = v.trim() == "true"
-                    } else if key == "name" {
-                        name = trim_quotes(v.trim())
-                    }
-                }
-                None -> ()
-            }
-        }
+    let pkg = toml.table(d, "package")
+    let rv = toml.get(d, pkg, "runtime")
+    if rv < 0 or d.v_kind[rv] != toml.V_BOOL or d.v_str[rv] != "true" {
+        return "\0"
     }
-    if runtime {
-        name
-    } else {
-        "\0"
+    let name = toml.as_str(d, toml.get(d, pkg, "name"))
+    if name == "\0" {
+        return ""
     }
+    name
 }
 
 /// A package's entry file: its declared `entry`, or `src/main.gr`.
 fn package_entry(dir: str) -> str {
     var entry = "src/main.gr"
-    match manifest_text(dir) {
-        Some(text) -> {
-            for raw in text.lines() {
-                let l = uncomment(raw)
-                match split_eq(l) {
-                    Some((k, v)) -> {
-                        if k.trim() == "entry" {
-                            entry = trim_quotes(v.trim())
-                            break
-                        }
-                    }
-                    None -> ()
+    match manifest_doc(dir) {
+        Some(d) -> {
+            if d.ok {
+                let e = toml.as_str(d, toml.get(d, toml.table(d, "package"), "entry"))
+                if e != "\0" {
+                    entry = e
                 }
             }
         }
@@ -677,16 +612,16 @@ fn version_parts(v: str) -> [str] {
     out
 }
 
-fn version_ok(v: str) -> bool {
+pub fn version_ok(v: str) -> bool {
     version_parts(v).len() == 3
 }
 
 /// A version as Rust displays it: `1.2.3`.
-fn version_shown(v: str) -> str {
+pub fn version_shown(v: str) -> str {
     version_parts(v).join(".")
 }
 
-fn version_err(v: str) -> str {
+pub fn version_err(v: str) -> str {
     "version `{v}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)"
 }
 
@@ -711,23 +646,23 @@ fn version_less(a: str, b: str) -> bool {
 
 /// `VersionReq::parse`: `=1.2.3` exact, `^1.2.3` or `1.2.3` compatible --
 /// the version written, its sign stripped.
-fn req_version(r: str) -> str {
-    let t = rtoml.rust_trim(r)
+pub fn req_version(r: str) -> str {
+    let t = toml.rust_trim(r)
     if t.starts_with("=") {
-        return rtoml.rust_trim(t.substr(1, t.len() - 1))
+        return toml.rust_trim(t.substr(1, t.len() - 1))
     }
     if t.starts_with("^") {
-        return rtoml.rust_trim(t.substr(1, t.len() - 1))
+        return toml.rust_trim(t.substr(1, t.len() - 1))
     }
     t
 }
 
 fn req_exact(r: str) -> bool {
-    rtoml.rust_trim(r).starts_with("=")
+    toml.rust_trim(r).starts_with("=")
 }
 
 /// A requirement as Rust displays it: `=1.2.3` or `^1.2.3`.
-fn req_shown(r: str) -> str {
+pub fn req_shown(r: str) -> str {
     if req_exact(r) {
         return "=" + version_shown(req_version(r))
     }
@@ -752,7 +687,7 @@ fn req_matches(r: str, v: str) -> bool {
     }
 }
 
-fn is_identifier(name: str) -> bool {
+pub fn is_identifier(name: str) -> bool {
     let kws = ["and", "as", "bench", "break", "const", "continue", "effect", "else", "extern", "fail", "false", "fn", "for", "handled_by", "if", "import", "in", "inout", "let", "match", "not", "or", "own", "parallel", "pub", "ref", "region", "return", "spawn", "test", "true", "try", "type", "unsafe", "var", "while", "with"]
     if name == "" {
         return false
@@ -773,7 +708,7 @@ fn is_identifier(name: str) -> bool {
 
 /// `Path::extension` is `gr`, in any case: the last component's text after
 /// its last `.`, when that `.` does not begin it.
-fn is_grasm_source(p: str) -> bool {
+pub fn is_grasm_source(p: str) -> bool {
     var segs: [str] = []
     for s in p.split("/") {
         if s != "" and s != "." {
@@ -819,9 +754,9 @@ pub fn enclosing_package_name(path: str) -> str {
 }
 
 /// `Manifest::load`: the manifest in `dir`, read by the Rust toolchain's
-/// own reader (rtoml.gr) and checked as `Manifest::parse` checks it, in its
+/// own reader (toml.gr) and checked as `Manifest::parse` checks it, in its
 /// order and its words.
-fn load_manifest(dir: str) -> Manifest {
+pub fn load_manifest(dir: str) -> Manifest {
     let path = join(dir, "grasm.toml")
     let text = match read_bytes(path) {
         Ok(b) -> {
@@ -840,24 +775,24 @@ fn load_manifest(dir: str) -> Manifest {
     m
 }
 
-fn parse_manifest(text: str) -> (bool, str, Manifest) {
+pub fn parse_manifest(text: str) -> (bool, str, Manifest) {
     let none = bad_manifest("")
-    let doc = rtoml.parse(text)
+    let doc = toml.parse(text)
     if not doc.ok {
         return (false, doc.why, none)
     }
-    let pkg = rtoml.table(doc, "package")
+    let pkg = toml.table(doc, "package")
     if pkg < 0 {
         return (false, "manifest is missing a [package] table", none)
     }
-    let name = rtoml.as_str(doc, rtoml.get(doc, pkg, "name"))
+    let name = toml.as_str(doc, toml.get(doc, pkg, "name"))
     if name == "\0" {
         return (false, "[package] is missing `name`", none)
     }
     if name == "" {
         return (false, "[package] name must not be empty", none)
     }
-    let version = rtoml.as_str(doc, rtoml.get(doc, pkg, "version"))
+    let version = toml.as_str(doc, toml.get(doc, pkg, "version"))
     if version == "\0" {
         return (false, "[package] is missing `version`", none)
     }
@@ -866,21 +801,21 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
     }
     var has_caps = false
     var caps: [str] = []
-    let cv = rtoml.get(doc, pkg, "capabilities")
+    let cv = toml.get(doc, pkg, "capabilities")
     if cv >= 0 {
-        if not rtoml.is_str_array(doc, cv) {
+        if not toml.is_str_array(doc, cv) {
             return (false, "`capabilities` must be an array of strings", none)
         }
         has_caps = true
-        caps = rtoml.str_array(doc, cv)
+        caps = toml.str_array(doc, cv)
     }
-    let lv = rtoml.get(doc, pkg, "links")
+    let lv = toml.get(doc, pkg, "links")
     var links: [str] = []
     if lv >= 0 {
-        if not rtoml.is_str_array(doc, lv) {
+        if not toml.is_str_array(doc, lv) {
             return (false, "`links` must be an array of strings", none)
         }
-        for lib in rtoml.str_array(doc, lv) {
+        for lib in toml.str_array(doc, lv) {
             if not link_name_ok(lib) {
                 return (false, "`links` entry `{lib}` is not a library name — letters, digits, `_`, `-`, `.` and `+`, and it must start with a letter, a digit or `_`", none)
             }
@@ -890,7 +825,7 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
         }
         links.sort()
     }
-    var entry = rtoml.as_str(doc, rtoml.get(doc, pkg, "entry"))
+    var entry = toml.as_str(doc, toml.get(doc, pkg, "entry"))
     if entry == "\0" {
         entry = "src/main.gr"
     }
@@ -903,22 +838,22 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
     if not is_grasm_source(entry) {
         return (false, "`entry` must name a `.gr` file: `{entry}` is not one, and the lockfile's checksum and `grasm publish` both cover this package's `.gr` sources — a file outside that set is executed but recorded nowhere", none)
     }
-    let rv = rtoml.get(doc, pkg, "runtime")
-    if rv >= 0 and doc.v_kind[rv] != rtoml.V_BOOL {
+    let rv = toml.get(doc, pkg, "runtime")
+    if rv >= 0 and doc.v_kind[rv] != toml.V_BOOL {
         return (false, "`runtime` must be `true` or `false`", none)
     }
     // Dependencies, in the order of their tables' names.
     var dep_names: [str] = []
     var paths: [str] = []
     var reqs: [str] = []
-    for ti in rtoml.subtables(doc, "dependencies") {
+    for ti in toml.subtables(doc, "dependencies") {
         let full = doc.t_names[ti]
         let d = full.substr(13, full.len() - 13)
-        let pth = rtoml.as_str(doc, rtoml.get(doc, ti, "path"))
+        let pth = toml.as_str(doc, toml.get(doc, ti, "path"))
         var r = "\0"
-        let vv = rtoml.get(doc, ti, "version")
+        let vv = toml.get(doc, ti, "version")
         if vv >= 0 {
-            r = rtoml.as_str(doc, vv)
+            r = toml.as_str(doc, vv)
             if r == "\0" {
                 return (false, "dependency `{d}`: `version` must be a string", none)
             }
@@ -939,7 +874,7 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
             return (false, "`[package]` has no key `{k}` — it takes `name`, `version`, `capabilities`, `entry`, `links`, `runtime`", none)
         }
     }
-    let root = rtoml.table(doc, "")
+    let root = toml.table(doc, "")
     if root >= 0 and doc.t_keys[root].len() > 0 {
         return (false, "`{doc.t_keys[root][0]}` is written above the first table header, so it belongs to no table — put it under `[package]`", none)
     }
@@ -952,7 +887,7 @@ fn parse_manifest(text: str) -> (bool, str, Manifest) {
         }
         return (false, "`[{tn}]` is not a table this manifest has — it takes `[package]` and `[dependencies.<name>]`", none)
     }
-    for ti in rtoml.subtables(doc, "dependencies") {
+    for ti in toml.subtables(doc, "dependencies") {
         let full = doc.t_names[ti]
         let d = full.substr(13, full.len() - 13)
         for k in doc.t_keys[ti] {
@@ -1028,7 +963,7 @@ pub fn resolve_graph(root_dir: str) -> Resolution {
 
 /// The registry's root, or "\0" when there is none: from the package's
 /// canonical directory up, or from the working directory joined to it.
-fn discover_registry(from: str) -> str {
+pub fn discover_registry(from: str) -> str {
     match env("GRASM_REGISTRY") {
         Some(d) -> return d
         None -> ()
@@ -1080,7 +1015,7 @@ fn registry_versions(reg: str, name: str) -> [str] {
 }
 
 /// `Path::is_file`: there, and not a directory.
-fn is_file(p: str) -> bool {
+pub fn is_file(p: str) -> bool {
     if not file_exists(p) {
         return false
     }

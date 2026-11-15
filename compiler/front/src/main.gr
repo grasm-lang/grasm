@@ -338,73 +338,70 @@ fn cmd_bench(list: str, rounds: i64) {
     print("lex_ns: {best_lex}   lex_parse_cst_ns: {best_parse}   lex_parse_cst_ast_ns: {best_ast}")
 }
 
-/// A manifest as `packages/toml` reads it: every key as a dotted path, in
-/// byte order, with its value's kind and the value -- a string JSON-quoted,
-/// an array's items in brackets. An inline table's members are listed under
-/// their own paths and the table itself is not. The entries of an array of
-/// tables follow, the arrays by name, each entry numbered (`bin[1].name`)
-/// and in the file's order, the keys sorted within it -- so a key read into
-/// the wrong entry shows. A file the reader refuses prints `refused` and its
-/// reason.
-fn cmd_toml(path: str) {
-    let text = match read_file(path) {
-        Ok(t) -> t
-        Err(e) -> {
-            eprint("error: cannot read `{path}`: {e}")
-            exit(1)
-            ""
-        }
-    }
-    let doc = toml.parse(text)
-    if not doc.ok {
-        print("refused line {doc.line}: {doc.why}")
-        return
-    }
-    // Each line behind a sort key: "0" and the line for a plain key; "1",
-    // the array's name, the entry's number and the line for an entry's.
-    var lines: [str] = []
-    for i in 0..doc.keys.len() {
-        let v = doc.values[i]
-        if toml.kind(v) == "table" {
-            continue
-        }
-        let at = doc.entries[i]
-        let line = at + "\t" + toml_value(v)
-        match at.index_of("[") {
-            None -> lines.push("0" + line)
-            Some(open) -> {
-                let close = at.index_of("]") ?? open
-                let n = at.substr(open + 1, close - open - 1)
-                lines.push("1" + at.substr(0, open) + "\u{1}" + n.pad_start(12, "0") + "\u{1}" + line)
-            }
-        }
-    }
-    lines.sort()
-    for l in lines {
-        if l.starts_with("0") {
-            print(l.substr(1, l.len() - 1))
-        } else {
-            let parts = l.split("\u{1}")
-            print(parts[2])
-        }
+/// `grasm toml`: a manifest as the toolchain's one TOML reader
+/// (packages/toml, the Rust toolchain's `grasm_pkg::toml` line for line)
+/// reads it: every key of every table as a dotted path, in byte order, a
+/// tab, its kind and value -- `str` and the string quoted as TIR quotes it,
+/// `int N`, `bool true`, `array [...]`; then each entry of each array of
+/// tables, the arrays by name, the entries numbered in the file's order, the
+/// keys sorted within one. A file the reader refuses prints `refused` and
+/// why, and is no failure.
+pub fn cmd_toml(path: str) {
+    let text = read_source(path).to_str()
+    for l in toml_lines(toml.parse(text)) {
+        print(l)
     }
 }
 
-fn toml_value(v: ref TomlValue) -> str {
-    match v {
-        Text(s) -> "str " + loader.quote(s)
-        Int(n) -> "int {n}"
-        Float(x) -> "float {x}"
-        Bool(b) -> if b { "bool true" } else { "bool false" }
-        Array(items) -> {
-            var parts: [str] = []
-            for it in items {
-                parts.push(toml_value(it))
-            }
-            "array [" + parts.join(", ") + "]"
-        }
-        Table(ks, vs) -> "table"
+pub fn toml_lines(doc: TomlDoc) -> [str] {
+    if not doc.ok {
+        return ["refused {doc.why}"]
     }
+    var lines: [str] = []
+    for ti in 0..doc.t_names.len() {
+        let table = doc.t_names[ti]
+        for ki in 0..doc.t_keys[ti].len() {
+            let k = doc.t_keys[ti][ki]
+            let at = if table == "" { k } else { table + "." + k }
+            lines.push(at + "\t" + toml_value(doc, doc.t_vals[ti][ki]))
+        }
+    }
+    lines.sort()
+    var arrays: [str] = []
+    for n in doc.a_names {
+        if not arrays.contains(n) {
+            arrays.push(n)
+        }
+    }
+    arrays.sort()
+    for n in arrays {
+        var i = 0
+        for ai in toml.entries(doc, n) {
+            for ki in 0..doc.a_keys[ai].len() {
+                lines.push("{n}[{i}].{doc.a_keys[ai][ki]}\t" + toml_value(doc, doc.a_vals[ai][ki]))
+            }
+            i += 1
+        }
+    }
+    lines
+}
+
+fn toml_value(doc: TomlDoc, v: i64) -> str {
+    let k = doc.v_kind[v]
+    if k == toml.V_STR {
+        return "str " + loader.quote(doc.v_str[v])
+    }
+    if k == toml.V_INT {
+        return "int {toml.int_value(doc, v)}"
+    }
+    if k == toml.V_BOOL {
+        return "bool " + doc.v_str[v]
+    }
+    var parts: [str] = []
+    for item in doc.v_items[v] {
+        parts.push(toml_value(doc, item))
+    }
+    "array [" + parts.join(", ") + "]"
 }
 
 /// The modules a program loads, as the file lines `grasm tir` begins with.

@@ -9,9 +9,14 @@ makes shipping them honest rather than quiet.
 `IoFailed` that `grasm run` and a native binary word differently; one
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
-two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: twelve, a nested
-interpolation's spans, a backslash at the end of a file, a space `grasm fmt`
+six, a block whose value is a map literal and a statement `if` whose
+branches' values differ, refused natively, and four in the manifest reader
+(`grasm_pkg::toml`, and the Grasm toolchain's `packages/toml` with it): a
+string cut at an escaped quote, escapes not undone, a multi-line string
+read with its quotes, and text after a string taken into it. Open S4: fifteen, three in
+the manifest readers -- non-TOML accepted, quoted and spaced names taken
+literally, and the Rust loader reading a dependency's path a second way --
+a nested interpolation's spans, a backslash at the end of a file, a space `grasm fmt`
 drops before a brace, `grasm bench`'s name column padded by bytes, `grasm
 doc` and the doc-example runner taking a fence or a hidden line behind any
 whitespace, six in `grasm
@@ -26,6 +31,94 @@ stack running out, each end the command.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
+
+## Found on 2026-11-14 by S8 part four (the toolchain's one TOML reader)
+
+The Rust toolchain reads manifests and lockfiles with `grasm_pkg::toml`, a
+line-at-a-time reader of a TOML subset ("anything outside that is a clear
+error rather than a silent misparse"). Fuzzed against Python's `tomllib`
+(`scripts/tomldiff.sh`, `scripts/lib/tomlfuzz.py`, 1,500 manifest-shaped
+files), it refuses valid TOML outside its subset -- floats, inline tables,
+arrays across lines, literal strings, dates, `0x` and `1_000` integers,
+nested arrays -- as it documents, and misreads in the ways below. The Grasm
+toolchain's reader, `packages/toml`, is the same reader line for line
+(docs/self-hosting.md §6.21, the owner's decision of 2026-11-14), so each is
+reproduced there and the two stay comparable; `tomldiff` counts every file
+on which they part from `tomllib` by a cause recorded here
+(`scripts/lib/tomlclass.py`) and fails on one it cannot explain. All are
+fixed in `packages/toml` at the S9 cutover, when the Rust reader is gone and
+nothing holds the toolchain to it; none is fixed in Rust.
+
+**A string is cut at an escaped quote followed by `#` -- *open, S3*.** The
+comment cut (`strip_comment`) and the array split (`split_top_level`) turn
+"inside a string" on and off at every `"`, escaped or not, so the `\"` of a
+valid string ends it for them. A `#` after it starts a comment, and what is
+left still begins and ends with a quote, so a value changes without an
+error:
+
+```
+[server]
+k = "a\"#b"
+```
+
+`grasm toml` -- and a program reading its configuration with
+`packages/toml` -- reads `server.k` as `a\` (one backslash); `tomllib`
+reads `a"#b`. In a manifest every key that could hold such a string is
+checked after it is read, so there the cut surfaces as a misleading refusal:
+`entry = "src/a\"#b.gr"` is refused because `` `src/a\` `` is not a `.gr`
+file. In an array the same quote splits an item: `k = ["a\", \"b"]` is
+refused (`cannot parse value`) where it is one string, `a", "b`.
+
+**`\u`, `\U`, `\b`, `\f` and `\r` are not undone, nor an unknown escape
+refused -- *open, S3*.** `unescape` knows `\n`, `\t`, `\"` and `\\` and keeps
+any other escape as written: `k = "\u0041"` is the six characters
+`\u0041`, not `A`; `k = "a\rb"` keeps the backslash. TOML refuses an escape
+it does not define (`k = "\q"`); this reader keeps it.
+
+**A multi-line string on one line is read with its quotes -- *open, S3*.**
+`k = """x"""` starts and ends with `"`, so it is the string `""x""`;
+`tomllib` reads `x`. Across lines, `k = """` is the string `"` and the lines
+after it are read as keys, so the file is refused at a later line.
+
+**Text after a string is taken into it -- *open, S3*.** A value that begins
+and ends with `"` is a string whatever is between: `k = "a" "b"` is
+`a" "b`, `k = "x"y"` is `x"y`. TOML refuses both.
+
+**Other files TOML refuses are read -- *open, S4*.** A key with a space in
+it (`a key = 1`, the key `a key`), an integer with a leading zero (`k = 007`,
+7), a table name with an empty part (`[dependencies.]`, a table named
+`dependencies.`, which a manifest then refuses as an unknown table). Each is
+read with a value no TOML reader would give, but no manifest key takes it
+silently.
+
+**Quotes and spaces in a table name or key are kept -- *open, S4*.** A
+header is the text between its brackets, trimmed: `[a."b.c"]` is the table
+`a."b.c"` (TOML: `a` -> `b.c`), `[ dependencies . y ]` the table
+`dependencies . y`, and a key loses only double quotes: `'lit' = 1` is the
+key `'lit'`. In a manifest each is then refused as an unknown table or key,
+or a dependency whose name does not match its package's.
+
+**The Rust loader reads a dependency's path a second way -- *open, S4*.**
+Beside `grasm_pkg::toml`, `loader.rs` reads a manifest line by line for a
+package's dependencies, its entry and `runtime` (`package_dependencies`,
+`package_entry`, `runtime_package`): the line cut at its first `#`, quotes
+trimmed, no escape undone, and the first `entry =` on any line taken. So a
+dependency's path with a `#` in it is resolved to one directory and loaded
+from another:
+
+```
+app/grasm.toml     [package] name = "app" ... [dependencies.mid] path = "../mid"
+mid/grasm.toml     [package] name = "mid" ... [dependencies.lib] path = "../lib#2"
+lib#2/grasm.toml   [package] name = "lib" ...
+mid/src/main.gr    import lib  (and `pub fn g` calling `lib.f()`)
+```
+
+`grasm check app/src/main.gr` says ``cannot load module `lib` `` and looked
+in `lib/src/main.gr`, though the graph resolves. The Grasm loader asks the
+same questions of the one reader's document (§6.21), so it loads `lib#2` and
+accepts the program: a difference between the two toolchains, kept by
+decision rather than reproduced, because reproducing it would mean a second
+TOML reader. The fix in Rust is the loader asking `Manifest::load`.
 
 ## Found on 2026-11-13 by S8 part three (`doc`, `api` and the bundle in Grasm)
 

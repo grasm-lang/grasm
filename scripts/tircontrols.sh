@@ -152,20 +152,28 @@ control field-swapped 'TIR differs' scripts/tirdiff.sh emit.gr \
 # values traded: every key is still there with a value it was given, so only
 # a dump that says which entry each key is in can tell.
 control toml-entries 'packages/toml and the Rust reader differ' scripts/tomldiff.sh packages/toml/src/main.gr \
-    '    Doc{ keys: keys, values: values, entries: entries, ok: true, why: "", line: 0 }' \
+    '    TomlDoc{ ok: true, why: "", t_names: names,' \
     '    var traded = false
-    for i in 0..keys.len() {
+    for i in 0..a_names.len() {
         let from = i + 1
-        for j in from..keys.len() {
-            if not traded and keys[i] == keys[j] and entries[i] != entries[j] {
-                let v = values[i]
-                values[i] = values[j]
-                values[j] = v
-                traded = true
+        for j in from..a_names.len() {
+            for ki in 0..a_keys[i].len() {
+                for kj in 0..a_keys[j].len() {
+                    if not traded and a_names[i] == a_names[j] and a_keys[i][ki] == a_keys[j][kj] {
+                        var vi = a_vals[i]
+                        var vj = a_vals[j]
+                        let v = vi[ki]
+                        vi[ki] = vj[kj]
+                        vj[kj] = v
+                        a_vals[i] = vi
+                        a_vals[j] = vj
+                        traded = true
+                    }
+                }
             }
         }
     }
-    Doc{ keys: keys, values: values, entries: entries, ok: true, why: "", line: 0 }'
+    TomlDoc{ ok: true, why: "", t_names: names,'
 
 # The fuzzer, told to skip an engine: its own counts must give it away.
 ran=$((ran + 1))

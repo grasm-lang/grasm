@@ -10,10 +10,10 @@ entry = "src/main.gr"
 # Rust toolchain's `canonicalize` calls it, which is the `unsafe`.
 capabilities = ["io", "unsafe"]
 
-# The loader reads manifests with rtoml.gr, a port of the Rust toolchain's
-# own reader, so its diagnostics about one are Rust's (docs/self-hosting.md
-# §6.13). The TOML package serves only `front toml`, which tomldiff holds to
-# the Rust reader and to Python's tomllib.
+# Manifests and lockfiles are read by packages/toml, the toolchain's one TOML
+# reader: the Rust toolchain's own, line for line, so that what the loader
+# says about a manifest is what `grasm check` says (docs/self-hosting.md
+# §6.13, §6.21).
 [dependencies.toml]
 path = "../../packages/toml"
-version = "^1.0.0"
+version = "^2.0.0"
