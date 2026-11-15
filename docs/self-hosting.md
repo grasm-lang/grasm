@@ -5910,6 +5910,146 @@ first value (under (A); under (B) an escape decoded otherwise).
 `fixpoint` must still find its stage 3 its stage 2, and `clidiff` runs again
 with stage 2's command.
 
+**Steps two to four, as built** (2026-11-14).
+
+- **One reader** (step two). `packages/toml` is `rtoml.gr`'s reader, the
+  Rust toolchain's line for line, with an accessor API over it: tables and
+  arrays of tables by index (`table`, `get`, `subtables`, `entries`,
+  `entry_get`), values by dotted path (`text_of`, `int_of`, `bool_of`,
+  `texts_of`, `keys_under`), `render_value`, and `quote` as the lockfile
+  writes; version 2.0.0, its API being new. `rtoml.gr` is deleted, and the
+  reader `packages/toml` had with it. The loader, the Grasm command's `grasm
+  toml` (now `front.cmd_toml`, which `front toml` runs too) and the lockfile
+  read through it; so do the loader's line-by-line questions -- a
+  dependency's path, the entry, `runtime` -- which asked the manifest's text
+  as the Rust loader does (the coordinator accepted the plan). No program of
+  `loaddiff`'s or `diagdiff`'s moved (below); the one program known to
+  answer otherwise is the reproducer in docs/known-issues.md, a dependency's
+  path with a `#` in it, which the Rust loader cuts and the Grasm one does
+  not. `packages/toml-demo` is rewritten to the dialect: its first document
+  had a float (`ratio = 1.5`), an underscored integer (`big = 1_000_000`), a
+  literal string (`entry = 'src/main.gr'`), a date, a nested array and an
+  inline table, each now refused -- it shows them refused, with the Rust
+  reader's words -- and the escape `ü`, which the reader keeps as
+  written. `tomldiff` is as decided above; `tomlclass.py` names the causes;
+  the counts at the default size and seed are in `tomldiff.sh` and
+  `tomlclass.expected`. The two controls that planted into the old readers
+  plant into `packages/toml`: `diagcontrols`' `manifest-words` and
+  `tircontrols`' `toml-entries`.
+- **`deps`, `add`, `publish`** (step three): `compiler/grasm/src/pkg.gr`,
+  about 640 lines, as the design above says. `front`'s ceilings gained
+  `whole_program_effects`, made `effects_of_package`,
+  `effects_by_package` and `effect_sites_of_package` public, word a
+  package that cannot be analysed as `first_failure` does, and walk a
+  package's sources as `source_files` does -- each real directory once,
+  sorted by component -- a walk the ceilings `check` enforces now share.
+  The command depends on `packages/toml` and `crypto_hash` (the
+  lockfile's SHA-256).
+- **The gates** (step four): `clidiff`'s four sections; `clicases.txt`
+  without the `elsewhere` tags of the three and with 24 new lines (261
+  cases); `regcases.py` (24 cases, 129 commands, 14 lockfile edits from
+  `lockedit.py` between them); `clicontrols`' four controls, as above.
+
+**What the gates found** (2026-11-14 and 15, this branch's tree, nothing
+else running on the machine; the stage-1 command built by the Rust
+`grasm`):
+
+- `tomldiff`: "manifests: 1450 read alike by all three: 1450 (9599 keys)
+  refused by all three: 0 disagree: 0"; "fuzzed: 1500 (seed 1) the Rust
+  reader's bytes: 1500 read as tomllib reads them: 1051, 577 of them
+  refused by both"; "where the Rust reader is not tomllib: refuses-valid
+  216 accepts-invalid 156 reads-otherwise 77 unexplained: 0", the causes'
+  counts the ones `tomlclass.expected` records.
+- `loaddiff` "programs: 1737 same modules: 1671 (5403 modules; 321 with a
+  package's own import) loaded, then refused: 64 unloadable by both: 2
+  disagree: 0"; `diagdiff` "programs: 4280 ... refused with the same
+  output: 1437 (conformance: 66) accepted by both: 2843 differ: 0 Rust
+  panics: 0", 114,791 diagnostics and 36,163 help lines compared, the 67
+  package cases the same. Both are §6.19's counts, but 2,843 accepted where
+  §6.19 had 2,840 (the checkout holds three more `.gr` files): routing the
+  loader's questions through the one reader moved no program.
+- `diagcontrols` "controls: 9 caught: 9 missed: 0" (`manifest-words` now
+  planted in `packages/toml`); `tircontrols` "controls: 8 caught: 8 missed:
+  0" (`toml-entries` likewise).
+- `clicontrols` "controls: 22 caught: 22 missed: 0", 92 minutes: §6.20's
+  eighteen and `lock-order`, `dep-dropped` (each "registry
+  lowest-at-floor: grasm deps app ... the files differ"), `publish-where`
+  ("registry publish: grasm publish pkg --registry reg") and `toml-first`
+  ("registry lockfile: grasm deps app --locked -- exit 1 (Rust) and 0
+  (Grasm)").
+- `fixpoint`: "programs: 6 and the grasm command artifacts per stage: 16
+  and 2 compared: 54 ... identical: 54 differ: 0"; "stage 2's TIR the same
+  as grasm tir's: 6 of 6"; "the command's build the stage pipeline's (its
+  rt.o and the 4 programs): 5 of 5". The command's stage 3 is its stage 2:
+  `grasm` 4,405,384 bytes (4,372,312 at §6.20), SHA-256
+  `84c5a7aa6b6e4b57cdd1e3d05a2e1af01ea71eb1a9e6728d9a1677c4139a8cb2`, and
+  `rt.o` 555,224 bytes. 24 minutes.
+- `clidiff` with the command stage 1 is: the first whole run passed every
+  section up to `publish` with no difference, and was stopped in
+  `publish` after 11 hours, 500 packages in: it compared every byte of the
+  growing registry after each package, which is quadratic. The section now
+  holds each publish to the registry's paths and modes and to the bytes of
+  what it wrote, and the whole registry's bytes once at the end; run again
+  alone (`ONLY=publish`), 14 minutes: "publish: 1448 packages the same,
+  registries and all: 1448, 635 of them published". The floors of the four
+  new sections were then set a margin below these runs (the agent's):
+  `registry` 120 commands and 60 refusals, `deps` 1,400 packages, lockfiles
+  written and refusals, `add` 1,400, `publish` 600 published.
+- `clidiff` with stage 2's command (`fixpoint`'s, built by stage 1's
+  command alone), the whole run with every floor in force, passing, 559
+  minutes: "lines: 261 the same: 253 not here, as §6.17 says: 3 the runtime
+  built: 1 a target refused: 4"; "corpus: 1737 programs, 8685 commands ...
+  the same: 8685, 138 of them refusals"; "toml: 1474 files the same: 1474,
+  19 of them refused by both"; "run: 651 ... the same: 651 timed out: 0";
+  "fmt: 2010 files, ... 20100 commands the same: 20100 rewritten alike:
+  7648 refused alike: 387"; "lint: 2010 files, 5427 commands (1407 with
+  --only) the same: 5427 findings: 993"; "test: 1737 programs, 1961
+  commands ... the same: 1960, 12 of them with a failing test the host's
+  panic: 0 both timed out, --contracts: 1"; "test, main as a test: 651
+  programs the same: 649, 13 of them failing the host's panic: 2"; "bench:
+  ... the same: 1743 timing lines in the format: 6"; "doc: 1737 programs,
+  3168 commands (1426 written with -o, 66543 items) the same: 3168, 71 of
+  them refusals"; "api: ... 10793 commands (1132 with a surface) the same:
+  10793 ..."; "bundle: 651 ... the command and Rust's payload: 651 run
+  alike, plain and with arguments: 651 ... built twice the same: 651";
+  "source: 1737 programs the same output and file: 1737, 1086 of them
+  refusals ..."; "build: 648 ... run alike: 648 built twice the same: 648";
+  "target: 65 programs ... 195 of 195"; "registry: 129 commands (93 deps,
+  23 add, 13 publish; 14 lockfile edits between them) the same, files and
+  all: 129, 75 of them refusals"; "deps: 1448 packages, 4344 commands the
+  same, lockfiles and all: 4344, 1447 of them refusals lockfiles written:
+  1448"; "add: 1448 packages the same, manifests and all: 1448, 0 of them
+  refusals"; "publish: 1448 packages the same, registries and all: 1448,
+  635 of them published"; "the Grasm command's package calls proc_run or
+  proc_pipeline: 0 time(s)". The stage-1 run's sections gave the same lines.
+- `gatecheck` "gate helpers checked: 587 undefined: 0 ..."; `fmttest`
+  "formatted: 2004 unformatted: 0 does not parse: 5 exempt: 1"; `gfmttest`
+  "checked: 1533 disagreeing: 0"; `linttest` "linted: 2005 findings: 993
+  does not parse: 5 broke: 0" (993 where §6.20 had 1,001: the deleted
+  `rtoml.gr` and the old reader had findings).
+- The litter check, against lists taken before the first gate: the
+  worktree's and the main checkout's files git does not track, and their
+  top levels: no new untracked file and no new top-level entry in either.
+  Each gate's git-ignored `target/` was removed after it ran, and the
+  `__pycache__` directories the controls' Python fuzzers leave under
+  `scripts/` were removed at the end.
+- Time: the Rust `deps compiler/grasm` took 1 minute 48 seconds and the
+  Grasm one 3 minutes 38 seconds (once each, nothing else running, not to
+  be quoted): every source file of each of 19 packages loaded and checked
+  as a program of its own.
+
+Not run on this branch: the rest of `allgates.sh`.
+
+**What is left for S8 after this part.** `lsp`, `dap` and `journal`; the
+rest as §6.20 left it -- `test --schedules` and `--schedule-seed` for a
+test that starts tasks, a panic inside a `concurrent` task under `test`,
+one the runtime's channel operations raise, the interpreter's own stack,
+the `IoFailed` wording; the LSP on the query engine, DAP, journal and
+replay, the wasm32 backend. The Rust TOML reader's misreadings, kept in the
+one reader until S9 (docs/known-issues.md). Three tracked lockfiles
+(`apps/apigateway`, `examples/jsonlib/app`, `examples/workspace/app`) are
+stale as `examples/registry/app`'s was, and were left as they are.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
@@ -5924,8 +6064,8 @@ share), `fuzz_rtfmt` (number formatting against the Rust runtime) and
 dialect as the Grasm backend lowers it, driven from C), `rtlint` (no plain
 access to a process cell outside its lock) and `fuzz_rtrelease` (the release
 walk against the Rust runtime's) (§6.9), `loaddiff` (the module graph
-against the Rust loader's), `tomldiff` (every manifest read by
-`packages/toml`, the Rust reader and `tomllib`), `tirrefuse` (what the Rust
+against the Rust loader's), `tomldiff` (every manifest, and fuzzed ones, read
+by `packages/toml`, the Rust reader and `tomllib`, §6.21), `tirrefuse` (what the Rust
 frontend refuses, the Grasm one refuses), `fuzz_tir`, `frontsmoke` (front to
 binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
 = stage 3), `stagediff` (two stages' output on the corpus) and
