@@ -35,6 +35,12 @@
 //                          documentation from `///`        compiler/front's AST (§6.20)
 //     api <file.gr> [--against F]
 //                          the public surface, and what changed in it (§6.20)
+//     deps [dir] [--locked]
+//                          the package graph, its ceilings, the lockfile (§6.21)
+//     add <name> <version> [dir]
+//                          a registry dependency added to grasm.toml (§6.21)
+//     publish [dir] [--registry R]
+//                          a package copied into a registry, a directory (§6.21)
 //
 // Each is the packages' own code, called in this process: nothing here
 // starts a process, and the Rust toolchain is on no path it takes. The other
@@ -53,6 +59,7 @@ import testing
 import docgen
 import api
 import bundle
+import pkg
 
 /// The toolchain's version, `grasm --version`'s: the workspace's, which the
 /// Rust command takes from its manifest. `clidiff` holds the two equal.
@@ -97,6 +104,12 @@ fn main() {
         docgen.cmd_doc(a)
     } else if cmd == "api" {
         api.cmd_api(a)
+    } else if cmd == "deps" {
+        pkg.cmd_deps(a)
+    } else if cmd == "add" {
+        pkg.cmd_add(a)
+    } else if cmd == "publish" {
+        pkg.cmd_publish(a)
     } else if cmd == "toml" {
         front.cmd_toml(operand(a, "usage: grasm toml <file.toml>"))
     } else if cmd == "version" or cmd == "--version" {
@@ -125,7 +138,7 @@ fn operand(a: [str], usage_line: str) -> str {
 /// Whether `cmd` is one of the Rust `grasm`'s subcommands that this one
 /// does not run yet.
 fn elsewhere(cmd: str) -> bool {
-    let them = ["deps", "publish", "add", "lsp", "dap", "journal"]
+    let them = ["lsp", "dap", "journal"]
     them.contains(cmd)
 }
 
@@ -133,7 +146,7 @@ fn elsewhere(cmd: str) -> bool {
 /// and exit 1 -- never handed to anything else.
 fn not_here(cmd: str) {
     eprint("error: `grasm {cmd}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc` and `api`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20)")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc`, `api`, `deps`, `add` and `publish`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20, §6.21)")
     exit(1)
 }
 

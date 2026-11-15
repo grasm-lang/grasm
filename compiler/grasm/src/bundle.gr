@@ -43,6 +43,12 @@ pub fn own_exe() -> str {
 /// chmod(2): the bundle is an executable, mode 0755, as Rust sets it.
 extern fn chmod(path: str, mode: i64) -> i64
 
+/// chmod(2), for `grasm publish`'s copies: whether it was done.
+pub fn set_mode(path: str, mode: i64) -> bool {
+    let rc = unsafe { chmod(path, mode) }
+    rc == 0
+}
+
 // ---------------------------------------------------------------------
 // The payload
 // ---------------------------------------------------------------------

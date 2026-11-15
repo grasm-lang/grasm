@@ -1,0 +1,643 @@
+// `grasm deps`, `grasm add` and `grasm publish` (crates/grasm/src/main.rs
+// `cmd_deps`, `cmd_add`, `cmd_publish`; crates/grasm_pkg): the package
+// graph and its ceilings, the lockfile, a dependency added to a manifest,
+// and a package copied into a registry -- every message, exit status and
+// file as the Rust command's (docs/self-hosting.md §6.21).
+//
+// A registry is a directory, `<root>/<name>/<version>/`: nothing here
+// reaches the network. The graph is `front`'s loader's (`resolve_graph`,
+// the registry with it), each package's effects `front`'s ceilings'
+// (`effects_of_package`, `effects_by_package`, `effect_sites_of_package`),
+// and the lockfile is read with the toolchain's one TOML reader,
+// packages/toml.
+import front.loader
+import front.ceiling
+import front.prog
+import front.ast
+import toml
+import crypto_hash
+import build
+import bundle
+
+/// A failure, as `main` reports an `Err`: `error: ...`, exit 1.
+fn give_up(why: str) {
+    eprint("error: {why}")
+    exit(1)
+}
+
+// ---------------------------------------------------------------------
+// grasm deps [dir] [--locked]
+// ---------------------------------------------------------------------
+
+pub fn cmd_deps(a: [str]) {
+    let locked = a.contains("--locked")
+    var dir = build.first_operand(a.slice(1, a.len()), [])
+    if dir == "\0" {
+        dir = "."
+    }
+    let r = loader.resolve_graph(dir)
+    if not r.ok {
+        give_up(r.why)
+    }
+    let n = r.names.len()
+    let root = r.mfs[n - 1]
+    print("{root.name} {root.version} — {n} package(s) in the graph")
+
+    // What each package performs in the root's whole program.
+    var whole: Map[str, [str]] = map()
+    var root_at = -1
+    for i in 0..n {
+        if root_at < 0 and loader.same_dir(r.dirs[i], dir) {
+            root_at = i
+        }
+    }
+    if root_at >= 0 {
+        var all: Map[str, str] = map()
+        for i in 0..n {
+            all.set(r.names[i], r.dirs[i])
+        }
+        whole = ceiling.whole_program_effects(loader.join(r.dirs[root_at], r.mfs[root_at].entry), all)
+    }
+
+    var unanalyzable: [str] = []
+    var unknown: [str] = []
+    var violations: [str] = []
+    var helps: [str] = []
+    for i in 0..n {
+        let m = r.mfs[i]
+        let (ok, why, by_itself) = ceiling.effects_of_package(r.dirs[i], m)
+        if not ok {
+            print("  {m.name.pad_end(16, " ")} CANNOT ANALYZE")
+            unanalyzable.push(why)
+            continue
+        }
+        var performed: Map[str, bool] = map()
+        for e in by_itself {
+            performed.set(e, true)
+        }
+        for e in whole.get(m.name) ?? [] {
+            performed.set(e, true)
+        }
+        let shown = sorted(performed)
+        let declared = if m.has_caps { set_of(m.caps).join(", ") } else { "(unrestricted)" }
+        print("  {m.name.pad_end(16, " ")} performs [{shown.join(", ")}]  permits [{declared}]")
+        let v = violation(m, shown)
+        if v != "" {
+            violations.push(v)
+            helps.push(ceiling_help(r.dirs[i], m, shown))
+        }
+        let (vok, vocab) = vocabulary(r.dirs[i], m)
+        if vok {
+            for u in unknown_names(m, vocab) {
+                unknown.push(u)
+            }
+        }
+    }
+
+    if unanalyzable.len() > 0 {
+        for u in unanalyzable {
+            eprint("error: cannot analyze {u}")
+        }
+        eprint("  help: a package whose effects cannot be inferred cannot be held to its ceiling,\n        so its dependents get no guarantee at all")
+        give_up("{unanalyzable.len()} package(s) could not be checked")
+    }
+    if unknown.len() > 0 {
+        for u in unknown {
+            eprint("error: {u}")
+        }
+        eprint("  help: a capability must be `io`, `async`, `net`, `proc`, `unsafe`, `mem`, or an effect the program declares")
+        give_up("{unknown.len()} capability name(s) do not exist")
+    }
+    if violations.len() > 0 {
+        for i in 0..violations.len() {
+            eprint("error: {violations[i]}")
+            eprint("  help: {helps[i]}")
+        }
+        give_up("{violations.len()} package(s) exceed their declared capabilities")
+    }
+
+    // The lock.
+    var entries: [LockEntry] = []
+    for i in 0..n {
+        let m = r.mfs[i]
+        let (ok, why, sum) = package_checksum(r.dirs[i])
+        if not ok {
+            give_up(why)
+        }
+        entries.push(LockEntry{ name: m.name, version: m.version, checksum: sum, has_caps: m.has_caps, caps: set_of(m.caps) })
+    }
+    let lock_path = loader.join(dir, "grasm.lock")
+    var existing = "\0"
+    match read_bytes(lock_path) {
+        Ok(b) -> {
+            if loader.utf8_ok(b) {
+                existing = b.to_str()
+            }
+        }
+        Err(_) -> ()
+    }
+    var changes: [str] = []
+    if existing != "\0" {
+        changes = diff_lock(existing, entries)
+    }
+    if locked {
+        if existing == "\0" {
+            give_up("no grasm.lock — `--locked` checks the graph against one, and there is nothing to check it against (run `grasm deps` to write it)")
+        }
+        if changes.len() > 0 {
+            for c in changes {
+                eprint("error: {c}")
+            }
+            eprint("  help: run `grasm deps` without --locked to accept these and update grasm.lock")
+            give_up("{changes.len()} change(s) since grasm.lock")
+        }
+        print("grasm.lock is up to date")
+        return
+    }
+    for c in changes {
+        print("  note: {c}")
+    }
+    match write_file(lock_path, render_lock(entries)) {
+        Ok(_) -> ()
+        Err(e) -> give_up("cannot write {lock_path}: {loader.io_error_text(e)}")
+    }
+    print("wrote {lock_path}")
+}
+
+/// A set's members in byte order, once each, as a `BTreeSet` holds them.
+fn set_of(xs: [str]) -> [str] {
+    var m: Map[str, bool] = map()
+    for x in xs {
+        m.set(x, true)
+    }
+    sorted(m)
+}
+
+fn sorted(m: Map[str, bool]) -> [str] {
+    var ks = m.keys()
+    ks.sort()
+    ks
+}
+
+/// `check_capabilities` as `CapabilityViolation` displays it, or "".
+fn violation(m: Manifest, performed: [str]) -> str {
+    if not m.has_caps {
+        return ""
+    }
+    let declared = set_of(m.caps)
+    var exceeded: [str] = []
+    for e in performed {
+        if not declared.contains(e) {
+            exceeded.push(e)
+        }
+    }
+    if exceeded.len() == 0 {
+        return ""
+    }
+    let allowed = if declared.len() == 0 { "nothing" } else { "`" + declared.join("`, `") + "`" }
+    "package `{m.name}` performs `{exceeded.join("`, `")}` but its manifest only permits {allowed}"
+}
+
+/// `ceiling_help`: where the package performs each effect it should not.
+fn ceiling_help(dir: str, m: Manifest, performed: [str]) -> str {
+    let declared = set_of(m.caps)
+    let sites = ceiling.effect_sites_of_package(dir, m)
+    var where_at: [str] = []
+    for e in performed {
+        if declared.contains(e) {
+            continue
+        }
+        match sites.get(e) {
+            Some(at) -> where_at.push("`{e}` at {at}")
+            None -> ()
+        }
+    }
+    var help = "either add the capability to that package's manifest, or stop it from performing the effect"
+    if where_at.len() > 0 {
+        help = help + "\n  performed: " + where_at.join(", ")
+    }
+    help
+}
+
+/// `effect_vocabulary_of_package`: the runtime's capabilities and every
+/// effect the package's program declares, in any module it loads; not ok
+/// when it cannot be loaded.
+fn vocabulary(dir: str, m: Manifest) -> (bool, [str]) {
+    let entry = loader.join(dir, m.entry)
+    if not file_exists(entry) {
+        return (false, [])
+    }
+    var owng: Map[str, str] = map()
+    let g = loader.resolve_graph(dir)
+    if g.ok {
+        for i in 0..g.names.len() {
+            owng.set(g.names[i], g.dirs[i])
+        }
+    }
+    let l = loader.load_with(entry, owng)
+    if l.fatal != "" {
+        return (false, [])
+    }
+    let p = prog.build(l)
+    var names: Map[str, bool] = map()
+    for b in ["io", "async", "net", "proc", "unsafe", "mem"] {
+        names.set(b, true)
+    }
+    for mi in 0..p.m_name.len() {
+        for d in p.m_decls[mi] {
+            if prog.kind(p, d) == ast.D_EFFECT {
+                names.set(prog.name(p, prog.sl(p, d, 0)), true)
+            }
+        }
+    }
+    (true, sorted(names))
+}
+
+/// `check_capability_names`, each as `UnknownCapability` displays it.
+fn unknown_names(m: Manifest, vocab: [str]) -> [str] {
+    var out: [str] = []
+    if not m.has_caps {
+        return out
+    }
+    for c in set_of(m.caps) {
+        if vocab.contains(c) {
+            continue
+        }
+        var line = "package `{m.name}` declares capability `{c}`, which is not an effect this program defines"
+        let near = nearest(c, vocab)
+        if near != "\0" {
+            line = line + " — did you mean `{near}`?"
+        }
+        out.push(line)
+    }
+    out
+}
+
+/// The closest name within `max(2, len/3)` edits (the length in bytes), the
+/// first of the closest in byte order; "\0" for none.
+fn nearest(word: str, vocab: [str]) -> str {
+    var best = "\0"
+    var best_d = -1
+    for v in vocab {
+        let d = edit_distance(word, v)
+        var limit = v.to_bytes().len() / 3
+        if limit < 2 {
+            limit = 2
+        }
+        if d <= limit and (best_d < 0 or d < best_d) {
+            best = v
+            best_d = d
+        }
+    }
+    best
+}
+
+/// Levenshtein distance over characters.
+fn edit_distance(a: str, b: str) -> i64 {
+    let x = a.chars()
+    let y = b.chars()
+    var prev: [i64] = []
+    for j in 0..y.len() + 1 {
+        prev.push(j)
+    }
+    var cur: [i64] = []
+    for _ in 0..y.len() + 1 {
+        cur.push(0)
+    }
+    for i in 1..x.len() + 1 {
+        cur[0] = i
+        for j in 1..y.len() + 1 {
+            var sub = prev[j - 1]
+            if x[i - 1] != y[j - 1] {
+                sub += 1
+            }
+            var best = sub
+            if prev[j] + 1 < best {
+                best = prev[j] + 1
+            }
+            if cur[j - 1] + 1 < best {
+                best = cur[j - 1] + 1
+            }
+            cur[j] = best
+        }
+        let tmp = prev
+        prev = cur
+        cur = tmp
+    }
+    prev[y.len()]
+}
+
+// ---------------------------------------------------------------------
+// The lockfile (grasm_pkg `build_lock`, `render_lock`, `parse_lock`,
+// `diff_lock`)
+// ---------------------------------------------------------------------
+
+type LockEntry = { name: str, version: str, checksum: str, has_caps: bool, caps: [str] }
+
+/// `package_checksum`: SHA-256 over `grasm.toml`, a zero byte, its text, a
+/// zero byte, then each source file's path below the package, a zero byte,
+/// its bytes and a zero byte, in `source_files`' order; lowercase hex.
+fn package_checksum(dir: str) -> (bool, str, str) {
+    let (ok, why, files) = ceiling.source_files(dir)
+    if not ok {
+        return (false, why, "")
+    }
+    var buf = byte_builder()
+    match read_bytes(loader.join(dir, "grasm.toml")) {
+        Ok(b) -> {
+            buf.push_str("grasm.toml")
+            buf.push_byte(0)
+            buf.push_bytes(b)
+            buf.push_byte(0)
+        }
+        Err(_) -> ()
+    }
+    for f in files {
+        buf.push_str(relative(f, dir))
+        buf.push_byte(0)
+        match read_bytes(f) {
+            Ok(b) -> buf.push_bytes(b)
+            Err(e) -> return (false, "cannot read {f}: {loader.io_error_text(e)}", "")
+        }
+        buf.push_byte(0)
+    }
+    var hex = ""
+    for w in crypto_hash.sha256_bytes(buf.to_bytes().to_list()) {
+        hex = hex + crypto_hash.hex8(w)
+    }
+    (true, "", hex)
+}
+
+/// `Path::strip_prefix` of a path `source_files` made from `dir`: what
+/// follows it, as written.
+fn relative(f: str, dir: str) -> str {
+    if dir == "" {
+        return f
+    }
+    let cut = if dir.ends_with("/") { dir.len() } else { dir.len() + 1 }
+    let b = f.to_bytes()
+    b.slice(cut, b.len()).to_str()
+}
+
+fn render_lock(entries: [LockEntry]) -> str {
+    var out = str_builder()
+    out.push_str("# Generated by `grasm deps`. Commit this file.\n# Checksums are SHA-256 over each package's grasm.toml and its sorted .gr sources.\n")
+    for e in entries {
+        out.push_str("\n[[package]]\n")
+        out.push_str("name = {toml.quote(e.name)}\n")
+        out.push_str("version = {toml.quote(e.version)}\n")
+        out.push_str("checksum = {toml.quote(e.checksum)}\n")
+        if e.has_caps {
+            var caps: [str] = []
+            for c in e.caps {
+                caps.push(toml.quote(c))
+            }
+            out.push_str("capabilities = [{caps.join(", ")}]\n")
+        }
+    }
+    out.to_str()
+}
+
+/// `parse_lock`: the entries a lockfile records; not ok when the reader
+/// refuses it or an entry lacks a name, a version or a checksum.
+fn parse_lock(text: str) -> (bool, [LockEntry]) {
+    let d = toml.parse(text)
+    if not d.ok {
+        return (false, [])
+    }
+    var out: [LockEntry] = []
+    for ai in toml.entries(d, "package") {
+        let name = toml.as_str(d, toml.entry_get(d, ai, "name"))
+        let version = toml.as_str(d, toml.entry_get(d, ai, "version"))
+        let checksum = toml.as_str(d, toml.entry_get(d, ai, "checksum"))
+        if name == "\0" or version == "\0" or checksum == "\0" {
+            return (false, [])
+        }
+        let cv = toml.entry_get(d, ai, "capabilities")
+        let has = toml.is_str_array(d, cv)
+        let caps = if has { toml.str_array(d, cv) } else { [] }
+        out.push(LockEntry{ name: name, version: version, checksum: checksum, has_caps: has, caps: caps })
+    }
+    (true, out)
+}
+
+/// `diff_lock`, each change as `LockChange` displays it.
+fn diff_lock(previous: str, current: [LockEntry]) -> [str] {
+    let (ok, recorded) = parse_lock(previous)
+    if not ok {
+        return ["the existing lockfile is unreadable and will be rewritten"]
+    }
+    // By name, the last entry of a name winning, as a `BTreeMap` collects.
+    var by_name: Map[str, i64] = map()
+    for i in 0..recorded.len() {
+        by_name.set(recorded[i].name, i)
+    }
+    var out: [str] = []
+    for e in current {
+        match by_name.get(e.name) {
+            None -> out.push("`{e.name}` is not in the lockfile")
+            Some(i) -> {
+                let old = recorded[i]
+                if old.version != e.version {
+                    out.push("`{e.name}` is version {e.version} but the lockfile records {old.version}")
+                }
+                if old.checksum != e.checksum {
+                    out.push("`{e.name}` contents changed since the lockfile ({first12(old.checksum)}… → {first12(e.checksum)}…)")
+                }
+                if old.has_caps != e.has_caps or old.caps != e.caps {
+                    out.push("`{e.name}` now declares {show_caps(e.has_caps, e.caps)} where the lockfile recorded {show_caps(old.has_caps, old.caps)}")
+                }
+            }
+        }
+    }
+    var present: Map[str, bool] = map()
+    for e in current {
+        present.set(e.name, true)
+    }
+    for old in recorded {
+        if not present.has(old.name) {
+            out.push("`{old.name}` is in the lockfile but no longer a dependency")
+        }
+    }
+    out
+}
+
+/// `&s[..s.len().min(12)]`: the first twelve bytes.
+fn first12(s: str) -> str {
+    let b = s.to_bytes()
+    if b.len() <= 12 {
+        return s
+    }
+    b.slice(0, 12).to_str()
+}
+
+fn show_caps(has: bool, caps: [str]) -> str {
+    if not has {
+        return "no ceiling"
+    }
+    if caps.len() == 0 {
+        return "[] (nothing permitted)"
+    }
+    "[" + caps.join(", ") + "]"
+}
+
+// ---------------------------------------------------------------------
+// grasm add <name> <version> [dir]
+// ---------------------------------------------------------------------
+
+pub fn cmd_add(a: [str]) {
+    if a.len() < 3 {
+        eprint("usage: grasm add <name> <version> [dir]")
+        exit(1)
+    }
+    let name = a[1]
+    let version = a[2]
+    var dir = "."
+    if a.len() > 3 and not a[3].starts_with("--") {
+        dir = a[3]
+    }
+    // `VersionReq::parse`.
+    let want = loader.req_version(version)
+    if not loader.version_ok(want) {
+        give_up(loader.version_err(want))
+    }
+    let req = loader.req_shown(version)
+    if not loader.is_identifier(name) {
+        give_up("`{name}` is not a usable dependency name: a consumer writes `import {name}`, so it has to be a Grasm identifier — letters, digits and `_`, not starting with a digit, and not a keyword")
+    }
+    let path = loader.join(dir, "grasm.toml")
+    var text = ""
+    match read_bytes(path) {
+        Ok(b) -> {
+            if not loader.utf8_ok(b) {
+                give_up("cannot read {path}: stream did not contain valid UTF-8")
+            }
+            text = b.to_str()
+        }
+        Err(e) -> give_up("cannot read {path}: {loader.io_error_text(e)}")
+    }
+    let (ok, why, m) = loader.parse_manifest(text)
+    if not ok {
+        give_up(why)
+    }
+    for i in 0..m.dep_names.len() {
+        if m.dep_names[i] == name {
+            if m.dep_reqs[i] != "\0" {
+                give_up("`{name}` is already a dependency, at {loader.req_shown(m.dep_reqs[i])}")
+            }
+            give_up("`{name}` is already a dependency, by path")
+        }
+    }
+    var out = text
+    if not out.ends_with("\n") {
+        out = out + "\n"
+    }
+    out = out + "\n[dependencies.{name}]\nversion = \"{req}\"\n"
+    match write_file(path, out) {
+        Ok(_) -> ()
+        Err(e) -> give_up("cannot write {path}: {loader.io_error_text(e)}")
+    }
+    print("added `{name}` {req} to {m.name}")
+    print("  run `grasm deps` to resolve it")
+}
+
+// ---------------------------------------------------------------------
+// grasm publish [dir] [--registry R]
+// ---------------------------------------------------------------------
+
+pub fn cmd_publish(a: [str]) {
+    let rest = a.slice(1, a.len())
+    var dir = build.first_operand(rest, ["--registry"])
+    if dir == "\0" {
+        dir = "."
+    }
+    // The registry: `--registry`, else `GRASM_REGISTRY`, else the nearest
+    // `.grasm/registry`.
+    var reg = build.value_after(rest, "--registry")
+    if reg == "\0" {
+        reg = loader.discover_registry(dir)
+        if reg == "\0" {
+            give_up("no registry found\n  pass --registry <dir>, set GRASM_REGISTRY, or create .grasm/registry")
+        }
+    }
+    let m = loader.load_manifest(dir)
+    if not m.ok {
+        give_up(m.why)
+    }
+    let version = loader.version_shown(m.version)
+    let entry = loader.join(dir, m.entry)
+    if not file_exists(entry) {
+        give_up("package `{m.name}`: entry file {entry} does not exist")
+    }
+    if not m.has_caps {
+        give_up("package `{m.name}` has no `capabilities` key, so nothing about what it may reach is checked for the people who depend on it\n  add `capabilities = []` if it performs nothing, or list what it performs")
+    }
+    let (eok, ewhy, performed) = ceiling.effects_of_package(dir, m)
+    if not eok {
+        give_up(ewhy)
+    }
+    let v = violation(m, performed)
+    if v != "" {
+        give_up("{v}\n  refusing to publish a package that exceeds its own ceiling")
+    }
+    for i in 0..m.dep_names.len() {
+        if m.dep_paths[i] != "\0" {
+            let d = m.dep_names[i]
+            give_up("`{m.name}` depends on `{d}` by path, which cannot travel into a registry: only this package's own directory is published, so the release would name a dependency no consumer can resolve\n  give `{d}` a `version` and publish it first")
+        }
+    }
+    let dest = loader.join(loader.join(reg, m.name), version)
+    if file_exists(loader.join(dest, "grasm.toml")) {
+        let parts = version.split(".")
+        let next = (parts[2].parse_int() ?? 0) + 1
+        give_up("`{m.name}` {version} is already in the registry at {dest}\n  a published version is immutable — publish {parts[0]}.{parts[1]}.{next} instead\n  (`grasm.lock` records a checksum per package, so content that\n  changes under a fixed version is exactly what it exists to catch)")
+    }
+    match make_dir(dest) {
+        Ok(_) -> ()
+        Err(e) -> give_up("cannot create {dest}: {loader.io_error_text(e)}")
+    }
+    var files = 0
+    copy_into(loader.join(dir, "grasm.toml"), loader.join(dest, "grasm.toml"))
+    files += 1
+    let (sok, swhy, sources) = ceiling.source_files(dir)
+    if not sok {
+        give_up(swhy)
+    }
+    for f in sources {
+        let to = loader.join(dest, relative(f, dir))
+        let up = loader.parent(to)
+        if up != "\0" and up != "" {
+            match make_dir(up) {
+                Ok(_) -> ()
+                Err(e) -> give_up("cannot create {up}: {loader.io_error_text(e)}")
+            }
+        }
+        copy_into(f, to)
+        files += 1
+    }
+    print("published {m.name} {version} — {files} file(s) to {dest}")
+}
+
+/// `std::fs::copy`: the bytes, and the source's permission bits.
+fn copy_into(from: str, to: str) {
+    let up = loader.parent(to)
+    if up != "\0" and up != "" {
+        match make_dir(up) {
+            Ok(_) -> ()
+            Err(e) -> give_up("cannot create {up}: {loader.io_error_text(e)}")
+        }
+    }
+    match read_bytes(from) {
+        Ok(b) -> {
+            match write_bytes(to, b) {
+                Ok(_) -> ()
+                Err(e) -> give_up("cannot copy {from} to {to}: {loader.io_error_text(e)}")
+            }
+        }
+        Err(e) -> give_up("cannot copy {from} to {to}: {loader.io_error_text(e)}")
+    }
+    let mode = build.file_mode(from)
+    if mode >= 0 {
+        let _ = bundle.set_mode(to, mode)
+    }
+}

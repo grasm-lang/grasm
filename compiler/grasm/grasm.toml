@@ -28,3 +28,12 @@ path = "../../tools/tirinterp"
 
 [dependencies.gfmt]
 path = "../../tools/gfmt"
+
+# `deps` reads and writes the lockfile with the toolchain's one TOML reader,
+# and checksums each package with SHA-256 (docs/self-hosting.md §6.21).
+[dependencies.toml]
+path = "../../packages/toml"
+version = "^2.0.0"
+
+[dependencies.crypto_hash]
+path = "../../packages/crypto_hash"

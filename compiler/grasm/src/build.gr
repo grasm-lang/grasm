@@ -141,6 +141,20 @@ fn file_kind(p: str) -> i64 {
     }
 }
 
+/// The permission bits of `p` (`st_mode` & 0o7777), following symbolic
+/// links; -1 when it cannot be asked.
+pub fn file_mode(p: str) -> i64 {
+    if p.contains("\0") {
+        return -1
+    }
+    let buf = bytes_filled(144, 0)
+    let rc = unsafe { stat(p, buf) }
+    if rc != 0 {
+        return -1
+    }
+    (buf.at(4) + 256 * buf.at(5)).bit_and(4095)
+}
+
 /// `Path::file_stem`: the last component's name before its last `.`, unless
 /// that `.` is its first character; "\0" when there is no last component.
 pub fn file_stem(p: str) -> str {

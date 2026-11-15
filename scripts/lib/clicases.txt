@@ -172,17 +172,48 @@ doc -o
 api x.gr --against
 fmt --check --x
 lint --only
-elsewhere deps
+deps
 deps --locked --x
-elsewhere publish --registry r
+publish --registry r
 publish --registry
-elsewhere add a b c d
+add a b c d
 add a --x
 elsewhere lsp
 lsp --x
 elsewhere dap a b c
 elsewhere journal x
 journal --full --x
+
+# `deps`, `add` and `publish` (docs/self-hosting.md §6.21). Each case runs in
+# a directory whose entries link to the checkout's, so a `deps` that wrote a
+# lockfile, or an `add` that wrote a manifest, would write into the
+# checkout's own package: only lines that refuse before writing are here,
+# and `publish` writes into a registry in the case's directory. clidiff's
+# `registry`, `deps`, `add` and `publish` sections run the rest on copies.
+deps --locked
+deps nowhere
+deps nowhere also
+deps -- nowhere
+deps examples/hello.gr
+deps --registry r
+deps --locked nowhere --locked
+publish
+publish nowhere --registry r
+publish --registry r nowhere
+publish --locked
+publish packages/toml --registry r
+publish packages/toml --registry r --registry s
+add
+add a
+add a 1.0.0 nowhere
+add --registry r x
+add a 1.0.0 --registry
+add a 1.0.0 --registry r
+add match 1.0.0
+add a-b 1.0.0
+add a x
+add a =1.2
+add a 1.0.0 -- x
 
 # `fmt` (docs/self-hosting.md §6.19): the operand is the first argument not
 # starting with `--`, after a `--` too; `--check` counts anywhere. Only

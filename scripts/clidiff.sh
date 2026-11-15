@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # The `grasm` command in Grasm against the Rust one (docs/self-hosting.md
-# §6.17, §6.19 and §6.20, S8 parts one to three): the same stdout, stderr,
-# exit status and files.
+# §6.17, §6.19, §6.20 and §6.21, S8 parts one to four): the same stdout,
+# stderr, exit status and files.
 #
 # `compiler/grasm` runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`,
-# `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc` and `api` with
-# the Grasm toolchain's own code, and reads every command line as the Rust
-# command reads it. Fourteen sections, each both commands on the same input
-# from the same directory -- six of part one:
+# `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc`, `api`,
+# `deps`, `add` and `publish` with the Grasm toolchain's own code, and reads
+# every command line as the Rust command reads it. Eighteen sections, each
+# both commands on the same input from the same directory -- six of part
+# one:
 #
 #   lines   every command line in scripts/lib/clicases.txt, in an empty
 #           directory of each command's own that links to the checkout's
@@ -70,6 +71,23 @@
 #           the file; every tenth with a `main` also run from that file by
 #           both commands
 #
+# and four for the package commands of S8 part four (§6.21), each side in a
+# copy of its own, the copies' paths taken out:
+#
+#   registry  the package graphs and registries scripts/lib/regcases.py
+#             writes, its `deps`, `add` and `publish` lines in order, with
+#             lockfile edits (scripts/lib/lockedit.py) between them: the
+#             output, and every path, mode and byte of the case after each
+#   deps      every package git tracks a manifest of, in a copy of the
+#             checkout: `deps --locked`, `deps`, `deps --locked`, the
+#             lockfile compared after each
+#   add       every package: a registry dependency added, the manifest
+#             compared
+#   publish   every package, into a registry of each side's own: the output
+#             and the registry, every path, mode and byte
+#
+# A registry is a directory: nothing here reaches the network.
+#
 # A section's floors hold only on a whole run.
 #
 # The Grasm command never starts another program: nothing in its package
@@ -83,7 +101,8 @@
 # `rt.o` beside it (a stage, docs/self-hosting.md §6.17); without it one is
 # built here: by `$GRASM build --native`, and its `rt.o` by itself.
 # `ONLY=<section>[,<section>]` runs those sections, `FILES=<list>` takes the
-# corpus programs from a file; the floors hold only on a whole run.
+# corpus programs from a file, `PACKAGES=<list>` the package directories of
+# `deps`, `add` and `publish`; the floors hold only on a whole run.
 # `CLI_SRC=<dir>` is the command's source to count `proc_run` in (a
 # control's planted copy); `CLIDIFF_FAULT=nogrep` skips the count, for a
 # control.
@@ -100,7 +119,7 @@ corpus_require
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-ONLY=${ONLY:-lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target}
+ONLY=${ONLY:-lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target,registry,deps,add,publish}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
 if ! command -v sandbox-exec >/dev/null 2>&1; then
@@ -1057,6 +1076,224 @@ if want build || want target; then
     fi
 fi
 
+# -------------------------------------------------------------------------
+# The package commands (§6.21). Each side works in a copy of its own -- the
+# checkout's tracked files, or `regcases.py`'s trees -- because `deps`
+# writes a lockfile into the package, `add` its manifest, `publish` a
+# registry; the copies' own paths are taken out of the output (`@`). A
+# registry is a directory in the copy: nothing reaches the network, and no
+# `.grasm/registry` above the work directory, or `GRASM_REGISTRY` in the
+# environment, can stand in for the one a case names.
+# -------------------------------------------------------------------------
+unset GRASM_REGISTRY
+PK="$(cd "$WORK" && pwd -P)/pk"
+if want registry || want deps || want add || want publish; then
+    up=$(dirname "$PK")
+    while [ "$up" != / ]; do
+        if [ -e "$up/.grasm/registry" ]; then
+            echo "error: $up/.grasm/registry exists, and a package here without a registry of its own would find it"
+            exit 1
+        fi
+        up=$(dirname "$up")
+    done
+fi
+
+# Every entry under `$1`, with its mode, and each file's digest.
+pk_tree() {
+    (cd "$1" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r f; do
+        if [ -L "$f" ]; then
+            echo "l $f"
+        elif [ -d "$f" ]; then
+            echo "d $(stat -f %Lp "$f") $f"
+        else
+            echo "f $(stat -f %Lp "$f") $f $(shasum -a 256 <"$f" | cut -c1-16)"
+        fi
+    done)
+}
+
+# pk_pair DIR ENV ARGS...: the Rust command in $PK/r/DIR and the Grasm one
+# in $PK/g/DIR, ENV (`-` for none) set for both; their output with the
+# copies' paths taken out, in $WORK/pk.{r,g}.{out,err,rc}.
+pk_pair() {
+    local dir=$1 env=$2
+    shift 2
+    local s
+    for s in r g; do
+        local -a run=("$GRASM")
+        [ "$s" = g ] && run=(sandbox-exec -p "$NOEXEC" "$G")
+        if [ "$env" = - ]; then
+            (cd "$PK/$s/$dir" && $RUN_LIMIT "${run[@]}" "$@" >"$WORK/pk.$s.out" 2>"$WORK/pk.$s.err" </dev/null)
+        else
+            (cd "$PK/$s/$dir" && env "$env" $RUN_LIMIT "${run[@]}" "$@" >"$WORK/pk.$s.out" 2>"$WORK/pk.$s.err" </dev/null)
+        fi
+        echo $? >"$WORK/pk.$s.rc"
+        sed -i '' -e "s|$PK/$s|@|g" "$WORK/pk.$s.out" "$WORK/pk.$s.err"
+    done
+}
+
+# Whether the last pair answered alike; reported as $1 if not.
+pk_same() {
+    if cmp -s "$WORK/pk.r.out" "$WORK/pk.g.out" && cmp -s "$WORK/pk.r.err" "$WORK/pk.g.err" &&
+        cmp -s "$WORK/pk.r.rc" "$WORK/pk.g.rc"; then
+        return 0
+    fi
+    fail "$1 -- exit $(cat "$WORK/pk.r.rc") (Rust) and $(cat "$WORK/pk.g.rc") (Grasm)"
+    diff "$WORK/pk.r.out" "$WORK/pk.g.out" | head -6 | sed 's/^/  /'
+    diff "$WORK/pk.r.err" "$WORK/pk.g.err" | head -6 | sed 's/^/  /'
+    return 1
+}
+
+# Whether file $1 (under each copy) is the same on both sides, or absent
+# from both.
+pk_file_same() {
+    if [ -e "$PK/r/$1" ] || [ -e "$PK/g/$1" ]; then
+        cmp -s "$PK/r/$1" "$PK/g/$1"
+    fi
+}
+
+# A copy of the checkout's tracked files for each side.
+pk_checkout() {
+    rm -rf "$PK"
+    mkdir -p "$PK/r" "$PK/g"
+    git ls-files -z | (cd "$ROOT" && cpio -0pdm "$PK/r" 2>/dev/null)
+    git ls-files -z | (cd "$ROOT" && cpio -0pdm "$PK/g" 2>/dev/null)
+}
+
+# -------------------------------------------------------------------------
+# registry: `regcases.py`'s package graphs and registries, its commands in
+# order on each side's copy, the output and every file of the case compared
+# after each one
+# -------------------------------------------------------------------------
+reg_runs=0
+reg_same=0
+reg_deps=0
+reg_add=0
+reg_publish=0
+reg_edits=0
+reg_refused=0
+if want registry; then
+    rm -rf "$PK"
+    python3 scripts/lib/regcases.py "$PK/r" >"$WORK/regcmds"
+    python3 scripts/lib/regcases.py "$PK/g" >/dev/null
+    while IFS=$'\t' read -r case_name cwd env line; do
+        read -r -a args <<<"$line"
+        if [ "${args[0]}" = @edit ]; then
+            (cd "$PK/r/$case_name/$cwd" && python3 "$ROOT/scripts/lib/lockedit.py" "${args[1]}" "${args[2]}") &&
+                (cd "$PK/g/$case_name/$cwd" && python3 "$ROOT/scripts/lib/lockedit.py" "${args[1]}" "${args[2]}") ||
+                fail "registry $case_name: the edit ${args[1]} could not be made"
+            reg_edits=$((reg_edits + 1))
+            continue
+        fi
+        reg_runs=$((reg_runs + 1))
+        case "${args[0]}" in
+        deps) reg_deps=$((reg_deps + 1)) ;;
+        add) reg_add=$((reg_add + 1)) ;;
+        publish) reg_publish=$((reg_publish + 1)) ;;
+        esac
+        pk_pair "$case_name/$cwd" "$env" "${args[@]}"
+        pk_tree "$PK/r/$case_name" >"$WORK/pk.r.tree"
+        pk_tree "$PK/g/$case_name" >"$WORK/pk.g.tree"
+        if pk_same "registry $case_name: grasm $line (in $cwd, $env)"; then
+            if cmp -s "$WORK/pk.r.tree" "$WORK/pk.g.tree"; then
+                reg_same=$((reg_same + 1))
+                [ "$(cat "$WORK/pk.r.rc")" != 0 ] && reg_refused=$((reg_refused + 1))
+            else
+                fail "registry $case_name: grasm $line (in $cwd, $env) -- the files differ"
+                diff "$WORK/pk.r.tree" "$WORK/pk.g.tree" | head -6 | sed 's/^/  /'
+            fi
+        fi
+    done <"$WORK/regcmds"
+    echo "registry: $reg_runs commands ($reg_deps deps, $reg_add add, $reg_publish publish; $reg_edits lockfile edits between them)   the same, files and all: $reg_same, $reg_refused of them refusals"
+fi
+
+# Every package in the checkout: the directories of the manifests git tracks.
+if [ -n "${PACKAGES:-}" ]; then
+    cp "$PACKAGES" "$WORK/packages"
+else
+    git ls-files '*grasm.toml' | sed -e 's|/grasm.toml$||' -e 's|^grasm.toml$|.|' >"$WORK/packages"
+fi
+packages=$(grep -c . "$WORK/packages")
+
+# -------------------------------------------------------------------------
+# deps: every package, `deps --locked` (the tracked lockfile or none), `deps`
+# (the lockfile written), `deps --locked` over it; the lockfile compared
+# after each
+# -------------------------------------------------------------------------
+deps_runs=0
+deps_same=0
+deps_written=0
+deps_refused=0
+if want deps; then
+    pk_checkout
+    while IFS= read -r p; do
+        for flags in --locked "" --locked; do
+            deps_runs=$((deps_runs + 1))
+            pk_pair . - deps "$p" $flags
+            if pk_same "grasm deps $p $flags"; then
+                if pk_file_same "$p/grasm.lock"; then
+                    deps_same=$((deps_same + 1))
+                    [ "$(cat "$WORK/pk.r.rc")" != 0 ] && deps_refused=$((deps_refused + 1))
+                    [ -z "$flags" ] && grep -q '^wrote ' "$WORK/pk.r.out" && deps_written=$((deps_written + 1))
+                else
+                    fail "grasm deps $p $flags -- the lockfiles differ"
+                    diff "$PK/r/$p/grasm.lock" "$PK/g/$p/grasm.lock" | head -6 | sed 's/^/  /'
+                fi
+            fi
+        done
+    done <"$WORK/packages"
+    echo "deps: $packages packages, $deps_runs commands   the same, lockfiles and all: $deps_same, $deps_refused of them refusals   lockfiles written: $deps_written"
+fi
+
+# -------------------------------------------------------------------------
+# add: every package, a registry dependency added to its manifest
+# -------------------------------------------------------------------------
+add_runs=0
+add_same=0
+add_refused=0
+if want add; then
+    pk_checkout
+    while IFS= read -r p; do
+        add_runs=$((add_runs + 1))
+        pk_pair . - add clidiff_probe ^1.2.3 "$p"
+        if pk_same "grasm add clidiff_probe ^1.2.3 $p"; then
+            if pk_file_same "$p/grasm.toml"; then
+                add_same=$((add_same + 1))
+                [ "$(cat "$WORK/pk.r.rc")" != 0 ] && add_refused=$((add_refused + 1))
+            else
+                fail "grasm add clidiff_probe ^1.2.3 $p -- the manifests differ"
+            fi
+        fi
+    done <"$WORK/packages"
+    echo "add: $packages packages   the same, manifests and all: $add_same, $add_refused of them refusals"
+fi
+
+# -------------------------------------------------------------------------
+# publish: every package into a registry of each side's own; the output,
+# and the registry's every path, mode and byte
+# -------------------------------------------------------------------------
+pub_runs=0
+pub_same=0
+pub_done=0
+if want publish; then
+    pk_checkout
+    while IFS= read -r p; do
+        pub_runs=$((pub_runs + 1))
+        pk_pair . - publish "$p" --registry clidiff-registry
+        if pk_same "grasm publish $p --registry clidiff-registry"; then
+            mkdir -p "$PK/r/clidiff-registry" "$PK/g/clidiff-registry"
+            if cmp -s <(pk_tree "$PK/r/clidiff-registry") <(pk_tree "$PK/g/clidiff-registry"); then
+                pub_same=$((pub_same + 1))
+                [ "$(cat "$WORK/pk.r.rc")" = 0 ] && pub_done=$((pub_done + 1))
+            else
+                fail "grasm publish $p --registry clidiff-registry -- the registries differ"
+                diff <(pk_tree "$PK/r/clidiff-registry") <(pk_tree "$PK/g/clidiff-registry") | head -6 | sed 's/^/  /'
+            fi
+        fi
+    done <"$WORK/packages"
+    echo "publish: $packages packages   the same, registries and all: $pub_same, $pub_done of them published"
+fi
+rm -rf "$PK"
+
 echo "the Grasm command's package calls proc_run or proc_pipeline: $started time(s)"
 if [ "$started" != 0 ]; then
     FAILED+=("compiler/grasm calls proc_run or proc_pipeline $started time(s): the command must start no process")
@@ -1069,12 +1306,12 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 fi
 
 # The counts add up, and a whole run compared enough to mean something.
-whole=$([ -z "${FILES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target ] && echo 1)
+whole=$([ -z "${FILES:-}" ] && [ -z "${PACKAGES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target,registry,deps,add,publish ] && echo 1)
 if want lines && [ $((lines_same + lines_elsewhere + lines_runtime + lines_target)) -ne "$lines" ]; then
     echo "lines: the counts do not add up to $lines"
     exit 1
 fi
-if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 6 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
+if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 3 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
     echo "lines: too few compared ($lines, $lines_elsewhere not here, $lines_runtime runtime, $lines_target target)"
     exit 1
 fi
@@ -1123,6 +1360,22 @@ fi
 if want build && { [ "$built_same" -ne "$builds" ] || [ "$ran_same" -ne $((builds - build_refused)) ] || [ "$repro" -ne "$ran_same" ] ||
     [ $((builds + external)) -ne "$mains" ]; }; then
     echo "build: the counts do not add up ($built_same, $ran_same, $repro of $builds; $external external of $mains)"
+    exit 1
+fi
+if want registry && { [ "$reg_same" -ne "$reg_runs" ] || [ $((reg_deps + reg_add + reg_publish)) -ne "$reg_runs" ]; }; then
+    echo "registry: the counts do not add up ($reg_same of $reg_runs; $reg_deps deps, $reg_add add, $reg_publish publish)"
+    exit 1
+fi
+if want deps && { [ "$deps_same" -ne "$deps_runs" ] || [ "$deps_runs" -ne $((3 * packages)) ]; }; then
+    echo "deps: the counts do not add up ($deps_same of $deps_runs, $packages packages)"
+    exit 1
+fi
+if want add && { [ "$add_same" -ne "$add_runs" ] || [ "$add_runs" -ne "$packages" ]; }; then
+    echo "add: the counts do not add up ($add_same of $add_runs, $packages packages)"
+    exit 1
+fi
+if want publish && { [ "$pub_same" -ne "$pub_runs" ] || [ "$pub_runs" -ne "$packages" ]; }; then
+    echo "publish: the counts do not add up ($pub_same of $pub_runs, $packages packages)"
     exit 1
 fi
 if [ -n "$whole" ]; then

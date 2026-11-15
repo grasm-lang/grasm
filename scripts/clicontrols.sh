@@ -27,9 +27,14 @@
 #   api-missed     a changed signature not reported                 an api differs
 #   bundle-entry   the bundle names its entry with its directory    a bundle differs
 #   source-order   `--source` writes the modules last first          a source differs
+#   lock-order     `deps` writes the lockfile's entries last first    a lockfile differs
+#   dep-dropped    `deps` leaves the first package out of the lock    a lockfile differs
+#   publish-where  `publish` writes into <registry>/<version>/<name>  a registry differs
+#   toml-first     the TOML reader keeps the first of a key set twice
+#                  in an entry of an array of tables, not the last    a deps differs
 #
 # `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
-# 18 holds only on a whole run.
+# 22 holds only on a whole run.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -250,6 +255,34 @@ control source-order '^DIFF: grasm build packages/b39-demo/src/main.gr --source 
         let i = l.names.len() - 1 - j
         text.push_str("//!module ")'
 
+# S8 part four (§6.21): the lockfile's order, a package dropped from it, a
+# registry written in the wrong place, and the TOML reader.
+PKG=compiler/grasm/src/pkg.gr
+TOML=packages/toml/src/main.gr
+
+control lock-order '^DIFF: registry [a-z-]+: grasm deps app .*the files differ' ONLY=registry "$PKG" \
+    '    for e in entries {
+        out.push_str("\n[[package]]\n")' \
+    '    for j in 0..entries.len() {
+        let e = entries[entries.len() - 1 - j]
+        out.push_str("\n[[package]]\n")'
+
+control dep-dropped '^DIFF: registry [a-z-]+: grasm deps' ONLY=registry "$PKG" \
+    '    var entries: [LockEntry] = []
+    for i in 0..n {' \
+    '    var entries: [LockEntry] = []
+    for i in 1..n {'
+
+control publish-where '^DIFF: registry publish: grasm publish pkg --registry reg ' ONLY=registry "$PKG" \
+    '    let dest = loader.join(loader.join(reg, m.name), version)' \
+    '    let dest = loader.join(loader.join(reg, version), m.name)'
+
+control toml-first '^DIFF: registry lockfile: grasm deps app' ONLY=registry "$TOML" \
+    '            if at_key >= 0 {
+                vals[at_key] = vid' \
+    '            if at_key >= 0 {
+                let _first = vid'
+
 echo
 echo "controls: $ran   caught: $caught   missed: $missed"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -262,4 +295,4 @@ if [ -n "${CONTROLS:-}" ]; then
     [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
     exit
 fi
-[ "$ran" -ge 18 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 22 ] && [ "$caught" = "$ran" ]

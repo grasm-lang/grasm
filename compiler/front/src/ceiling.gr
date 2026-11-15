@@ -108,7 +108,7 @@ pub fn check_with_help(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> ([str],
 /// Where a package performs each effect, as `path:line:column` of the first
 /// place (grasm_pkg `effect_sites_of_package`): its entry file's program,
 /// then every other source file it has, each loaded as a program.
-fn effect_sites_of_package(dir: str, m: Manifest) -> Map[str, str] {
+pub fn effect_sites_of_package(dir: str, m: Manifest) -> Map[str, str] {
     var out: Map[str, str] = map()
     let entry = loader.join(dir, m.entry)
     if not file_exists(entry) {
@@ -127,8 +127,9 @@ fn effect_sites_of_package(dir: str, m: Manifest) -> Map[str, str] {
         return map()
     }
     sites_of(prog.build(l), out)
-    for f in source_files(dir) {
-        if f != entry {
+    let (_, _, files) = source_files(dir)
+    for f in files {
+        if not loader.same_path(f, entry) {
             let l2 = loader.load_with(f, owng)
             if l2.fatal == "" {
                 sites_of(prog.build(l2), out)
@@ -364,7 +365,7 @@ fn value_tables(c: Ck, inout t: Tys) -> (Map[i64, [str]], Map[i64, [str]]) {
 
 /// What each package performs in this program, by the prefix its modules
 /// carry ("" for the entry package): the rows of what escapes it.
-fn effects_by_package(p: Prog, c: Ck, inout t: Tys) -> Map[str, [str]] {
+pub fn effects_by_package(p: Prog, c: Ck, inout t: Tys) -> Map[str, [str]] {
     let (vr, cr) = value_tables(c, t)
     let x = effrows.build_with(p, vr, cr, p.deps)
     var acc: Map[str, Map[str, bool]] = map()
@@ -389,10 +390,25 @@ fn effects_by_package(p: Prog, c: Ck, inout t: Tys) -> Map[str, [str]] {
     out
 }
 
-/// What a package performs on its own: its entry file and every other
-/// source file it has, each loaded and checked as a program. Not ok, with
-/// why, when one of them cannot be.
-fn effects_of_package(dir: str, m: Manifest) -> (bool, str, [str]) {
+/// What each package performs in the program `entry` begins, loaded with
+/// every package of the graph by name (`grasm deps`'s whole program): none
+/// when it does not load.
+pub fn whole_program_effects(entry: str, resolved: Map[str, str]) -> Map[str, [str]] {
+    let l = loader.load_with(entry, resolved)
+    if l.fatal != "" {
+        return map()
+    }
+    let p = prog.build(l)
+    let (c, t0) = sema.check_program(p)
+    var t = t0
+    effects_by_package(p, c, t)
+}
+
+/// What a package performs on its own (grasm_pkg `effects_of_package`): its
+/// entry file and every other source file it has, each loaded and checked
+/// as a program. Not ok, with why in grasm_pkg's words, when one of them
+/// cannot be.
+pub fn effects_of_package(dir: str, m: Manifest) -> (bool, str, [str]) {
     let entry = loader.join(dir, m.entry)
     if not file_exists(entry) {
         return (false, "package `{m.name}`: entry file {entry} does not exist", [])
@@ -406,8 +422,9 @@ fn effects_of_package(dir: str, m: Manifest) -> (bool, str, [str]) {
     }
     var all: Map[str, bool] = map()
     var files = [entry]
-    for f in source_files(dir) {
-        if f != entry {
+    let (_, _, all_files) = source_files(dir)
+    for f in all_files {
+        if not loader.same_path(f, entry) {
             files.push(f)
         }
     }
@@ -429,15 +446,33 @@ fn effects_of_file(path: str, owng: Map[str, str]) -> (bool, str, [str]) {
         return (false, l.fatal, [])
     }
     if l.diags.len() > 0 {
-        return (false, "`{loader.tidy(path)}` — {l.diags[0]}", [])
+        return (false, failure(l, l.d_s[0], l.diags[0], path), [])
     }
     let p = prog.build(l)
     let (c, t0) = sema.check_program(p)
     var t = t0
     if c.d_s.len() > 0 {
-        return (false, "`{loader.tidy(path)}` — {c.d_msg[0]}", [])
+        return (false, failure(l, c.d_s[0], c.d_msg[0], path), [])
     }
     (true, "", effects_of_program(p, c, t))
+}
+
+/// grasm_pkg `first_failure`: the file the first diagnostic is in, tidied,
+/// and "(reached through a dependency)" when that is not the file loaded --
+/// any other module, the package's own included, as the Rust words have it.
+fn failure(l: Loaded, start: i64, msg: str, entry: str) -> str {
+    var fi = 0
+    for i in 0..l.bases.len() {
+        if start >= l.bases[i] {
+            fi = i
+        }
+    }
+    let shown = loader.tidy(l.paths[fi])
+    var whose = ""
+    if l.paths[fi] != loader.tidy(entry) and l.names[fi] != "" and l.bases[fi] != 0 {
+        whose = " (reached through a dependency)"
+    }
+    "`{shown}`{whose} — {msg}"
 }
 
 fn is_foreign(p: Prog, module: str) -> bool {
@@ -587,19 +622,32 @@ fn fenced_blocks(doc: str) -> [str] {
     blocks
 }
 
-/// Every `.gr` file under a directory, sorted.
-fn source_files(dir: str) -> [str] {
+/// grasm_pkg `source_files`: every Grasm source file under a directory
+/// (`.gr` in any case), following symbolic links to directories but
+/// reading each real directory once, sorted as `PathBuf` sorts -- by
+/// component, so `a/b.gr` comes before `a-b.gr`. Not ok, with why, when a
+/// directory cannot be read.
+pub fn source_files(dir: str) -> (bool, str, [str]) {
     var out: [str] = []
     var seen: Map[str, bool] = map()
-    collect_sources(dir, out, seen)
-    out.sort()
-    out
+    let (ok, why) = collect_sources(dir, out, seen)
+    if not ok {
+        return (false, why, [])
+    }
+    sort_paths(out)
+    var uniq: [str] = []
+    for f in out {
+        if uniq.len() == 0 or uniq[uniq.len() - 1] != f {
+            uniq.push(f)
+        }
+    }
+    (true, "", uniq)
 }
 
-fn collect_sources(dir: str, inout out: [str], inout seen: Map[str, bool]) {
-    let real = loader.tidy(dir)
+fn collect_sources(dir: str, inout out: [str], inout seen: Map[str, bool]) -> (bool, str) {
+    let real = loader.real_dir(dir)
     if seen.has(real) {
-        return
+        return (true, "")
     }
     seen.set(real, true)
     match list_dir(dir) {
@@ -607,15 +655,47 @@ fn collect_sources(dir: str, inout out: [str], inout seen: Map[str, bool]) {
             for n in names {
                 let path = loader.join(dir, n)
                 match list_dir(path) {
-                    Ok(_) -> collect_sources(path, out, seen)
+                    Ok(_) -> {
+                        let (ok, why) = collect_sources(path, out, seen)
+                        if not ok {
+                            return (false, why)
+                        }
+                    }
                     Err(_) -> {
-                        if n.to_lower().ends_with(".gr") {
+                        if loader.is_grasm_source(path) {
                             out.push(path)
                         }
                     }
                 }
             }
+            (true, "")
         }
-        Err(_) -> ()
+        Err(e) -> (false, "cannot read directory {dir}: {loader.io_error_text(e)}")
     }
+}
+
+/// Paths in `PathBuf` order: compared component by component.
+pub fn sort_paths(inout xs: [str]) {
+    for i in 1..xs.len() {
+        var j = i
+        while j > 0 and path_less(xs[j], xs[j - 1]) {
+            let tmp = xs[j]
+            xs[j] = xs[j - 1]
+            xs[j - 1] = tmp
+            j -= 1
+        }
+    }
+}
+
+fn path_less(a: str, b: str) -> bool {
+    let x = loader.components(a)
+    let y = loader.components(b)
+    var i = 0
+    while i < x.len() and i < y.len() {
+        if x[i] != y[i] {
+            return x[i] < y[i]
+        }
+        i += 1
+    }
+    x.len() < y.len()
 }

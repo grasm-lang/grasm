@@ -720,7 +720,7 @@ fn file_at(p: TirProg, at: i64) -> i64 {
 fn schedules_not_here(o: TestOpts) {
     let flag = if o.has_schedule_seed { "--schedule-seed" } else { "--schedules" }
     eprint("error: `grasm test {flag}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc` and `api`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20)")
+    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc`, `api`, `deps`, `add` and `publish`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20, §6.21)")
     exit(1)
 }
 
