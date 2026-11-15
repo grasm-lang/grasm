@@ -1426,5 +1426,16 @@ if [ -n "$whole" ]; then
         echo "too little compared in doc, api, bundle or source: $doc_written documents, $doc_items items, $doc_refused refused; $api_surfaces surfaces, $api_added added, $api_removed removed, $api_changed changed, $api_refused refused; $bundle_ran bundles run alike, $bundle_iofailed in the IoFailed wording; $source_refused refused, $source_ran run"
         exit 1
     fi
+    # The floors of §6.21's sections, a margin below the first whole run
+    # (2026-11-15, the stage-1 command): `registry` 129 commands, 75 of them
+    # refusals; `deps` 1,448 packages, 1,448 lockfiles written, 1,447
+    # refusals (the first `--locked`, where no lockfile was); `add` 1,448;
+    # `publish` 635 published.
+    if [ "$reg_runs" -lt 120 ] || [ "$reg_refused" -lt 60 ] ||
+        [ "$packages" -lt 1400 ] || [ "$deps_written" -lt 1400 ] || [ "$deps_refused" -lt 1400 ] ||
+        [ "$add_same" -lt 1400 ] || [ "$pub_done" -lt 600 ]; then
+        echo "too little compared in registry, deps, add or publish: $reg_runs registry commands, $reg_refused refused; $packages packages, $deps_written lockfiles written, $deps_refused refused; $add_same added; $pub_done published"
+        exit 1
+    fi
 fi
 exit 0
