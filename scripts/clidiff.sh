@@ -1268,28 +1268,42 @@ if want add; then
 fi
 
 # -------------------------------------------------------------------------
-# publish: every package into a registry of each side's own; the output,
-# and the registry's every path, mode and byte
+# publish: every package into a registry of each side's own; after each, the
+# registry's every path and mode, and the bytes of what it just wrote; at
+# the end every byte of the whole registry
 # -------------------------------------------------------------------------
 pub_runs=0
 pub_same=0
 pub_done=0
+# Every path under `$1` and its mode, one `stat` for the lot: comparing
+# every byte after each of 1,448 publishes would be quadratic.
+pk_names() {
+    (cd "$1" && find . -mindepth 1 -exec stat -f '%Lp %N' {} + | LC_ALL=C sort)
+}
 if want publish; then
     pk_checkout
+    mkdir -p "$PK/r/clidiff-registry" "$PK/g/clidiff-registry"
     while IFS= read -r p; do
         pub_runs=$((pub_runs + 1))
         pk_pair . - publish "$p" --registry clidiff-registry
         if pk_same "grasm publish $p --registry clidiff-registry"; then
-            mkdir -p "$PK/r/clidiff-registry" "$PK/g/clidiff-registry"
-            if cmp -s <(pk_tree "$PK/r/clidiff-registry") <(pk_tree "$PK/g/clidiff-registry"); then
+            dest=$(sed -n 's/^published .* to \(clidiff-registry\/.*\)$/\1/p' "$WORK/pk.r.out")
+            if ! cmp -s <(pk_names "$PK/r/clidiff-registry") <(pk_names "$PK/g/clidiff-registry"); then
+                fail "grasm publish $p --registry clidiff-registry -- the registries' paths differ"
+                diff <(pk_names "$PK/r/clidiff-registry") <(pk_names "$PK/g/clidiff-registry") | head -6 | sed 's/^/  /'
+            elif [ -n "$dest" ] && ! cmp -s <(pk_tree "$PK/r/$dest") <(pk_tree "$PK/g/$dest"); then
+                fail "grasm publish $p --registry clidiff-registry -- what it wrote differs"
+                diff <(pk_tree "$PK/r/$dest") <(pk_tree "$PK/g/$dest") | head -6 | sed 's/^/  /'
+            else
                 pub_same=$((pub_same + 1))
                 [ "$(cat "$WORK/pk.r.rc")" = 0 ] && pub_done=$((pub_done + 1))
-            else
-                fail "grasm publish $p --registry clidiff-registry -- the registries differ"
-                diff <(pk_tree "$PK/r/clidiff-registry") <(pk_tree "$PK/g/clidiff-registry") | head -6 | sed 's/^/  /'
             fi
         fi
     done <"$WORK/packages"
+    if ! cmp -s <(pk_tree "$PK/r/clidiff-registry") <(pk_tree "$PK/g/clidiff-registry"); then
+        fail "publish: the two registries differ at the end"
+        diff <(pk_tree "$PK/r/clidiff-registry") <(pk_tree "$PK/g/clidiff-registry") | head -6 | sed 's/^/  /'
+    fi
     echo "publish: $packages packages   the same, registries and all: $pub_same, $pub_done of them published"
 fi
 rm -rf "$PK"
