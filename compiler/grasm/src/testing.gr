@@ -965,7 +965,7 @@ fn shrink_call(inout r: TestRunner, fid: i64, inout inputs: [Value], inout messa
 // ---------------------------------------------------------------------
 
 /// Where a statement starts (`stmt_start`), in its module's own offsets.
-fn stmt_start(a: Ast, s: i64) -> i64 {
+pub fn stmt_start(a: Ast, s: i64) -> i64 {
     if a.k[s] == ast.S_EXPR {
         return expr_start(a, sl(a, s, 0))
     }

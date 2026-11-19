@@ -1445,7 +1445,7 @@ if want journal; then
         done
         # More than `args`: built natively below, and mangled.
         rich=0
-        if "$GRASM" journal "$WORK/jr.jrnl" | tail -1 | grep -qvE 'builtin\(s\): args [0-9]+$'; then
+        if "$GRASM" journal "$WORK/jr.jrnl" | tail -1 | grep -cvE 'builtin\(s\): args [0-9]+$' >/dev/null; then
             echo "$n $src" >>"$WORK/jrich"
             rich=1
         fi
@@ -1525,6 +1525,8 @@ d_fixed=0
 d_skipped=0
 d_rust_otherwise=0
 d_pane_only=0
+d_host=0
+declare -a D_HOST=()
 declare -a D_OTHERWISE=()
 declare -a D_PANE=()
 DAP_LIMIT=${DAP_LIMIT:-60}
@@ -1548,6 +1550,14 @@ dap_compare() { # label input
     local g_rc=${PIPESTATUS[0]}
     if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.sum" "$WORK/g.sum" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
         d_same=$((d_same + 1))
+        return 0
+    fi
+    # A panic the host's channel operations raise ends the Grasm command
+    # there, under `dap` as under `test` (§6.19, decision (3): the
+    # interpreter's channels are the host's): counted, as `test` counts it.
+    if [ "$g_rc" = 101 ] && grep -qE '^panic: (send on a closed channel|close of a closed channel|deadlock: )' "$WORK/g.err"; then
+        d_host=$((d_host + 1))
+        D_HOST+=("$1")
         return 0
     fi
     # The Rust adapter runs a program without the checker's facts -- the
@@ -1641,9 +1651,12 @@ if want dap; then
         python3 scripts/lib/dapscript.py fixed journal "$src" "$WORK/d.in" "$WORK/jrec/$jn.jrnl"
         dap_compare "journal $src" "$WORK/d.in" "$src" && d_fixed=$((d_fixed + 1))
     done <"$WORK/jrich"
-    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
+    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   the host's channel panic: $d_host   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
     if [ ${#D_OTHERWISE[@]} -gt 0 ]; then
         printf '  run otherwise by the Rust adapter: %s\n' $(printf '%s\n' "${D_OTHERWISE[@]}" | sort -u)
+    fi
+    if [ ${#D_HOST[@]} -gt 0 ]; then
+        printf '  the host channel panic: %s\n' "${D_HOST[@]}"
     fi
     if [ ${#D_PANE[@]} -gt 0 ]; then
         printf '  the variables pane alone: %s\n' "${D_PANE[@]}"
@@ -1783,7 +1796,7 @@ if want journal && [ "$j_same" -ne "$j_runs" ]; then
     echo "journal: $j_same of $j_runs programs compared"
     exit 1
 fi
-if want dap && [ $((d_same + d_rust_otherwise + d_pane_only)) -ne "$d_runs" ]; then
+if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_host)) -ne "$d_runs" ]; then
     echo "dap: $d_same of $d_runs sessions compared"
     exit 1
 fi

@@ -6,6 +6,7 @@
 // it, and its TIR handed to the TIR interpreter, which runs it with the
 // debugger attached (`tools/tirinterp/src/debug.gr`) for the second.
 import front.loader
+import front.ast
 import front.prog
 import front.sema
 import front.emit
@@ -183,7 +184,7 @@ fn loaded(path: str) -> (str, Loaded, TirProg, Map[i64, i64]) {
         Ok(x) -> x
         Err(problems) -> return ("the Grasm debug adapter cannot run `{path}`: {problems.join("; ")}", l, load.empty_prog(), empty)
     }
-    let offs = testing.stmt_offsets(tp, l)
+    let offs = statement_starts(tp, l)
     // Every block's statements must line up with the source's, or a stop
     // would be at the wrong place (decision (3)).
     for b in 0..tp.blk_node.len() {
@@ -195,6 +196,50 @@ fn loaded(path: str) -> (str, Loaded, TirProg, Map[i64, i64]) {
         }
     }
     ("", l, tp, offs)
+}
+
+/// Where each TIR statement starts: its block lined up with the AST block
+/// of the same span and the same number of statements, as coverage lines
+/// them up (`testing.stmt_offsets`). A contract's wrapper and its body are
+/// two blocks of one span, told apart by their statements; two that still
+/// tie are taken in order.
+fn statement_starts(p: TirProg, l: Loaded) -> Map[i64, i64] {
+    var spans: Map[str, [[i64]]] = map()
+    for f in 0..l.mods.len() {
+        let a = l.mods[f].a
+        let base = l.bases[f]
+        for id in 0..a.k.len() {
+            if a.k[id] == ast.A_BLOCK and a.s[id] >= 0 {
+                let v = a.pool[a.off[id]]
+                var ss: [i64] = []
+                for st in a.pool.slice(a.off[v], a.off[v] + a.n[v]) {
+                    ss.push(testing.stmt_start(a, st) + base)
+                }
+                let key = "{a.s[id] + base}:{a.e[id] + base}"
+                var have = spans.get(key) ?? []
+                have.push(ss)
+                spans.set(key, have)
+            }
+        }
+    }
+    var used: Map[str, bool] = map()
+    var out: Map[i64, i64] = map()
+    for b in 0..p.blk_node.len() {
+        let node = p.blk_node[b]
+        let key = "{p.blk_s[b]}:{p.blk_e[b]}"
+        let cands = spans.get(key) ?? []
+        for c in 0..cands.len() {
+            let ss = cands[c]
+            if ss.len() == p.nk[node] and not used.has(key + "#{c}") {
+                used.set(key + "#{c}", true)
+                for i in 0..ss.len() {
+                    out.set(p.kids[p.k0[node] + i], ss[i])
+                }
+                break
+            }
+        }
+    }
+    out
 }
 
 fn line_starts(b: bytes) -> [i64] {

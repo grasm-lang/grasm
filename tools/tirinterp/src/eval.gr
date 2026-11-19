@@ -2076,6 +2076,7 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
     let n = cx.nk[e]
     var paths: [Path] = []
     var deferred: [i64] = []
+    var late: [i64] = []
     for i in 0..n {
         let a = kid(cx, e, i)
         if i < modes.len() and modes[i] == 1 {
@@ -2095,8 +2096,11 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
             } else if cx.dbg {
                 // Under the debugger the place keeps its value while the
                 // other arguments run, as the reference's does: a stop in
-                // one of them shows it.
-                args.push(read_path(cx, path))
+                // one of them shows it. It is moved out once they have run,
+                // so the callee still holds it alone (a copy here made every
+                // write to it in the callee copy the whole value).
+                late.push(i)
+                args.push(VUnit)
             } else {
                 args.push(swap_path(cx, path, VUnit))
             }
@@ -2112,6 +2116,9 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
     }
     for i in deferred {
         args[i] = read_path(cx, paths[i])
+    }
+    for i in late {
+        args[i] = swap_path(cx, paths[i], VUnit)
     }
     let r = call_fn(cx, fid, args)
     // Taken, not shared: a written-back value the context still held would
