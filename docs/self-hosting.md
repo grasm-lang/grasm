@@ -6063,8 +6063,9 @@ for the journal, every byte of the file a recording writes and of what a
 replay prints. The Rust toolchain stays stage 0 and the oracle and is not
 changed; where its behaviour is wrong it is reproduced and recorded in
 docs/known-issues.md. The decisions are numbered (1) to (9); each was
-proposed by the agent implementing this part and awaits the coordinator's
-acceptance, and the owner may reverse any of it.
+proposed by the agent implementing this part and accepted by the
+coordinator on 2026-11-15, with the conditions written under it, and the
+owner may reverse any of it.
 
 **No network, no sockets.** Neither Rust server can open a socket:
 `grasm lsp` and `grasm dap` take no option and speak `Content-Length` framed
@@ -6339,8 +6340,12 @@ all -- "cannot export _unjournaled_host: it is not defined" -- because the
 Grasm backend leaves out an `export fn` that no Grasm code calls, and the
 link then refuses the export. That is a defect of the Grasm backend (an
 exported function is a root), found here; no corpus program met it
-(`clidiff`'s `build` builds all 648 alike). Part of this decision is to fix
-it in `compiler/s3`, with a test, before the command relies on it. No corpus
+(`clidiff`'s `build` builds all 648 alike). Fixed first, in its own commit (the coordinator's condition): every
+`export fn` is a root of the program in `compiler/mir`, and `linktest`
+builds `scripts/fixtures/link/export_uncalled.gr` with both backends and
+runs both -- the function must be in the executable and answer 42 through
+`dlsym` (with the old rule, "compiler/link failed: cannot export
+_fixture_uncalled: it is not defined"). No corpus
 program defines it, so `rtswap`, `jfuzz` and `replaytest` see nothing
 change; Linux ELF executables are static and have no `dlsym`, and the
 command does not run there yet, so the ELF runtime keeps today's rule until
@@ -6355,6 +6360,20 @@ brief); give the program a builtin (a language change, frozen); name the
 exemption in another environment variable (the person replaying sets
 `GRASM_REPLAY`, not that); let the gate run the section on stage 2 alone
 (weaker: stage 1 is the build of the command by the reference compiler).
+A link flag that sets the bit was the less magic one and is not as cheap:
+the command is built by `grasm build --native` (stage 1 by the Rust
+command, stages 2 and 3 by the Grasm one, a release by whichever ships),
+and a flag that only the Grasm command reads is a line the two commands
+answer differently, while one the Rust command would have to pass cannot
+be added; the exported name travels with the source and every build of it.
+
+The symbol is a switch for debugging and replay, **not a security
+boundary** (the coordinator's condition, written here and beside the check
+in `compiler/rt`): any program can export it and keep its own effects out
+of the journal. That is acceptable because the journal is not an audit log
+-- it records what a cooperating program read, so a failure can be made to
+happen again, and a program that wants to hide its effects can already do
+so by calling C, which no journal records.
 
 **(3) The adapter runs in the TIR interpreter, through a hook that does
 nothing unless a debugger is attached.** As §6.17 and §6.19 put `run`,

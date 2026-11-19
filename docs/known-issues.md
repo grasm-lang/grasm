@@ -9,11 +9,18 @@ makes shipping them honest rather than quiet.
 `IoFailed` that `grasm run` and a native binary word differently; one
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
-six, a block whose value is a map literal and a statement `if` whose
+ten, four in `grasm lsp`, `grasm dap` and the journal -- a replay
+leaving records unread in silence, a breakpoint by another path's
+spelling never stopping, positions as bytes, a diagnostic at the end of
+the buffer dropped -- a block whose value is a map literal and a statement `if` whose
 branches' values differ, refused natively, and four in the manifest reader
 (`grasm_pkg::toml`, and the Grasm toolchain's `packages/toml` with it): a
 string cut at an escaped quote, escapes not undone, a multi-line string
-read with its quotes, and text after a string taken into it. Open S4: fifteen, three in
+read with its quotes, and text after a string taken into it. Open S4: twenty, five in
+`grasm lsp` and `grasm dap` -- a surrogate pair read as two U+FFFD, an
+unparsable `Content-Length` after a good one, `terminate` not stopping the
+program, the adapter's own stack overflowing, registry packages not
+resolved by the adapter -- three in
 the manifest readers -- non-TOML accepted, quoted and spaced names taken
 literally, and the Rust loader reading a dependency's path a second way --
 a nested interpolation's spans, a backslash at the end of a file, a space `grasm fmt`
@@ -31,6 +38,96 @@ stack running out, each end the command.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
+
+## Found on 2026-11-15 by S8 part five (`lsp`, `dap` and the journal)
+
+Found while measuring what the Rust `grasm lsp`, `grasm dap` and the
+journal answer on the corpus, before the Grasm command took them over
+(docs/self-hosting.md §6.22). The Grasm command copies each, so the two
+stay comparable byte for byte (`scripts/clidiff.sh`), and none is fixed in
+Rust. Severities are the coordinator's (2026-11-15) but for the dropped
+diagnostic, rated S3 here for the reason the coordinator gave the first
+two: it quietly gives the wrong answer.
+
+**A replay that ends with records unread says nothing -- *open, S3*.**
+docs/replay.md: "A replay that ends with records unread says so". It does
+not: `grasm_journal::check_exhausted` exists and nothing calls it, so a
+replay that stopped short of the recorded run passes for a whole one.
+
+```
+$ printf 'fn main() / {io} {\n  print(now_millis() > 0)\n  print(now_millis() > 0)\n}\n' > two.gr
+$ printf 'fn main() / {io} {\n  print(now_millis() > 0)\n}\n' > one.gr
+$ GRASM_RECORD=two.jrnl grasm run two.gr >/dev/null
+$ GRASM_REPLAY=two.jrnl grasm run one.gr; echo "exit $?"
+true
+exit 0
+```
+
+**A breakpoint set by another spelling of the path never stops -- *open,
+S3*.** `setBreakpoints` answers `verified: true` when any loaded file has
+the same *file name*, and stores the path as the client sent it; a stop
+compares that path with the loader's spelling exactly. An editor sends an
+absolute path, so for a program launched by a relative one the breakpoint
+is reported verified and the program runs past it. Reproducer: launch
+`pan.gr` (any program with a statement on line 3) with `"program":
+"pan.gr"`, after `setBreakpoints` with `"source": {"path":
+"/abs/dir/pan.gr"}, "breakpoints": [{"line": 3}]` -- the answer is
+`{"line":3,"verified":true}`, and the next event is `exited`.
+
+**Positions are byte offsets, not UTF-16 code units -- *open, S3*.** The
+language server reads a position's `character` as a byte offset into the
+line (`Doc::offset_at`, "for ASCII sources ... the same") and writes every
+range's `character` as a byte column; the protocol counts UTF-16 code
+units. On a line with `é` before the cursor, hover and definition look one
+character to the right of where the editor points, and every range after
+it is drawn one column late per two-byte character.
+
+**A diagnostic at the end of the buffer is dropped -- *open, S3*.** The
+server keeps the diagnostics that start *before* the first file's end
+(`ds.retain(|d| d.span.start < end)`), so one that starts at the end --
+every "expected `}`" of an unclosed block at the end of a file -- is never
+shown, and the buffer is reported clean:
+
+```
+didOpen file://e.gr  "fn main() {\n  print(1)\n"
+-> {"method":"textDocument/publishDiagnostics","params":{"diagnostics":[],"uri":"file://e.gr"}}
+```
+
+(`grasm check` of the same text reports the error.) In a source bundle,
+whose first file is its first module, every diagnostic past that module is
+dropped the same way.
+
+**`😀` in a request reads as two U+FFFD -- *open, S4*.** Both
+servers' JSON reader (`json.rs`, one copy in each crate) decodes `\u`
+four digits at a time and has no surrogate pairs, so a character outside
+the Basic Multilingual Plane escaped as JSON escapes it becomes two
+replacement characters; the same character sent as UTF-8 is read right. It
+also takes `\u+041` as `A` (`u32::from_str_radix` accepts a sign).
+
+**An unparsable `Content-Length` after a good one -- *open, S4*.** The
+language server sets the length from every `Content-Length:` header and an
+unparsable value sets it to none, so `Content-Length: 5` then
+`Content-Length: x` reads no body, and the five bytes are read as headers;
+the adapter stops with `dap error: bad Content-Length:  x` (two spaces:
+the value keeps its leading one).
+
+**`terminate` and `disconnect` do not stop the program -- *open, S4*.**
+Both answer success and stop *stopping*; the program runs on to its end
+unsupervised, its output still sent as events. The capability is
+advertised as `supportsTerminateRequest`.
+
+**The adapter overflows its own stack and aborts -- *open, S4*.** Under
+`grasm dap` a program that recurses without end does not reach the
+interpreter's depth check: `serve` runs the interpreter on the thread's
+own stack, not the deep one `grasm run` gives it, and the process dies
+with "thread '<unknown>' has overflowed its stack", SIGABRT, exit 134,
+mid-protocol. `spec/conformance/E-PANIC-TRACE.gr` does it in a stepping
+session; `grasm run` reports `panic: stack overflow: recursion too deep`.
+
+**The adapter does not resolve registry packages -- *open, S4*.**
+`launch` loads with `load_from_disk`, without the registry walk `run`,
+`check` and `build` make, so `examples/registry/app/src/main.gr` launches
+as "`...` has errors: cannot load module ..." while `grasm run` runs it.
 
 ## Found on 2026-11-14 by S8 part four (the toolchain's one TOML reader)
 
