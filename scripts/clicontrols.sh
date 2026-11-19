@@ -40,12 +40,14 @@
 #   dap-line       every stop a line further on                      a session differs
 #   lsp-diag       a diagnostic at the end of the buffer kept         a session differs
 #   lsp-hover      a function's signature written `->` with no spaces a session differs
+#   dap-hang       the adapter never ends a session of `testing_tour`,
+#                  even given the program's run time               a session differs
 #   net-handle     every `tcp_connect` leaks a listener first, so each
 #                  socket's handle is one higher before any `net_close`,
 #                  outside the journal's renumbering exception     the journals differ
 #
 # `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
-# 29 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
+# 30 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
 # its runtime object from the planted sources too.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -310,13 +312,14 @@ control toml-first '^DIFF: registry lockfile: grasm deps app' ONLY=registry "$TO
 # S8 part five (§6.22): a journal entry lost, the command's exemption from
 # its own runtime's journal gone, a response field dropped, a step on the
 # wrong line, a diagnostic kept that Rust drops, a hover reworded, a socket
-# handle off by one before any `net_close`.
+# handle off by one before any `net_close`, a session that never ends.
 printf '%s\n' packages/certdiff/src/main.gr >"$WORK/certdiff"
 printf '%s\n' examples/hello.gr >"$WORK/hello"
 printf '%s\n' spec/conformance/L-LIB-NET-WORKERS.gr >"$WORK/networkers"
 BUILTINS=tools/tirinterp/src/builtins.gr
 JOURNAL=tools/tirinterp/src/journal.gr
 DEBUG=tools/tirinterp/src/debug.gr
+DAPCMD=compiler/grasm/src/dap.gr
 LSP=compiler/grasm/src/lsp.gr
 RTJ=compiler/rt/src/journal.gr
 
@@ -341,6 +344,20 @@ control net-handle '^DIFF: GRASM_RECORD grasm run spec/conformance/L-LIB-NET-WOR
             let _ = tcp_listen(0) ?? 0
             int_result(p, tcp_connect(str_of(p, args[0]), int_of(args[1])))
         }'
+
+# A session the Grasm adapter does not end in its limit is given the
+# program's own run time once more (§6.22), and no longer: a hang still
+# fails. A short limit keeps the control short.
+control dap-hang '^DIFF: grasm dap step examples/testing_tour.gr -- exit 0 \(Rust\) and 124 \(Grasm\)' "ONLY=dap FILES=$WORK/tour DAP_LIMIT=10" "$DAPCMD" \
+    '    cx.trap = true
+    cx.dbg = true' \
+    '    cx.trap = true
+    if l.paths[0].ends_with("testing_tour.gr") {
+        while true {
+            cx.d_seq += 0
+        }
+    }
+    cx.dbg = true'
 
 control dap-field '^DIFF: grasm dap step examples/hello.gr ' "ONLY=dap FILES=$WORK/hello" "$DEBUG" \
     '("threadId", json.jint(THREAD_ID)), ("allThreadsStopped", JBool(true))' \
@@ -370,4 +387,4 @@ if [ -n "${CONTROLS:-}" ]; then
     [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
     exit
 fi
-[ "$ran" -ge 29 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 30 ] && [ "$caught" = "$ran" ]

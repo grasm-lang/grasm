@@ -1546,6 +1546,9 @@ d_skipped=0
 d_rust_otherwise=0
 d_pane_only=0
 d_replayed=0
+d_slow=0
+d_slow_s=0
+d_slow_at=""
 d_host=0
 declare -a D_REPLAYED=()
 declare -a D_HOST=()
@@ -1573,6 +1576,31 @@ dap_compare() { # label input
     if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.sum" "$WORK/g.sum" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
         d_same=$((d_same + 1))
         return 0
+    fi
+    # A corpus session the Grasm side did not end in its limit: once more,
+    # given the program's own run time -- that command's plain `grasm run` of
+    # it, timed here -- on top of the limit (the coordinator's decision,
+    # §6.22: most of a heavy program's session is the program running to its
+    # end once the input stops, and the stage-2 interpreter runs parmap in
+    # 157 s). Still a finite limit, so a hang fails; counted and printed, and
+    # held to a ceiling below, so a general slowdown fails too.
+    if [ "$g_rc" = 124 ] && [ -n "${3:-}" ]; then
+        local s0 s1 run_s took
+        s0=$(date +%s)
+        timeout $((DAP_LIMIT * 20)) sandbox-exec -p "$NORUST" "$G" run "$3" >/dev/null 2>&1 </dev/null
+        s1=$(date +%s)
+        run_s=$((s1 - s0))
+        timeout $((DAP_LIMIT * 4 + run_s)) sandbox-exec -p "$NORUST" "$G" dap <"$2" 2>"$WORK/g.err" | python3 scripts/lib/streamsum.py >"$WORK/g.sum"
+        g_rc=${PIPESTATUS[0]}
+        took=$(($(date +%s) - s1))
+        if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.sum" "$WORK/g.sum" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
+            d_slow=$((d_slow + 1))
+            if [ "$took" -gt "$d_slow_s" ]; then
+                d_slow_s=$took
+                d_slow_at="$3 ${1%% *} $took s, run $run_s s"
+            fi
+            return 0
+        fi
     fi
     # A panic the host's channel operations raise ends the Grasm command
     # there, under `dap` as under `test` (§6.19, decision (3): the
@@ -1707,6 +1735,11 @@ if want dap; then
     fi
     if [ ${#D_REPLAYED[@]} -gt 0 ]; then
         printf '  the same under one recording: %s\n' "${D_REPLAYED[@]}"
+    fi
+    if [ "$d_slow" -gt 0 ]; then
+        echo "  given the program's own run time: $d_slow (slowest: $d_slow_at)"
+    else
+        echo "  given the program's own run time: 0"
     fi
     if [ ${#D_PANE[@]} -gt 0 ]; then
         printf '  the variables pane alone: %s\n' "${D_PANE[@]}"
@@ -1846,8 +1879,14 @@ if want journal && [ "$j_same" -ne "$j_runs" ]; then
     echo "journal: $j_same of $j_runs programs compared"
     exit 1
 fi
-if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_replayed + d_host)) -ne "$d_runs" ]; then
+if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_replayed + d_slow + d_host)) -ne "$d_runs" ]; then
     echo "dap: $d_same of $d_runs sessions compared"
+    exit 1
+fi
+# The sessions given their program's own run time are a few heavy programs,
+# not a slower adapter: past three, something is.
+if want dap && [ "$d_slow" -gt 3 ]; then
+    echo "dap: $d_slow sessions needed their program's own run time on top of the limit -- more than 3"
     exit 1
 fi
 if want lsp && [ "$l_same" -ne "$l_runs" ]; then
