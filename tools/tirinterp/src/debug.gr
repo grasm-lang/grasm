@@ -37,22 +37,48 @@ let R_TERMINATE = 4
 let THREAD_ID = 1
 
 // ----- scopes ------------------------------------------------------------------------
+//
+// Each list of the context this file changes is taken out, changed and put
+// back (`var l = cx.d_sc; cx.d_sc = []; l.push(..); cx.d_sc = l`), never
+// changed in place: a method call on a field of a struct finds the field by
+// its name at run time, and `Cx` has some eighty, the debugger's last, which
+// made the stage-2 command's step sessions twice as slow as they are this
+// way (docs/self-hosting.md §6.22). Taken, not copied, so each stays held
+// once.
 
 pub fn push_scope(inout cx: Cx) {
-    cx.d_sc.push(cx.d_bname.len())
+    var sc = cx.d_sc
+    cx.d_sc = []
+    sc.push(cx.d_bname.len())
+    cx.d_sc = sc
 }
 
 pub fn pop_scope(inout cx: Cx) {
-    let s = cx.d_sc.pop() ?? 0
+    var sc = cx.d_sc
+    cx.d_sc = []
+    let s = sc.pop() ?? 0
+    cx.d_sc = sc
     truncate(cx, s)
 }
 
 fn truncate(inout cx: Cx, n: i64) {
-    while cx.d_bname.len() > n {
-        cx.d_bname.pop()
-        cx.d_bvar.pop()
-        cx.d_bval.pop()
+    if cx.d_bname.len() <= n {
+        return
     }
+    var names = cx.d_bname
+    var vars = cx.d_bvar
+    var vals = cx.d_bval
+    cx.d_bname = []
+    cx.d_bvar = []
+    cx.d_bval = []
+    while names.len() > n {
+        names.pop()
+        vars.pop()
+        vals.pop()
+    }
+    cx.d_bname = names
+    cx.d_bvar = vars
+    cx.d_bval = vals
 }
 
 /// A binding of variable `v`, named as the function the frame belongs to
@@ -60,16 +86,28 @@ fn truncate(inout cx: Cx, n: i64) {
 pub fn bind(inout cx: Cx, v: i64) {
     let names = cx.d_names
     let name = if v < names.len() { names[v] } else { "" }
-    cx.d_bname.push(name)
-    cx.d_bvar.push(v)
-    cx.d_bval.push(VUnit)
+    push_binding(cx, name, v, VUnit)
 }
 
 fn bind_value(inout cx: Cx, name: str, v: Value) {
-    cx.d_bname.push(name)
-    cx.d_bvar.push(-1)
-    cx.d_bval.push(v)
+    push_binding(cx, name, -1, v)
 }
+
+fn push_binding(inout cx: Cx, name: str, var_id: i64, v: Value) {
+    var names = cx.d_bname
+    var vars = cx.d_bvar
+    var vals = cx.d_bval
+    cx.d_bname = []
+    cx.d_bvar = []
+    cx.d_bval = []
+    names.push(name)
+    vars.push(var_id)
+    vals.push(v)
+    cx.d_bname = names
+    cx.d_bvar = vars
+    cx.d_bval = vals
+}
+
 
 /// A declared function's call begins: its frame, at the statement running
 /// now, and its parameters' scope.
@@ -138,11 +176,26 @@ fn wrap(inout cx: Cx, op: i64, a: i64, inner: i64) -> i64 {
 }
 
 pub fn enter_fn(inout cx: Cx, fid: i64) {
-    cx.d_saved_cur.push(cx.d_cur)
-    cx.d_saved_names.push(cx.d_names)
-    cx.d_fname.push(cx.p.fn_name[fid])
-    cx.d_fsite.push(cx.d_cur)
-    cx.d_act.push(cx.d_sc.len())
+    var saved_cur = cx.d_saved_cur
+    var saved_names = cx.d_saved_names
+    var fname = cx.d_fname
+    var fsite = cx.d_fsite
+    var act = cx.d_act
+    cx.d_saved_cur = []
+    cx.d_saved_names = []
+    cx.d_fname = []
+    cx.d_fsite = []
+    cx.d_act = []
+    saved_cur.push(cx.d_cur)
+    saved_names.push(cx.d_names)
+    fname.push(cx.p.fn_name[fid])
+    fsite.push(cx.d_cur)
+    act.push(cx.d_sc.len())
+    cx.d_saved_cur = saved_cur
+    cx.d_saved_names = saved_names
+    cx.d_fname = fname
+    cx.d_fsite = fsite
+    cx.d_act = act
     cx.d_names = cx.p.fn_vnames[fid]
     push_scope(cx)
     for v in cx.p.fn_params[fid] {
@@ -153,14 +206,37 @@ pub fn enter_fn(inout cx: Cx, fid: i64) {
 /// It returned: its scopes go, its frame goes, and the position is the
 /// caller's again.
 pub fn leave_fn(inout cx: Cx) {
-    let a = cx.d_act.pop() ?? 0
+    let a = popped_act(cx)
     while cx.d_sc.len() > a {
         pop_scope(cx)
     }
-    cx.d_fname.pop()
-    cx.d_fsite.pop()
-    cx.d_cur = cx.d_saved_cur.pop() ?? -1
-    cx.d_names = cx.d_saved_names.pop() ?? []
+    var fname = cx.d_fname
+    var fsite = cx.d_fsite
+    var saved_cur = cx.d_saved_cur
+    var saved_names = cx.d_saved_names
+    cx.d_fname = []
+    cx.d_fsite = []
+    cx.d_saved_cur = []
+    cx.d_saved_names = []
+    fname.pop()
+    fsite.pop()
+    let cur = saved_cur.pop() ?? -1
+    let names = saved_names.pop() ?? []
+    cx.d_fname = fname
+    cx.d_fsite = fsite
+    cx.d_saved_cur = saved_cur
+    cx.d_saved_names = saved_names
+    cx.d_cur = cur
+    cx.d_names = names
+}
+
+/// The scope count a call began at, taken off its stack.
+fn popped_act(inout cx: Cx) -> i64 {
+    var act = cx.d_act
+    cx.d_act = []
+    let a = act.pop() ?? 0
+    cx.d_act = act
+    a
 }
 
 /// A closure is made: what the reference copies into it -- every name its
@@ -188,16 +264,31 @@ pub fn closure_made(inout cx: Cx, ci: i64, serial: i64) {
         }
         i -= 1
     }
-    cx.d_env.set(serial, cx.d_envn.len())
-    cx.d_envn.push(names)
-    cx.d_envv.push(vals)
+    var env = cx.d_env
+    var envn = cx.d_envn
+    var envv = cx.d_envv
+    cx.d_env = map()
+    cx.d_envn = []
+    cx.d_envv = []
+    env.set(serial, envn.len())
+    envn.push(names)
+    envv.push(vals)
+    cx.d_env = env
+    cx.d_envn = envn
+    cx.d_envv = envv
 }
 
 /// A closure's call begins: one scope, its copied surroundings and then its
 /// parameters.
 pub fn enter_closure(inout cx: Cx, ci: i64, serial: i64) {
-    cx.d_saved_names.push(cx.d_names)
-    cx.d_act.push(cx.d_sc.len())
+    var saved_names = cx.d_saved_names
+    var act = cx.d_act
+    cx.d_saved_names = []
+    cx.d_act = []
+    saved_names.push(cx.d_names)
+    act.push(cx.d_sc.len())
+    cx.d_saved_names = saved_names
+    cx.d_act = act
     let fid = cx.p.clo_fid[ci]
     cx.d_names = if fid >= 0 { cx.p.fn_vnames[fid] } else { [] }
     push_scope(cx)
@@ -217,11 +308,15 @@ pub fn enter_closure(inout cx: Cx, ci: i64, serial: i64) {
 }
 
 pub fn leave_closure(inout cx: Cx) {
-    let a = cx.d_act.pop() ?? 0
+    let a = popped_act(cx)
     while cx.d_sc.len() > a {
         pop_scope(cx)
     }
-    cx.d_names = cx.d_saved_names.pop() ?? []
+    var saved_names = cx.d_saved_names
+    cx.d_saved_names = []
+    let names = saved_names.pop() ?? []
+    cx.d_saved_names = saved_names
+    cx.d_names = names
 }
 
 fn act_bindings_start(cx: Cx) -> i64 {
@@ -576,8 +671,14 @@ pub fn set_breakpoints(inout cx: Cx, req: Json) -> Json {
                 }
             }
             if not there {
-                cx.d_bp_path.push(path)
-                cx.d_bp_line.push(l32)
+                var paths = cx.d_bp_path
+                var lines = cx.d_bp_line
+                cx.d_bp_path = []
+                cx.d_bp_line = []
+                paths.push(path)
+                lines.push(l32)
+                cx.d_bp_path = paths
+                cx.d_bp_line = lines
             }
         }
         verified.push(json.obj([("verified", JBool(ok)), ("line", json.jint(line))]))
@@ -590,8 +691,11 @@ pub fn set_breakpoints(inout cx: Cx, req: Json) -> Json {
 /// The program printed `text`: an `output` event per whole line
 /// (`OutputSink`).
 pub fn out(inout cx: Cx, text: str) {
-    cx.d_out.push_str(text)
-    let b = cx.d_out.to_bytes()
+    var o = cx.d_out
+    cx.d_out = byte_builder()
+    o.push_str(text)
+    let b = o.to_bytes()
+    cx.d_out = o
     var start = 0
     for i in 0..b.len() {
         if b.at(i) == 10 {
@@ -624,12 +728,18 @@ pub fn capture_trace(inout cx: Cx) {
     cx.d_traced = true
     var at = cx.d_cur
     var i = cx.d_fname.len() - 1
+    var tfn = cx.d_trace_fn
+    var tat = cx.d_trace_at
+    cx.d_trace_fn = []
+    cx.d_trace_at = []
     while i >= 0 {
-        cx.d_trace_fn.push(cx.d_fname[i])
-        cx.d_trace_at.push(at)
+        tfn.push(cx.d_fname[i])
+        tat.push(at)
         at = cx.d_fsite[i]
         i -= 1
     }
+    cx.d_trace_fn = tfn
+    cx.d_trace_at = tat
 }
 
 /// The run is over: the trace, if a panic left one, then `exited` and
