@@ -6050,6 +6050,511 @@ one reader until S9 (docs/known-issues.md). Three tracked lockfiles
 (`apps/apigateway`, `examples/jsonlib/app`, `examples/workspace/app`) are
 stale as `examples/registry/app`'s was, and were left as they are.
 
+### 6.22 S8 part five: `lsp`, `dap` and `journal`, with replay
+
+Written 2026-11-15, before any code, as the design to build to. Parts one to
+four (§6.17, §6.19-§6.21) left `lsp`, `dap` and `journal` answering "not in
+the Grasm toolchain yet". This part takes the three into `compiler/grasm`,
+held to the Rust command byte for byte: the same reading of the command line
+(`prevalidate` already reads all three), the same bytes on stdout and stderr
+in the same order, the same exit status, the same files written -- for the
+two servers, every byte of every response to a fixed transcript of requests;
+for the journal, every byte of the file a recording writes and of what a
+replay prints. The Rust toolchain stays stage 0 and the oracle and is not
+changed; where its behaviour is wrong it is reproduced and recorded in
+docs/known-issues.md. The decisions are numbered (1) to (9); each was
+proposed by the agent implementing this part and awaits the coordinator's
+acceptance, and the owner may reverse any of it.
+
+**No network, no sockets.** Neither Rust server can open a socket:
+`grasm lsp` and `grasm dap` take no option and speak `Content-Length` framed
+JSON on stdin and stdout only (`crates/grasm/src/main.rs`; the command line
+check gives `lsp` and `dap` no flag). The Grasm servers do the same and
+nothing more.
+
+#### What the Rust side does
+
+**The journal** is two things. *Recording and replay* is not a subcommand:
+`GRASM_RECORD=<path>` or `GRASM_REPLAY=<path>` in the environment
+(`crates/grasm_journal`; docs/replay.md), read once per thread, the first
+time the thread asks, so under `grasm run` (and `test`, `bench`, `dap`,
+which run the same interpreter) the first journaled call or C call decides
+the mode. The Rust interpreter's hooks (`crates/grasm_interp/src/journal.rs`
+and 60 call sites) cover the 40 builtins `builtins.rs` marks `Recorded` --
+the file, clock, environment, argument, stdin, entropy, socket and process
+surface -- each gated after its arguments are evaluated and before its
+effect, and recorded after it; `net_close` records `()`, `file_exists` a
+`bool`, and under replay the first C call stops the run. Values cross as
+`Wire` (`GRASMJRNL2`, then per record a `u32` name length, the name, a `u32`
+value length, the value: tag 0-8 for unit, `i64`, `f64` bits, bool, text,
+bytes, list, tuple, variant with its type name), `Ok` and `Err` as variants
+of type `!`. Each record is written to the file as it happens. The file is
+created only when the first question is asked, so a program that reaches
+nothing leaves no file, and a replay of a file that does not exist goes
+unnoticed by a program that asks nothing (both checked 2026-11-15). Words
+and status, all exit 7: `grasm: cannot record to <p>: <e>`,
+`grasm: cannot replay <p>: <e>`, the journal "ran out at call N (`name`)",
+"at call N the recording says `a` and this run asked for `b`", "this run
+calls the C function `f`". A replay that ends with records unread says
+nothing: `check_exhausted` exists and nothing calls it, though
+docs/replay.md says a replay "says so" -- a defect of the Rust toolchain,
+reproduced and recorded. *`grasm journal <file> [--full]`* prints a
+recording: the operand is `args.get(1)` unless it starts with `--` (so
+`journal --full j` is the usage, exit 1); the file read whole and parsed
+(`grasm: cannot read <p>: <e>`, exit 1, `<e>` in `grasm_sys`'s words -- "No
+such file or directory", "Is a directory", "not a Grasm journal", "journal
+ends mid-record", a value's own errors); then `<p> — N record(s), B bytes`
+(B from `metadata`, 0 if that fails), and either "The program read nothing
+from outside itself." or one line per record -- two spaces, `{i:>places}`,
+two, `{name:<width}`, two, the value -- (width in bytes of the longest name,
+padded in characters, as `bench` pads), and a tally of calls per builtin in
+byte order. A value is rendered within a budget of 48 characters, or none
+with `--full`: text quoted with `\n`, `\r`, `\t` and `"` escaped and cut
+after the budget with "… N more char(s)"; bytes as a count and `budget/3`
+hex pairs; lists and tuples by their first three items, each with a third of
+the budget; a variant by its name and fields; a float as Rust's `{}` writes
+it; names and text decoded lossily.
+
+**`lsp`** (`crates/grasm_lsp`, 708 lines and a 334-line JSON reader and
+writer of its own). One loop: read a message (header lines to a blank one,
+`Content-Length:` parsed as `usize` -- an unparsable value forgets an
+earlier one -- the body read exactly and decoded lossily; a read error ends
+the server with `lsp error: <e>`, exit 1; end of input ends it with 0); a
+body that is not JSON is skipped; otherwise the method is handled and, if
+the message had an `id` and the handler a result,
+`{"id","jsonrpc","result"}` is written, then any notification. `initialize`
+(the capabilities and `grasm-lsp` `1.1.0`), `shutdown` (null),
+`textDocument/didOpen`, `didChange` (the last change's text: full sync) and
+`didSave` (each a `publishDiagnostics`), `hover`, `definition`,
+`completion`, `documentSymbol`; `exit` ends the loop only after `shutdown`;
+every other method gets no answer at all. Diagnostics: for a `file://` URI,
+the path after the prefix loaded with the buffer as the entry
+(`load_from_disk_in`, no registry packages), the loader's diagnostics or
+else the checker's, only those that start before the end of the first file,
+each `message` (and `"\nhelp: " + help`), severity 1, source `grasm`, its
+range in 0-based lines and *byte* columns; for any other URI, or a load that
+fails, `analyze` -- the buffer parsed and, if it parsed, checked as one
+module named `main` with no imports. Hover, definition, completion and
+symbols parse the buffer alone and look only at its own declarations: a
+function's signature, a type's body, an effect's operation count, a
+variant's fields, with the `///` text under a rule; a builtin's one-line
+help from a fixed table of eleven; completion's items are the file's
+declarations, 27 keywords and those eleven builtins. A position is a line
+and a character taken as a *byte* offset into the line, clamped to it. JSON
+objects are written with their keys in byte order (`BTreeMap`), numbers as
+`f64` (an integral one as an integer, saturating; any other as Rust's `{}`),
+strings with `"`, `\`, `\n`, `\r`, `\t` escaped and other controls as
+`\u00xx`; the reader takes `\u` four characters at a time (a surrogate is
+U+FFFD, so a pair is two of them) and reports every failure in words of its
+own.
+
+**`dap`** (`crates/grasm_dap`, 879 lines, its own copy of the JSON code).
+Phase one, before the program runs: requests answered in order with `seq`
+counting every message read; `initialize` (eight capabilities, then an
+`initialized` event), `launch` (the program loaded from disk and checked --
+the loader's and the checker's diagnostics *together*, unlike `check` -- the
+first one's message as "`p` has errors: m", or "cannot load `p`: e"; with
+`"journal": "<path>"` that recording installed first, as a replay, "cannot
+replay <path>: e" -- a failed launch is a failed response and a `terminated`
+event, exit 0), `setBreakpoints` (held, every line reported verified),
+`threads`, `configurationDone` (ends the phase; before a `launch`, "dap
+error: configurationDone arrived before launch", exit 1), `disconnect` and
+`terminate` (exit 0), anything else answered with a null body. A framing or
+JSON error here is `dap error: <e>`, exit 1. Phase two runs `main` in the
+reference interpreter with a hook before every statement: it stops when the
+resume mode says (stop on entry steps in; a breakpoint is a file and a line;
+`next` stops at the same depth or shallower, `stepOut` shallower), sends
+`stopped` (reason `breakpoint` or `step`), and serves requests until one
+resumes: `stackTrace` (frames innermost first, each `module::function`, the
+innermost at the statement running, each outer one at the statement that was
+running in it when the call was made, path and file name, line and byte
+column), `scopes` (one, `Locals`, readable only for frame 0), `variables`
+(every name in the innermost frame's scopes, the innermost binding of each,
+sorted by name; the value as the interpreter prints it, a string as Rust's
+`{:?}`; a type name of the value's kind), `evaluate` (a name looked up,
+nothing more; else "no variable named `x`"), `setBreakpoints` (replaces that
+file's), `threads`, `continue`, `next`, `stepIn`, `stepOut`, `disconnect`
+and `terminate` (which stop the stopping, not the program: it runs on to its
+end); end of input or a bad frame in this phase ends the stopping the same
+way. The program's stdout becomes `output` events a line at a time (lossy
+UTF-8), its stderr is the adapter's stderr, a panic adds one `stderr` output
+event with the stack trace, and the run ends with `exited` (the status) and
+`terminated`; exit 0. Tasks of a `concurrent` block run in interpreters of
+their own with no debugger, so the Rust adapter never stops inside one.
+
+#### What Rust answers on the corpus
+
+Measured 2026-11-15 with the main checkout's `grasm` (the release of
+2026-11-01), from the worktree's root, stdin `/dev/null` for runs, each
+program once, at a one-minute load of about 5 from other work.
+
+- **The journal**: the 651 corpus programs with a `main` (`clidiff`'s list),
+  each run once under `GRASM_RECORD` with a 120-second limit (`clidiff`
+  gives 1,800): 4 ran past it (`examples/parallel_map.gr`,
+  `packages/b29-demo`, `crypto_hash-demo`, `password-demo`). Of the 647, 467
+  left no file -- they asked the journal nothing -- 6 left a 10-byte file
+  holding only the magic (they call C and nothing journaled: `termios-demo`
+  and five `T-EXTERN*`/`L-LIB-CALL-C` conformance programs), 140 recorded
+  `args` and nothing else, and 38 recorded more: 6,262 records and 1.7 MB in
+  all, of 39 of the 40 journaled builtins (all but `udp_recv_from`), from
+  `read_bytes_at` 3,317 times (`lsm-demo`) to `now_millis`, `input`,
+  `sleep_millis` and `udp_send` once each. Exit statuses: 620 zero, 18
+  panics (101), 8 one, 1 `exit(255)`. Each recording replayed by Rust: 176
+  printed and exited as recorded; the 8 others stop with exit 7 at their
+  first C call (`isatty`, `SDL_Init`, `call_c`, `strlen`, `sqrt`, `abs`), as
+  designed. Recorded a second time, 175 of the 184 files were the same
+  bytes; the 9 others differ only in the values of `now_millis`,
+  `monotonic_millis`, `monotonic_nanos`, `random_bytes`, `net_port` and
+  `tcp_peer` -- the builtins whose answer depends on when and where, and the
+  only ones a comparison of two recordings may normalise.
+- **`lsp`**: every tracked `.gr` file (2,010), one scripted session each
+  (`initialize`, `didOpen`, `documentSymbol`, `hover` and `definition` at
+  each `fn`/`type`/`effect` name and at 40 identifiers spread over the file,
+  `completion`, a `didChange` adding a function with a type error and two
+  hovers on it, a `didChange` dropping the last `}`, `didSave`, `shutdown`,
+  `exit`): every session exited 0; 253,306 messages and 42 MB of responses,
+  39,861 hovers with a result and 36,459 definitions, 2,348 diagnostics (the
+  type-error probe in 2,009 files; in the one source bundle,
+  `ProjectGold/36-markdown-editor/bundle.gr`, the probe is in its last
+  module, past the first file, and is dropped). 277 seconds of the Rust
+  server's time in all; the longest, 8.9 s, are `compiler/grasm`'s files,
+  each change reloading the whole command. Every diagnostic of the unclosed
+  `{` was dropped (below).
+- **`dap`**: the 651 programs, each with a session that stops on entry and
+  steps in 200 times, asking `threads`, `stackTrace`, `scopes` and
+  `variables` at each stop, then ends its input; every fourth (211) also
+  with a session of 100 stops cycling `next`, `stepIn`, `next`, `stepOut`,
+  `stepIn`, `stepIn`, `next`, and one with a breakpoint on every third line
+  and 50 `continue`s -- each session limited to 60 s (300 s for the first 17
+  programs; the session costs a whole run, since the program runs on after
+  the input ends). 1,073 sessions, 445,262 messages, 72,996 stops, 281,094
+  variables shown -- `i64` 112,046, `list` 54,628, `str` 52,167, `struct`
+  21,771, `f64` 11,660, `bytes` 11,248, `bool` 9,021, `map` 2,870, `variant`
+  1,734, `ref` 1,514, `tuple` 797, `fn` 759, `ByteBuilder` 298, `StrBuilder`
+  216, `result` 206, `()` 109, `range` 50, and no `u64` at all; frames up to
+  101 deep; 42 sessions ending in a panic with its stack trace, 13 with
+  status 1, one with 255. 3.3 GB of responses, 2.4 GB of it one session:
+  `sieve`'s list of a million booleans rendered whole in the pane at each of
+  200 stops. Seven sessions ran past the limit (`b29-demo`,
+  `crypto_hash-demo`, `password-demo`), three launches failed
+  (`examples/registry/app`, whose registry package the adapter's loader does
+  not resolve, "cannot load module"), and one aborted: `E-PANIC-TRACE`'s
+  deliberate unbounded recursion overflows the Rust adapter's own stack --
+  "thread '<unknown>' has overflowed its stack", SIGABRT, exit 134 -- where
+  `grasm run` reports the panic, because `serve` does not run the
+  interpreter on the deep stack `run` uses (a Rust defect, recorded). The
+  Rust adapter's time: 982 s for the 651 stepping sessions, 1,237 s for the
+  422 others, `examples/parallel_map.gr` alone 488 s.
+
+#### What Grasm has, and what has to be written
+
+What exists: `front`'s loader, parser and checker with Rust's diagnostics in
+Rust's order and words (`diagdiff`, which compares the rendered diagnostics,
+and the renderer keeps the checker's order), its AST node for node with the
+`///` map (`asttest`, `doc`), `rdebug` (Rust's `{:?}` of a string), gfmt's
+`char::is_whitespace`; `tirinterp`, which `run` runs in this process, with
+`fault`/`exit_with` unwinding and the statement-to-AST map `testing.gr`
+built for `--coverage` (`stmt_offsets`: each TIR block's children lined up
+with the AST block of the same span); and the Grasm runtime's own journal
+(`compiler/rt/src/journal.gr`), which records and replays native programs
+and is held to the Rust runtime's by `jfuzz` and `rtswap`. What does not:
+any JSON, any framing, a loader entry given in memory, a one-module check,
+any journal in the interpreter, any debugger hook.
+
+- **A JSON reader and writer and the framing**, ported from
+  `grasm_lsp/src/json.rs` (identical in `grasm_dap` but for a comment) --
+  not `packages/json`, whose errors, number writing, key order and escapes
+  are its own -- with Rust's `str::parse::<f64>`, `usize`'s parse (a leading
+  `+`), `char::is_whitespace`, `trim_end`, `read_line`'s UTF-8 check
+  ("stream did not contain valid UTF-8"), `read_exact`'s "failed to fill
+  whole buffer", `String::from_utf8`'s error words and `from_utf8_lossy`,
+  and Rust's `{}` for a float (the language's `to_str` less a `.0`, as
+  `float_text` adds it). In `tools/tirinterp/src/json.gr`, since the adapter
+  runs inside the interpreter (below); the command's LSP imports it from
+  there. Decision (8).
+- **Standard input and output as bytes.** `input()` cannot read bytes, see
+  the end of input, or keep a `\r`, and `print` cannot write a message
+  without a newline after it, so the servers read fd 0 with `read(2)` and
+  write fd 1 with `write(2)` through `extern fn`, as the command already
+  calls `stat(2)` and `chmod(2)`, with a buffer of their own (decision (9)).
+  Nothing else in the command writes to stdout while a server runs.
+- **`lsp`**: `compiler/grasm/src/lsp.gr` -- the loop, the handlers, the
+  signature writers (`render_fn_signature`, `render_type_decl`, `type_text`:
+  the LSP's own forms, not `doc`'s), `word_at`, the two fixed tables -- over
+  two additions to `front`: `load_with`'s entry text given in memory
+  (`load_from_disk_in`) and a one-module check (`analyze`).
+- **The journal**: `tools/tirinterp/src/journal.gr` -- `Wire`, its encoding
+  and decoding with every error in Rust's words, the lazy mode
+  (`GRASM_RECORD`, `GRASM_REPLAY`, chosen at the first question, the file
+  created then), `gate`, `put`, `refuse_foreign`, `install` (for the
+  adapter's `journal` argument) and `render`; the 40 builtins and the C call
+  hooked in `builtins.gr`, `cabi.gr` and `ccall.gr` as the Rust interpreter
+  hooks them -- after the arguments, before the effect -- with each
+  builtin's answer converted to and from `Wire` in the shapes the Rust
+  interpreter gives (an `IoError` variant of type `IoError`, `Option`, `!`,
+  tuples). Decision (1). `compiler/grasm/src/journalcmd.gr` is
+  `grasm journal`.
+- **The runtime's exemption**: decision (2) below.
+- **`dap`**: `tools/tirinterp/src/dap.gr` -- both phases, the session, the
+  hook's stopping rule, the responses -- and the interpreter's debugger
+  hooks, decisions (3) to (7). The command's `dap` arm loads and checks the
+  program as the Rust one does (`front.load` with both diagnostic lists),
+  builds the TIR and the statement map, and hands over.
+
+#### The decisions
+
+**(1) The program's journal is the TIR interpreter's.** The Rust interpreter
+records and replays with hooks of its own over the shared format, and so
+does `tirinterp`: it is the engine `run`, `test`, `bench` and now `dap` run,
+its builtins are its own implementations, and only it knows which host
+operations are the program's. Writing each record to the file as it happens,
+as Rust does, so a run that panics or exits leaves the records before it.
+The alternative -- letting the host runtime's journal record the interpreted
+program, since `tirinterp`'s builtins call the host's -- was rejected: the
+host makes calls the program did not (the interpreter's own reads), and the
+program makes calls the host never sees (`args()`, answered from the command
+line it was given).
+
+**(2) A Grasm executable may be exempt from its own runtime's journal, and
+the command is.** Measured 2026-11-15: under `GRASM_RECORD`, the Grasm
+command (part four's, on the Rust runtime) wrote eleven records for a
+program that makes two -- its own `file_size` and `read_bytes_at` of itself
+(the bundle check), `args`, five `file_exists` and the source's `read_bytes`
+-- and a native program built by the Grasm command records the same way on
+the Grasm runtime. Under `GRASM_REPLAY` it would be worse: the command's own
+first call would take the program's first record, and its first C call
+(`stat`) would stop the run. No program can opt out today: the mode is read
+from the environment at the first journaled call or C call, both of which
+the command makes before it knows anything, and every C call checks it. So
+`compiler/rt`'s journal (a runtime package; the language freeze does not
+cover it) learns one thing: at the first question, before reading the
+environment, it looks for an exported symbol `unjournaled_host` in the main
+executable (`dlsym(RTLD_MAIN_ONLY)`) and, if it is there, the executable's
+journal is off for good -- no record, no replay, no refusal of C calls. The
+command defines it with `export fn` (not `grasm_...`: the checker keeps
+names beginning `grasm_` for the runtime and the compiler). Tried
+2026-11-15: a program exporting it and asking `dlsym(-5, ...)` finds it when
+built by the Rust command; built by the Grasm command it does not link at
+all -- "cannot export _unjournaled_host: it is not defined" -- because the
+Grasm backend leaves out an `export fn` that no Grasm code calls, and the
+link then refuses the export. That is a defect of the Grasm backend (an
+exported function is a root), found here; no corpus program met it
+(`clidiff`'s `build` builds all 648 alike). Part of this decision is to fix
+it in `compiler/s3`, with a test, before the command relies on it. No corpus
+program defines it, so `rtswap`, `jfuzz` and `replaytest` see nothing
+change; Linux ELF executables are static and have no `dlsym`, and the
+command does not run there yet, so the ELF runtime keeps today's rule until
+it needs another way. What it costs: **the Rust runtime has no such rule**
+and is not to be changed, so a command linked with it -- stage 1, as
+`clidiff` and `fixpoint` build it -- journals itself under either variable.
+The `journal` section of the gate therefore runs on commands linked with the
+Grasm runtime: stage 2, and a stage 1 linked as `rtswap` links a Cranelift
+object, `compiler/link -interpose rt.o`; every other section runs on stage 1
+as built today. The alternatives: change the Rust runtime (refused by the
+brief); give the program a builtin (a language change, frozen); name the
+exemption in another environment variable (the person replaying sets
+`GRASM_REPLAY`, not that); let the gate run the section on stage 2 alone
+(weaker: stage 1 is the build of the command by the reference compiler).
+
+**(3) The adapter runs in the TIR interpreter, through a hook that does
+nothing unless a debugger is attached.** As §6.17 and §6.19 put `run`,
+`test` and `bench` there: the program's stdout is the adapter's to frame,
+and the stops must happen in this process. The interpreter gains a debugger
+state in its context (`cx.dbg`, off for `run`, `test` and `bench`): before
+each block child that `stmt_offsets` maps to an AST statement, the
+statement's start becomes the current position and the stopping rule is
+asked; a stop serves the protocol from inside the evaluation, as the Rust
+adapter serves it from inside its hook. A block whose children do not line
+up with the AST's (none is expected; coverage relies on the same map, and
+the count is measured at step three) refuses the launch rather than stepping
+wrongly. `run` stays the same bytes: every change is behind `cx.dbg` or
+`cx.jrnl`, and `tirinterp`, `frontsmoke` and `clidiff`'s `run` section hold
+it.
+
+**(4) The reference's frames and scopes, kept beside the interpreter's.**
+The interpreter's frames are slot arrays; the reference's are a call stack
+of `(module::name, call site)` and, per frame, a stack of name-to-value
+scopes. Under the debugger the interpreter keeps the second shape as the
+reference builds it: a frame pushed for every call of a declared function
+(its name as TIR writes it, `module::name`, as the reference's
+`module::function`; the call site the current statement when the call was
+made -- the reference's `cur_span`, which a closure's statements also move
+and only a declared function's return restores), a scope pushed for every
+block, function body, closure call, `for` iteration and `match` arm, and a
+binding recorded at each `let`, `let (..)`, parameter, loop variable and
+pattern binding by its var id, its value read from the slot at the stop. A
+closure's call scope is the reference's: the names its body mentions
+(`mentioned_names`, ported over front's AST) bound where it was made, by
+value, and its parameters. Two things the interpreter does for speed would
+show through and are turned off under the debugger: moving a value out of a
+slot at its last use (the reference keeps the binding, so the pane shows it)
+and any slot reuse that would make one name show another's value. A `ref`
+shows as `ref#slot.generation`, so the interpreter's slab hands out slots
+and generations in the reference's order (1,514 `ref` values in the measured
+panes). Which value kinds the pane names (`i64`, `u64`, `str`, `list`,
+`map`, `struct`, `variant`, `result`, `fn`, `range`, ...) is decided by the
+reference's representation, not the static type: `let x: u8 = 5` is an `i64`
+there, and a `u64` is `u64` only where the reference made a `U64`; the rules
+are taken from `grasm_interp` and measured on the corpus's transcripts (no
+variable of type `u64` in them).
+
+**(5) The program's stdin under the adapter is the protocol.** The Rust
+adapter reads requests through a `BufReader` over `stdin()`, and the
+program's `input()` reads the same process stdin through its own lock, so
+what a program that reads stdin sees under `dap` depends on two buffers'
+sizes. The Grasm adapter answers `input()` from the protocol stream the same
+way only by accident, so the three corpus programs that call `input()`
+(`packages/bindgen-demo`, `L-LIB-IO`, `T-EFFECT-BUILTIN`) are left out of
+the sessions, and the difference is recorded, not designed.
+
+**(6) `concurrent` tasks do not stop, as in the reference.** The Rust
+interpreter runs a `concurrent` block's tasks in task interpreters with no
+debugger; the TIR interpreter runs them as host tasks on copies of its
+context, which carry the debugger switched off. A task's prints reach the
+adapter as the reference's do (collected, then written to the program's
+output when the reference writes them), measured on the four corpus programs
+with a `concurrent` block in their own source (`E-ACTOR`, `E-CONCURRENT`,
+`E-DEADLOCK`, `E-SCHEDULE`). `parallel` blocks, `par_map` and `net_workers`
+run in order on the one interpreter in both, and stop as any statement does.
+
+**(7) A panic and an exit under the adapter unwind.** `cx.trap`, which §6.19
+gave `test` and `bench`, is on under the adapter too, so a panic becomes
+`exited` 101 with the stack trace event, built from the frames of (4) at the
+statement where the panic first left a statement, as the reference captures
+it; an `exit(n)` is `exited` n. A recursion that runs out of stack is the
+one thing that cannot match: under `run` the reference stops at its own
+depth count and the interpreter at its host's stack, so the traces differ in
+length, and under `dap` the Rust adapter does not even get that far -- it
+overflows its own stack and aborts (exit 134, measured on the one corpus
+program that does this, `E-PANIC-TRACE`). An abort is not a behaviour to
+copy; such programs are left out of the sessions, and the Grasm adapter
+reports the panic as `run` would.
+
+**(8) One JSON port, in `tirinterp`.** Above.
+
+**(9) The servers use `read(2)` and `write(2)`.** Above.
+
+#### What the interpreter must change, and `run`
+
+In `tools/tirinterp`: the journal module and a gate-and-record around each
+of the 40 builtins and the C call (`cx.jrnl`, chosen at the first question;
+off and never asked under any command that sets neither variable, which is
+every gate but the new one); the debugger state and the hook in
+`block_prefix`, the reference's frames and scopes kept beside its own,
+last-use moves turned into copies, the program's prints routed to the
+adapter, all behind `cx.dbg`; `cx.trap` on under the adapter. Under `run`,
+`test` and `bench` with neither variable set nothing of this is reached but
+two flag tests per statement and per builtin, so `run` stays the same bytes,
+held by `tirinterp`, `frontsmoke` and `clidiff`'s `run` section, and its
+speed is measured against §6.17's table on the nine benchmarks before and
+after. `test` and `bench` record and replay too, as Rust's do, since the
+hooks are the interpreter's; the gate exercises `run` and the adapter's
+launch argument, and `test` under a recording is sampled (the programs whose
+tests make a journaled call).
+
+**Order** (the brief's): the journal and replay first (step two), with the
+runtime's exemption and the backend's `export fn` fix, the JSON port and
+`grasm journal`; then the adapter (step three); then the language server
+(step four); then the gates and controls (step five). Each step's checks are
+run before the next starts.
+
+#### How each is held to Rust
+
+`clidiff` gains three sections, both commands from the worktree's root on
+the same input, every byte compared, the counts asserted and a floor on a
+whole run; `scripts/lib/clicases.txt` loses the `elsewhere` tags of the
+three and gains the lines that reach each arm's own checks (`journal`
+without a file, with `--full` first, with two files, on a missing file, a
+directory, a file that is not a journal, a truncated one; `lsp x`, `dap x`,
+`lsp --x`).
+
+- **`journal`**: every corpus program with a `main`, run by each command
+  under `GRASM_RECORD` into a file of its own: stdout, stderr (the trace
+  stripped, as in `run`) and status the same, the same file or none, and the
+  two files the same bytes once the values of the builtins that answer
+  differently from run to run (`now_millis`, `monotonic_millis`,
+  `monotonic_nanos`, `random_bytes`, `net_port`, `tcp_peer`: what recording
+  twice with Rust found) are replaced by a placeholder of the same shape.
+  Then each command replays *Rust's* recording, and Rust replays the Grasm
+  command's: the same bytes as the recording run printed. `grasm journal`
+  and `grasm journal --full` by both commands on both recordings. And for
+  every program whose recording holds a record, five journals
+  `scripts/lib/jmangle.py` writes from it, each replayed and printed by
+  both: one record short (ran out), the first record renamed (diverged), cut
+  mid-record, the magic broken, and every value of the first text record
+  grown past the budget; plus the 38 programs whose recording holds more
+  than `args`, built natively by the Grasm command, recorded by the
+  executable and replayed by both commands' `run` (a native recording is the
+  case docs/replay.md exists for). Cost, estimated: one more `run` section
+  for the recordings (the Rust half took 22 minutes here, with four programs
+  cut at 120 s), and a few minutes for the 184 programs' replays and the 38
+  programs' mangled journals and native builds.
+- **`dap`**: the measured sessions, transcripts made by
+  `scripts/lib/dapscript.py` (to be written): every corpus program with a
+  `main` but those decisions (5) and (7) leave out stops on entry and steps
+  in 200 times; every fourth also cycles `next`, `stepIn`, `next`, `stepOut`
+  100 times and runs to a breakpoint on every third line 50 times -- at each
+  stop `threads`, `stackTrace`, `scopes` and `variables` -- then its input
+  ends, the program runs to its end unsupervised, and its output events and
+  exit are compared too. The two streams are compared as they arrive, by
+  length and SHA-256, never stored: one is 2.4 GB. A session the Rust
+  adapter does not finish in 60 s is counted and not compared (seven of
+  1,073 here), and the two extra sessions are skipped for a program whose
+  stepping session took Rust more than 10 s (counted). And a fixed set:
+  launch failures (the conformance programs that must not compile, every
+  tenth; a missing file; the registry app; a journal that is missing and one
+  that is not a journal), `configurationDone` before `launch`, `evaluate` of
+  a name that exists and one that does not, `scopes` of an outer frame,
+  `variables` of reference 0, breakpoints replaced in phase two,
+  `disconnect` while stopped, framing and JSON errors in each phase (every
+  error message of the reader), and the `journal` launch argument on the
+  recordings above. Cost, estimated: the Rust half about 22 minutes on the
+  measured times; the Grasm half is the TIR interpreter with the hook, 0.8
+  to 2.9 times Rust's time on `run` (§6.17), so the section about an hour to
+  an hour and a half.
+- **`lsp`**: one scripted session per tracked `.gr` file -- `initialize`,
+  `didOpen`, `documentSymbol`, `hover` and `definition` at every
+  declaration's name and at 40 identifiers spread over the file,
+  `completion`, a `didChange` adding a function with a type error and a
+  hover on it, a `didChange` that no longer parses (dropping the last `}`),
+  `didSave`, `shutdown`, `exit` -- and a fixed set: an `untitled:` URI (the
+  one-module check), a `file://` path that does not exist, a request before
+  `didOpen`, positions past a line's end and past the last line, a line with
+  non-ASCII text, a method nobody handles with and without an `id`, ids of
+  every JSON type, a body that is not JSON, a header with no
+  `Content-Length`, one with an unparsable length after a good one, invalid
+  UTF-8 in a header and in a body, a body cut short, `exit` before
+  `shutdown`, and JSON strings with every escape (a surrogate pair among
+  them) and numbers in every form. Cost, estimated: 277 s of the Rust
+  server's time, the Grasm server's to be measured at step four (front
+  checks each change three times per file, as Rust does), and about ten
+  minutes of transcript writing -- under half an hour.
+
+`clicontrols` gains a control for each: a journal record dropped (a
+builtin's hook skipped), the exemption removed (the command records itself),
+a response field dropped (`allThreadsStopped`), a step that lands on the
+wrong line (a statement's start one line on), a variable's binding not
+shadowed, a diagnostic missed (the end-of-file filter off by one the other
+way), a hover signature reworded. `fixpoint` must still find stage 3 the
+same as stage 2, and the stage-2 command passes the whole `clidiff`.
+
+**Copied from Rust, and recorded as its defects** (docs/known-issues.md,
+each with a reproducer): a replay that leaves records unread says nothing,
+where docs/replay.md says it does; the LSP drops every diagnostic that
+starts at the end of the buffer -- an unclosed `{` at the end of a file
+shows no error at all -- because it keeps those that start *before* the
+first file's end; positions and ranges are byte offsets where the protocol
+says UTF-16 code units; the escape pair `\uD83D\uDE00` reads as two U+FFFD;
+an unparsable `Content-Length` after a good one forgets the good one (LSP)
+or ends the adapter (DAP); `terminate` and `disconnect` do not stop the
+program; the adapter overflows its own stack on a deep recursion and aborts,
+where `run` reports the panic; and it loads a program without the registry
+packages `run` resolves, so a program with a registry dependency cannot be
+debugged ("cannot load module"); and a breakpoint set by a path spelled
+other than the launch's -- an absolute path, as editors send, for a program
+launched by a relative one -- is answered `verified` and never stops
+(checked 2026-11-15).
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
