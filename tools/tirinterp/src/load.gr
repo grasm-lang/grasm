@@ -89,6 +89,22 @@ pub let OP_P_ERR = 87
 pub let OP_P_TUPLE = 88
 pub let OP_P_OR = 89
 
+// Opcodes no TIR has: what `grasm dap` (`debug.rewrite`) and a journal
+// (`journal.mark`) turn nodes into before a run, so a run with neither
+// tests for them nowhere.
+pub let OP_DBG_FNBODY = 101
+pub let OP_DBG_LOOPBODY = 102
+pub let OP_DBG_CLOBODY = 103
+pub let OP_DBG_CALLINOUT = 104
+pub let OP_DBG_PRINT = 105
+pub let OP_TASK_PRINT = 106
+pub let OP_DBG_BLOCK = 107
+pub let OP_DBG_MATCH = 108
+pub let OP_DBG_LET = 109
+pub let OP_DBG_LETTUPLE = 110
+pub let OP_DBG_CLOSURE = 111
+pub let OP_J_BUILTIN = 112
+
 /// The program, ready to run.
 type TirProg = {
     op: [i64],

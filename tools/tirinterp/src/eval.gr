@@ -139,6 +139,13 @@ type Cx = {
     // without the debugger makes nothing for them.
     d_saved_cur: [i64],
     d_saved_names: [[str]],
+    // The closure value being called, for its body's node to read; and
+    // what a task of a `concurrent` block runs: the nodes as they were
+    // before `debug.rewrite`, but for its prints.
+    d_serial: i64,
+    d_task_op: [i64],
+    d_task_kids: [i64],
+    d_task_body: [i64],
     d_bname: [str],
     d_bvar: [i64],
     d_bval: [Value],
@@ -168,7 +175,7 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         consts.push(VUnit)
         built.push(false)
     }
-    Cx{
+    var cx = Cx{
         op: p.op,
         a: p.a,
         b: p.b,
@@ -239,6 +246,10 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         d_names: [],
         d_saved_cur: [],
         d_saved_names: [],
+        d_serial: 0,
+        d_task_op: [],
+        d_task_kids: [],
+        d_task_body: [],
         d_bname: [],
         d_bvar: [],
         d_bval: [],
@@ -254,6 +265,8 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         d_strdebug: same_text,
         d_tout: [],
     }
+    journal.mark(cx)
+    cx
 }
 
 /// A panic of the program, saying `msg`. Under `run` the host's own, which
@@ -389,9 +402,6 @@ pub fn ev(inout cx: Cx, start: i64) -> Value {
             // OP_BLOCK: every statement but the last, then the last in
             // this call.
             16 -> {
-                if cx.dbg {
-                    return debug_block(cx, e)
-                }
                 e = block_prefix(cx, e)
                 if e < 0 {
                     return VUnit
@@ -401,9 +411,6 @@ pub fn ev(inout cx: Cx, start: i64) -> Value {
             24 -> e = cx.kids[cx.k0[e]]
             // OP_MATCH: the arm that matched runs in this call.
             25 -> {
-                if cx.dbg {
-                    return debug_match(cx, e)
-                }
                 e = match_arm(cx, e)
                 if e < 0 {
                     return VUnit
@@ -491,6 +498,68 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
         45 -> cabi.call_c_node(cx, e)
         // OP_TLS
         46 -> cabi.tls_cell(cx, e)
+        // The nodes `grasm dap` and a journal make (`debug.rewrite`,
+        // `journal.mark`).
+        101 -> {
+            debug.enter_fn(cx, cx.a[e])
+            let r = ev(cx, kid(cx, e, 0))
+            debug.leave_fn(cx)
+            r
+        }
+        102 -> {
+            debug.push_scope(cx)
+            debug.bind(cx, cx.a[e])
+            let r = ev(cx, kid(cx, e, 0))
+            debug.pop_scope(cx)
+            r
+        }
+        103 -> {
+            debug.enter_closure(cx, cx.a[e], cx.d_serial)
+            let r = ev(cx, kid(cx, e, 0))
+            debug.leave_closure(cx)
+            r
+        }
+        104 -> debug_call_inout(cx, e)
+        105 -> {
+            let v = ev(cx, kid(cx, e, 0))
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            debug.out(cx, value.show(cx.p, v) + "\n")
+            VUnit
+        }
+        106 -> {
+            let v = ev(cx, kid(cx, e, 0))
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            chan_send(cx.d_tout[0], value.show(cx.p, v) + "\n")
+            VUnit
+        }
+        107 -> debug_block(cx, e)
+        108 -> debug_match(cx, e)
+        109 -> {
+            let r = let_stmt(cx, e)
+            if cx.ctl == 0 {
+                debug.bind(cx, cx.a[e])
+            }
+            r
+        }
+        110 -> {
+            let r = let_tuple(cx, e)
+            if cx.ctl == 0 {
+                for i in 1..cx.nk[e] {
+                    debug.bind(cx, cx.a[kid(cx, e, i)])
+                }
+            }
+            r
+        }
+        111 -> {
+            let v = closure(cx, e)
+            debug.closure_made(cx, cx.a[e], cx.serial)
+            v
+        }
+        112 -> builtins.journaled(cx, e)
         _ -> panic("tirinterp: node {e} has no evaluation (opcode {cx.op[e]})")
     }
 }
@@ -516,9 +585,6 @@ fn let_stmt(inout cx: Cx, e: i64) -> Value {
         return VUnit
     }
     cx.fr[cx.a[e]] = v
-    if cx.dbg {
-        debug.bind(cx, cx.a[e])
-    }
     VUnit
 }
 
@@ -698,9 +764,6 @@ fn closure(inout cx: Cx, e: i64) -> Value {
         caps.push(cx.fr[v])
     }
     cx.serial += 1
-    if cx.dbg {
-        debug.closure_made(cx, ci, cx.serial)
-    }
     VClosure(e, cx.serial, caps)
 }
 
@@ -1245,9 +1308,6 @@ fn let_tuple(inout cx: Cx, e: i64) -> Value {
             }
             for i in 0..names {
                 cx.fr[cx.a[kid(cx, e, i + 1)]] = items[i]
-                if cx.dbg {
-                    debug.bind(cx, cx.a[kid(cx, e, i + 1)])
-                }
             }
             VUnit
         }
@@ -1317,11 +1377,7 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
                     return VUnit
                 }
                 cx.fr[var_id] = VInt(i)
-                if cx.dbg {
-                    loop_body(cx, var_id, body)
-                } else {
-                    ev(cx, body)
-                }
+                ev(cx, body)
                 if not loop_goes_on(cx) {
                     return VUnit
                 }
@@ -1335,11 +1391,7 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
         VStr(s) -> {
             for c in s.chars() {
                 cx.fr[var_id] = VStr(c)
-                if cx.dbg {
-                    loop_body(cx, var_id, body)
-                } else {
-                    ev(cx, body)
-                }
+                ev(cx, body)
                 if not loop_goes_on(cx) {
                     return VUnit
                 }
@@ -1350,26 +1402,12 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
     }
 }
 
-/// A `for` body under the debugger: in a scope of its own holding the
-/// loop's variable, as the reference has it. Its callers test `cx.dbg`
-/// themselves, so a run without the debugger makes no call for it.
-fn loop_body(inout cx: Cx, var_id: i64, body: i64) {
-    debug.push_scope(cx)
-    debug.bind(cx, var_id)
-    ev(cx, body)
-    debug.pop_scope(cx)
-}
-
 fn for_items(inout cx: Cx, e: i64, items: [Value]) -> Value {
     let var_id = cx.b[e]
     let body = kid(cx, e, 1)
     for x in items {
         cx.fr[var_id] = x
-        if cx.dbg {
-            loop_body(cx, var_id, body)
-        } else {
-            ev(cx, body)
-        }
+        ev(cx, body)
         if not loop_goes_on(cx) {
             return VUnit
         }
@@ -1967,13 +2005,7 @@ pub fn run_body(inout cx: Cx, node: i64, inout frame: [Value]) -> Value {
 /// Runs a declared function's body in `frame`, which holds its arguments.
 fn run_fn(inout cx: Cx, fid: i64, inout frame: [Value]) -> Value {
     swap_frame(cx, frame)
-    if cx.dbg {
-        debug.enter_fn(cx, fid)
-    }
     let r = body(cx, cx.p.fn_body[fid])
-    if cx.dbg {
-        debug.leave_fn(cx)
-    }
     // What each `inout` parameter holds at the end goes back to the caller
     // -- after a failure too ([E-INOUT-FAIL]).
     let modes = cx.p.fn_modes[fid]
@@ -2019,13 +2051,10 @@ pub fn call_value(inout cx: Cx, f: Value, inout args: [Value]) -> Value {
                 }
             }
             swap_frame(cx, frame)
-            if cx.dbg {
-                debug.enter_closure(cx, ci, serial)
-            }
+            // Which closure value this is, for the debugger's body node
+            // (`debug.rewrite`); a store, so a run without it tests nothing.
+            cx.d_serial = serial
             let r = body(cx, kid(cx, node, 0))
-            if cx.dbg {
-                debug.leave_closure(cx)
-            }
             swap_frame(cx, frame)
             finish(cx, r, cx.b[node] == 1)
         }
@@ -2066,13 +2095,7 @@ fn call_node(inout cx: Cx, e: i64) -> Value {
         callee[params[i]] = v
     }
     swap_frame(cx, callee)
-    if cx.dbg {
-        debug.enter_fn(cx, fid)
-    }
     let r = body(cx, cx.p.fn_body[fid])
-    if cx.dbg {
-        debug.leave_fn(cx)
-    }
     swap_frame(cx, callee)
     finish(cx, r, cx.p.fn_fallible[fid])
 }
@@ -2082,6 +2105,70 @@ fn call_node(inout cx: Cx, e: i64) -> Value {
 /// place another argument mentions is read only once the others have run,
 /// so it is what they left there (`eval_call_args_paths`).
 fn call_inout(inout cx: Cx, e: i64) -> Value {
+    let fid = cx.a[e]
+    var args: [Value] = []
+    let modes = cx.p.fn_modes[fid]
+    let aliased = cx.b[e]
+    let n = cx.nk[e]
+    var paths: [Path] = []
+    var deferred: [i64] = []
+    for i in 0..n {
+        let a = kid(cx, e, i)
+        if i < modes.len() and modes[i] == 1 {
+            let path = expr_path(cx, a)
+            if path[0] == -2 {
+                return VUnit
+            }
+            if path[0] == -1 {
+                let v = ev(cx, a)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+                args.push(v)
+            } else if aliased.ushr(i).bit_and(1) == 1 {
+                deferred.push(i)
+                args.push(VUnit)
+            } else {
+                args.push(swap_path(cx, path, VUnit))
+            }
+            paths.push(path)
+        } else {
+            let v = ev(cx, a)
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            args.push(v)
+            paths.push([-1])
+        }
+    }
+    for i in deferred {
+        args[i] = read_path(cx, paths[i])
+    }
+    let r = call_fn(cx, fid, args)
+    // Taken, not shared: a written-back value the context still held would
+    // be copied by the next write to it, which made a loop of `inout` calls
+    // on a growing structure quadratic.
+    var wb = cx.wb
+    cx.wb = []
+    var w = 0
+    for i in 0..n {
+        if i < modes.len() and modes[i] == 1 {
+            if paths[i][0] >= 0 and w < wb.len() {
+                swap_path(cx, paths[i], value.take(wb[w]))
+            }
+            w += 1
+        }
+    }
+    r
+}
+
+/// `call_inout` under the debugger (`debug.rewrite`), kept beside it: a
+/// change to one is a change to both. The place keeps its value while the
+/// other arguments run, as the reference's does: a stop in one of them
+/// shows it. It is moved out once they have run, so the callee still holds
+/// it alone (a copy here made every write to it in the callee copy the
+/// whole value).
+fn debug_call_inout(inout cx: Cx, e: i64) -> Value {
     let fid = cx.a[e]
     var args: [Value] = []
     let modes = cx.p.fn_modes[fid]
@@ -2106,7 +2193,7 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
             } else if aliased.ushr(i).bit_and(1) == 1 {
                 deferred.push(i)
                 args.push(VUnit)
-            } else if cx.dbg {
+            } else {
                 // Under the debugger the place keeps its value while the
                 // other arguments run, as the reference's does: a stop in
                 // one of them shows it. It is moved out once they have run,
@@ -2114,8 +2201,6 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
                 // write to it in the callee copy the whole value).
                 late.push(i)
                 args.push(VUnit)
-            } else {
-                args.push(swap_path(cx, path, VUnit))
             }
             paths.push(path)
         } else {
@@ -2448,6 +2533,11 @@ fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
                 if base.dbg {
                     mine.dbg = false
                     mine.d_tout = [tout]
+                    mine.op = base.d_task_op
+                    mine.kids = base.d_task_kids
+                    var tp = mine.p
+                    tp.fn_body = base.d_task_body
+                    mine.p = tp
                 }
                 take_slab(mine)
                 ev(mine, bodies[i])

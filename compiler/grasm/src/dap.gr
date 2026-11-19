@@ -323,6 +323,7 @@ fn run_debugged(input: In, seq: i64, pending: [Json], stop_on_entry: bool, has_j
     }
     cx.trap = true
     cx.dbg = true
+    debug.rewrite(cx)
     cx.d_in = input
     cx.d_seq = seq
     cx.d_paths = l.paths

@@ -515,6 +515,21 @@ pub fn initial_state() -> i64 {
     }
 }
 
+/// Under a journal, turns every call of a built-in it records into an
+/// `OP_J_BUILTIN` node (`builtins.journaled`), so a run with no journal
+/// tests for one nowhere. Run when a context is made, and again once a
+/// journal is installed (`install`); a node turned once is not turned again.
+pub fn mark(inout cx: Cx) {
+    if cx.jstate == J_OFF {
+        return
+    }
+    for e in 0..cx.op.len() {
+        if cx.op[e] == load.OP_BUILTIN and journaled(cx.a[e]) {
+            cx.op[e] = load.OP_J_BUILTIN
+        }
+    }
+}
+
 /// Chooses the mode, the first time the run asks (`grasm_journal::open`).
 pub fn ensure(inout cx: Cx) {
     if cx.jstate != J_UNASKED {
@@ -570,6 +585,7 @@ pub fn install(inout cx: Cx, raw: bytes) -> () ! str {
     cx.jvals = vals
     cx.jat = 0
     cx.jstate = J_REPLAY
+    mark(cx)
     ()
 }
 

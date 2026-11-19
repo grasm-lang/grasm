@@ -4,7 +4,9 @@
 // through the reference interpreter's `DebugHook` (docs/self-hosting.md
 // §6.22, decisions (3) to (7)).
 //
-// Nothing here runs unless `cx.dbg` is set, which only `grasm dap` sets.
+// Nothing here runs unless `grasm dap` has set `cx.dbg` and turned the
+// program's nodes into the debugger's (`rewrite`): a run without it tests
+// for the debugger nowhere.
 // What the reference shows -- its call stack of `module::function` and call
 // sites, and per call its stack of scopes from name to value -- is kept
 // beside the interpreter's slot frames, in the reference's shape:
@@ -20,6 +22,7 @@
 //   * the current position: the start of the statement last begun, which
 //     a return from a declared function puts back.
 import eval
+import load
 import value
 import json
 import rpc
@@ -70,6 +73,70 @@ fn bind_value(inout cx: Cx, name: str, v: Value) {
 
 /// A declared function's call begins: its frame, at the statement running
 /// now, and its parameters' scope.
+/// Turns the program's nodes into the debugger's, once, before `main` runs:
+/// blocks, `match`es, `let`s, closures, `inout` calls and `print`s become
+/// nodes of their own, and every function's body, `for` body and closure
+/// body is put under a node that keeps the reference's frames and scopes
+/// (the `OP_DBG_*` arms of `eval`). A task of a `concurrent` block runs the
+/// nodes as they were, but for its prints, which go to its block.
+pub fn rewrite(inout cx: Cx) {
+    let n = cx.op.len()
+    var tops = cx.op
+    for e in 0..n {
+        if tops[e] == load.OP_BUILTIN and cx.a[e] == 1 {
+            tops[e] = load.OP_TASK_PRINT
+        }
+    }
+    cx.d_task_op = tops
+    cx.d_task_kids = cx.kids
+    cx.d_task_body = cx.p.fn_body
+    for e in 0..n {
+        let op = cx.op[e]
+        if op == load.OP_BLOCK {
+            cx.op[e] = load.OP_DBG_BLOCK
+        } else if op == load.OP_MATCH {
+            cx.op[e] = load.OP_DBG_MATCH
+        } else if op == load.OP_LET {
+            cx.op[e] = load.OP_DBG_LET
+        } else if op == load.OP_LETTUPLE {
+            cx.op[e] = load.OP_DBG_LETTUPLE
+        } else if op == load.OP_CALL and cx.c[e] != 0 {
+            cx.op[e] = load.OP_DBG_CALLINOUT
+        } else if op == load.OP_BUILTIN and cx.a[e] == 1 {
+            cx.op[e] = load.OP_DBG_PRINT
+        } else if op == load.OP_FOR {
+            let at = cx.k0[e] + 1
+            cx.kids[at] = wrap(cx, load.OP_DBG_LOOPBODY, cx.b[e], cx.kids[at])
+        } else if op == load.OP_CLOSURE {
+            cx.op[e] = load.OP_DBG_CLOSURE
+            let at = cx.k0[e]
+            cx.kids[at] = wrap(cx, load.OP_DBG_CLOBODY, cx.a[e], cx.kids[at])
+        }
+    }
+    var p = cx.p
+    for fid in 0..p.fn_body.len() {
+        if p.fn_body[fid] >= 0 {
+            p.fn_body[fid] = wrap(cx, load.OP_DBG_FNBODY, fid, p.fn_body[fid])
+        }
+    }
+    cx.p = p
+}
+
+/// A node of the debugger's over `inner`: opcode `op`, `a` what it needs.
+fn wrap(inout cx: Cx, op: i64, a: i64, inner: i64) -> i64 {
+    let id = cx.op.len()
+    cx.op.push(op)
+    cx.a.push(a)
+    cx.b.push(0)
+    cx.c.push(0)
+    cx.s.push(cx.s[inner])
+    cx.lit.push(VUnit)
+    cx.k0.push(cx.kids.len())
+    cx.nk.push(1)
+    cx.kids.push(inner)
+    id
+}
+
 pub fn enter_fn(inout cx: Cx, fid: i64) {
     cx.d_saved_cur.push(cx.d_cur)
     cx.d_saved_names.push(cx.d_names)
