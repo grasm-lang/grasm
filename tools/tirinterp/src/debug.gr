@@ -70,8 +70,9 @@ fn bind_value(inout cx: Cx, name: str, v: Value) {
 
 /// A declared function's call begins: its frame, at the statement running
 /// now, and its parameters' scope.
-pub fn enter_fn(inout cx: Cx, fid: i64) -> (i64, [str]) {
-    let saved = (cx.d_cur, cx.d_names)
+pub fn enter_fn(inout cx: Cx, fid: i64) {
+    cx.d_saved_cur.push(cx.d_cur)
+    cx.d_saved_names.push(cx.d_names)
     cx.d_fname.push(cx.p.fn_name[fid])
     cx.d_fsite.push(cx.d_cur)
     cx.d_act.push(cx.d_sc.len())
@@ -80,21 +81,19 @@ pub fn enter_fn(inout cx: Cx, fid: i64) -> (i64, [str]) {
     for v in cx.p.fn_params[fid] {
         bind(cx, v)
     }
-    saved
 }
 
 /// It returned: its scopes go, its frame goes, and the position is the
 /// caller's again.
-pub fn leave_fn(inout cx: Cx, saved: (i64, [str])) {
+pub fn leave_fn(inout cx: Cx) {
     let a = cx.d_act.pop() ?? 0
     while cx.d_sc.len() > a {
         pop_scope(cx)
     }
     cx.d_fname.pop()
     cx.d_fsite.pop()
-    let (cur, names) = saved
-    cx.d_cur = cur
-    cx.d_names = names
+    cx.d_cur = cx.d_saved_cur.pop() ?? -1
+    cx.d_names = cx.d_saved_names.pop() ?? []
 }
 
 /// A closure is made: what the reference copies into it -- every name its
@@ -129,8 +128,8 @@ pub fn closure_made(inout cx: Cx, ci: i64, serial: i64) {
 
 /// A closure's call begins: one scope, its copied surroundings and then its
 /// parameters.
-pub fn enter_closure(inout cx: Cx, ci: i64, serial: i64) -> [str] {
-    let saved = cx.d_names
+pub fn enter_closure(inout cx: Cx, ci: i64, serial: i64) {
+    cx.d_saved_names.push(cx.d_names)
     cx.d_act.push(cx.d_sc.len())
     let fid = cx.p.clo_fid[ci]
     cx.d_names = if fid >= 0 { cx.p.fn_vnames[fid] } else { [] }
@@ -148,15 +147,14 @@ pub fn enter_closure(inout cx: Cx, ci: i64, serial: i64) -> [str] {
     for v in cx.p.clo_params[ci] {
         bind(cx, v)
     }
-    saved
 }
 
-pub fn leave_closure(inout cx: Cx, saved: [str]) {
+pub fn leave_closure(inout cx: Cx) {
     let a = cx.d_act.pop() ?? 0
     while cx.d_sc.len() > a {
         pop_scope(cx)
     }
-    cx.d_names = saved
+    cx.d_names = cx.d_saved_names.pop() ?? []
 }
 
 fn act_bindings_start(cx: Cx) -> i64 {

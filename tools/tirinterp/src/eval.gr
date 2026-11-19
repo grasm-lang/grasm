@@ -134,6 +134,11 @@ type Cx = {
     d_fsite: [i64],
     d_cur: i64,
     d_names: [str],
+    // What a call under the debugger restores when it returns: the caller's
+    // position and names. Kept here, not in the call's locals, so a run
+    // without the debugger makes nothing for them.
+    d_saved_cur: [i64],
+    d_saved_names: [[str]],
     d_bname: [str],
     d_bvar: [i64],
     d_bval: [Value],
@@ -232,6 +237,8 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         d_fsite: [],
         d_cur: -1,
         d_names: [],
+        d_saved_cur: [],
+        d_saved_names: [],
         d_bname: [],
         d_bvar: [],
         d_bval: [],
@@ -1310,7 +1317,11 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
                     return VUnit
                 }
                 cx.fr[var_id] = VInt(i)
-                loop_body(cx, var_id, body)
+                if cx.dbg {
+                    loop_body(cx, var_id, body)
+                } else {
+                    ev(cx, body)
+                }
                 if not loop_goes_on(cx) {
                     return VUnit
                 }
@@ -1324,7 +1335,11 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
         VStr(s) -> {
             for c in s.chars() {
                 cx.fr[var_id] = VStr(c)
-                loop_body(cx, var_id, body)
+                if cx.dbg {
+                    loop_body(cx, var_id, body)
+                } else {
+                    ev(cx, body)
+                }
                 if not loop_goes_on(cx) {
                     return VUnit
                 }
@@ -1335,17 +1350,14 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
     }
 }
 
-/// A `for` body, under the debugger in a scope of its own holding the
-/// loop's variable, as the reference has it.
+/// A `for` body under the debugger: in a scope of its own holding the
+/// loop's variable, as the reference has it. Its callers test `cx.dbg`
+/// themselves, so a run without the debugger makes no call for it.
 fn loop_body(inout cx: Cx, var_id: i64, body: i64) {
-    if cx.dbg {
-        debug.push_scope(cx)
-        debug.bind(cx, var_id)
-        ev(cx, body)
-        debug.pop_scope(cx)
-        return
-    }
+    debug.push_scope(cx)
+    debug.bind(cx, var_id)
     ev(cx, body)
+    debug.pop_scope(cx)
 }
 
 fn for_items(inout cx: Cx, e: i64, items: [Value]) -> Value {
@@ -1353,7 +1365,11 @@ fn for_items(inout cx: Cx, e: i64, items: [Value]) -> Value {
     let body = kid(cx, e, 1)
     for x in items {
         cx.fr[var_id] = x
-        loop_body(cx, var_id, body)
+        if cx.dbg {
+            loop_body(cx, var_id, body)
+        } else {
+            ev(cx, body)
+        }
         if not loop_goes_on(cx) {
             return VUnit
         }
@@ -1951,13 +1967,12 @@ pub fn run_body(inout cx: Cx, node: i64, inout frame: [Value]) -> Value {
 /// Runs a declared function's body in `frame`, which holds its arguments.
 fn run_fn(inout cx: Cx, fid: i64, inout frame: [Value]) -> Value {
     swap_frame(cx, frame)
-    var saved: (i64, [str]) = (0, [])
     if cx.dbg {
-        saved = debug.enter_fn(cx, fid)
+        debug.enter_fn(cx, fid)
     }
     let r = body(cx, cx.p.fn_body[fid])
     if cx.dbg {
-        debug.leave_fn(cx, saved)
+        debug.leave_fn(cx)
     }
     // What each `inout` parameter holds at the end goes back to the caller
     // -- after a failure too ([E-INOUT-FAIL]).
@@ -2004,13 +2019,12 @@ pub fn call_value(inout cx: Cx, f: Value, inout args: [Value]) -> Value {
                 }
             }
             swap_frame(cx, frame)
-            var saved: [str] = []
             if cx.dbg {
-                saved = debug.enter_closure(cx, ci, serial)
+                debug.enter_closure(cx, ci, serial)
             }
             let r = body(cx, kid(cx, node, 0))
             if cx.dbg {
-                debug.leave_closure(cx, saved)
+                debug.leave_closure(cx)
             }
             swap_frame(cx, frame)
             finish(cx, r, cx.b[node] == 1)
@@ -2052,13 +2066,12 @@ fn call_node(inout cx: Cx, e: i64) -> Value {
         callee[params[i]] = v
     }
     swap_frame(cx, callee)
-    var saved: (i64, [str]) = (0, [])
     if cx.dbg {
-        saved = debug.enter_fn(cx, fid)
+        debug.enter_fn(cx, fid)
     }
     let r = body(cx, cx.p.fn_body[fid])
     if cx.dbg {
-        debug.leave_fn(cx, saved)
+        debug.leave_fn(cx)
     }
     swap_frame(cx, callee)
     finish(cx, r, cx.p.fn_fallible[fid])
