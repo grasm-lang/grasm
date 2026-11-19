@@ -338,7 +338,7 @@ control exempt-gone '^DIFF: GRASM_RECORD grasm run examples/hello.gr -- a journa
 control net-handle '^DIFF: GRASM_RECORD grasm run spec/conformance/L-LIB-NET-WORKERS.gr -- the journals differ: record 3 \(tcp_connect\) differs' "ONLY=journal FILES=$WORK/networkers CLI_JOURNAL_BUILD=1" "$BUILTINS" \
     '        22 -> int_result(p, tcp_connect(str_of(p, args[0]), int_of(args[1])))' \
     '        22 -> {
-            let _ = tcp_listen(0)
+            let _ = tcp_listen(0) ?? 0
             int_result(p, tcp_connect(str_of(p, args[0]), int_of(args[1])))
         }'
 
