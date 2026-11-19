@@ -499,69 +499,99 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
         // OP_TLS
         46 -> cabi.tls_cell(cx, e)
         // The nodes `grasm dap` and a journal make (`debug.rewrite`,
-        // `journal.mark`).
-        101 -> {
-            debug.enter_fn(cx, cx.a[e])
-            let r = ev(cx, kid(cx, e, 0))
-            debug.leave_fn(cx)
-            r
-        }
-        102 -> {
-            debug.push_scope(cx)
-            debug.bind(cx, cx.a[e])
-            let r = ev(cx, kid(cx, e, 0))
-            debug.pop_scope(cx)
-            r
-        }
-        103 -> {
-            debug.enter_closure(cx, cx.a[e], cx.d_serial)
-            let r = ev(cx, kid(cx, e, 0))
-            debug.leave_closure(cx)
-            r
-        }
+        // `journal.mark`), each a call, so this function's frame is no
+        // larger for them.
+        101 -> dbg_fn_body(cx, e)
+        102 -> dbg_loop_body(cx, e)
+        103 -> dbg_closure_body(cx, e)
         104 -> debug_call_inout(cx, e)
-        105 -> {
-            let v = ev(cx, kid(cx, e, 0))
-            if cx.ctl != 0 {
-                return VUnit
-            }
-            debug.out(cx, value.show(cx.p, v) + "\n")
-            VUnit
-        }
-        106 -> {
-            let v = ev(cx, kid(cx, e, 0))
-            if cx.ctl != 0 {
-                return VUnit
-            }
-            chan_send(cx.d_tout[0], value.show(cx.p, v) + "\n")
-            VUnit
-        }
+        105 -> dbg_print(cx, e)
+        106 -> task_print(cx, e)
         107 -> debug_block(cx, e)
         108 -> debug_match(cx, e)
-        109 -> {
-            let r = let_stmt(cx, e)
-            if cx.ctl == 0 {
-                debug.bind(cx, cx.a[e])
-            }
-            r
-        }
-        110 -> {
-            let r = let_tuple(cx, e)
-            if cx.ctl == 0 {
-                for i in 1..cx.nk[e] {
-                    debug.bind(cx, cx.a[kid(cx, e, i)])
-                }
-            }
-            r
-        }
-        111 -> {
-            let v = closure(cx, e)
-            debug.closure_made(cx, cx.a[e], cx.serial)
-            v
-        }
+        109 -> dbg_let(cx, e)
+        110 -> dbg_let_tuple(cx, e)
+        111 -> dbg_closure(cx, e)
         112 -> builtins.journaled(cx, e)
         _ -> panic("tirinterp: node {e} has no evaluation (opcode {cx.op[e]})")
     }
+}
+
+// ----- the debugger's nodes (`debug.rewrite`) -------------------------------------
+
+/// The body a node of the debugger's is over, evaluated: on a fresh stack
+/// halfway between `body`'s hops, as each call of the program costs more
+/// host frames under the debugger (`scheme-demo` overflowed a fiber).
+fn dbg_inner(inout cx: Cx, e: i64) -> Value {
+    if cx.depth % HOP == HOP / 2 and cx.baton.is_empty() {
+        return ev_elsewhere(cx, kid(cx, e, 0))
+    }
+    ev(cx, kid(cx, e, 0))
+}
+
+fn dbg_fn_body(inout cx: Cx, e: i64) -> Value {
+    debug.enter_fn(cx, cx.a[e])
+    let r = dbg_inner(cx, e)
+    debug.leave_fn(cx)
+    r
+}
+
+fn dbg_loop_body(inout cx: Cx, e: i64) -> Value {
+    debug.push_scope(cx)
+    debug.bind(cx, cx.a[e])
+    let r = ev(cx, kid(cx, e, 0))
+    debug.pop_scope(cx)
+    r
+}
+
+fn dbg_closure_body(inout cx: Cx, e: i64) -> Value {
+    debug.enter_closure(cx, cx.a[e], cx.d_serial)
+    let r = dbg_inner(cx, e)
+    debug.leave_closure(cx)
+    r
+}
+
+fn dbg_print(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    debug.out(cx, value.show(cx.p, v) + "\n")
+    VUnit
+}
+
+/// A task's `print` under the debugger: to its block, which sends it.
+fn task_print(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    chan_send(cx.d_tout[0], value.show(cx.p, v) + "\n")
+    VUnit
+}
+
+fn dbg_let(inout cx: Cx, e: i64) -> Value {
+    let r = let_stmt(cx, e)
+    if cx.ctl == 0 {
+        debug.bind(cx, cx.a[e])
+    }
+    r
+}
+
+fn dbg_let_tuple(inout cx: Cx, e: i64) -> Value {
+    let r = let_tuple(cx, e)
+    if cx.ctl == 0 {
+        for i in 1..cx.nk[e] {
+            debug.bind(cx, cx.a[kid(cx, e, i)])
+        }
+    }
+    r
+}
+
+fn dbg_closure(inout cx: Cx, e: i64) -> Value {
+    let v = closure(cx, e)
+    debug.closure_made(cx, cx.a[e], cx.serial)
+    v
 }
 
 /// Evaluates children `from..` of `e` into `out`; false when one of them
