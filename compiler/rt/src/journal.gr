@@ -33,6 +33,7 @@ import fsys
 
 extern fn getenv(name: addr) -> addr
 extern fn strlen(p: addr) -> i64
+extern fn dlsym(handle: addr, name: addr) -> addr
 
 /// 0 until this thread asks; then 1 off, 2 recording, 3 replaying.
 thread_local J_STATE: i64
@@ -100,6 +101,23 @@ fn cannot(lead: addr, ln: i64, path: addr, pn: i64, why: addr) {
 }
 
 fn open() {
+    // An executable that exports `unjournaled_host` -- the `grasm` command,
+    // whose own reads are not its program's -- is never journaled: no
+    // record, no replay, no refusal of a C call. The command's TIR
+    // interpreter keeps the journal of the program it runs, as the Rust
+    // interpreter does (docs/self-hosting.md §6.22, decision (2)).
+    //
+    // A switch for debugging and replay, not a security boundary: any
+    // program can export the name and keep its own effects out of the
+    // journal. That is acceptable because the journal is not an audit log
+    // -- it records what a cooperating program read, so that a failure can
+    // be made to happen again -- and a program that wants to hide an
+    // effect can already make it through C, which no journal records.
+    // `os.RTLD_MAIN`: on Darwin the executable's own exports alone.
+    if not sysv.null(unsafe { dlsym(mem_addr(os.RTLD_MAIN), mem_static("unjournaled_host")) }) {
+        unsafe { mem_tls(J_STATE).store_i64(1) }
+        return
+    }
     var n = 0
     let rec = unsafe { env_text(mem_static("GRASM_RECORD"), n) }
     if not sysv.null(rec) {

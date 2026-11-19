@@ -28,6 +28,9 @@ import value
 import builtins
 import cabi
 import rawmem
+import journal
+import debug
+import rpc
 
 /// Why evaluation is unwinding: nothing, a loop exit, a return, or an error
 /// propagating to the nearest function that can fail.
@@ -102,6 +105,55 @@ type Cx = {
     blocks_run: i64,
     cov: bool,
     hits: Map[i64, bool],
+    // The journal (`journal`, docs/replay.md): its mode, chosen the first
+    // time the program asks; the file a recording appends to; a replay's
+    // records and how many this run has taken.
+    jstate: i64,
+    jpath: str,
+    jnames: [str],
+    jvals: [Wire],
+    jat: i64,
+    // `grasm dap` (`debug`, docs/self-hosting.md §6.22): whether a debugger
+    // is attached, and what it keeps -- the protocol's input and sequence,
+    // the breakpoints, the files, each statement's position, how to go on,
+    // the reference's frames and scopes, the program's output not yet sent,
+    // a panic's stack, and a string's `{:?}` (front's, handed over).
+    dbg: bool,
+    d_in: In,
+    d_seq: i64,
+    d_bp_path: [str],
+    d_bp_line: [i64],
+    d_paths: [str],
+    d_bases: [i64],
+    d_starts: [[i64]],
+    d_stmt: Map[i64, i64],
+    d_resume: i64,
+    d_step_depth: i64,
+    d_terminated: bool,
+    d_fname: [str],
+    d_fsite: [i64],
+    d_cur: i64,
+    d_names: [str],
+    d_bname: [str],
+    d_bvar: [i64],
+    d_bval: [Value],
+    d_sc: [i64],
+    d_act: [i64],
+    d_env: Map[i64, i64],
+    d_envn: [[str]],
+    d_envv: [[Value]],
+    d_out: ByteBuilder,
+    d_traced: bool,
+    d_trace_fn: [str],
+    d_trace_at: [i64],
+    d_strdebug: fn(str) -> str,
+    // A `concurrent` task's prints under the debugger, for its block to send.
+    d_tout: [Chan[str]],
+}
+
+/// A string as itself: the placeholder for the debugger's `{:?}`.
+fn same_text(s: str) -> str {
+    s
 }
 
 pub fn new_cx(p: TirProg, args: [str]) -> Cx {
@@ -159,6 +211,41 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         blocks_run: 0,
         cov: false,
         hits: map(),
+        jstate: journal.initial_state(),
+        jpath: "",
+        jnames: [],
+        jvals: [],
+        jat: 0,
+        dbg: false,
+        d_in: rpc.stdin_reader(),
+        d_seq: 0,
+        d_bp_path: [],
+        d_bp_line: [],
+        d_paths: [],
+        d_bases: [],
+        d_starts: [],
+        d_stmt: map(),
+        d_resume: 0,
+        d_step_depth: 0,
+        d_terminated: false,
+        d_fname: [],
+        d_fsite: [],
+        d_cur: -1,
+        d_names: [],
+        d_bname: [],
+        d_bvar: [],
+        d_bval: [],
+        d_sc: [],
+        d_act: [],
+        d_env: map(),
+        d_envn: [],
+        d_envv: [],
+        d_out: byte_builder(),
+        d_traced: false,
+        d_trace_fn: [],
+        d_trace_at: [],
+        d_strdebug: same_text,
+        d_tout: [],
     }
 }
 
@@ -174,6 +261,9 @@ pub fn fault(inout cx: Cx, msg: str) -> Value {
         panic(msg)
     }
     if cx.ctl == 0 {
+        if cx.dbg {
+            debug.capture_trace(cx)
+        }
         cx.ctl = CTL_PANIC
         cx.carry = VStr(msg)
     }
@@ -292,6 +382,9 @@ pub fn ev(inout cx: Cx, start: i64) -> Value {
             // OP_BLOCK: every statement but the last, then the last in
             // this call.
             16 -> {
+                if cx.dbg {
+                    return debug_block(cx, e)
+                }
                 e = block_prefix(cx, e)
                 if e < 0 {
                     return VUnit
@@ -301,6 +394,9 @@ pub fn ev(inout cx: Cx, start: i64) -> Value {
             24 -> e = cx.kids[cx.k0[e]]
             // OP_MATCH: the arm that matched runs in this call.
             25 -> {
+                if cx.dbg {
+                    return debug_match(cx, e)
+                }
                 e = match_arm(cx, e)
                 if e < 0 {
                     return VUnit
@@ -413,6 +509,9 @@ fn let_stmt(inout cx: Cx, e: i64) -> Value {
         return VUnit
     }
     cx.fr[cx.a[e]] = v
+    if cx.dbg {
+        debug.bind(cx, cx.a[e])
+    }
     VUnit
 }
 
@@ -454,6 +553,76 @@ fn block_prefix(inout cx: Cx, e: i64) -> i64 {
         cx.hits.set(cx.kids[base + n - 1], true)
     }
     cx.kids[base + n - 1]
+}
+
+/// A block under the debugger: in a scope of its own, every statement
+/// after the debugger has seen it (`eval_block`, `before_stmt`).
+fn debug_block(inout cx: Cx, e: i64) -> Value {
+    debug.push_scope(cx)
+    let n = cx.nk[e]
+    let base = cx.k0[e]
+    var last = VUnit
+    for i in 0..n {
+        let k = cx.kids[base + i]
+        debug.before_stmt(cx, k)
+        let v = ev(cx, k)
+        if cx.ctl != 0 {
+            debug.pop_scope(cx)
+            return VUnit
+        }
+        last = if i + 1 == n { v } else { VUnit }
+    }
+    debug.pop_scope(cx)
+    last
+}
+
+/// A `match` under the debugger: the arm's bindings in a scope of their
+/// own, its guard and its body inside it.
+fn debug_match(inout cx: Cx, e: i64) -> Value {
+    let raw = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    let v = if cx.c[e] == 1 { deref(cx, raw) } else { raw }
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    for i in 1..cx.nk[e] {
+        let arm = kid(cx, e, i)
+        if pmatch(cx, kid(cx, arm, 0), v) {
+            debug.push_scope(cx)
+            bind_pattern(cx, kid(cx, arm, 0))
+            if cx.a[arm] == 1 {
+                let g = ev(cx, kid(cx, arm, 1))
+                if cx.ctl != 0 {
+                    debug.pop_scope(cx)
+                    return VUnit
+                }
+                if is_true(g) {
+                    let r = ev(cx, kid(cx, arm, 2))
+                    debug.pop_scope(cx)
+                    return r
+                }
+                debug.pop_scope(cx)
+            } else {
+                let r = ev(cx, kid(cx, arm, 1))
+                debug.pop_scope(cx)
+                return r
+            }
+        }
+    }
+    fault(cx, "no match arm matched `{value.show(cx.p, v)}`")
+}
+
+/// The variables a pattern binds, for the debugger.
+fn bind_pattern(inout cx: Cx, pt: i64) {
+    if cx.op[pt] == 84 {
+        debug.bind(cx, cx.a[pt])
+        return
+    }
+    for i in 0..cx.nk[pt] {
+        bind_pattern(cx, kid(cx, pt, i))
+    }
 }
 
 fn return_stmt(inout cx: Cx, e: i64) -> Value {
@@ -522,6 +691,9 @@ fn closure(inout cx: Cx, e: i64) -> Value {
         caps.push(cx.fr[v])
     }
     cx.serial += 1
+    if cx.dbg {
+        debug.closure_made(cx, ci, cx.serial)
+    }
     VClosure(e, cx.serial, caps)
 }
 
@@ -1066,6 +1238,9 @@ fn let_tuple(inout cx: Cx, e: i64) -> Value {
             }
             for i in 0..names {
                 cx.fr[cx.a[kid(cx, e, i + 1)]] = items[i]
+                if cx.dbg {
+                    debug.bind(cx, cx.a[kid(cx, e, i + 1)])
+                }
             }
             VUnit
         }
@@ -1135,7 +1310,7 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
                     return VUnit
                 }
                 cx.fr[var_id] = VInt(i)
-                ev(cx, body)
+                loop_body(cx, var_id, body)
                 if not loop_goes_on(cx) {
                     return VUnit
                 }
@@ -1149,7 +1324,7 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
         VStr(s) -> {
             for c in s.chars() {
                 cx.fr[var_id] = VStr(c)
-                ev(cx, body)
+                loop_body(cx, var_id, body)
                 if not loop_goes_on(cx) {
                     return VUnit
                 }
@@ -1160,12 +1335,25 @@ fn for_loop(inout cx: Cx, e: i64) -> Value {
     }
 }
 
+/// A `for` body, under the debugger in a scope of its own holding the
+/// loop's variable, as the reference has it.
+fn loop_body(inout cx: Cx, var_id: i64, body: i64) {
+    if cx.dbg {
+        debug.push_scope(cx)
+        debug.bind(cx, var_id)
+        ev(cx, body)
+        debug.pop_scope(cx)
+        return
+    }
+    ev(cx, body)
+}
+
 fn for_items(inout cx: Cx, e: i64, items: [Value]) -> Value {
     let var_id = cx.b[e]
     let body = kid(cx, e, 1)
     for x in items {
         cx.fr[var_id] = x
-        ev(cx, body)
+        loop_body(cx, var_id, body)
         if not loop_goes_on(cx) {
             return VUnit
         }
@@ -1763,7 +1951,14 @@ pub fn run_body(inout cx: Cx, node: i64, inout frame: [Value]) -> Value {
 /// Runs a declared function's body in `frame`, which holds its arguments.
 fn run_fn(inout cx: Cx, fid: i64, inout frame: [Value]) -> Value {
     swap_frame(cx, frame)
+    var saved: (i64, [str]) = (0, [])
+    if cx.dbg {
+        saved = debug.enter_fn(cx, fid)
+    }
     let r = body(cx, cx.p.fn_body[fid])
+    if cx.dbg {
+        debug.leave_fn(cx, saved)
+    }
     // What each `inout` parameter holds at the end goes back to the caller
     // -- after a failure too ([E-INOUT-FAIL]).
     let modes = cx.p.fn_modes[fid]
@@ -1795,7 +1990,7 @@ pub fn call_fn(inout cx: Cx, fid: i64, inout args: [Value]) -> Value {
 /// Calls a function value: a closure or a named function.
 pub fn call_value(inout cx: Cx, f: Value, inout args: [Value]) -> Value {
     match f {
-        VClosure(node, _, caps) -> {
+        VClosure(node, serial, caps) -> {
             let ci = cx.a[node]
             var frame = cx.p.clo_frame[ci]
             let cv = cx.p.clo_caps[ci]
@@ -1809,7 +2004,14 @@ pub fn call_value(inout cx: Cx, f: Value, inout args: [Value]) -> Value {
                 }
             }
             swap_frame(cx, frame)
+            var saved: [str] = []
+            if cx.dbg {
+                saved = debug.enter_closure(cx, ci, serial)
+            }
             let r = body(cx, kid(cx, node, 0))
+            if cx.dbg {
+                debug.leave_closure(cx, saved)
+            }
             swap_frame(cx, frame)
             finish(cx, r, cx.b[node] == 1)
         }
@@ -1850,7 +2052,14 @@ fn call_node(inout cx: Cx, e: i64) -> Value {
         callee[params[i]] = v
     }
     swap_frame(cx, callee)
+    var saved: (i64, [str]) = (0, [])
+    if cx.dbg {
+        saved = debug.enter_fn(cx, fid)
+    }
     let r = body(cx, cx.p.fn_body[fid])
+    if cx.dbg {
+        debug.leave_fn(cx, saved)
+    }
     swap_frame(cx, callee)
     finish(cx, r, cx.p.fn_fallible[fid])
 }
@@ -1883,6 +2092,11 @@ fn call_inout(inout cx: Cx, e: i64) -> Value {
             } else if aliased.ushr(i).bit_and(1) == 1 {
                 deferred.push(i)
                 args.push(VUnit)
+            } else if cx.dbg {
+                // Under the debugger the place keeps its value while the
+                // other arguments run, as the reference's does: a stop in
+                // one of them shows it.
+                args.push(read_path(cx, path))
             } else {
                 args.push(swap_path(cx, path, VUnit))
             }
@@ -2179,6 +2393,7 @@ pub fn take_slab(inout cx: Cx) {
 }
 
 fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
+    let tout: Chan[str] = chan_new(1048576)
     let baton: Chan[Slab] = chan_new(1)
     chan_send(baton, slab_out(cx))
     let outcomes: Chan[Value] = chan_new(bodies.len())
@@ -2189,6 +2404,13 @@ fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
                 var mine = base
                 mine.fr = value.list_of(frames[i])
                 mine.baton = [baton]
+                // A task never stops under the debugger, as the reference's
+                // task interpreters have none; its prints come back through
+                // `tout`, in the order written.
+                if base.dbg {
+                    mine.dbg = false
+                    mine.d_tout = [tout]
+                }
                 take_slab(mine)
                 ev(mine, bodies[i])
                 // A `return` ends the task; an error leaves the block
@@ -2202,6 +2424,15 @@ fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
     match chan_recv(baton) {
         Some(s) -> slab_in(cx, s)
         None -> ()
+    }
+    if cx.dbg {
+        chan_close(tout)
+        while true {
+            match chan_recv(tout) {
+                Some(text) -> debug.out(cx, text)
+                None -> break
+            }
+        }
     }
     for _ in 0..bodies.len() {
         match chan_recv(outcomes) {

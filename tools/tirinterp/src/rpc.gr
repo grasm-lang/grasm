@@ -1,0 +1,323 @@
+// Standard input and output as bytes, and the `Content-Length` framing the
+// language server and the debug adapter read and write
+// (`crates/grasm_lsp/src/lib.rs` and `crates/grasm_dap/src/lib.rs`,
+// `read_message` and `write_message`; docs/self-hosting.md §6.22).
+//
+// `input()` cannot read bytes, see the end of input or keep a `\r`, and
+// `print` cannot write a message without a newline after it, so the two
+// servers read fd 0 with `read(2)` and write fd 1 with `write(2)`, through a
+// buffer of their own -- what `BufReader::read_line` and `read_exact` do.
+import json
+
+extern fn read(fd: i64, buf: bytes, n: i64) -> i64
+extern fn write(fd: i64, buf: bytes, n: i64) -> i64
+
+/// Standard input, read ahead into `buf` from `pos`.
+type In = {
+    buf: bytes,
+    pos: i64,
+    eof: bool,
+}
+
+pub fn stdin_reader() -> In {
+    In{ buf: bytes_of([]), pos: 0, eof: false }
+}
+
+/// Reads more of standard input; false at its end.
+fn fill(inout r: In) -> bool {
+    if r.eof {
+        return false
+    }
+    let chunk = bytes_filled(65536, 0)
+    let n = unsafe { read(0, chunk, 65536) }
+    if n <= 0 {
+        r.eof = true
+        return false
+    }
+    var b = byte_builder()
+    b.push_bytes(r.buf.slice(r.pos, r.buf.len()))
+    b.push_bytes(chunk.slice(0, n))
+    r.buf = b.to_bytes()
+    r.pos = 0
+    true
+}
+
+/// `BufRead::read_line`: the bytes up to and with the next `\n`, or to the
+/// end; none at the end. An error when they are not UTF-8, the bytes gone
+/// all the same.
+pub fn read_line(inout r: In) -> (bytes, str) {
+    var from = r.pos
+    while true {
+        var k = from
+        while k < r.buf.len() {
+            if r.buf.at(k) == 10 {
+                let line = r.buf.slice(r.pos, k + 1)
+                r.pos = k + 1
+                return checked_line(line)
+            }
+            k += 1
+        }
+        from = r.buf.len() - r.pos
+        if not fill(r) {
+            let line = r.buf.slice(r.pos, r.buf.len())
+            r.pos = r.buf.len()
+            return checked_line(line)
+        }
+    }
+    (bytes_of([]), "")
+}
+
+fn checked_line(line: bytes) -> (bytes, str) {
+    let (up_to, _) = utf8_check(line)
+    if up_to < line.len() {
+        return (line, "stream did not contain valid UTF-8")
+    }
+    (line, "")
+}
+
+/// `read_exact`: `n` bytes, or "failed to fill whole buffer" when the
+/// input ends first (what was there is gone).
+pub fn read_exact(inout r: In, n: i64) -> bytes ! str {
+    while r.buf.len() - r.pos < n {
+        if not fill(r) {
+            r.pos = r.buf.len()
+            fail("failed to fill whole buffer")
+        }
+    }
+    let out = r.buf.slice(r.pos, r.pos + n)
+    r.pos += n
+    out
+}
+
+/// Writes all of `b` to standard output.
+pub fn write_out(b: bytes) {
+    var at = 0
+    while at < b.len() {
+        let rest = b.slice(at, b.len())
+        let n = unsafe { write(1, rest, rest.len()) }
+        if n <= 0 {
+            return
+        }
+        at += n
+    }
+}
+
+/// `write!(out, "Content-Length: {}\r\n\r\n{}", ...)` and a flush.
+pub fn send(msg: Json) {
+    let body = json.to_text(msg).to_bytes()
+    var b = byte_builder()
+    b.push_bytes("Content-Length: {body.len()}\r\n\r\n".to_bytes())
+    b.push_bytes(body)
+    write_out(b.to_bytes())
+}
+
+// ----- UTF-8, as `str::from_utf8` judges it ---------------------------------------
+
+/// How many bytes are valid, and the length of the invalid sequence after
+/// them -- 0 when the input ends inside a sequence (`Utf8Error`'s
+/// `valid_up_to` and `error_len`).
+pub fn utf8_check(b: bytes) -> (i64, i64) {
+    var i = 0
+    let n = b.len()
+    while i < n {
+        let c = b.at(i)
+        if c < 128 {
+            i += 1
+            continue
+        }
+        var w = 0
+        if c >= 194 and c <= 223 {
+            w = 2
+        } else if c >= 224 and c <= 239 {
+            w = 3
+        } else if c >= 240 and c <= 244 {
+            w = 4
+        } else {
+            return (i, 1)
+        }
+        if i + 1 >= n {
+            return (i, 0)
+        }
+        let d = b.at(i + 1)
+        var lo = 128
+        var hi = 191
+        if c == 224 {
+            lo = 160
+        } else if c == 237 {
+            hi = 159
+        } else if c == 240 {
+            lo = 144
+        } else if c == 244 {
+            hi = 143
+        }
+        if d < lo or d > hi {
+            return (i, 1)
+        }
+        if w >= 3 {
+            if i + 2 >= n {
+                return (i, 0)
+            }
+            let e = b.at(i + 2)
+            if e < 128 or e > 191 {
+                return (i, 2)
+            }
+        }
+        if w == 4 {
+            if i + 3 >= n {
+                return (i, 0)
+            }
+            let f = b.at(i + 3)
+            if f < 128 or f > 191 {
+                return (i, 3)
+            }
+        }
+        i += w
+    }
+    (n, 0)
+}
+
+/// `Utf8Error`'s words.
+pub fn utf8_error(b: bytes) -> str {
+    let (up_to, len) = utf8_check(b)
+    if len == 0 {
+        return "incomplete utf-8 byte sequence from index {up_to}"
+    }
+    "invalid utf-8 sequence of {len} bytes from index {up_to}"
+}
+
+// ----- header lines ----------------------------------------------------------------
+
+/// `trim_end` and `trim` by Unicode whitespace.
+pub fn trim_end(s: str) -> str {
+    let b = s.to_bytes()
+    var e = b.len()
+    while e > 0 {
+        // The whitespace character ending at `e`, if there is one.
+        var k = e - 1
+        while k > 0 and b.at(k) >= 128 and b.at(k) < 192 {
+            k -= 1
+        }
+        if gfmt_ws(b, k, e) == e - k {
+            e = k
+        } else {
+            break
+        }
+    }
+    b.slice(0, e).to_str()
+}
+
+pub fn trim(s: str) -> str {
+    let b = trim_end(s).to_bytes()
+    var i = 0
+    while i < b.len() {
+        let n = gfmt_ws(b, i, b.len())
+        if n == 0 {
+            break
+        }
+        i += n
+    }
+    b.slice(i, b.len()).to_str()
+}
+
+fn gfmt_ws(b: bytes, i: i64, end: i64) -> i64 {
+    json.ws_len(b, i, end)
+}
+
+/// `str::parse::<usize>`: digits after an optional `+`, none missing.
+pub fn parse_usize(s: str) -> Option[i64] {
+    let b = s.to_bytes()
+    var i = 0
+    if b.len() > 0 and b.at(0) == 43 {
+        i = 1
+    }
+    if i >= b.len() {
+        return None
+    }
+    var v = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 48 or c > 57 {
+            return None
+        }
+        if v > 922337203685477580 {
+            return None
+        }
+        v = v * 10 + (c - 48)
+        if v < 0 {
+            return None
+        }
+        i += 1
+    }
+    Some(v)
+}
+
+// ----- framing ----------------------------------------------------------------------
+
+/// What the language server reads (`grasm_lsp::read_message`): `Ok(None)`
+/// at the end of input as `(false, ..)`; a header naming no length, or one
+/// that does not parse, as an empty body; the body decoded lossily. An
+/// error is the read's.
+pub fn lsp_read(inout r: In) -> (bool, str) ! str {
+    var length = -1
+    while true {
+        let (line, err) = read_line(r)
+        if err != "" {
+            fail(err)
+        }
+        if line.len() == 0 {
+            return (false, "")
+        }
+        let t = trim_end(line.to_str())
+        if t == "" {
+            break
+        }
+        if t.starts_with("Content-Length:") {
+            let rest = t.to_bytes().slice(15, t.to_bytes().len()).to_str()
+            length = parse_usize(trim(rest)) ?? -1
+        }
+    }
+    if length < 0 {
+        return (true, "")
+    }
+    let body = try read_exact(r, length)
+    (true, body.to_str())
+}
+
+/// What the debug adapter reads (`grasm_dap::read_message`): `(false, ..)`
+/// at the end of input; every failure in its words.
+pub fn dap_read(inout r: In) -> (bool, Json) ! str {
+    var length = -1
+    while true {
+        let (line, err) = read_line(r)
+        if err != "" {
+            fail("reading header: {err}")
+        }
+        if line.len() == 0 {
+            return (false, JNull)
+        }
+        let t = trim_end(line.to_str())
+        if t == "" {
+            break
+        }
+        if t.starts_with("Content-Length:") {
+            let v = t.to_bytes().slice(15, t.to_bytes().len()).to_str()
+            match parse_usize(trim(v)) {
+                Some(n) -> length = n
+                None -> fail("bad Content-Length: {v}")
+            }
+        }
+    }
+    if length < 0 {
+        fail("message had no Content-Length")
+    }
+    let body = match read_exact(r, length) {
+        Ok(b) -> b
+        Err(e) -> fail("reading body: {e}")
+    }
+    let (up_to, _) = utf8_check(body)
+    if up_to < body.len() {
+        fail("body is not UTF-8: {utf8_error(body)}")
+    }
+    let j = try json.parse(body.to_str())
+    (true, j)
+}

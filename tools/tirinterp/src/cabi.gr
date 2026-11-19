@@ -16,6 +16,7 @@ import load
 import value
 import ccall
 import rawmem
+import journal
 
 /// Everything already loaded in this process, to `dlsym` on macOS.
 extern fn dlsym(handle: addr, name: str) -> addr
@@ -57,6 +58,7 @@ pub fn call_extern_node(inout cx: Cx, e: i64) -> Value {
 /// Calls the C function `fid` declares.
 pub fn call_extern(inout cx: Cx, fid: i64, inout args: [Value]) -> Value {
     let name = short(cx.p.fn_name[fid])
+    journal.refuse_foreign(cx, name)
     let at = find(name)
     if at == 0 {
         return not_found(cx, name)
@@ -173,6 +175,9 @@ pub fn call_c_node(inout cx: Cx, e: i64) -> Value {
     }
     var args: [Value] = vs.slice(1, vs.len())
     let sig = cx.s[e]
+    // Natively nothing can tell a Grasm function's address from a C
+    // function's, so a replay refuses both, as the reference does.
+    journal.refuse_foreign(cx, "call_c")
     if at == 0 {
         return eval.fault(cx, "call_c through the null address")
     }

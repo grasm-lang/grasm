@@ -9,6 +9,8 @@
 import eval
 import load
 import value
+import journal
+import debug
 
 /// The largest string or buffer the reference will build (`MAX_ALLOC`).
 let MAX_ALLOC = 8589934592
@@ -327,11 +329,34 @@ pub fn builtin(inout cx: Cx, e: i64) -> Value {
     if not eval.eval_kids(cx, e, 0, args) {
         return VUnit
     }
+    // A built-in that reaches outside the program, under a journal: after
+    // its arguments, before its effect (`grasm_interp::journal`).
+    if cx.jstate != journal.J_OFF and journal.journaled(code) {
+        journal.ensure(cx)
+        if cx.jstate == journal.J_REPLAY {
+            return journal.gate(cx, cx.s[e])
+        }
+        let v = builtin_now(cx, e, code, args)
+        if cx.jstate == journal.J_RECORD {
+            journal.put(cx, cx.s[e], v)
+        }
+        return v
+    }
+    builtin_now(cx, e, code, args)
+}
+
+fn builtin_now(inout cx: Cx, e: i64, code: i64, inout args: [Value]) -> Value {
     let p = cx.p
     match code {
         // print
         1 -> {
-            print(value.show(p, args[0]))
+            if cx.dbg {
+                debug.out(cx, value.show(p, args[0]) + "\n")
+            } else if cx.d_tout.len() > 0 {
+                chan_send(cx.d_tout[0], value.show(p, args[0]) + "\n")
+            } else {
+                print(value.show(p, args[0]))
+            }
             VUnit
         }
         // fail

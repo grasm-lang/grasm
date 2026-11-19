@@ -1,0 +1,717 @@
+// `grasm lsp`: the language server, on stdin and stdout only, answering as
+// the Rust one answers (`crates/grasm_lsp/src/lib.rs`; docs/self-hosting.md
+// §6.22) -- every response, field and notification, in the same order, the
+// same bytes. Diagnostics are `compiler/front`'s, which `diagdiff` holds to
+// the Rust checker's; hover, definition, completion and symbols read the
+// buffer's own declarations from front's AST, which `asttest` holds to the
+// Rust parser's.
+//
+// What the Rust server does that the protocol does not say, copied
+// (docs/known-issues.md): positions are byte offsets, not UTF-16 code
+// units; a diagnostic that starts at the end of the buffer is dropped; a
+// `Content-Length` that does not parse forgets one that did.
+import front.ast
+import front.lex
+import front.parse
+import front.cst
+import front.loader
+import front.prog
+import front.sema
+import front.rdebug
+import tirinterp.json
+import tirinterp.rpc
+
+/// What the server holds: each open buffer by URI, and whether `shutdown`
+/// came.
+type Server = {
+    uris: [str],
+    texts: [str],
+    shutdown: bool,
+}
+
+pub fn cmd_lsp() {
+    var sv = Server{ uris: [], texts: [], shutdown: false }
+    var r = rpc.stdin_reader()
+    while true {
+        let (more, msg) = match rpc.lsp_read(r) {
+            Ok(x) -> x
+            Err(e) -> {
+                eprint("lsp error: {e}")
+                exit(1)
+                (false, "")
+            }
+        }
+        if not more {
+            break
+        }
+        let req = match json.parse(msg) {
+            Ok(j) -> j
+            // A malformed frame is ignored rather than crashing the editor.
+            Err(_) -> continue
+        }
+        let method = json.as_str(json.get(req, "method")) ?? ""
+        let (result, has_result, notes) = handle(sv, method, req)
+        match json.get(req, "id") {
+            Some(id) -> if has_result {
+                rpc.send(json.obj([("jsonrpc", json.jstr("2.0")), ("id", id), ("result", result)]))
+            }
+            None -> ()
+        }
+        for n in notes {
+            rpc.send(n)
+        }
+        if sv.shutdown and method == "exit" {
+            break
+        }
+    }
+    exit(0)
+}
+
+fn text_of(sv: Server, uri: str) -> Option[str] {
+    for i in 0..sv.uris.len() {
+        if sv.uris[i] == uri {
+            return Some(sv.texts[i])
+        }
+    }
+    None
+}
+
+fn set_text(inout sv: Server, uri: str, text: str) {
+    for i in 0..sv.uris.len() {
+        if sv.uris[i] == uri {
+            sv.texts[i] = text
+            return
+        }
+    }
+    sv.uris.push(uri)
+    sv.texts.push(text)
+}
+
+/// A method's answer: the result and whether there is one, and the
+/// notifications after it.
+fn handle(inout sv: Server, method: str, req: Json) -> (Json, bool, [Json]) {
+    if method == "initialize" {
+        let caps = json.obj([
+            ("textDocumentSync", json.jint(1)),
+            ("hoverProvider", JBool(true)),
+            ("definitionProvider", JBool(true)),
+            ("documentSymbolProvider", JBool(true)),
+            ("completionProvider", json.obj([("triggerCharacters", JArr([json.jstr(".")]))])),
+        ])
+        let info = json.obj([("name", json.jstr("grasm-lsp")), ("version", json.jstr("1.1.0"))])
+        return (json.obj([("capabilities", caps), ("serverInfo", info)]), true, [])
+    }
+    if method == "shutdown" {
+        sv.shutdown = true
+        return (JNull, true, [])
+    }
+    if method == "textDocument/didOpen" {
+        let uri = json.as_str(json.path(req, "params.textDocument.uri")) ?? ""
+        let text = json.as_str(json.path(req, "params.textDocument.text")) ?? ""
+        set_text(sv, uri, text)
+        return (JNull, false, notified(diagnostics_for(sv, uri)))
+    }
+    if method == "textDocument/didChange" {
+        let uri = json.as_str(json.path(req, "params.textDocument.uri")) ?? ""
+        // Full sync: the last content change carries the whole file.
+        var text = ""
+        match json.path(req, "params.contentChanges") {
+            Some(c) -> match c {
+                JArr(items) -> if items.len() > 0 {
+                    text = json.as_str(json.get(items[items.len() - 1], "text")) ?? ""
+                }
+                _ -> ()
+            }
+            None -> ()
+        }
+        set_text(sv, uri, text)
+        return (JNull, false, notified(diagnostics_for(sv, uri)))
+    }
+    if method == "textDocument/didSave" {
+        let uri = json.as_str(json.path(req, "params.textDocument.uri")) ?? ""
+        return (JNull, false, notified(diagnostics_for(sv, uri)))
+    }
+    if method == "textDocument/hover" {
+        return (hover(sv, req), true, [])
+    }
+    if method == "textDocument/definition" {
+        return (definition(sv, req), true, [])
+    }
+    if method == "textDocument/completion" {
+        return (completion(sv, req), true, [])
+    }
+    if method == "textDocument/documentSymbol" {
+        return (symbols(sv, req), true, [])
+    }
+    (JNull, false, [])
+}
+
+/// `Reply::notify`: none when the notification is null.
+fn notified(n: Json) -> [Json] {
+    match n {
+        JNull -> []
+        _ -> [n]
+    }
+}
+
+// ----- positions ------------------------------------------------------------------
+
+fn line_starts(b: bytes) -> [i64] {
+    var starts = [0]
+    for i in 0..b.len() {
+        if b.at(i) == 10 {
+            starts.push(i + 1)
+        }
+    }
+    starts
+}
+
+/// `Doc::range_of`: 0-based lines and byte columns, each end clamped to
+/// the text.
+fn range_of(text: str, s: i64, e: i64) -> Json {
+    let b = text.to_bytes()
+    let starts = line_starts(b)
+    json.obj([("start", place(starts, s.min(b.len()))), ("end", place(starts, e.min(b.len())))])
+}
+
+fn place(starts: [i64], at: i64) -> Json {
+    var lo = 0
+    var hi = starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= at {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    json.obj([("line", json.jint(lo)), ("character", json.jint(at - starts[lo]))])
+}
+
+/// `Doc::offset_at`: a line and a character taken as a byte offset into
+/// it, clamped to the line; past the last line, the end.
+fn offset_at(text: str, line: i64, ch: i64) -> i64 {
+    let b = text.to_bytes()
+    var off = 0
+    var i = 0
+    var start = 0
+    while start < b.len() {
+        var end = start
+        while end < b.len() and b.at(end) != 10 {
+            end += 1
+        }
+        let next = if end < b.len() { end + 1 } else { end }
+        if i == line {
+            return off + ch.min(end - start)
+        }
+        off += next - start
+        start = next
+        i += 1
+    }
+    off
+}
+
+/// `as u32` of a number the client sent.
+fn as_u32(n: i64) -> i64 {
+    n.bit_and(4294967295)
+}
+
+/// The buffer and the offset a request points at (`doc_and_offset`).
+fn doc_and_offset(sv: Server, req: Json) -> Option[(str, i64)] {
+    let uri = match json.as_str(json.path(req, "params.textDocument.uri")) {
+        Some(u) -> u
+        None -> return None
+    }
+    let text = match text_of(sv, uri) {
+        Some(t) -> t
+        None -> return None
+    }
+    let line = match json.as_int(json.path(req, "params.position.line")) {
+        Some(n) -> as_u32(n)
+        None -> return None
+    }
+    let ch = match json.as_int(json.path(req, "params.position.character")) {
+        Some(n) -> as_u32(n)
+        None -> return None
+    }
+    Some((text, offset_at(text, line, ch)))
+}
+
+fn is_word(c: i64) -> bool {
+    (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+}
+
+/// `word_at`: the identifier around byte `off`, if any.
+fn word_at(text: str, off0: i64) -> Option[str] {
+    let b = text.to_bytes()
+    let off = off0.min(b.len())
+    if off >= b.len() and off == 0 {
+        return None
+    }
+    var start = off
+    while start > 0 and is_word(b.at(start - 1)) {
+        start -= 1
+    }
+    var end = off
+    while end < b.len() and is_word(b.at(end)) {
+        end += 1
+    }
+    if start == end {
+        return None
+    }
+    Some(b.slice(start, end).to_str())
+}
+
+// ----- the buffer as a module -------------------------------------------------------
+
+fn sl(a: Ast, id: i64, i: i64) -> i64 {
+    a.pool[a.off[id] + i]
+}
+
+fn items(a: Ast, v: i64) -> [i64] {
+    a.pool.slice(a.off[v], a.off[v] + a.n[v])
+}
+
+/// `grasm_syntax::parse(text).module`, whatever the parser said of it.
+fn parsed(text: str) -> ModuleAst {
+    let sb = text.to_bytes()
+    let lx = lex.lex(sb, true)
+    let p = parse.parse(sb, lx)
+    let c = cst.build(p)
+    ast.build(c, sb, p.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+}
+
+fn doc_for(m: ModuleAst, d: i64) -> Option[str] {
+    for q in 0..m.doc_keys.len() {
+        if m.doc_keys[q] == m.a.s[d] {
+            return Some(m.doc_vals[q])
+        }
+    }
+    None
+}
+
+fn name_of(a: Ast, d: i64) -> str {
+    let k = a.k[d]
+    if k == ast.D_FN or k == ast.D_TYPE {
+        return a.t[sl(a, d, 2)]
+    }
+    if k == ast.D_EFFECT {
+        return a.t[sl(a, d, 0)]
+    }
+    if k == ast.D_CONST or k == ast.D_EXTERN or k == ast.D_TLS or k == ast.D_PLS or k == ast.D_INTERFACE {
+        return a.t[sl(a, d, 1)]
+    }
+    ""
+}
+
+/// The ident node of a declaration's name.
+fn name_node(a: Ast, d: i64) -> i64 {
+    let k = a.k[d]
+    if k == ast.D_FN or k == ast.D_TYPE {
+        return sl(a, d, 2)
+    }
+    sl(a, d, 0)
+}
+
+fn dotted(a: Ast, path: i64) -> str {
+    var parts: [str] = []
+    for s in items(a, sl(a, path, 0)) {
+        parts.push(a.t[s])
+    }
+    parts.join(".")
+}
+
+/// The LSP's `type_text`: a function type without its effect row.
+fn type_text(a: Ast, te: i64) -> str {
+    let k = a.k[te]
+    if k == ast.Y_REF {
+        return "ref " + type_text(a, sl(a, te, 0))
+    }
+    if k == ast.Y_NAME {
+        let path = dotted(a, sl(a, te, 0))
+        let args = items(a, sl(a, te, 1))
+        if args.len() == 0 {
+            return path
+        }
+        var parts: [str] = []
+        for x in args {
+            parts.push(type_text(a, x))
+        }
+        return path + "[" + parts.join(", ") + "]"
+    }
+    if k == ast.Y_FN {
+        var ps: [str] = []
+        for x in items(a, sl(a, te, 0)) {
+            ps.push(type_text(a, x))
+        }
+        return "fn(" + ps.join(", ") + ") -> " + type_text(a, sl(a, te, 1))
+    }
+    if k == ast.Y_LIST {
+        return "[" + type_text(a, sl(a, te, 0)) + "]"
+    }
+    if k == ast.Y_FALLIBLE {
+        return type_text(a, sl(a, te, 0)) + " ! " + type_text(a, sl(a, te, 1))
+    }
+    if k == ast.Y_TUPLE or k == ast.Y_UNION {
+        var parts: [str] = []
+        for x in items(a, sl(a, te, 0)) {
+            parts.push(type_text(a, x))
+        }
+        let sep = if k == ast.Y_TUPLE { ", " } else { " | " }
+        return "(" + parts.join(sep) + ")"
+    }
+    ""
+}
+
+/// `render_fn_signature`.
+fn fn_signature(a: Ast, d: i64) -> str {
+    var params: [str] = []
+    for p in items(a, sl(a, d, 5)) {
+        let mode = sl(a, p, 0)
+        let m = if mode == 1 { "inout " } else if mode == 2 { "own " } else { "" }
+        params.push(m + a.t[sl(a, p, 1)] + ": " + type_text(a, sl(a, p, 2)))
+    }
+    var s = str_builder()
+    if sl(a, d, 0) != 0 {
+        s.push_str("pub ")
+    }
+    s.push_str("fn ")
+    s.push_str(a.t[sl(a, d, 2)])
+    let gens = sl(a, d, 3)
+    if a.n[gens] > 0 {
+        var gs: [str] = []
+        for g in items(a, gens) {
+            gs.push(a.t[g])
+        }
+        s.push_str("[" + gs.join(", ") + "]")
+    }
+    s.push_str("(" + params.join(", ") + ")")
+    let ret = sl(a, d, 6)
+    if ret >= 0 {
+        s.push_str(" -> " + type_text(a, ret))
+    }
+    let err = sl(a, d, 7)
+    if err >= 0 {
+        s.push_str(" ! " + type_text(a, err))
+    }
+    let row = sl(a, d, 8)
+    if row >= 0 {
+        var names: [str] = []
+        for p in items(a, row) {
+            names.push(dotted(a, p))
+        }
+        s.push_str(" / \{" + names.join(", ") + "}")
+    }
+    s.to_str()
+}
+
+fn fields_text(a: Ast, v: i64) -> str {
+    var parts: [str] = []
+    for f in items(a, v) {
+        parts.push(a.t[sl(a, f, 0)] + ": " + type_text(a, sl(a, f, 1)))
+    }
+    parts.join(", ")
+}
+
+/// `render_type_decl`: no `pub`, no generics.
+fn type_decl(a: Ast, d: i64) -> str {
+    let name = a.t[sl(a, d, 2)]
+    let body = sl(a, d, 4)
+    let k = a.k[body]
+    if k == ast.B_STRUCT {
+        return "type {name} = \{ {fields_text(a, sl(a, body, 0))} }"
+    }
+    if k == ast.B_SUM {
+        var vs: [str] = []
+        for v in items(a, sl(a, body, 0)) {
+            let fs = sl(a, v, 1)
+            if a.n[fs] == 0 {
+                vs.push(a.t[sl(a, v, 0)])
+            } else {
+                vs.push(a.t[sl(a, v, 0)] + "(" + fields_text(a, fs) + ")")
+            }
+        }
+        return "type {name} = | " + vs.join(" | ")
+    }
+    "type {name} = {type_text(a, sl(a, body, 0))}"
+}
+
+/// A sum type's variants: their ident nodes.
+fn variants(a: Ast, d: i64) -> [i64] {
+    let body = sl(a, d, 4)
+    if a.k[body] != ast.B_SUM {
+        return []
+    }
+    items(a, sl(a, body, 0))
+}
+
+fn markdown(text: str) -> Json {
+    json.obj([("contents", json.obj([("kind", json.jstr("markdown")), ("value", json.jstr("```grasm\n{text}\n```"))]))])
+}
+
+// ----- the requests -----------------------------------------------------------------
+
+fn hover(sv: Server, req: Json) -> Json {
+    let (text, off) = match doc_and_offset(sv, req) {
+        Some(x) -> x
+        None -> return JNull
+    }
+    let m = parsed(text)
+    let a = m.a
+    let word = match word_at(text, off) {
+        Some(w) -> w
+        None -> return JNull
+    }
+    for d in m.decls {
+        let k = a.k[d]
+        if k == ast.D_FN and name_of(a, d) == word {
+            return with_doc(m, d, fn_signature(a, d))
+        }
+        if k == ast.D_TYPE and name_of(a, d) == word {
+            return with_doc(m, d, type_decl(a, d))
+        }
+        if k == ast.D_EFFECT and name_of(a, d) == word {
+            let n = a.n[sl(a, d, 1)]
+            let plural = if n == 1 { "" } else { "s" }
+            return with_doc(m, d, "effect {word} ({n} operation{plural})")
+        }
+        if k == ast.D_TYPE {
+            for v in variants(a, d) {
+                if a.t[sl(a, v, 0)] == word {
+                    return markdown("{name_of(a, d)}.{word}({fields_text(a, sl(a, v, 1))})")
+                }
+            }
+        }
+    }
+    let doc = builtin_doc(word)
+    if doc != "" {
+        return markdown(doc)
+    }
+    JNull
+}
+
+/// A declaration's `///` block under its signature, after a rule.
+fn with_doc(m: ModuleAst, d: i64, signature: str) -> Json {
+    match doc_for(m, d) {
+        Some(doc) -> markdown("{signature}\n\n---\n\n{doc}")
+        None -> markdown(signature)
+    }
+}
+
+fn definition(sv: Server, req: Json) -> Json {
+    let (text, off) = match doc_and_offset(sv, req) {
+        Some(x) -> x
+        None -> return JNull
+    }
+    let uri = json.as_str(json.path(req, "params.textDocument.uri")) ?? ""
+    let m = parsed(text)
+    let a = m.a
+    let word = match word_at(text, off) {
+        Some(w) -> w
+        None -> return JNull
+    }
+    for d in m.decls {
+        let k = a.k[d]
+        if (k == ast.D_FN or k == ast.D_TYPE or k == ast.D_EFFECT) and name_of(a, d) == word {
+            let n = name_node(a, d)
+            return json.obj([("uri", json.jstr(uri)), ("range", range_of(text, a.s[n], a.e[n]))])
+        }
+        if k == ast.D_TYPE {
+            for v in variants(a, d) {
+                let n = sl(a, v, 0)
+                if a.t[n] == word {
+                    return json.obj([("uri", json.jstr(uri)), ("range", range_of(text, a.s[n], a.e[n]))])
+                }
+            }
+        }
+    }
+    JNull
+}
+
+fn item(label: str, kind: i64, detail: str) -> Json {
+    json.obj([("label", json.jstr(label)), ("kind", json.jint(kind)), ("detail", json.jstr(detail))])
+}
+
+fn completion(sv: Server, req: Json) -> Json {
+    let (text, _) = match doc_and_offset(sv, req) {
+        Some(x) -> x
+        None -> return JNull
+    }
+    let m = parsed(text)
+    let a = m.a
+    var out: [Json] = []
+    for d in m.decls {
+        let k = a.k[d]
+        if k == ast.D_FN {
+            out.push(item(name_of(a, d), 3, fn_signature(a, d)))
+        } else if k == ast.D_TYPE {
+            let tn = name_of(a, d)
+            out.push(item(tn, 7, type_decl(a, d)))
+            for v in variants(a, d) {
+                out.push(item(a.t[sl(a, v, 0)], 4, "variant of {tn}"))
+            }
+        } else if k == ast.D_EFFECT {
+            out.push(item(name_of(a, d), 8, "effect"))
+        }
+    }
+    for kw in keywords() {
+        out.push(item(kw, 14, "keyword"))
+    }
+    let bs = builtins()
+    for i in 0..bs.len() {
+        let (name, doc) = bs[i]
+        out.push(item(name, 3, doc))
+    }
+    JArr(out)
+}
+
+fn symbols(sv: Server, req: Json) -> Json {
+    let uri = match json.as_str(json.path(req, "params.textDocument.uri")) {
+        Some(u) -> u
+        None -> return JNull
+    }
+    let text = match text_of(sv, uri) {
+        Some(t) -> t
+        None -> return JNull
+    }
+    let m = parsed(text)
+    let a = m.a
+    let esc = rdebug.new_esc_table()
+    var out: [Json] = []
+    for d in m.decls {
+        let k = a.k[d]
+        var name = name_of(a, d)
+        var kind = 12
+        if k == ast.D_CONST {
+            kind = 14
+        } else if k == ast.D_TLS or k == ast.D_PLS {
+            kind = 13
+        } else if k == ast.D_TYPE {
+            kind = 23
+        } else if k == ast.D_EFFECT or k == ast.D_INTERFACE {
+            kind = 11
+        } else if k == ast.D_TEST {
+            name = "test " + rdebug.str_debug(esc, a.t[d])
+        } else if k == ast.D_BENCH {
+            name = "bench " + rdebug.str_debug(esc, a.t[d])
+        } else if k == ast.D_IMPORT {
+            name = "import " + dotted(a, sl(a, d, 0))
+            kind = 2
+        } else if k == ast.D_IMPL {
+            name = "impl " + dotted(a, sl(a, d, 0)) + " for " + a.t[d]
+            kind = 5
+        }
+        let r = range_of(text, a.s[d], a.e[d])
+        out.push(json.obj([("name", json.jstr(name)), ("kind", json.jint(kind)), ("range", r), ("selectionRange", r)]))
+    }
+    JArr(out)
+}
+
+// ----- diagnostics ------------------------------------------------------------------
+
+/// `diagnostics_for`: the buffer checked as `grasm check` resolves it, the
+/// buffer standing in for the entry file; for a URI that is not a file, or
+/// a load that fails, the buffer alone as one module.
+fn diagnostics_for(sv: Server, uri: str) -> Json {
+    let text = match text_of(sv, uri) {
+        Some(t) -> t
+        None -> return JNull
+    }
+    var msgs: [str] = []
+    var helps: [str] = []
+    var ss: [i64] = []
+    var es: [i64] = []
+    var whole = true
+    if uri.starts_with("file://") {
+        let path = uri.to_bytes().slice(7, uri.to_bytes().len()).to_str()
+        let none: Map[str, str] = map()
+        let l = loader.load_text(path, none, text)
+        if l.fatal == "" {
+            gather(l, msgs, helps, ss, es)
+            // Only this file's: the others belong to their own URIs.
+            let end = if l.srcs.len() > 0 { l.srcs[0].len() } else { 9223372036854775807 }
+            var keep_m: [str] = []
+            var keep_h: [str] = []
+            var keep_s: [i64] = []
+            var keep_e: [i64] = []
+            for i in 0..ss.len() {
+                if ss[i] < end {
+                    keep_m.push(msgs[i])
+                    keep_h.push(helps[i])
+                    keep_s.push(ss[i])
+                    keep_e.push(es[i])
+                }
+            }
+            msgs = keep_m
+            helps = keep_h
+            ss = keep_s
+            es = keep_e
+            whole = false
+        }
+    }
+    if whole {
+        gather(loader.single_module(text), msgs, helps, ss, es)
+    }
+    var items_out: [Json] = []
+    for i in 0..msgs.len() {
+        var msg = msgs[i]
+        if helps[i] != "" {
+            msg = msg + "\nhelp: " + helps[i]
+        }
+        items_out.push(json.obj([("range", range_of(text, ss[i], es[i])), ("severity", json.jint(1)), ("source", json.jstr("grasm")), ("message", json.jstr(msg))]))
+    }
+    json.obj([("jsonrpc", json.jstr("2.0")), ("method", json.jstr("textDocument/publishDiagnostics")), ("params", json.obj([("uri", json.jstr(uri)), ("diagnostics", JArr(items_out))]))])
+}
+
+/// The loader's and the parser's diagnostics, or else the checker's.
+fn gather(l: Loaded, inout msgs: [str], inout helps: [str], inout ss: [i64], inout es: [i64]) {
+    if l.diags.len() > 0 {
+        for i in 0..l.diags.len() {
+            msgs.push(l.diags[i])
+            helps.push(l.d_help[i])
+            ss.push(l.d_s[i])
+            es.push(l.d_e[i])
+        }
+        return
+    }
+    let p = prog.build(l)
+    let (c, _) = sema.check_program(p)
+    for i in 0..c.d_s.len() {
+        msgs.push(c.d_msg[i])
+        helps.push(c.d_help[i])
+        ss.push(c.d_s[i])
+        es.push(c.d_e[i])
+    }
+}
+
+// ----- the fixed tables -------------------------------------------------------------
+
+fn keywords() -> [str] {
+    ["fn", "pub", "let", "var", "own", "inout", "type", "effect", "with", "handled_by", "match", "if", "else", "for", "while", "in", "return", "try", "true", "false", "break", "continue", "and", "or", "not", "import", "test"]
+}
+
+fn builtins() -> [(str, str)] {
+    [
+        ("print", "print(value) — write a line to stdout (io effect)"),
+        ("assert", "assert(cond: bool) — panic unless true"),
+        ("assert_eq", "assert_eq(a, b) — panic unless equal"),
+        ("panic", "panic(msg: str) — abort with a message"),
+        ("fail", "fail(err) — raise the error branch of `T ! E`"),
+        ("map", "map() — a new empty Map[K, V]"),
+        ("args", "args() -> [str] — program arguments (io effect)"),
+        ("input", "input() -> str — read a line from stdin (io effect)"),
+        ("read_file", "read_file(path: str) -> str ! IoError (io effect)"),
+        ("write_file", "write_file(path: str, content: str) -> () ! IoError (io effect)"),
+        ("file_exists", "file_exists(path: str) -> bool (io effect)"),
+    ]
+}
+
+fn builtin_doc(name: str) -> str {
+    for b in builtins() {
+        let (n, d) = b
+        if n == name {
+            return d
+        }
+    }
+    ""
+}

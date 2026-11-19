@@ -26,6 +26,11 @@ pub let MAP_PRIVATE_ANON = 34
 /// `dlsym`'s handle for every object the process has loaded.
 pub let RTLD_DEFAULT = 0
 
+/// `dlsym`'s handle for the executable's own exports. glibc has no
+/// RTLD_MAIN_ONLY, so this is RTLD_DEFAULT, whose search starts with the
+/// executable (and goes on to its libraries).
+pub let RTLD_MAIN = 0
+
 /// Where a `struct dirent`'s name starts.
 pub let DIRENT_NAME = 19
 

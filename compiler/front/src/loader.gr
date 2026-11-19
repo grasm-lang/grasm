@@ -1619,10 +1619,6 @@ pub fn load(entry_path: str) -> Loaded {
 /// `load_from_disk_with`: the program from `entry_path`, given the package
 /// directories already resolved, by name.
 pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
-    var entry_src_dir = parent(entry_path)
-    if entry_src_dir == "\0" {
-        entry_src_dir = ""
-    }
     let entry_display = tidy(entry_path)
     let entry_bytes = match read_bytes(entry_path) {
         Ok(b) -> b
@@ -1631,7 +1627,19 @@ pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
     if not utf8_ok(entry_bytes) {
         return empty_loaded("cannot read `{entry_display}`: stream did not contain valid UTF-8")
     }
-    let entry_src = entry_bytes.to_str()
+    load_text(entry_path, resolved, entry_bytes.to_str())
+}
+
+/// `load_from_disk_in` with the entry's text given rather than read: the
+/// program `entry_path` would be if that file held `entry_src` -- what the
+/// language server checks an editor's buffer as (docs/self-hosting.md
+/// §6.22).
+pub fn load_text(entry_path: str, resolved: Map[str, str], entry_src: str) -> Loaded {
+    var entry_src_dir = parent(entry_path)
+    if entry_src_dir == "\0" {
+        entry_src_dir = ""
+    }
+    let entry_display = tidy(entry_path)
     // A source bundle carries its own modules; there is nothing on disk to
     // look for.
     if entry_src.trim_start().starts_with("//!module ") {
@@ -2101,4 +2109,28 @@ fn hex4(n: i64) -> str {
         v = v / 16
     }
     s
+}
+
+/// One source as a program of one module, `main`, with no imports resolved
+/// and nothing read from disk: what `grasm_sema::analyze` checks (`check`,
+/// one `ModuleView` with an empty import map) -- the language server's view
+/// of a buffer it cannot load (docs/self-hosting.md §6.22). Only the
+/// parser's diagnostics.
+pub fn single_module(src: str) -> Loaded {
+    let sb = src.to_bytes()
+    let lx = lex.lex(sb, true)
+    let ps = parse.parse(sb, lx)
+    let c = cst.build(ps)
+    let m = ast.build(c, sb, ps.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+    var out = empty_loaded("")
+    parse_diags(out, ps, 0)
+    out.names.push("main")
+    out.aliases.push("main")
+    out.paths.push("main.gr")
+    out.srcs.push(sb)
+    out.bases.push(0)
+    out.imp_alias.push([])
+    out.imp_full.push([])
+    out.mods.push(m)
+    out
 }

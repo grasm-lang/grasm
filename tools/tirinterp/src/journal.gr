@@ -1,0 +1,610 @@
+// The record-and-replay journal (docs/replay.md; docs/self-hosting.md
+// §6.22), as the reference interpreter keeps it: `crates/grasm_journal` and
+// `crates/grasm_interp/src/journal.rs`, byte for byte the same file.
+//
+// `GRASM_RECORD=path` writes a journal, `GRASM_REPLAY=path` reads one, both
+// set records. The mode is chosen the first time the run asks -- its first
+// journaled built-in or C call -- and a recording creates the file then, so
+// a program that asks nothing leaves none. The file is `GRASMJRNL2` and
+// then one record per call that reached outside the program: a `u32` name
+// length, the name, a `u32` value length, the value. A value is a `Wire`,
+// the one encoding every engine reads: a tag byte, then 0 unit, 1 an `i64`,
+// 2 an `f64`'s bits, 3 a byte, 4 text and 5 bytes each a `u32` length and
+// the bytes, 6 a list and 7 a tuple each a `u32` count and the items, 8 a
+// variant's type and name as text and its fields as a list. Little-endian
+// throughout. Each record is written as it happens.
+//
+// On replay each journaled built-in takes the next record, which must name
+// it; one that names another call, or none left, stops the run with exit 7,
+// as a C call does -- a recording holds nothing a C function did. A replay
+// that ends with records unread says nothing, as the reference says
+// nothing (docs/known-issues.md).
+//
+// The journal is the interpreted program's: the command that runs it is
+// exempt from its own runtime's journal (`unjournaled_host`,
+// compiler/grasm), so the host's reads are never recorded and never
+// replayed.
+import load
+import value
+import eval
+
+/// A Grasm value in the one shape every engine reads (`grasm_journal::Wire`).
+type Wire =
+    | WUnit
+    | WInt(v: i64)
+    | WFloat(v: f64)
+    | WBool(v: bool)
+    | WStr(v: str)
+    | WBytes(v: bytes)
+    | WList(items: [Wire])
+    | WTuple(items: [Wire])
+    | WVariant(ty: str, name: str, fields: [Wire])
+
+/// The modes, in `Cx.jstate`: not asked yet, off, recording, replaying.
+pub let J_UNASKED = 0
+pub let J_OFF = 1
+pub let J_RECORD = 2
+pub let J_REPLAY = 3
+
+/// A budget no value reaches: `usize::MAX`, `--full`.
+pub let FULL = 4611686018427387904
+
+pub fn magic() -> bytes {
+    "GRASMJRNL2".to_bytes()
+}
+
+/// Whether the built-in `code` (its index in `builtins.builtin_names` plus
+/// one) is one the journal records (`Journal::Recorded` in
+/// `grasm_sema::builtins`): forty.
+pub fn journaled(code: i64) -> bool {
+    match code {
+        4 -> true
+        8 -> true
+        12 -> true
+        15 -> true
+        16 -> true
+        17 -> true
+        18 -> true
+        20 -> true
+        21 -> true
+        22 -> true
+        23 -> true
+        24 -> true
+        25 -> true
+        26 -> true
+        27 -> true
+        28 -> true
+        29 -> true
+        30 -> true
+        31 -> true
+        32 -> true
+        34 -> true
+        35 -> true
+        36 -> true
+        38 -> true
+        39 -> true
+        40 -> true
+        41 -> true
+        45 -> true
+        48 -> true
+        49 -> true
+        50 -> true
+        51 -> true
+        53 -> true
+        54 -> true
+        55 -> true
+        58 -> true
+        59 -> true
+        60 -> true
+        62 -> true
+        63 -> true
+        _ -> false
+    }
+}
+
+// ----- the encoding ----------------------------------------------------------
+
+fn push_u32(inout b: ByteBuilder, n: i64) {
+    b.push_byte(n.bit_and(255))
+    b.push_byte(n.ushr(8).bit_and(255))
+    b.push_byte(n.ushr(16).bit_and(255))
+    b.push_byte(n.ushr(24).bit_and(255))
+}
+
+fn push_i64(inout b: ByteBuilder, n: i64) {
+    for k in 0..8 {
+        b.push_byte(n.ushr(8 * k).bit_and(255))
+    }
+}
+
+fn push_text(inout b: ByteBuilder, s: str) {
+    let t = s.to_bytes()
+    push_u32(b, t.len())
+    b.push_bytes(t)
+}
+
+fn write_into(inout b: ByteBuilder, w: Wire) {
+    match w {
+        WUnit -> b.push_byte(0)
+        WInt(v) -> {
+            b.push_byte(1)
+            push_i64(b, v)
+        }
+        WFloat(v) -> {
+            b.push_byte(2)
+            push_i64(b, v.to_bits())
+        }
+        WBool(v) -> {
+            b.push_byte(3)
+            b.push_byte(if v { 1 } else { 0 })
+        }
+        WStr(v) -> {
+            b.push_byte(4)
+            push_text(b, v)
+        }
+        WBytes(v) -> {
+            b.push_byte(5)
+            push_u32(b, v.len())
+            b.push_bytes(v)
+        }
+        WList(items) -> {
+            b.push_byte(6)
+            push_u32(b, items.len())
+            for x in items {
+                write_into(b, x)
+            }
+        }
+        WTuple(items) -> {
+            b.push_byte(7)
+            push_u32(b, items.len())
+            for x in items {
+                write_into(b, x)
+            }
+        }
+        WVariant(ty, name, fields) -> {
+            b.push_byte(8)
+            push_text(b, ty)
+            push_text(b, name)
+            push_u32(b, fields.len())
+            for x in fields {
+                write_into(b, x)
+            }
+        }
+    }
+}
+
+pub fn encode(w: Wire) -> bytes {
+    var b = byte_builder()
+    write_into(b, w)
+    b.to_bytes()
+}
+
+/// One record as `put` writes it.
+pub fn framed_record(name: str, w: Wire) -> bytes {
+    let payload = encode(w)
+    var b = byte_builder()
+    push_text(b, name)
+    push_u32(b, payload.len())
+    b.push_bytes(payload)
+    b.to_bytes()
+}
+
+fn u32_at(raw: bytes, at: i64) -> i64 {
+    raw.at(at) + raw.at(at + 1).shl(8) + raw.at(at + 2).shl(16) + raw.at(at + 3).shl(24)
+}
+
+fn i64_at(raw: bytes, at: i64) -> i64 {
+    var v = 0
+    for k in 0..8 {
+        v = v.bit_or(raw.at(at + k).shl(8 * k))
+    }
+    v
+}
+
+fn take(raw: bytes, inout at: i64, n: i64) -> bytes ! str {
+    if at + n > raw.len() {
+        fail("a recorded value ends early")
+    }
+    let v = raw.slice(at, at + n)
+    at += n
+    v
+}
+
+fn take_u32(raw: bytes, inout at: i64) -> i64 ! str {
+    let b = try take(raw, at, 4)
+    u32_at(b, 0)
+}
+
+fn take_text(raw: bytes, inout at: i64) -> str ! str {
+    let n = try take_u32(raw, at)
+    let b = try take(raw, at, n)
+    b.to_str()
+}
+
+fn take_many(raw: bytes, inout at: i64) -> [Wire] ! str {
+    let n = try take_u32(raw, at)
+    var out: [Wire] = []
+    for _ in 0..n {
+        out.push(try read_from(raw, at))
+    }
+    out
+}
+
+fn read_from(raw: bytes, inout at: i64) -> Wire ! str {
+    let tag = (try take(raw, at, 1)).at(0)
+    if tag == 0 {
+        return WUnit
+    }
+    if tag == 1 {
+        let b = try take(raw, at, 8)
+        return WInt(i64_at(b, 0))
+    }
+    if tag == 2 {
+        let b = try take(raw, at, 8)
+        return WFloat(i64_at(b, 0).from_bits())
+    }
+    if tag == 3 {
+        let b = try take(raw, at, 1)
+        return WBool(b.at(0) != 0)
+    }
+    if tag == 4 {
+        return WStr(try take_text(raw, at))
+    }
+    if tag == 5 {
+        let n = try take_u32(raw, at)
+        return WBytes(try take(raw, at, n))
+    }
+    if tag == 6 {
+        return WList(try take_many(raw, at))
+    }
+    if tag == 7 {
+        return WTuple(try take_many(raw, at))
+    }
+    if tag == 8 {
+        let ty = try take_text(raw, at)
+        let name = try take_text(raw, at)
+        return WVariant(ty, name, try take_many(raw, at))
+    }
+    fail("unknown value tag {tag} in the journal")
+}
+
+pub fn decode(raw: bytes) -> Wire ! str {
+    var at = 0
+    let w = try read_from(raw, at)
+    if at != raw.len() {
+        fail("trailing bytes after a recorded value")
+    }
+    w
+}
+
+fn take_rec(raw: bytes, inout at: i64, n: i64) -> bytes ! str {
+    if at + n > raw.len() {
+        fail("journal ends mid-record")
+    }
+    let v = raw.slice(at, at + n)
+    at += n
+    v
+}
+
+/// A journal's records (`grasm_journal::parse`): every value decoded, so a
+/// file with one bad value is refused whole.
+pub fn parse(raw: bytes) -> ([str], [Wire]) ! str {
+    let m = magic()
+    if raw.len() < m.len() or raw.slice(0, m.len()) != m {
+        fail("not a Grasm journal")
+    }
+    var at = m.len()
+    var names: [str] = []
+    var vals: [Wire] = []
+    while at < raw.len() {
+        let nl = u32_at(try take_rec(raw, at, 4), 0)
+        let name = (try take_rec(raw, at, nl)).to_str()
+        let vl = u32_at(try take_rec(raw, at, 4), 0)
+        let v = try decode(try take_rec(raw, at, vl))
+        names.push(name)
+        vals.push(v)
+    }
+    (names, vals)
+}
+
+/// What `grasm_sys` says of a failed file operation: the system's message,
+/// without `std`'s "(os error N)".
+pub fn io_words(e: IoError) -> str {
+    match e {
+        NotFound(_) -> "No such file or directory"
+        IoFailed(m) -> m
+    }
+}
+
+/// The journal at `path` (`grasm_journal::read`).
+pub fn read(path: str) -> ([str], [Wire]) ! str {
+    match read_bytes(path) {
+        Ok(raw) -> parse(raw)
+        Err(e) -> fail(io_words(e))
+    }
+}
+
+// ----- one line of it, for a person ----------------------------------------------
+
+/// A value rendered within `budget` characters (`Wire::render`).
+pub fn render(w: Wire, budget: i64) -> str {
+    match w {
+        WUnit -> "()"
+        WInt(v) -> v.to_str()
+        WFloat(v) -> rust_float(v)
+        WBool(v) -> if v { "true" } else { "false" }
+        WStr(s) -> quoted(s, budget)
+        WBytes(b) -> {
+            let shown = b.len().min(budget / 3)
+            var hex: [str] = []
+            for i in 0..shown {
+                hex.push(hex2(b.at(i)))
+            }
+            let tail = if shown < b.len() { " … {b.len() - shown} more" } else { "" }
+            "{b.len()} byte(s) {hex.join(" ")}{tail}"
+        }
+        WList(items) -> bracketed(items, budget, "[", "]")
+        WTuple(items) -> bracketed(items, budget, "(", ")")
+        WVariant(_, name, fields) -> {
+            if fields.is_empty() {
+                return name
+            }
+            let sub = (budget - (name.to_bytes().len() + 2)).max(0)
+            var inner: [str] = []
+            for f in fields {
+                inner.push(render(f, sub))
+            }
+            "{name}({inner.join(", ")})"
+        }
+    }
+}
+
+fn hex2(n: i64) -> str {
+    let d = "0123456789abcdef".chars()
+    d[n.ushr(4)] + d[n.bit_and(15)]
+}
+
+/// Rust's `{}` of a double: the language's text less the `.0` it adds to
+/// an integral one (`float_text`).
+pub fn rust_float(v: f64) -> str {
+    let s = v.to_str()
+    if s.ends_with(".0") {
+        let b = s.to_bytes()
+        return b.slice(0, b.len() - 2).to_str()
+    }
+    s
+}
+
+fn quoted(s: str, budget: i64) -> str {
+    var out = str_builder()
+    out.push_str("\"")
+    let cs = s.chars()
+    for n in 0..cs.len() {
+        if n >= budget {
+            return "{out.to_str()}\" … {cs.len() - n} more char(s)"
+        }
+        let c = cs[n]
+        if c == "\n" {
+            out.push_str("\\n")
+        } else if c == "\r" {
+            out.push_str("\\r")
+        } else if c == "\t" {
+            out.push_str("\\t")
+        } else if c == "\"" {
+            out.push_str("\\\"")
+        } else {
+            out.push_str(c)
+        }
+    }
+    out.push_str("\"")
+    out.to_str()
+}
+
+fn bracketed(items: [Wire], budget: i64, open: str, close: str) -> str {
+    let shown = items.len().min(3)
+    var parts: [str] = []
+    for i in 0..shown {
+        parts.push(render(items[i], budget / 3))
+    }
+    if shown < items.len() {
+        parts.push("… {items.len() - shown} more")
+    }
+    "{open}{parts.join(", ")}{close}"
+}
+
+// ----- values ------------------------------------------------------------------------
+
+/// A value of the program in the one shape (`journal::to_wire`). No
+/// built-in answers with anything else; one that did would be a hook's
+/// mistake, said by name, exit 7.
+pub fn to_wire(p: TirProg, v: Value) -> Wire {
+    match v {
+        VUnit -> WUnit
+        VInt(n) -> WInt(n)
+        VFloat(f) -> WFloat(f)
+        VBool(b) -> WBool(b)
+        VStr(s) -> WStr(s)
+        VBytes(b) -> WBytes(b)
+        VList(items) -> WList(wires(p, items))
+        VTuple(items) -> WTuple(wires(p, items))
+        VOk(x) -> WVariant("!", "Ok", [to_wire(p, x)])
+        VErr(x) -> WVariant("!", "Err", [to_wire(p, x)])
+        VVariant(ty, idx, fields) -> WVariant(p.ty_name[ty], p.ty_variants[ty][idx], wires(p, fields))
+        VRange(_, _, _) -> unsupported("range")
+        VMap(_, _, _, _, _) -> unsupported("map")
+        VRef(_, _) -> unsupported("reference")
+        VU64(_) -> unsupported("u64")
+        VStrB(_) -> unsupported("string builder")
+        VByteB(_) -> unsupported("byte builder")
+        VStruct(_, _) -> unsupported("struct")
+        VClosure(_, _, _) -> unsupported("closure")
+        VFn(_) -> unsupported("function")
+    }
+}
+
+fn wires(p: TirProg, items: [Value]) -> [Wire] {
+    var out: [Wire] = []
+    for x in items {
+        out.push(to_wire(p, x))
+    }
+    out
+}
+
+fn unsupported(what: str) -> Wire {
+    eprint("grasm: cannot record a {what} — the journal has no encoding for it, and recording something else in its place would make the replay a lie about what happened")
+    exit(7)
+    WUnit
+}
+
+/// A recorded value as the program's (`journal::from_wire`).
+pub fn from_wire(p: TirProg, w: Wire) -> Value {
+    match w {
+        WUnit -> VUnit
+        WInt(n) -> VInt(n)
+        WFloat(f) -> VFloat(f)
+        WBool(b) -> VBool(b)
+        WStr(s) -> VStr(s)
+        WBytes(b) -> VBytes(b)
+        WList(items) -> VList(values(p, items))
+        WTuple(items) -> VTuple(values(p, items))
+        WVariant(ty, name, fields) -> {
+            if ty == "!" and name == "Ok" {
+                return VOk(if fields.is_empty() { VUnit } else { from_wire(p, fields[0]) })
+            }
+            if ty == "!" and name == "Err" {
+                return VErr(if fields.is_empty() { VUnit } else { from_wire(p, fields[0]) })
+            }
+            for t in 0..p.ty_name.len() {
+                if p.ty_name[t] == ty {
+                    let vs = p.ty_variants[t]
+                    for i in 0..vs.len() {
+                        if vs[i] == name {
+                            return VVariant(t, i, values(p, fields))
+                        }
+                    }
+                }
+            }
+            eprint("grasm: the journal answers with `{ty}::{name}`, which this program has no type for")
+            exit(7)
+            VUnit
+        }
+    }
+}
+
+fn values(p: TirProg, items: [Wire]) -> [Value] {
+    var out: [Value] = []
+    for x in items {
+        out.push(from_wire(p, x))
+    }
+    out
+}
+
+// ----- the mode --------------------------------------------------------------------
+
+/// The mode a run starts in: off when neither variable is set, so a run
+/// with no journal pays one comparison a built-in; else not chosen yet,
+/// which the first question does, as the reference's does.
+pub fn initial_state() -> i64 {
+    match env("GRASM_RECORD") {
+        Some(_) -> return J_UNASKED
+        None -> ()
+    }
+    match env("GRASM_REPLAY") {
+        Some(_) -> J_UNASKED
+        None -> J_OFF
+    }
+}
+
+/// Chooses the mode, the first time the run asks (`grasm_journal::open`).
+pub fn ensure(inout cx: Cx) {
+    if cx.jstate != J_UNASKED {
+        return
+    }
+    match env("GRASM_RECORD") {
+        Some(path) -> {
+            match write_bytes(path, magic()) {
+                Ok(_) -> ()
+                Err(e) -> {
+                    eprint("grasm: cannot record to {path}: {io_words(e)}")
+                    exit(7)
+                }
+            }
+            cx.jpath = path
+            cx.jstate = J_RECORD
+            return
+        }
+        None -> ()
+    }
+    match env("GRASM_REPLAY") {
+        Some(path) -> {
+            match read(path) {
+                Ok(r) -> {
+                    let (names, vals) = r
+                    cx.jnames = names
+                    cx.jvals = vals
+                    cx.jat = 0
+                    cx.jstate = J_REPLAY
+                }
+                Err(why) -> {
+                    eprint("grasm: cannot replay {path}: {why}")
+                    exit(7)
+                }
+            }
+            return
+        }
+        None -> ()
+    }
+    cx.jstate = J_OFF
+}
+
+/// Replays a journal handed over as bytes (`grasm_journal::install`): the
+/// debug adapter's `journal` launch argument.
+pub fn install(inout cx: Cx, raw: bytes) -> () ! str {
+    let r = try parse(raw)
+    ensure(cx)
+    if cx.jstate != J_OFF {
+        fail("this run already has a journal")
+    }
+    let (names, vals) = r
+    cx.jnames = names
+    cx.jvals = vals
+    cx.jat = 0
+    cx.jstate = J_REPLAY
+    ()
+}
+
+/// The next recorded answer for `name` (`grasm_journal::gate`), which must
+/// name it; else the run stops.
+pub fn gate(inout cx: Cx, name: str) -> Value {
+    if cx.jat >= cx.jnames.len() {
+        eprint("grasm: the journal ran out at call {cx.jat + 1} (`{name}`) — the program reached outside itself more often than the recording holds, so it has diverged from the run being replayed")
+        exit(7)
+    }
+    let recorded = cx.jnames[cx.jat]
+    if recorded != name {
+        eprint("grasm: at call {cx.jat + 1} the recording says `{recorded}` and this run asked for `{name}` — the program has taken a different path from the one recorded, so this is not a replay of it")
+        exit(7)
+    }
+    let w = cx.jvals[cx.jat]
+    cx.jat += 1
+    from_wire(cx.p, w)
+}
+
+/// Writes one record, after the effect happened (`grasm_journal::put`).
+pub fn put(cx: Cx, name: str, v: Value) {
+    // A write that fails is not reported, as the reference's is not.
+    match append_bytes(cx.jpath, framed_record(name, to_wire(cx.p, v))) {
+        Ok(_) -> ()
+        Err(_) -> ()
+    }
+}
+
+/// Stops a replay that is about to call C (`grasm_journal::refuse_foreign`).
+pub fn refuse_foreign(inout cx: Cx, name: str) {
+    ensure(cx)
+    if cx.jstate != J_REPLAY {
+        return
+    }
+    eprint("grasm: this run calls the C function `{name}`, and a recording holds nothing a C function did — replaying would call it for real, so the replay stops here")
+    exit(7)
+}

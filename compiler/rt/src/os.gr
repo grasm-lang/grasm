@@ -33,6 +33,9 @@ pub let MAP_PRIVATE_ANON = 4098
 /// `dlsym`'s handle for every image the process has loaded.
 pub let RTLD_DEFAULT = -2
 
+/// `dlsym`'s handle for the executable's own exports: RTLD_MAIN_ONLY.
+pub let RTLD_MAIN = -5
+
 /// Where a `struct dirent`'s name starts.
 pub let DIRENT_NAME = 21
 

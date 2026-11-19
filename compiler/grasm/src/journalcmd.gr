@@ -1,0 +1,61 @@
+// `grasm journal <file> [--full]`: what a recorded run read from outside
+// itself (docs/replay.md), printed as the Rust command prints it
+// (crates/grasm/src/main.rs, `Some("journal")`; docs/self-hosting.md §6.22).
+// The reading and the rendering are the TIR interpreter's journal's, the
+// one this command records and replays with.
+import tirinterp.journal
+
+pub fn cmd_journal(a: [str]) {
+    if a.len() < 2 or a[1].starts_with("--") {
+        eprint("usage: grasm journal <file> [--full]")
+        exit(1)
+    }
+    let path = a[1]
+    // `--full` anywhere, as the Rust command looks for it; else 48
+    // characters a value.
+    let budget = if a.contains("--full") { journal.FULL } else { 48 }
+    let (names, vals) = match journal.read(path) {
+        Ok(r) -> r
+        Err(why) -> {
+            eprint("grasm: cannot read {path}: {why}")
+            exit(1)
+            ([], [])
+        }
+    }
+    let size = match file_size(path) {
+        Ok(n) -> n
+        Err(_) -> 0
+    }
+    print("{path} — {names.len()} record(s), {size} bytes")
+    if names.is_empty() {
+        print("")
+        print("The program read nothing from outside itself.")
+        return
+    }
+    // The widest name in bytes, padded in characters, as `format!` pads.
+    var width = 0
+    for n in names {
+        width = width.max(n.to_bytes().len())
+    }
+    let places = "{names.len()}".len()
+    print("")
+    for i in 0..names.len() {
+        let num = "{i + 1}"
+        let pad_num = " ".repeat((places - num.len()).max(0))
+        let pad_name = " ".repeat((width - names[i].chars().len()).max(0))
+        print("  {pad_num}{num}  {names[i]}{pad_name}  {journal.render(vals[i], budget)}")
+    }
+    // Calls per built-in, in byte order of the name.
+    var tally: Map[str, i64] = map()
+    for n in names {
+        tally.set(n, (tally.get(n) ?? 0) + 1)
+    }
+    var keys = tally.keys()
+    keys.sort()
+    var summary: [str] = []
+    for k in keys {
+        summary.push("{k} {tally.get(k) ?? 0}")
+    }
+    print("")
+    print("  {names.len()} call(s) across {keys.len()} builtin(s): {summary.join(", ")}")
+}

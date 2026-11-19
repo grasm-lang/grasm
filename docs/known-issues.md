@@ -9,8 +9,9 @@ makes shipping them honest rather than quiet.
 `IoFailed` that `grasm run` and a native binary word differently; one
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
-ten, four in `grasm lsp`, `grasm dap` and the journal -- a replay
-leaving records unread in silence, a breakpoint by another path's
+eleven, five in `grasm lsp`, `grasm dap` and the journal -- the adapter
+running a program without the checker's facts, a replay leaving records
+unread in silence, a breakpoint by another path's
 spelling never stopping, positions as bytes, a diagnostic at the end of
 the buffer dropped -- a block whose value is a map literal and a statement `if` whose
 branches' values differ, refused natively, and four in the manifest reader
@@ -48,6 +49,42 @@ stay comparable byte for byte (`scripts/clidiff.sh`), and none is fixed in
 Rust. Severities are the coordinator's (2026-11-15) but for the dropped
 diagnostic, rated S3 here for the reason the coordinator gave the first
 two: it quietly gives the wrong answer.
+
+**The debug adapter runs a program without the checker's facts -- *open,
+S3*.** `grasm_dap::serve` makes its interpreter with `Interp::new_program`
+and never hands it what `grasm run` hands it from the checker
+(`set_float_literals`, `set_narrow_ints`, `set_mem_ops`, `set_c_facts`,
+`set_ok_wrapped`, `set_field_calls`, `set_interfaces`,
+`set_fallible_closures`, `set_float_sums`; `crates/grasm_interp/src/lib.rs`).
+So under `grasm dap` a program computes otherwise than under `grasm run`:
+an integer literal a `[f64]` stores stays an integer, a `u8` does not wrap,
+a `u64` is signed, `call_c` and raw memory are "not resolved", and an
+actor's methods called from a task panic (`spec/conformance/E-ACTOR.gr`
+ends 101 at its first `go`). Measured 2026-11-15:
+
+```
+fn main() {
+    var xs: [f64] = []
+    xs.push(3)
+    print(xs)
+    let b: u8 = 250
+    print(b + 10)
+    let u: u64 = 18446744073709551615
+    print(u / 2)
+}
+```
+
+prints `[3.0]`, `4` and `9223372036854775807` under `grasm run`, and `[3]`,
+`260` and `0` as `output` events under `grasm dap`; its variables pane
+shows `u` as an `i64` holding `-1`. Rated S3 here, by the coordinator's
+rule for the others (it quietly gives the wrong answer); by
+docs/release-scope.md's words it is close to S1 (a wrong answer a program
+can see), though in a tool rather than an engine. Not copied: the Grasm
+adapter runs the program as `grasm run` does, since TIR carries the facts
+the Rust adapter drops and undoing them would mean another interpreter;
+`clidiff` holds a session where the Rust adapter prints or ends otherwise
+than `grasm run` to `grasm run` instead, and counts it (docs/self-hosting.md
+§6.22).
 
 **A replay that ends with records unread says nothing -- *open, S3*.**
 docs/replay.md: "A replay that ends with records unread says so". It does

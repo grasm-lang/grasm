@@ -32,9 +32,18 @@
 #   publish-where  `publish` writes into <registry>/<version>/<name>  a registry differs
 #   toml-first     the TOML reader keeps the first of a key set twice
 #                  in an entry of an array of tables, not the last    a deps differs
+#   journal-lost   the interpreter's journal drops every `read_bytes` record
+#                                                                    the journals differ
+#   exempt-gone    the runtime looks for another name than `unjournaled_host`,
+#                  so the command journals its own reads             a recording differs
+#   dap-field      `stopped` without `allThreadsStopped`             a session differs
+#   dap-line       every stop a line further on                      a session differs
+#   lsp-diag       a diagnostic at the end of the buffer kept         a session differs
+#   lsp-hover      a function's signature written `->` with no spaces a session differs
 #
 # `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
-# 22 holds only on a whole run.
+# 28 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
+# its runtime object from the planted sources too.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -95,7 +104,11 @@ open(path, "w").write(text)
 EOF
     mkdir -p "$WORK/$name/cli"
     "$GRASM" build "$WORK/$name/compiler/grasm/src/main.gr" --native --no-incremental -o "$WORK/$name/cli/grasm" || return 1
-    cp "$WORK/clean/rt.o" "$WORK/$name/cli/rt.o"
+    if [ -n "${PLANT_RT:-}" ]; then
+        "$WORK/clean/grasm" build "$WORK/$name/compiler/rt/src/main.gr" --native -o "$WORK/$name/cli/rt.o" || return 1
+    else
+        cp "$WORK/clean/rt.o" "$WORK/$name/cli/rt.o"
+    fi
 }
 
 # control NAME WHY ENV FILE OLD NEW: plant, then clidiff, with the
@@ -107,7 +120,9 @@ control() {
         return 0
     fi
     ran=$((ran + 1))
-    if ! plant "$name" "$file" "$@" >"$WORK/$name.plant" 2>&1; then
+    local plant_rt=
+    case " $envs " in *" PLANT_RT=1 "*) plant_rt=1 ;; esac
+    if ! PLANT_RT=$plant_rt plant "$name" "$file" "$@" >"$WORK/$name.plant" 2>&1; then
         missed=$((missed + 1))
         MISSED+=("$name: could not be planted: $(head -3 "$WORK/$name.plant" | tr '\n' ' ')")
         echo "MISSED: $name could not be planted"
@@ -283,6 +298,43 @@ control toml-first '^DIFF: registry lockfile: grasm deps app' ONLY=registry "$TO
     '            if at_key >= 0 {
                 let _first = vid'
 
+# S8 part five (§6.22): a journal entry lost, the command's exemption from
+# its own runtime's journal gone, a response field dropped, a step on the
+# wrong line, a diagnostic kept that Rust drops, a hover reworded.
+printf '%s\n' packages/certdiff/src/main.gr >"$WORK/certdiff"
+printf '%s\n' examples/hello.gr >"$WORK/hello"
+JOURNAL=tools/tirinterp/src/journal.gr
+DEBUG=tools/tirinterp/src/debug.gr
+LSP=compiler/grasm/src/lsp.gr
+RTJ=compiler/rt/src/journal.gr
+
+control journal-lost '^DIFF: GRASM_RECORD grasm run packages/certdiff/src/main.gr -- the journals differ' "ONLY=journal FILES=$WORK/certdiff CLI_JOURNAL_BUILD=1" "$JOURNAL" \
+    'pub fn put(cx: Cx, name: str, v: Value) {' \
+    'pub fn put(cx: Cx, name: str, v: Value) {
+    if name == "read_bytes" {
+        return
+    }'
+
+control exempt-gone '^DIFF: GRASM_RECORD grasm run examples/hello.gr -- a journal written by one command and not the other' "ONLY=journal FILES=$WORK/hello CLI_JOURNAL_BUILD=1 PLANT_RT=1" "$RTJ" \
+    'mem_static("unjournaled_host")' \
+    'mem_static("unjournaled_hosx")'
+
+control dap-field '^DIFF: grasm dap step examples/hello.gr ' "ONLY=dap FILES=$WORK/hello" "$DEBUG" \
+    '("threadId", json.jint(THREAD_ID)), ("allThreadsStopped", JBool(true))' \
+    '("threadId", json.jint(THREAD_ID))'
+
+control dap-line '^DIFF: grasm dap step examples/hello.gr ' "ONLY=dap FILES=$WORK/hello" "$DEBUG" \
+    '    (cx.d_paths[f], lo + 1, off - starts[lo] + 1)' \
+    '    (cx.d_paths[f], lo + 2, off - starts[lo] + 1)'
+
+control lsp-diag '^DIFF: grasm lsp on examples/hello.gr ' "ONLY=lsp FILES=$WORK/hello" "$LSP" \
+    '                if ss[i] < end {' \
+    '                if ss[i] <= end {'
+
+control lsp-hover '^DIFF: grasm lsp on examples/hello.gr ' "ONLY=lsp FILES=$WORK/hello" "$LSP" \
+    '        s.push_str(" -> " + type_text(a, ret))' \
+    '        s.push_str("->" + type_text(a, ret))'
+
 echo
 echo "controls: $ran   caught: $caught   missed: $missed"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -295,4 +347,4 @@ if [ -n "${CONTROLS:-}" ]; then
     [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
     exit
 fi
-[ "$ran" -ge 22 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 28 ] && [ "$caught" = "$ran" ]

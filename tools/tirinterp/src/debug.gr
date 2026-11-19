@@ -1,0 +1,585 @@
+// The debug adapter's second phase, inside the interpreter: the program
+// runs, and before each statement the adapter may stop it and serve
+// requests until told to go on -- as `crates/grasm_dap/src/lib.rs` does
+// through the reference interpreter's `DebugHook` (docs/self-hosting.md
+// §6.22, decisions (3) to (7)).
+//
+// Nothing here runs unless `cx.dbg` is set, which only `grasm dap` sets.
+// What the reference shows -- its call stack of `module::function` and call
+// sites, and per call its stack of scopes from name to value -- is kept
+// beside the interpreter's slot frames, in the reference's shape:
+//
+//   * a frame for every call of a declared function, named as TIR names it,
+//     at the statement that was running when it was called; a closure's
+//     call is not a frame, as it is not in the reference;
+//   * per call (a function's or a closure's) a stack of scopes: the
+//     parameters', then one per block, `for` iteration and `match` arm; a
+//     binding by its variable, read from the slot when a request asks, or
+//     -- a closure's surroundings, which the reference copies when the
+//     closure is made -- by value;
+//   * the current position: the start of the statement last begun, which
+//     a return from a declared function puts back.
+import eval
+import value
+import json
+import rpc
+
+let R_CONTINUE = 0
+let R_NEXT = 1
+let R_STEPIN = 2
+let R_STEPOUT = 3
+let R_TERMINATE = 4
+
+/// The one thread the adapter reports.
+let THREAD_ID = 1
+
+// ----- scopes ------------------------------------------------------------------------
+
+pub fn push_scope(inout cx: Cx) {
+    cx.d_sc.push(cx.d_bname.len())
+}
+
+pub fn pop_scope(inout cx: Cx) {
+    let s = cx.d_sc.pop() ?? 0
+    truncate(cx, s)
+}
+
+fn truncate(inout cx: Cx, n: i64) {
+    while cx.d_bname.len() > n {
+        cx.d_bname.pop()
+        cx.d_bvar.pop()
+        cx.d_bval.pop()
+    }
+}
+
+/// A binding of variable `v`, named as the function the frame belongs to
+/// names it.
+pub fn bind(inout cx: Cx, v: i64) {
+    let names = cx.d_names
+    let name = if v < names.len() { names[v] } else { "" }
+    cx.d_bname.push(name)
+    cx.d_bvar.push(v)
+    cx.d_bval.push(VUnit)
+}
+
+fn bind_value(inout cx: Cx, name: str, v: Value) {
+    cx.d_bname.push(name)
+    cx.d_bvar.push(-1)
+    cx.d_bval.push(v)
+}
+
+/// A declared function's call begins: its frame, at the statement running
+/// now, and its parameters' scope.
+pub fn enter_fn(inout cx: Cx, fid: i64) -> (i64, [str]) {
+    let saved = (cx.d_cur, cx.d_names)
+    cx.d_fname.push(cx.p.fn_name[fid])
+    cx.d_fsite.push(cx.d_cur)
+    cx.d_act.push(cx.d_sc.len())
+    cx.d_names = cx.p.fn_vnames[fid]
+    push_scope(cx)
+    for v in cx.p.fn_params[fid] {
+        bind(cx, v)
+    }
+    saved
+}
+
+/// It returned: its scopes go, its frame goes, and the position is the
+/// caller's again.
+pub fn leave_fn(inout cx: Cx, saved: (i64, [str])) {
+    let a = cx.d_act.pop() ?? 0
+    while cx.d_sc.len() > a {
+        pop_scope(cx)
+    }
+    cx.d_fname.pop()
+    cx.d_fsite.pop()
+    let (cur, names) = saved
+    cx.d_cur = cur
+    cx.d_names = names
+}
+
+/// A closure is made: what the reference copies into it -- every name its
+/// body mentions that is bound here, the innermost binding's value.
+pub fn closure_made(inout cx: Cx, ci: i64, serial: i64) {
+    let fid = cx.p.clo_fid[ci]
+    let fnames = if fid >= 0 { cx.p.fn_vnames[fid] } else { [] }
+    var wanted: Map[str, bool] = map()
+    for v in cx.p.clo_reads[ci] {
+        if v < fnames.len() {
+            wanted.set(fnames[v], true)
+        }
+    }
+    var names: [str] = []
+    var vals: [Value] = []
+    let from = act_bindings_start(cx)
+    var seen: Map[str, bool] = map()
+    var i = cx.d_bname.len() - 1
+    while i >= from {
+        let n = cx.d_bname[i]
+        if wanted.has(n) and not seen.has(n) {
+            seen.set(n, true)
+            names.push(n)
+            vals.push(binding_value(cx, i))
+        }
+        i -= 1
+    }
+    cx.d_env.set(serial, cx.d_envn.len())
+    cx.d_envn.push(names)
+    cx.d_envv.push(vals)
+}
+
+/// A closure's call begins: one scope, its copied surroundings and then its
+/// parameters.
+pub fn enter_closure(inout cx: Cx, ci: i64, serial: i64) -> [str] {
+    let saved = cx.d_names
+    cx.d_act.push(cx.d_sc.len())
+    let fid = cx.p.clo_fid[ci]
+    cx.d_names = if fid >= 0 { cx.p.fn_vnames[fid] } else { [] }
+    push_scope(cx)
+    match cx.d_env.get(serial) {
+        Some(k) -> {
+            let names = cx.d_envn[k]
+            let vals = cx.d_envv[k]
+            for j in 0..names.len() {
+                bind_value(cx, names[j], vals[j])
+            }
+        }
+        None -> ()
+    }
+    for v in cx.p.clo_params[ci] {
+        bind(cx, v)
+    }
+    saved
+}
+
+pub fn leave_closure(inout cx: Cx, saved: [str]) {
+    let a = cx.d_act.pop() ?? 0
+    while cx.d_sc.len() > a {
+        pop_scope(cx)
+    }
+    cx.d_names = saved
+}
+
+fn act_bindings_start(cx: Cx) -> i64 {
+    if cx.d_act.is_empty() {
+        return 0
+    }
+    let a = cx.d_act[cx.d_act.len() - 1]
+    if a < cx.d_sc.len() {
+        return cx.d_sc[a]
+    }
+    cx.d_bname.len()
+}
+
+fn binding_value(cx: Cx, i: i64) -> Value {
+    let v = cx.d_bvar[i]
+    if v < 0 {
+        return cx.d_bval[i]
+    }
+    if v < cx.fr.len() {
+        return cx.fr[v]
+    }
+    VUnit
+}
+
+/// The innermost binding of `name` in the current call, if any
+/// (`debug_lookup`).
+fn lookup(cx: Cx, name: str) -> Option[Value] {
+    let from = act_bindings_start(cx)
+    var i = cx.d_bname.len() - 1
+    while i >= from {
+        if cx.d_bname[i] == name {
+            return Some(binding_value(cx, i))
+        }
+        i -= 1
+    }
+    None
+}
+
+// ----- where things are -----------------------------------------------------------
+
+/// (path, 1-based line, 1-based byte column) of program offset `at`
+/// (`SourceMap::locate`).
+fn locate(cx: Cx, at0: i64) -> (str, i64, i64) {
+    let at = at0.max(0)
+    var f = 0
+    for i in 0..cx.d_bases.len() {
+        if at >= cx.d_bases[i] {
+            f = i
+        }
+    }
+    if cx.d_paths.is_empty() {
+        return ("", 1, 1)
+    }
+    let starts = cx.d_starts[f]
+    let off = at - cx.d_bases[f]
+    var lo = 0
+    var hi = starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    (cx.d_paths[f], lo + 1, off - starts[lo] + 1)
+}
+
+fn file_name(path: str) -> str {
+    let parts = path.split("/")
+    parts[parts.len() - 1]
+}
+
+// ----- the protocol ---------------------------------------------------------------
+
+pub fn event(inout cx: Cx, name: str, body: Json) {
+    cx.d_seq += 1
+    rpc.send(json.obj([("seq", json.jint(cx.d_seq)), ("type", json.jstr("event")), ("event", json.jstr(name)), ("body", body)]))
+}
+
+fn respond(inout cx: Cx, req: Json, body: Json) {
+    cx.d_seq += 1
+    rpc.send(json.obj([
+        ("seq", json.jint(cx.d_seq)),
+        ("type", json.jstr("response")),
+        ("request_seq", json.jint(json.as_int(json.get(req, "seq")) ?? 0)),
+        ("success", JBool(true)),
+        ("command", json.jstr(json.as_str(json.get(req, "command")) ?? "")),
+        ("body", body),
+    ]))
+}
+
+fn respond_fail(inout cx: Cx, req: Json, message: str) {
+    cx.d_seq += 1
+    rpc.send(json.obj([
+        ("seq", json.jint(cx.d_seq)),
+        ("type", json.jstr("response")),
+        ("request_seq", json.jint(json.as_int(json.get(req, "seq")) ?? 0)),
+        ("success", JBool(false)),
+        ("command", json.jstr(json.as_str(json.get(req, "command")) ?? "")),
+        ("message", json.jstr(message)),
+    ]))
+}
+
+pub fn thread_list() -> Json {
+    json.obj([("threads", JArr([json.obj([("id", json.jint(THREAD_ID)), ("name", json.jstr("main"))])]))])
+}
+
+/// Before statement `node`: where the program is now, and whether to stop
+/// there (`Suspender::before_stmt`).
+pub fn before_stmt(inout cx: Cx, node: i64) {
+    let at = match cx.d_stmt.get(node) {
+        Some(o) -> o
+        None -> return
+    }
+    cx.d_cur = at
+    if cx.d_terminated {
+        return
+    }
+    let depth = cx.d_fname.len()
+    let (path, line, _) = locate(cx, at)
+    var hit = false
+    for i in 0..cx.d_bp_path.len() {
+        if cx.d_bp_path[i] == path and cx.d_bp_line[i] == line {
+            hit = true
+        }
+    }
+    let r = cx.d_resume
+    let stop = if r == R_CONTINUE { hit } else if r == R_STEPIN { true } else if r == R_NEXT { hit or depth <= cx.d_step_depth } else if r == R_STEPOUT { hit or depth < cx.d_step_depth } else { false }
+    if not stop {
+        return
+    }
+    let reason = if hit and r == R_CONTINUE { "breakpoint" } else { "step" }
+    event(cx, "stopped", json.obj([("reason", json.jstr(reason)), ("threadId", json.jint(THREAD_ID)), ("allThreadsStopped", JBool(true))]))
+    serve_while_stopped(cx)
+}
+
+fn serve_while_stopped(inout cx: Cx) {
+    while true {
+        let msg = match rpc.dap_read(cx.d_in) {
+            Ok(x) -> {
+                let (more, m) = x
+                if not more {
+                    cx.d_terminated = true
+                    cx.d_resume = R_TERMINATE
+                    return
+                }
+                m
+            }
+            Err(_) -> {
+                // The client vanished: stop rather than run on unsupervised.
+                cx.d_terminated = true
+                cx.d_resume = R_TERMINATE
+                return
+            }
+        }
+        let command = json.as_str(json.get(msg, "command")) ?? ""
+        let depth = cx.d_fname.len()
+        if command == "continue" {
+            cx.d_resume = R_CONTINUE
+            respond(cx, msg, json.obj([("allThreadsContinued", JBool(true))]))
+            return
+        }
+        if command == "next" {
+            cx.d_resume = R_NEXT
+            cx.d_step_depth = depth
+            respond(cx, msg, JNull)
+            return
+        }
+        if command == "stepIn" {
+            cx.d_resume = R_STEPIN
+            respond(cx, msg, JNull)
+            return
+        }
+        if command == "stepOut" {
+            cx.d_resume = R_STEPOUT
+            cx.d_step_depth = depth
+            respond(cx, msg, JNull)
+            return
+        }
+        if command == "disconnect" or command == "terminate" {
+            cx.d_resume = R_TERMINATE
+            cx.d_terminated = true
+            respond(cx, msg, JNull)
+            return
+        }
+        if command == "threads" {
+            respond(cx, msg, thread_list())
+        } else if command == "stackTrace" {
+            let body = stack_trace(cx)
+            respond(cx, msg, body)
+        } else if command == "scopes" {
+            let frame_id = json.as_int(json.path(msg, "arguments.frameId")) ?? 0
+            respond(cx, msg, scopes(frame_id))
+        } else if command == "variables" {
+            let body = variables(cx, msg)
+            respond(cx, msg, body)
+        } else if command == "evaluate" {
+            let expr = json.as_str(json.path(msg, "arguments.expression")) ?? ""
+            let name = rpc.trim(expr)
+            match lookup(cx, name) {
+                Some(v) -> {
+                    let body = json.obj([("result", json.jstr(render(cx, v))), ("type", json.jstr(type_name(v))), ("variablesReference", json.jint(0))])
+                    respond(cx, msg, body)
+                }
+                // Only a name is looked up; evaluating anything else would
+                // run code with effects while stopped.
+                None -> respond_fail(cx, msg, "no variable named `{name}`")
+            }
+        } else if command == "setBreakpoints" {
+            let body = set_breakpoints(cx, msg)
+            respond(cx, msg, body)
+        } else {
+            respond(cx, msg, JNull)
+        }
+    }
+}
+
+fn stack_trace(cx: Cx) -> Json {
+    var frames: [Json] = []
+    var at = cx.d_cur
+    var i = cx.d_fname.len() - 1
+    while i >= 0 {
+        let (path, line, col) = locate(cx, at)
+        let id = cx.d_fname.len() - 1 - i
+        frames.push(json.obj([
+            ("id", json.jint(id)),
+            ("name", json.jstr(cx.d_fname[i])),
+            ("source", json.obj([("name", json.jstr(file_name(path))), ("path", json.jstr(path))])),
+            ("line", json.jint(line)),
+            ("column", json.jint(col)),
+        ]))
+        at = cx.d_fsite[i]
+        i -= 1
+    }
+    json.obj([("totalFrames", json.jint(frames.len())), ("stackFrames", JArr(frames))])
+}
+
+/// One scope per frame; only the innermost's locals can be read.
+fn scopes(frame_id: i64) -> Json {
+    let inner = frame_id == 0
+    json.obj([("scopes", JArr([json.obj([
+        ("name", json.jstr("Locals")),
+        ("variablesReference", json.jint(if inner { 1 } else { 0 })),
+        ("expensive", JBool(false)),
+        ("presentationHint", json.jstr(if inner { "locals" } else { "registers" })),
+    ])]))])
+}
+
+/// Every name bound in the current call, its innermost binding, by name.
+fn variables(cx: Cx, req: Json) -> Json {
+    let reference = json.as_int(json.path(req, "arguments.variablesReference")) ?? 0
+    if reference != 1 {
+        return json.obj([("variables", JArr([]))])
+    }
+    let from = act_bindings_start(cx)
+    var seen: Map[str, i64] = map()
+    var names: [str] = []
+    var i = cx.d_bname.len() - 1
+    while i >= from {
+        let n = cx.d_bname[i]
+        if not seen.has(n) {
+            seen.set(n, i)
+            names.push(n)
+        }
+        i -= 1
+    }
+    names.sort()
+    var out: [Json] = []
+    for n in names {
+        let v = binding_value(cx, seen.get(n) ?? 0)
+        out.push(json.obj([("name", json.jstr(n)), ("value", json.jstr(render(cx, v))), ("type", json.jstr(type_name(v))), ("variablesReference", json.jint(0))]))
+    }
+    json.obj([("variables", JArr(out))])
+}
+
+/// A value as the variables pane shows it: a string as Rust's `{:?}`, the
+/// rest as the program would print it.
+fn render(cx: Cx, v: Value) -> str {
+    match v {
+        VStr(s) -> {
+            let f = cx.d_strdebug
+            f(s)
+        }
+        _ -> value.show(cx.p, v)
+    }
+}
+
+/// The reference's name for a value's kind.
+pub fn type_name(v: Value) -> str {
+    match v {
+        VInt(_) -> "i64"
+        VU64(_) -> "u64"
+        VRef(_, _) -> "ref"
+        VFloat(_) -> "f64"
+        VBool(_) -> "bool"
+        VStr(_) -> "str"
+        VBytes(_) -> "bytes"
+        VStrB(_) -> "StrBuilder"
+        VByteB(_) -> "ByteBuilder"
+        VList(_) -> "list"
+        VMap(_, _, _, _, _) -> "map"
+        VTuple(_) -> "tuple"
+        VStruct(_, _) -> "struct"
+        VVariant(_, _, _) -> "variant"
+        VOk(_) -> "result"
+        VErr(_) -> "result"
+        VClosure(_, _, _) -> "fn"
+        VFn(_) -> "fn"
+        VRange(_, _, _) -> "range"
+        VUnit -> "()"
+    }
+}
+
+/// `set_breakpoints`: a new list replaces that file's.
+pub fn set_breakpoints(inout cx: Cx, req: Json) -> Json {
+    let path = json.as_str(json.path(req, "arguments.source.path")) ?? ""
+    var keep_p: [str] = []
+    var keep_l: [i64] = []
+    for i in 0..cx.d_bp_path.len() {
+        if cx.d_bp_path[i] != path {
+            keep_p.push(cx.d_bp_path[i])
+            keep_l.push(cx.d_bp_line[i])
+        }
+    }
+    cx.d_bp_path = keep_p
+    cx.d_bp_line = keep_l
+    var requested: [Json] = []
+    match json.path(req, "arguments.breakpoints") {
+        Some(j) -> match j {
+            JArr(items) -> requested = items
+            _ -> ()
+        }
+        None -> ()
+    }
+    var known = false
+    for p in cx.d_paths {
+        if p == path or file_name(p) == file_name(path) {
+            known = true
+        }
+    }
+    var verified: [Json] = []
+    for bp in requested {
+        let line = json.as_int(json.get(bp, "line")) ?? 0
+        let ok = known and line > 0
+        if ok {
+            let l32 = line.bit_and(4294967295)
+            var there = false
+            for i in 0..cx.d_bp_path.len() {
+                if cx.d_bp_path[i] == path and cx.d_bp_line[i] == l32 {
+                    there = true
+                }
+            }
+            if not there {
+                cx.d_bp_path.push(path)
+                cx.d_bp_line.push(l32)
+            }
+        }
+        verified.push(json.obj([("verified", JBool(ok)), ("line", json.jint(line))]))
+    }
+    json.obj([("breakpoints", JArr(verified))])
+}
+
+// ----- the program's output, and its end --------------------------------------------
+
+/// The program printed `text`: an `output` event per whole line
+/// (`OutputSink`).
+pub fn out(inout cx: Cx, text: str) {
+    cx.d_out.push_str(text)
+    let b = cx.d_out.to_bytes()
+    var start = 0
+    for i in 0..b.len() {
+        if b.at(i) == 10 {
+            event(cx, "output", json.obj([("category", json.jstr("stdout")), ("output", json.jstr(b.slice(start, i + 1).to_str()))]))
+            start = i + 1
+        }
+    }
+    if start > 0 {
+        var rest = byte_builder()
+        rest.push_bytes(b.slice(start, b.len()))
+        cx.d_out = rest
+    }
+}
+
+/// What is left of the output once the program has ended.
+pub fn flush(inout cx: Cx) {
+    let b = cx.d_out.to_bytes()
+    if b.len() > 0 {
+        cx.d_out = byte_builder()
+        event(cx, "output", json.obj([("category", json.jstr("stdout")), ("output", json.jstr(b.to_str()))]))
+    }
+}
+
+/// A panic is leaving its first statement: the stack as it is
+/// (`capture_trace`), innermost first.
+pub fn capture_trace(inout cx: Cx) {
+    if cx.d_traced {
+        return
+    }
+    cx.d_traced = true
+    var at = cx.d_cur
+    var i = cx.d_fname.len() - 1
+    while i >= 0 {
+        cx.d_trace_fn.push(cx.d_fname[i])
+        cx.d_trace_at.push(at)
+        at = cx.d_fsite[i]
+        i -= 1
+    }
+}
+
+/// The run is over: the trace, if a panic left one, then `exited` and
+/// `terminated`.
+pub fn finish_run(inout cx: Cx, code: i64) {
+    flush(cx)
+    if cx.d_trace_fn.len() > 0 {
+        var text = str_builder()
+        text.push_str("stack trace (innermost first):\n")
+        for i in 0..cx.d_trace_fn.len() {
+            let (path, line, col) = locate(cx, cx.d_trace_at[i])
+            text.push_str("  {cx.d_trace_fn[i]} at {path}:{line}:{col}\n")
+        }
+        event(cx, "output", json.obj([("category", json.jstr("stderr")), ("output", json.jstr(text.to_str()))]))
+    }
+    event(cx, "exited", json.obj([("exitCode", json.jint(code))]))
+    event(cx, "terminated", json.obj([]))
+}

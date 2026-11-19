@@ -12,7 +12,8 @@
 #               (`build` without `--native`) only in the size
 #   elsewhere   a subcommand the Grasm command does not cover: it says it
 #               is not here, on stderr, and exits 1 (docs/self-hosting.md
-#               §6.17); the Rust one does whatever it does
+#               §6.17); the Rust one does whatever it does. Since §6.22 it
+#               covers every one, and no line has this tag
 #   runtime     a runtime package built `--native`: the Grasm command writes
 #               the runtime's object; the Rust one says there is no `main`
 #   target      a `--target` the Grasm backend does not write: refused in its
@@ -178,11 +179,22 @@ publish --registry r
 publish --registry
 add a b c d
 add a --x
-elsewhere lsp
+lsp
 lsp --x
-elsewhere dap a b c
-elsewhere journal x
+lsp a b c
+dap
+dap a b c
+dap --x
+journal
+journal x
 journal --full --x
+journal --full x
+journal -
+journal .
+journal examples/hello.gr
+journal examples/hello.gr x
+journal -- --full
+journal -x examples/hello.gr
 
 # `deps`, `add` and `publish` (docs/self-hosting.md §6.21). Each case runs in
 # a directory whose entries link to the checkout's, so a `deps` that wrote a

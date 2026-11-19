@@ -119,7 +119,8 @@ corpus_require
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-ONLY=${ONLY:-lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target,registry,deps,add,publish}
+ALL=lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target,registry,deps,add,publish,journal,dap,lsp
+ONLY=${ONLY:-$ALL}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
 if ! command -v sandbox-exec >/dev/null 2>&1; then
@@ -128,6 +129,7 @@ if ! command -v sandbox-exec >/dev/null 2>&1; then
 fi
 
 # The Grasm command.
+CLI_GIVEN=${CLI:-}
 if [ -n "${CLI:-}" ]; then
     CLI=$(cd "$CLI" && pwd) || exit 1
 else
@@ -144,6 +146,32 @@ G="$CLI/grasm"
 if [ ! -x "$G" ] || [ ! -f "$CLI/rt.o" ]; then
     echo "error: $CLI holds no grasm with rt.o beside it"
     exit 1
+fi
+# The command the `journal` section records and replays with: one whose
+# runtime is the Grasm one, which leaves the command's own reads out of the
+# journal (`unjournaled_host`, docs/self-hosting.md §6.22, decision (2)).
+# The Rust runtime cannot, so a command built here by the Rust `grasm` is
+# built again for this section as `scripts/rtswap.sh` builds a program on
+# the Grasm runtime: the Cranelift object, linked by `compiler/link` with
+# `rt.o` interposed. A `CLI=` command (a stage, built by the Grasm one) is
+# on the Grasm runtime already, unless `CLI_JOURNAL_BUILD=1` says to build
+# one so from `CLI_SRC` (the controls' planted copies);
+# `CLI_JOURNAL=<file>` names one.
+GJ=${CLI_JOURNAL:-}
+if want journal && [ -z "$GJ" ]; then
+    if [ -n "$CLI_GIVEN" ] && [ -z "${CLI_JOURNAL_BUILD:-}" ]; then
+        GJ=$G
+    else
+        GJ="$WORK/gj/grasm"
+        mkdir -p "$WORK/gj"
+        if ! "$GRASM" build "${CLI_SRC:-compiler/grasm/src}/main.gr" --native --no-incremental --target aarch64-apple-darwin -o "$WORK/gj/grasm.o" >"$WORK/gj.log" 2>&1 ||
+            ! "$GRASM" build compiler/link/src/main.gr --native -o "$WORK/gj/link" >>"$WORK/gj.log" 2>&1 ||
+            ! "$WORK/gj/link" -interpose "$CLI/rt.o" "$WORK/gj/grasm.o" -dead_strip -exported_symbol _unjournaled_host -o "$GJ" >>"$WORK/gj.log" 2>&1; then
+            echo "error: the command does not build on the Grasm runtime:"
+            sed 's/^/  /' "$WORK/gj.log"
+            exit 1
+        fi
+    fi
 fi
 G_REAL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$G")
 RUST_DIR=$(dirname "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$GRASM")")
@@ -1308,6 +1336,335 @@ if want publish; then
 fi
 rm -rf "$PK"
 
+# -------------------------------------------------------------------------
+# journal, dap, lsp (docs/self-hosting.md §6.22)
+# -------------------------------------------------------------------------
+
+# Whether the last two runs, $WORK/r.* and $WORK/g.*, said the same, a
+# panic's stack trace taken out of the Rust side's stderr as in `run`.
+same_run() { # r_rc g_rc
+    [ "$1" = "$2" ] && cmp -s "$WORK/r.out" "$WORK/g.out" &&
+        [ "$(strip_trace "$(cat "$WORK/r.err")")" == "$(strip_trace "$(cat "$WORK/g.err")")" ]
+}
+
+# journal: every corpus program with a `main`, run by each command under
+# `GRASM_RECORD`, each into a file of its own: the same output and status,
+# the same file or none, and the two the same bytes but for the values of
+# the built-ins that answer differently each time (scripts/lib/jnorm.py).
+# Every recording is then replayed by both commands, the Grasm command's
+# replayed by Rust too, and printed by both with and without `--full`; and
+# from every one that holds a record, the journals scripts/lib/jmangle.py
+# makes, each replayed and printed by both. Then each program whose
+# recording holds more than `args` is built natively by the Grasm command,
+# recorded by the executable, and replayed by both commands' `run`.
+j_runs=0
+j_same=0
+j_files=0
+j_replayed=0
+j_shown=0
+j_mangled=0
+j_iofailed=0
+j_native=0
+j_native_same=0
+mkdir -p "$WORK/jrec"
+: >"$WORK/jrich"
+if want journal; then
+    n=0
+    while IFS= read -r src; do
+        n=$((n + 1))
+        j_runs=$((j_runs + 1))
+        rm -f "$WORK/jr.jrnl" "$WORK/jg.jrnl"
+        GRASM_RECORD="$WORK/jr.jrnl" $RUN_LIMIT "$GRASM" run "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        GRASM_RECORD="$WORK/jg.jrnl" $RUN_LIMIT sandbox-exec -p "$NORUST" "$GJ" run "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        if ! same_run "$r_rc" "$g_rc"; then
+            fail "GRASM_RECORD grasm run $src -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+            diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+            continue
+        fi
+        if { [ -f "$WORK/jr.jrnl" ] && [ ! -f "$WORK/jg.jrnl" ]; } || { [ ! -f "$WORK/jr.jrnl" ] && [ -f "$WORK/jg.jrnl" ]; }; then
+            fail "GRASM_RECORD grasm run $src -- a journal written by one command and not the other"
+            continue
+        fi
+        if [ ! -f "$WORK/jr.jrnl" ]; then
+            j_same=$((j_same + 1))
+            continue
+        fi
+        j_files=$((j_files + 1))
+        why=$(python3 scripts/lib/jnorm.py "$WORK/jr.jrnl" "$WORK/jg.jrnl")
+        case $? in
+        0) ;;
+        2) j_iofailed=$((j_iofailed + 1)) ;;
+        *)
+            fail "GRASM_RECORD grasm run $src -- the journals differ: $why"
+            continue
+            ;;
+        esac
+        cp "$WORK/jr.jrnl" "$WORK/jrec/$n.jrnl"
+        ok=1
+        # Replayed: Rust's recording by both, the Grasm command's by Rust.
+        for pair in "jr.jrnl:G" "jg.jrnl:R"; do
+            j=${pair%%:*}
+            GRASM_REPLAY="$WORK/$j" $RUN_LIMIT "$GRASM" run "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            if [ "${pair#*:}" = G ]; then
+                GRASM_REPLAY="$WORK/$j" $RUN_LIMIT sandbox-exec -p "$NORUST" "$GJ" run "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            else
+                GRASM_REPLAY="$WORK/jr.jrnl" $RUN_LIMIT sandbox-exec -p "$NORUST" "$GJ" run "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            fi
+            g_rc=$?
+            if same_run "$r_rc" "$g_rc"; then
+                j_replayed=$((j_replayed + 1))
+            else
+                fail "GRASM_REPLAY=$j grasm run $src -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+                diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+                ok=0
+            fi
+        done
+        # Printed, as the files are, by both.
+        for j in jr.jrnl jg.jrnl; do
+            for full in "" --full; do
+                (cd "$WORK" && "$GRASM" journal "$j" $full >r.out 2>r.err)
+                r_rc=$?
+                (cd "$WORK" && g journal "$j" $full >g.out 2>g.err)
+                g_rc=$?
+                if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.out" "$WORK/g.out" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
+                    j_shown=$((j_shown + 1))
+                else
+                    fail "grasm journal $j $full (of $src) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                    diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+                    ok=0
+                fi
+            done
+        done
+        # The mangled journals, replayed and printed by both.
+        rm -rf "$WORK/jm"
+        for k in $(python3 scripts/lib/jmangle.py "$WORK/jr.jrnl" "$WORK/jm"); do
+            GRASM_REPLAY="$WORK/jm/$k.jrnl" $RUN_LIMIT "$GRASM" run "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+            r_rc=$?
+            GRASM_REPLAY="$WORK/jm/$k.jrnl" $RUN_LIMIT sandbox-exec -p "$NORUST" "$GJ" run "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+            g_rc=$?
+            if ! same_run "$r_rc" "$g_rc"; then
+                fail "GRASM_REPLAY=$k.jrnl grasm run $src -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+                ok=0
+                continue
+            fi
+            (cd "$WORK/jm" && "$GRASM" journal "$k.jrnl" --full >../r.out 2>../r.err)
+            r_rc=$?
+            (cd "$WORK/jm" && g journal "$k.jrnl" --full >../g.out 2>../g.err)
+            g_rc=$?
+            if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.out" "$WORK/g.out" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
+                j_mangled=$((j_mangled + 1))
+            else
+                fail "grasm journal $k.jrnl --full (of $src) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+                diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+                ok=0
+            fi
+        done
+        [ "$ok" = 1 ] && j_same=$((j_same + 1))
+        # More than `args`: built natively below.
+        if "$GRASM" journal "$WORK/jr.jrnl" | tail -1 | grep -qvE 'builtin\(s\): args [0-9]+$'; then
+            echo "$n $src" >>"$WORK/jrich"
+        fi
+    done <"$WORK/mains"
+    # A native recording replayed under `grasm run`, which is what a
+    # recording is for (docs/replay.md).
+    while read -r n src; do
+        j_native=$((j_native + 1))
+        rm -rf "$WORK/jn"
+        mkdir -p "$WORK/jn"
+        if ! "$G" build "$src" --native -o "$WORK/jn/p" >"$WORK/jn/build.log" 2>&1; then
+            fail "grasm build $src --native -- does not build, to record it"
+            continue
+        fi
+        GRASM_RECORD="$WORK/jn/p.jrnl" $RUN_LIMIT "$WORK/jn/p" >"$WORK/jn/live.out" 2>/dev/null </dev/null
+        GRASM_REPLAY="$WORK/jn/p.jrnl" $RUN_LIMIT "$GRASM" run "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
+        r_rc=$?
+        GRASM_REPLAY="$WORK/jn/p.jrnl" $RUN_LIMIT sandbox-exec -p "$NORUST" "$GJ" run "$src" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null
+        g_rc=$?
+        if same_run "$r_rc" "$g_rc"; then
+            j_native_same=$((j_native_same + 1))
+        else
+            fail "a native recording of $src replayed -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            diff "$WORK/r.out" "$WORK/g.out" | head -4 | sed 's/^/  /'
+            diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+        fi
+    done <"$WORK/jrich"
+    echo "journal: $j_runs programs recorded   the same: $j_same, $j_files of them with a journal ($j_iofailed differing only in the IoFailed wording)   replays alike: $j_replayed   printed alike: $j_shown   mangled journals alike: $j_mangled   native recordings replayed alike: $j_native_same of $j_native"
+fi
+
+# dap: the sessions scripts/lib/dapscript.py writes -- every corpus program
+# with a `main` stepped into 200 times, every fourth also stepped over and
+# out and run to breakpoints -- and its fixed sessions; each answer stream
+# compared as it arrives by length and SHA-256 (scripts/lib/streamsum.py),
+# with the status and stderr. A program that reads stdin is left out (the
+# protocol is its stdin, decision (5)); a session the Rust adapter does not
+# finish in 60 s, or ends by overflowing its own stack (exit 134), is counted
+# and not compared; a program whose stepping took Rust more than 10 s gets
+# no other session.
+d_runs=0
+d_same=0
+d_reads_stdin=0
+d_rust_long=0
+d_rust_abort=0
+d_fixed=0
+d_skipped=0
+d_rust_otherwise=0
+declare -a D_OTHERWISE=()
+DAP_LIMIT=${DAP_LIMIT:-60}
+dap_compare() { # label input
+    local t0 t1
+    t0=$(date +%s)
+    timeout "$DAP_LIMIT" "$GRASM" dap <"$2" 2>"$WORK/r.err" | python3 scripts/lib/streamsum.py >"$WORK/r.sum"
+    local r_rc=${PIPESTATUS[0]}
+    t1=$(date +%s)
+    D_RUST_SECONDS=$((t1 - t0))
+    if [ "$r_rc" = 124 ]; then
+        d_rust_long=$((d_rust_long + 1))
+        return 0
+    fi
+    if [ "$r_rc" = 134 ]; then
+        d_rust_abort=$((d_rust_abort + 1))
+        return 0
+    fi
+    d_runs=$((d_runs + 1))
+    timeout $((DAP_LIMIT * 4)) sandbox-exec -p "$NORUST" "$G" dap <"$2" 2>"$WORK/g.err" | python3 scripts/lib/streamsum.py >"$WORK/g.sum"
+    local g_rc=${PIPESTATUS[0]}
+    if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.sum" "$WORK/g.sum" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
+        d_same=$((d_same + 1))
+        return 0
+    fi
+    # The Rust adapter runs a program without the checker's facts -- the
+    # literal a `[f64]` stores, a `u64`'s or a `u8`'s width, raw memory,
+    # `call_c`, interface calls (docs/known-issues.md) -- so where it prints
+    # or ends otherwise than `grasm run`, its session is not the one to hold
+    # the Grasm adapter to: counted, and the Grasm adapter held to `grasm
+    # run` instead.
+    if [ -n "${3:-}" ] && ! ran_as_run "$GRASM" "$3"; then
+        if ran_as_run "$G" "$3"; then
+            d_rust_otherwise=$((d_rust_otherwise + 1))
+            D_OTHERWISE+=("$3")
+            return 0
+        fi
+        fail "grasm dap $1 -- the Grasm adapter runs it otherwise than grasm run"
+        return 1
+    fi
+    fail "grasm dap $1 -- exit $r_rc (Rust) and $g_rc (Grasm), $(cat "$WORK/r.sum") and $(cat "$WORK/g.sum")"
+    diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+    return 1
+}
+
+# Whether adapter $1, launched on $2 with no stop, prints and ends as `grasm
+# run` does.
+ran_as_run() { # adapter program
+    python3 scripts/lib/dapscript.py fixed launch "$2" "$WORK/plain.in"
+    if [ "$1" = "$GRASM" ]; then
+        timeout $((DAP_LIMIT * 4)) "$1" dap <"$WORK/plain.in" 2>/dev/null | python3 scripts/lib/dapran.py >"$WORK/plain.dap"
+    else
+        timeout $((DAP_LIMIT * 4)) sandbox-exec -p "$NORUST" "$1" dap <"$WORK/plain.in" 2>/dev/null | python3 scripts/lib/dapran.py >"$WORK/plain.dap"
+    fi
+    timeout $((DAP_LIMIT * 4)) "$GRASM" run "$2" >"$WORK/plain.run" 2>/dev/null </dev/null
+    echo "exit $?" >>"$WORK/plain.run"
+    cmp -s "$WORK/plain.dap" "$WORK/plain.run"
+}
+if want dap; then
+    n=0
+    while IFS= read -r src; do
+        n=$((n + 1))
+        if grep -q 'input()' "$src"; then
+            d_reads_stdin=$((d_reads_stdin + 1))
+            continue
+        fi
+        python3 scripts/lib/dapscript.py step "$src" "$WORK/d.in"
+        dap_compare "step $src" "$WORK/d.in" "$src"
+        [ $((n % 4)) = 0 ] || continue
+        if [ "$D_RUST_SECONDS" -gt 10 ]; then
+            d_skipped=$((d_skipped + 2))
+            continue
+        fi
+        for kind in next bp; do
+            python3 scripts/lib/dapscript.py "$kind" "$src" "$WORK/d.in"
+            dap_compare "$kind $src" "$WORK/d.in" "$src"
+        done
+    done <"$WORK/mains"
+    # The fixed sessions, on `examples/hello.gr`; launches that fail, on
+    # every tenth conformance program that must not compile and the
+    # registry app; a journal given to launch, on the recordings above.
+    for f in $(python3 scripts/lib/dapscript.py list-fixed); do
+        python3 scripts/lib/dapscript.py fixed "$f" examples/hello.gr "$WORK/d.in"
+        dap_compare "fixed $f" "$WORK/d.in" && d_fixed=$((d_fixed + 1))
+    done
+    k=0
+    for src in $(grep -l '^//! expect: error$' spec/conformance/*.gr) examples/registry/app/src/main.gr; do
+        k=$((k + 1))
+        [ $((k % 10)) = 1 ] || [ "$src" = examples/registry/app/src/main.gr ] || continue
+        python3 scripts/lib/dapscript.py fixed launch "$src" "$WORK/d.in"
+        dap_compare "launch $src" "$WORK/d.in" && d_fixed=$((d_fixed + 1))
+    done
+    printf 'GRASMJRNL1' >"$WORK/notajournal.jrnl"
+    for j in "$WORK/nosuch.jrnl" "$WORK/notajournal.jrnl"; do
+        python3 scripts/lib/dapscript.py fixed journal examples/hello.gr "$WORK/d.in" "$j"
+        dap_compare "journal $j" "$WORK/d.in" && d_fixed=$((d_fixed + 1))
+    done
+    while read -r jn src; do
+        python3 scripts/lib/dapscript.py fixed journal "$src" "$WORK/d.in" "$WORK/jrec/$jn.jrnl"
+        dap_compare "journal $src" "$WORK/d.in" "$src" && d_fixed=$((d_fixed + 1))
+    done <"$WORK/jrich"
+    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
+    if [ ${#D_OTHERWISE[@]} -gt 0 ]; then
+        printf '  run otherwise by the Rust adapter: %s\n' $(printf '%s\n' "${D_OTHERWISE[@]}" | sort -u)
+    fi
+fi
+
+# lsp: a scripted session per tracked `.gr` file (scripts/lib/lspscript.py)
+# and its fixed sessions, every byte of the answers compared.
+l_runs=0
+l_same=0
+l_fixed=0
+if want lsp; then
+    while IFS= read -r f; do
+        l_runs=$((l_runs + 1))
+        python3 scripts/lib/lspscript.py file "$f" "$WORK/l.in"
+        "$GRASM" lsp <"$WORK/l.in" >"$WORK/r.out" 2>"$WORK/r.err"
+        r_rc=$?
+        g lsp <"$WORK/l.in" >"$WORK/g.out" 2>"$WORK/g.err"
+        g_rc=$?
+        if same3 "$r_rc" "$g_rc"; then
+            l_same=$((l_same + 1))
+        else
+            fail "grasm lsp on $f -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            python3 - "$WORK/r.out" "$WORK/g.out" <<'PY' | head -6 | sed 's/^/  /'
+import sys
+a, b = open(sys.argv[1], 'rb').read(), open(sys.argv[2], 'rb').read()
+i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+print("first difference at byte %d:" % i)
+print(" Rust:  %r" % a[max(0, i - 80):i + 120])
+print(" Grasm: %r" % b[max(0, i - 80):i + 120])
+PY
+        fi
+    done < <(tracked_gr)
+    for f in $(python3 scripts/lib/lspscript.py list-fixed); do
+        l_runs=$((l_runs + 1))
+        python3 scripts/lib/lspscript.py fixed "$f" "$WORK/l.in"
+        "$GRASM" lsp <"$WORK/l.in" >"$WORK/r.out" 2>"$WORK/r.err"
+        r_rc=$?
+        g lsp <"$WORK/l.in" >"$WORK/g.out" 2>"$WORK/g.err"
+        g_rc=$?
+        if same3 "$r_rc" "$g_rc"; then
+            l_same=$((l_same + 1))
+            l_fixed=$((l_fixed + 1))
+        else
+            fail "grasm lsp, fixed session $f -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+        fi
+    done
+    echo "lsp: $l_runs sessions   the same: $l_same, $l_fixed of them fixed"
+fi
+
 echo "the Grasm command's package calls proc_run or proc_pipeline: $started time(s)"
 if [ "$started" != 0 ]; then
     FAILED+=("compiler/grasm calls proc_run or proc_pipeline $started time(s): the command must start no process")
@@ -1320,12 +1677,12 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 fi
 
 # The counts add up, and a whole run compared enough to mean something.
-whole=$([ -z "${FILES:-}" ] && [ -z "${PACKAGES:-}" ] && [ "$ONLY" = lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target,registry,deps,add,publish ] && echo 1)
+whole=$([ -z "${FILES:-}" ] && [ -z "${PACKAGES:-}" ] && [ "$ONLY" = "$ALL" ] && echo 1)
 if want lines && [ $((lines_same + lines_elsewhere + lines_runtime + lines_target)) -ne "$lines" ]; then
     echo "lines: the counts do not add up to $lines"
     exit 1
 fi
-if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" -lt 3 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
+if want lines && { [ "$lines" -lt 140 ] || [ "$lines_elsewhere" != 0 ] || [ "$lines_runtime" != 1 ] || [ "$lines_target" != 4 ]; }; then
     echo "lines: too few compared ($lines, $lines_elsewhere not here, $lines_runtime runtime, $lines_target target)"
     exit 1
 fi
@@ -1390,6 +1747,18 @@ if want add && { [ "$add_same" -ne "$add_runs" ] || [ "$add_runs" -ne "$packages
 fi
 if want publish && { [ "$pub_same" -ne "$pub_runs" ] || [ "$pub_runs" -ne "$packages" ]; }; then
     echo "publish: the counts do not add up ($pub_same of $pub_runs, $packages packages)"
+    exit 1
+fi
+if want journal && [ "$j_same" -ne "$j_runs" ]; then
+    echo "journal: $j_same of $j_runs programs compared"
+    exit 1
+fi
+if want dap && [ $((d_same + d_rust_otherwise)) -ne "$d_runs" ]; then
+    echo "dap: $d_same of $d_runs sessions compared"
+    exit 1
+fi
+if want lsp && [ "$l_same" -ne "$l_runs" ]; then
+    echo "lsp: $l_same of $l_runs sessions compared"
     exit 1
 fi
 if [ -n "$whole" ]; then

@@ -145,6 +145,13 @@ type TirProg = {
     blk_node: [i64],
     blk_s: [i64],
     blk_e: [i64],
+    // For the debug adapter (docs/self-hosting.md §6.22): each function's
+    // variables' names by number, each closure's function (-1 for none) and
+    // the variables its body reads -- what the reference's `mentioned_names`
+    // finds -- and the names of its parameters.
+    fn_vnames: [[str]],
+    clo_fid: [i64],
+    clo_reads: [[i64]],
 }
 
 /// What loading builds, and what it needs along the way.
@@ -207,6 +214,11 @@ type Loader = {
     blk_node: [i64],
     blk_s: [i64],
     blk_e: [i64],
+    fn_vnames: [[str]],
+    clo_fid: [i64],
+    clo_reads: [[i64]],
+    vnames: Map[i64, str],
+    cur_fid: i64,
     t: Tree,
     fn_ids: Map[str, i64],
     const_ids: Map[str, i64],
@@ -349,6 +361,11 @@ fn note_ref(inout ld: Loader, v: i64) {
 }
 
 /// A binding site, logged the same way.
+/// Records variable `v`'s name, for the debug adapter.
+fn name_var(inout ld: Loader, v: i64, name: str) {
+    ld.vnames.set(v, name)
+}
+
 fn note_decl(inout ld: Loader, v: i64) {
     note_var(ld, v)
     ld.decl_log.push(v)
@@ -446,6 +463,7 @@ fn expr(inout ld: Loader, e: i64) -> i64 {
         "let" -> {
             let id = node_with(ld, e, OP_LET, int_at(t, e, 1), 0, "")
             note_decl(ld, ld.a[id])
+            name_var(ld, ld.a[id], word(t, e, 2))
             id
         }
         "if" -> if_node(ld, e)
@@ -562,6 +580,7 @@ fn let_tuple_node(inout ld: Loader, e: i64) -> i64 {
         let v = int_at(t, ve, 1)
         ld.a[vn] = v
         note_decl(ld, v)
+        name_var(ld, v, word(t, ve, 2))
         vars.push(vn)
     }
     set_kids(ld, id, vars)
@@ -688,6 +707,7 @@ fn for_node(inout ld: Loader, e: i64) -> i64 {
     let it = expr(ld, parts[1])
     let v = int_at(t, parts[0], 1)
     note_decl(ld, v)
+    name_var(ld, v, word(t, parts[0], 2))
     ld.b[id] = v
     let body = expr(ld, parts[2])
     set_kids(ld, id, [it, body])
@@ -759,6 +779,7 @@ fn pattern(inout ld: Loader, e: i64) -> i64 {
             let v = int_at(t, e, 2)
             ld.a[id] = v
             note_decl(ld, v)
+            name_var(ld, v, word(t, e, 3))
             id
         }
         "pvariant" -> {
@@ -815,6 +836,8 @@ fn closure_node(inout ld: Loader, e: i64) -> i64 {
     ld.clo_caps.push([])
     ld.clo_params.push([])
     ld.clo_frame.push([])
+    ld.clo_fid.push(-1)
+    ld.clo_reads.push([])
     ld.a[id] = ci
     ld.b[id] = if word(t, e, 3) == "fallible" { 1 } else { 0 }
     let refs_from = ld.ref_log.len()
@@ -824,6 +847,7 @@ fn closure_node(inout ld: Loader, e: i64) -> i64 {
     for ve in kid_elems(t, parts[0]) {
         let v = int_at(t, ve, 1)
         note_decl(ld, v)
+        name_var(ld, v, word(t, ve, 2))
         params.push(v)
     }
     let body = expr(ld, parts[1])
@@ -846,6 +870,8 @@ fn closure_node(inout ld: Loader, e: i64) -> i64 {
     }
     ld.clo_caps[ci] = seen.keys()
     ld.clo_params[ci] = params
+    ld.clo_fid[ci] = ld.cur_fid
+    ld.clo_reads[ci] = ld.ref_log.slice(refs_from, ld.ref_log.len())
     ld.clo_frame[ci] = frame_of(top + 1)
     set_kids(ld, id, [body])
     id
@@ -1214,6 +1240,7 @@ fn register(inout ld: Loader, e: i64) {
                 })
             }
             ld.fn_params.push(params)
+            ld.fn_vnames.push([])
             ld.fn_modes.push(modes)
             ld.fn_body.push(-1)
             ld.fn_frame.push([])
@@ -1233,6 +1260,7 @@ fn register(inout ld: Loader, e: i64) {
             ld.fn_ids.set(name, ld.fn_name.len())
             ld.fn_name.push(name)
             ld.fn_params.push([])
+            ld.fn_vnames.push([])
             ld.fn_modes.push([])
             ld.fn_body.push(-1)
             ld.fn_frame.push([])
@@ -1286,12 +1314,23 @@ fn define(inout ld: Loader, e: i64) {
         "fn" -> {
             let fid = ld.fn_ids.get(word(t, e, 1)) ?? 0
             ld.max_var = -1
+            ld.vnames = map()
+            ld.cur_fid = fid
             for v in ld.fn_params[fid] {
                 note_var(ld, v)
+            }
+            for pe in kid_elems(t, kid_elems(t, e)[0]) {
+                name_var(ld, int_at(t, pe, 2), word(t, pe, 3))
             }
             let body = expr(ld, kid_elems(t, e)[1])
             ld.fn_body[fid] = body
             ld.fn_frame[fid] = frame_of(ld.max_var + 1)
+            var names: [str] = []
+            for v in 0..(ld.max_var + 1) {
+                names.push(ld.vnames.get(v) ?? "")
+            }
+            ld.fn_vnames[fid] = names
+            ld.cur_fid = -1
         }
         "const" -> {
             let ci = ld.const_ids.get(word(t, e, 1)) ?? 0
@@ -1439,6 +1478,11 @@ fn new_loader(t: Tree) -> Loader {
         blk_node: [],
         blk_s: [],
         blk_e: [],
+        fn_vnames: [],
+        clo_fid: [],
+        clo_reads: [],
+        vnames: map(),
+        cur_fid: -1,
         t: t,
         fn_ids: map(),
         const_ids: map(),
@@ -1505,5 +1549,8 @@ fn prog_of(ld: Loader) -> TirProg {
         blk_node: ld.blk_node,
         blk_s: ld.blk_s,
         blk_e: ld.blk_e,
+        fn_vnames: ld.fn_vnames,
+        clo_fid: ld.clo_fid,
+        clo_reads: ld.clo_reads,
     }
 }

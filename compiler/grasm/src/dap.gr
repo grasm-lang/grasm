@@ -1,0 +1,298 @@
+// `grasm dap`: the debug adapter, on stdin and stdout only, answering as
+// the Rust one answers (`crates/grasm_dap/src/lib.rs`; docs/self-hosting.md
+// §6.22) -- every response and event, its fields and its `seq`, the same
+// bytes. This is its first phase, until `configurationDone`: the requests
+// answered here, the program loaded and checked as the Rust adapter loads
+// it, and its TIR handed to the TIR interpreter, which runs it with the
+// debugger attached (`tools/tirinterp/src/debug.gr`) for the second.
+import front.loader
+import front.prog
+import front.sema
+import front.emit
+import front.rdebug
+import tirinterp.sexp
+import tirinterp.load
+import tirinterp.eval
+import tirinterp.debug
+import tirinterp.journal
+import tirinterp.json
+import tirinterp.rpc
+import testing
+
+pub fn cmd_dap() {
+    var input = rpc.stdin_reader()
+    var seq = 0
+    var launched = false
+    var pending: [Json] = []
+    var stop_on_entry = false
+    var jraw = bytes_of([])
+    var has_journal = false
+    var lp: Loaded = loader.single_module("")
+    var tp: TirProg = load.empty_prog()
+    var stmts: Map[i64, i64] = map()
+    while true {
+        let msg = match rpc.dap_read(input) {
+            Ok(x) -> {
+                let (more, m) = x
+                if not more {
+                    exit(0)
+                }
+                m
+            }
+            Err(e) -> {
+                eprint("dap error: {e}")
+                exit(1)
+                JNull
+            }
+        }
+        let command = json.as_str(json.get(msg, "command")) ?? ""
+        seq += 1
+        if command == "initialize" {
+            rpc.send(json.obj([
+                ("seq", json.jint(seq)),
+                ("type", json.jstr("response")),
+                ("request_seq", json.jint(json.as_int(json.get(msg, "seq")) ?? 0)),
+                ("success", JBool(true)),
+                ("command", json.jstr("initialize")),
+                ("body", capabilities()),
+            ]))
+            seq += 1
+            rpc.send(json.obj([("seq", json.jint(seq)), ("type", json.jstr("event")), ("event", json.jstr("initialized")), ("body", json.obj([]))]))
+        } else if command == "launch" {
+            let program = json.as_str(json.path(msg, "arguments.program")) ?? ""
+            stop_on_entry = match json.path(msg, "arguments.stopOnEntry") {
+                Some(j) -> match j {
+                    JBool(b) -> b
+                    _ -> false
+                }
+                None -> false
+            }
+            // `"journal"`: step through a recorded run. Installed before
+            // the program loads, so its first effect is already answered
+            // from the recording; one that cannot be read fails the launch.
+            match json.as_str(json.path(msg, "arguments.journal")) {
+                Some(j) -> {
+                    let why = journal_refusal(j)
+                    if why != "" {
+                        rpc.send(err_response(seq, msg, "cannot replay {j}: {why}"))
+                        seq += 1
+                        rpc.send(terminated_event(seq))
+                        exit(0)
+                    }
+                    jraw = match read_bytes(j) {
+                        Ok(b) -> b
+                        Err(_) -> bytes_of([])
+                    }
+                    has_journal = true
+                }
+                None -> ()
+            }
+            let (why, l, p, offs) = loaded(program)
+            if why != "" {
+                rpc.send(err_response(seq, msg, why))
+                seq += 1
+                rpc.send(terminated_event(seq))
+                exit(0)
+            }
+            lp = l
+            tp = p
+            stmts = offs
+            launched = true
+            rpc.send(ok_response(seq, msg, json.obj([])))
+        } else if command == "setBreakpoints" {
+            // Held until the program runs, every line said to be verified.
+            pending.push(msg)
+            var verified: [Json] = []
+            match json.path(msg, "arguments.breakpoints") {
+                Some(j) -> match j {
+                    JArr(items) -> {
+                        for b in items {
+                            let line = json.as_int(json.get(b, "line")) ?? 0
+                            verified.push(json.obj([("verified", JBool(true)), ("line", json.jint(line))]))
+                        }
+                    }
+                    _ -> ()
+                }
+                None -> ()
+            }
+            rpc.send(ok_response(seq, msg, json.obj([("breakpoints", JArr(verified))])))
+        } else if command == "threads" {
+            rpc.send(ok_response(seq, msg, debug.thread_list()))
+        } else if command == "configurationDone" {
+            rpc.send(ok_response(seq, msg, json.obj([])))
+            break
+        } else if command == "disconnect" or command == "terminate" {
+            rpc.send(ok_response(seq, msg, json.obj([])))
+            exit(0)
+        } else {
+            rpc.send(ok_response(seq, msg, JNull))
+        }
+    }
+    if not launched {
+        seq += 1
+        rpc.send(terminated_event(seq))
+        eprint("dap error: configurationDone arrived before launch")
+        exit(1)
+    }
+    run_debugged(input, seq, pending, stop_on_entry, has_journal, jraw, lp, tp, stmts)
+}
+
+/// Why the journal at `j` cannot be replayed, or "" (`grasm_journal::install`
+/// of `fs::read`'s bytes).
+fn journal_refusal(j: str) -> str {
+    let raw = match read_bytes(j) {
+        Ok(b) -> b
+        Err(e) -> return loader.io_error_text(e)
+    }
+    var probe = eval.new_cx(load.empty_prog(), [])
+    match journal.install(probe, raw) {
+        Ok(_) -> ""
+        Err(why) -> why
+    }
+}
+
+/// The program, loaded and checked as the Rust adapter's `load` does it --
+/// `load_from_disk`, then the loader's and the checker's diagnostics
+/// together, the first one's message -- with its TIR and where each of its
+/// statements starts; or why not.
+fn loaded(path: str) -> (str, Loaded, TirProg, Map[i64, i64]) {
+    let none: Map[str, str] = map()
+    let l = loader.load_with(path, none)
+    let empty: Map[i64, i64] = map()
+    if l.fatal != "" {
+        return ("cannot load `{path}`: {l.fatal}", l, load.empty_prog(), empty)
+    }
+    if l.diags.len() > 0 {
+        return ("`{path}` has errors: {l.diags[0]}", l, load.empty_prog(), empty)
+    }
+    let p = prog.build(l)
+    let (c, t0) = sema.check_program(p)
+    if c.d_s.len() > 0 {
+        return ("`{path}` has errors: {c.d_msg[0]}", l, load.empty_prog(), empty)
+    }
+    var t = t0
+    let (text, holes) = emit.emit(c, t, p)
+    if holes.len() > 0 {
+        return ("the Grasm debug adapter cannot run `{path}`: its TIR has {holes.len()} hole(s)", l, load.empty_prog(), empty)
+    }
+    let tree = match sexp.read(text.to_bytes()) {
+        Ok(x) -> x
+        Err(msg) -> return ("the Grasm debug adapter cannot run `{path}`: its TIR does not read back: {msg}", l, load.empty_prog(), empty)
+    }
+    let tp = match load.load(tree) {
+        Ok(x) -> x
+        Err(problems) -> return ("the Grasm debug adapter cannot run `{path}`: {problems.join("; ")}", l, load.empty_prog(), empty)
+    }
+    let offs = testing.stmt_offsets(tp, l)
+    // Every block's statements must line up with the source's, or a stop
+    // would be at the wrong place (decision (3)).
+    for b in 0..tp.blk_node.len() {
+        let node = tp.blk_node[b]
+        for i in 0..tp.nk[node] {
+            if not offs.has(tp.kids[tp.k0[node] + i]) {
+                return ("the Grasm debug adapter cannot step `{path}`: a block of its TIR does not line up with the source (docs/self-hosting.md §6.22)", l, load.empty_prog(), empty)
+            }
+        }
+    }
+    ("", l, tp, offs)
+}
+
+fn line_starts(b: bytes) -> [i64] {
+    var starts = [0]
+    for i in 0..b.len() {
+        if b.at(i) == 10 {
+            starts.push(i + 1)
+        }
+    }
+    starts
+}
+
+/// The second phase: `main` under the debugger, then `exited` and
+/// `terminated`, exit 0.
+fn run_debugged(input: In, seq: i64, pending: [Json], stop_on_entry: bool, has_journal: bool, jraw: bytes, l: Loaded, tp: TirProg, stmts: Map[i64, i64]) {
+    var cx = eval.new_cx(tp, [])
+    if has_journal {
+        match journal.install(cx, jraw) {
+            Ok(_) -> ()
+            Err(_) -> ()
+        }
+    }
+    cx.trap = true
+    cx.dbg = true
+    cx.d_in = input
+    cx.d_seq = seq
+    cx.d_paths = l.paths
+    cx.d_bases = l.bases
+    var starts: [[i64]] = []
+    for src in l.srcs {
+        starts.push(line_starts(src))
+    }
+    cx.d_starts = starts
+    cx.d_stmt = stmts
+    cx.d_resume = if stop_on_entry { 2 } else { 0 }
+    let esc = rdebug.new_esc_table()
+    cx.d_strdebug = |s| rdebug.str_debug(esc, s)
+    for bp in pending {
+        let _ = debug.set_breakpoints(cx, bp)
+    }
+    var none: [Value] = []
+    let r = eval.call_fn(cx, tp.main_fn, none)
+    var code = 0
+    if cx.ctl == eval.CTL_PANIC {
+        code = 101
+    } else if cx.ctl == eval.CTL_EXIT {
+        code = match cx.carry {
+            VInt(n) -> n
+            _ -> 1
+        }
+    } else if cx.ctl == eval.CTL_ERR {
+        code = 1
+    } else {
+        match r {
+            VErr(_) -> code = 1
+            _ -> ()
+        }
+    }
+    debug.finish_run(cx, code)
+    exit(0)
+}
+
+/// What `initialize` says the adapter can do: only what it does.
+fn capabilities() -> Json {
+    json.obj([
+        ("supportsConfigurationDoneRequest", JBool(true)),
+        ("supportsTerminateRequest", JBool(true)),
+        ("supportsEvaluateForHovers", JBool(true)),
+        ("supportsSingleThreadExecutionRequests", JBool(false)),
+        ("supportsStepBack", JBool(false)),
+        ("supportsRestartRequest", JBool(false)),
+        ("supportsFunctionBreakpoints", JBool(false)),
+        ("supportsConditionalBreakpoints", JBool(false)),
+    ])
+}
+
+fn ok_response(seq: i64, req: Json, body: Json) -> Json {
+    json.obj([
+        ("seq", json.jint(seq)),
+        ("type", json.jstr("response")),
+        ("request_seq", json.jint(json.as_int(json.get(req, "seq")) ?? 0)),
+        ("success", JBool(true)),
+        ("command", json.jstr(json.as_str(json.get(req, "command")) ?? "")),
+        ("body", body),
+    ])
+}
+
+fn err_response(seq: i64, req: Json, message: str) -> Json {
+    json.obj([
+        ("seq", json.jint(seq)),
+        ("type", json.jstr("response")),
+        ("request_seq", json.jint(json.as_int(json.get(req, "seq")) ?? 0)),
+        ("success", JBool(false)),
+        ("command", json.jstr(json.as_str(json.get(req, "command")) ?? "")),
+        ("message", json.jstr(message)),
+    ])
+}
+
+fn terminated_event(seq: i64) -> Json {
+    json.obj([("seq", json.jint(seq)), ("type", json.jstr("event")), ("event", json.jstr("terminated")), ("body", json.obj([]))])
+}

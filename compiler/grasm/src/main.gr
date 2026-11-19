@@ -41,12 +41,16 @@
 //                          a registry dependency added to grasm.toml (§6.21)
 //     publish [dir] [--registry R]
 //                          a package copied into a registry, a directory (§6.21)
+//     journal <file> [--full]
+//                          what a recorded run read      tools/tirinterp (§6.22)
+//     lsp                  the language server (stdio)   compiler/front (§6.22)
+//     dap                  the debug adapter (stdio)     tools/tirinterp (§6.22)
 //
 // Each is the packages' own code, called in this process: nothing here
-// starts a process, and the Rust toolchain is on no path it takes. The other
-// subcommands say so and exit 1 (`not_here`); the usage, an unknown command
-// and every malformed command line are Rust's to the byte, because they are
-// read before any subcommand runs (`prevalidate`).
+// starts a process, and the Rust toolchain is on no path it takes. The
+// usage, an unknown command and every malformed command line are Rust's to
+// the byte, because they are read before any subcommand runs
+// (`prevalidate`).
 import front
 import front.loader
 import front.emit
@@ -60,10 +64,22 @@ import docgen
 import api
 import bundle
 import pkg
+import journalcmd
+import lsp
+import dap
 
 /// The toolchain's version, `grasm --version`'s: the workspace's, which the
 /// Rust command takes from its manifest. `clidiff` holds the two equal.
 let VERSION = "1.1.0"
+
+/// Exported so that this executable's runtime never journals it
+/// (compiler/rt/src/journal.gr): `GRASM_RECORD` and `GRASM_REPLAY` are for
+/// the program `run` interprets, whose journal the TIR interpreter keeps,
+/// not for the command's own reads of sources and manifests
+/// (docs/self-hosting.md §6.22, decision (2)). Nothing calls it.
+export fn unjournaled_host() -> i64 {
+    1
+}
 
 fn main() {
     // Started as a bundle (`grasm build` without `--native`): the program
@@ -110,12 +126,16 @@ fn main() {
         pkg.cmd_add(a)
     } else if cmd == "publish" {
         pkg.cmd_publish(a)
+    } else if cmd == "dap" {
+        dap.cmd_dap()
+    } else if cmd == "lsp" {
+        lsp.cmd_lsp()
+    } else if cmd == "journal" {
+        journalcmd.cmd_journal(a)
     } else if cmd == "toml" {
         front.cmd_toml(operand(a, "usage: grasm toml <file.toml>"))
     } else if cmd == "version" or cmd == "--version" {
         print("grasm {VERSION}")
-    } else if elsewhere(cmd) {
-        not_here(cmd)
     } else if cmd == "help" or cmd == "--help" or cmd == "-h" {
         usage(true)
     } else {
@@ -133,21 +153,6 @@ fn operand(a: [str], usage_line: str) -> str {
         exit(1)
     }
     a[1]
-}
-
-/// Whether `cmd` is one of the Rust `grasm`'s subcommands that this one
-/// does not run yet.
-fn elsewhere(cmd: str) -> bool {
-    let them = ["lsp", "dap", "journal"]
-    them.contains(cmd)
-}
-
-/// A subcommand of the Rust `grasm` that this one does not run yet: said,
-/// and exit 1 -- never handed to anything else.
-fn not_here(cmd: str) {
-    eprint("error: `grasm {cmd}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc`, `api`, `deps`, `add` and `publish`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20, §6.21)")
-    exit(1)
 }
 
 // ---------------------------------------------------------------------
