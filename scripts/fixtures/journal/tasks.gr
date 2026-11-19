@@ -1,0 +1,24 @@
+// Tasks of a `concurrent` block reaching outside the program, for
+// `scripts/clidiff.sh`'s `journal` section (docs/self-hosting.md §6.22): the
+// tasks share the run's one journal, in the order they call, recorded and
+// replayed as the reference's one interpreter thread records them. No
+// corpus program journals from a task.
+fn main() / {io, async} {
+    print(now_millis() > 0)
+    concurrent {
+        go {
+            print(file_exists("scripts/fixtures/journal/tasks.gr"))
+            print(env("GRASM_NO_SUCH_VARIABLE") == None)
+        }
+        go {
+            print(file_exists("scripts/fixtures/journal/no-such-file.gr"))
+        }
+        go {
+            match read_file("scripts/fixtures/journal/tasks.gr") {
+                Ok(s) -> print(s.len() > 0)
+                Err(_) -> print("unreadable")
+            }
+        }
+    }
+    print(args().len())
+}

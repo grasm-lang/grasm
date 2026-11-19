@@ -2332,6 +2332,14 @@ type Slab = {
     mem_next: i64,
     mem_freed: [i64],
     mem_forgot: i64,
+    // The journal travels with the slab: the program's tasks share one, in
+    // the order they reach outside it, as the reference's one interpreter
+    // thread does.
+    jstate: i64,
+    jpath: str,
+    jnames: [str],
+    jvals: [Wire],
+    jat: i64,
 }
 
 fn slab_out(inout cx: Cx) -> Slab {
@@ -2347,6 +2355,11 @@ fn slab_out(inout cx: Cx) -> Slab {
         mem_next: cx.mem_next,
         mem_freed: cx.mem_freed,
         mem_forgot: cx.mem_forgot,
+        jstate: cx.jstate,
+        jpath: cx.jpath,
+        jnames: cx.jnames,
+        jvals: cx.jvals,
+        jat: cx.jat,
     }
     cx.slab = []
     cx.gens = []
@@ -2372,6 +2385,11 @@ fn slab_in(inout cx: Cx, s: Slab) {
     cx.mem_next = s.mem_next
     cx.mem_freed = s.mem_freed
     cx.mem_forgot = s.mem_forgot
+    cx.jstate = s.jstate
+    cx.jpath = s.jpath
+    cx.jnames = s.jnames
+    cx.jvals = s.jvals
+    cx.jat = s.jat
 }
 
 /// Before a channel operation that may wait: a task puts the slab back for

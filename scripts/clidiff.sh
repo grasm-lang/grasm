@@ -1354,7 +1354,8 @@ same_run() { # r_rc g_rc
 # Every recording is then replayed by both commands, the Grasm command's
 # replayed by Rust too, and printed by both with and without `--full`; and
 # from every one that holds a record, the journals scripts/lib/jmangle.py
-# makes, each replayed and printed by both. Then each program whose
+# makes, each replayed and printed by both; and the same for
+# scripts/fixtures/journal/, which journal from tasks. Then each program whose
 # recording holds more than `args` is built natively by the Grasm command,
 # recorded by the executable, and replayed by both commands' `run`.
 j_runs=0
@@ -1470,7 +1471,7 @@ if want journal; then
         if "$GRASM" journal "$WORK/jr.jrnl" | tail -1 | grep -qvE 'builtin\(s\): args [0-9]+$'; then
             echo "$n $src" >>"$WORK/jrich"
         fi
-    done <"$WORK/mains"
+    done < <(cat "$WORK/mains"; ls scripts/fixtures/journal/*.gr)
     # A native recording replayed under `grasm run`, which is what a
     # recording is for (docs/replay.md).
     while read -r n src; do
