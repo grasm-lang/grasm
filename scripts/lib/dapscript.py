@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scripted debug-adapter sessions, for `scripts/clidiff.sh`'s `dap` section.
 
-    dapscript.py step|next|bp <program> <out>
+    dapscript.py step|next|bp <program> <out> [journal]
     dapscript.py fixed <name> <program> <out> [journal]
 
 Writes the bytes a client would send `grasm dap` on stdin -- framed
@@ -16,7 +16,8 @@ program runs on to its end with its output still reported.
   bp     a breakpoint on every third line of the program's file, then 50
          times: stackTrace, variables, continue
 
-and the fixed sessions, each one thing the corpus sessions do not reach:
+-- each launched with `journal` when one is given, so both adapters see
+the same answers from outside the program -- and the fixed sessions, each one thing the corpus sessions do not reach:
 evaluate, scopes of an outer frame, variables of reference 0, breakpoints
 replaced while stopped, disconnect while stopped, configurationDone before
 launch, a journal given to launch, and framing and JSON errors in each
@@ -50,11 +51,12 @@ def lines_of(prog):
         return f.read().count(b"\n") + 1
 
 
-def corpus(kind, prog):
+def corpus(kind, prog, journal):
     s = Script()
     s.req("initialize", {"adapterID": "grasm"})
+    extra = {"journal": journal} if journal else {}
     if kind == "step":
-        s.req("launch", {"program": prog, "stopOnEntry": True})
+        s.req("launch", dict({"program": prog, "stopOnEntry": True}, **extra))
         s.req("configurationDone")
         for _ in range(200):
             s.req("threads")
@@ -63,7 +65,7 @@ def corpus(kind, prog):
             s.req("variables", {"variablesReference": 1})
             s.req("stepIn", {"threadId": 1})
     elif kind == "next":
-        s.req("launch", {"program": prog, "stopOnEntry": True})
+        s.req("launch", dict({"program": prog, "stopOnEntry": True}, **extra))
         s.req("configurationDone")
         cycle = ["next", "stepIn", "next", "stepOut", "stepIn", "stepIn", "next"]
         for i in range(100):
@@ -73,7 +75,7 @@ def corpus(kind, prog):
     elif kind == "bp":
         bps = [{"line": n} for n in range(1, lines_of(prog) + 1, 3)]
         s.req("setBreakpoints", {"source": {"path": prog}, "breakpoints": bps})
-        s.req("launch", {"program": prog})
+        s.req("launch", dict({"program": prog}, **extra))
         s.req("configurationDone")
         for _ in range(50):
             s.req("stackTrace", {"threadId": 1})
@@ -209,7 +211,7 @@ def main():
         data = fixed(a[1], a[2], a[4] if len(a) > 4 else "")
         out = a[3]
     else:
-        data = corpus(a[0], a[1])
+        data = corpus(a[0], a[1], a[3] if len(a) > 3 else "")
         out = a[2]
     with open(out, "wb") as f:
         f.write(data)

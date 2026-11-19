@@ -1525,7 +1525,9 @@ d_fixed=0
 d_skipped=0
 d_rust_otherwise=0
 d_pane_only=0
+d_replayed=0
 d_host=0
+declare -a D_REPLAYED=()
 declare -a D_HOST=()
 declare -a D_OTHERWISE=()
 declare -a D_PANE=()
@@ -1574,6 +1576,31 @@ dap_compare() { # label input
         fi
         fail "grasm dap $1 -- the Grasm adapter runs it otherwise than grasm run"
         return 1
+    fi
+    # A program that asks outside itself -- random bytes, the clock, a port
+    # -- may take another path through itself from one run to the next
+    # (L-LIB-RANDOM's rejection sampling stops at a breakpoint as many times
+    # as it draws again): both adapters once more, launched with one
+    # recording of it the Rust command made, so both see the same answers.
+    # Counted.
+    if [ -n "${3:-}" ] && [[ " step next bp " == *" ${1%% *} "* ]]; then
+        rm -f "$WORK/once.jrnl"
+        GRASM_RECORD="$WORK/once.jrnl" timeout $((DAP_LIMIT * 4)) "$GRASM" run "$3" >/dev/null 2>&1 </dev/null
+        if [ -s "$WORK/once.jrnl" ] && ! "$GRASM" journal "$WORK/once.jrnl" 2>/dev/null | head -1 | grep -q ' 0 record(s)'; then
+            python3 scripts/lib/dapscript.py "${1%% *}" "$3" "$WORK/once.in" "$WORK/once.jrnl"
+            timeout "$DAP_LIMIT" "$GRASM" dap <"$WORK/once.in" 2>"$WORK/r.err" | python3 scripts/lib/streamsum.py >"$WORK/r.sum"
+            r_rc=${PIPESTATUS[0]}
+            timeout $((DAP_LIMIT * 4)) sandbox-exec -p "$NORUST" "$G" dap <"$WORK/once.in" 2>"$WORK/g.err" | python3 scripts/lib/streamsum.py >"$WORK/g.sum"
+            g_rc=${PIPESTATUS[0]}
+            if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.sum" "$WORK/g.sum" && cmp -s "$WORK/r.err" "$WORK/g.err"; then
+                d_replayed=$((d_replayed + 1))
+                D_REPLAYED+=("$1")
+                return 0
+            fi
+            fail "grasm dap $1 -- under one recording, exit $r_rc (Rust) and $g_rc (Grasm), $(cat "$WORK/r.sum") and $(cat "$WORK/g.sum")"
+            diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
+            return 1
+        fi
     fi
     # A difference in the variables pane alone -- a `u64` the Rust adapter
     # shows as an `i64`, for the same reason -- is a counted, printed
@@ -1651,12 +1678,15 @@ if want dap; then
         python3 scripts/lib/dapscript.py fixed journal "$src" "$WORK/d.in" "$WORK/jrec/$jn.jrnl"
         dap_compare "journal $src" "$WORK/d.in" "$src" && d_fixed=$((d_fixed + 1))
     done <"$WORK/jrich"
-    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   the host's channel panic: $d_host   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
+    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   the same under one recording: $d_replayed   the host's channel panic: $d_host   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
     if [ ${#D_OTHERWISE[@]} -gt 0 ]; then
         printf '  run otherwise by the Rust adapter: %s\n' $(printf '%s\n' "${D_OTHERWISE[@]}" | sort -u)
     fi
     if [ ${#D_HOST[@]} -gt 0 ]; then
         printf '  the host channel panic: %s\n' "${D_HOST[@]}"
+    fi
+    if [ ${#D_REPLAYED[@]} -gt 0 ]; then
+        printf '  the same under one recording: %s\n' "${D_REPLAYED[@]}"
     fi
     if [ ${#D_PANE[@]} -gt 0 ]; then
         printf '  the variables pane alone: %s\n' "${D_PANE[@]}"
@@ -1796,7 +1826,7 @@ if want journal && [ "$j_same" -ne "$j_runs" ]; then
     echo "journal: $j_same of $j_runs programs compared"
     exit 1
 fi
-if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_host)) -ne "$d_runs" ]; then
+if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_replayed + d_host)) -ne "$d_runs" ]; then
     echo "dap: $d_same of $d_runs sessions compared"
     exit 1
 fi
