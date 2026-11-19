@@ -40,9 +40,12 @@
 #   dap-line       every stop a line further on                      a session differs
 #   lsp-diag       a diagnostic at the end of the buffer kept         a session differs
 #   lsp-hover      a function's signature written `->` with no spaces a session differs
+#   net-handle     every `tcp_connect` leaks a listener first, so each
+#                  socket's handle is one higher before any `net_close`,
+#                  outside the journal's renumbering exception     the journals differ
 #
 # `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
-# 28 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
+# 29 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
 # its runtime object from the planted sources too.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -306,9 +309,12 @@ control toml-first '^DIFF: registry lockfile: grasm deps app' ONLY=registry "$TO
 
 # S8 part five (§6.22): a journal entry lost, the command's exemption from
 # its own runtime's journal gone, a response field dropped, a step on the
-# wrong line, a diagnostic kept that Rust drops, a hover reworded.
+# wrong line, a diagnostic kept that Rust drops, a hover reworded, a socket
+# handle off by one before any `net_close`.
 printf '%s\n' packages/certdiff/src/main.gr >"$WORK/certdiff"
 printf '%s\n' examples/hello.gr >"$WORK/hello"
+printf '%s\n' spec/conformance/L-LIB-NET-WORKERS.gr >"$WORK/networkers"
+BUILTINS=tools/tirinterp/src/builtins.gr
 JOURNAL=tools/tirinterp/src/journal.gr
 DEBUG=tools/tirinterp/src/debug.gr
 LSP=compiler/grasm/src/lsp.gr
@@ -324,6 +330,17 @@ control journal-lost '^DIFF: GRASM_RECORD grasm run packages/certdiff/src/main.g
 control exempt-gone '^DIFF: GRASM_RECORD grasm run examples/hello.gr -- a journal written by one command and not the other' "ONLY=journal FILES=$WORK/hello CLI_JOURNAL_BUILD=1 PLANT_RT=1" "$RTJ" \
     'mem_static("unjournaled_host")' \
     'mem_static("unjournaled_hosx")'
+
+# Socket handles numbered otherwise only after a `net_close`, as one
+# renumbering, are the journal comparison's counted exception (the Rust
+# interpreter never gives a handle out twice; §6.22): a handle that differs
+# before any `net_close` is still a difference.
+control net-handle '^DIFF: GRASM_RECORD grasm run spec/conformance/L-LIB-NET-WORKERS.gr -- the journals differ: record 3 \(tcp_connect\) differs' "ONLY=journal FILES=$WORK/networkers CLI_JOURNAL_BUILD=1" "$BUILTINS" \
+    '        22 -> int_result(p, tcp_connect(str_of(p, args[0]), int_of(args[1])))' \
+    '        22 -> {
+            let _ = tcp_listen(0)
+            int_result(p, tcp_connect(str_of(p, args[0]), int_of(args[1])))
+        }'
 
 control dap-field '^DIFF: grasm dap step examples/hello.gr ' "ONLY=dap FILES=$WORK/hello" "$DEBUG" \
     '("threadId", json.jint(THREAD_ID)), ("allThreadsStopped", JBool(true))' \
@@ -353,4 +370,4 @@ if [ -n "${CONTROLS:-}" ]; then
     [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
     exit
 fi
-[ "$ran" -ge 28 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 29 ] && [ "$caught" = "$ran" ]

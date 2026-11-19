@@ -1374,6 +1374,8 @@ j_replayed=0
 j_shown=0
 j_mangled=0
 j_iofailed=0
+j_handles=0
+declare -a J_HANDLES=()
 j_native=0
 j_native_same=0
 mkdir -p "$WORK/jrec"
@@ -1407,6 +1409,14 @@ if want journal; then
         case $? in
         0) ;;
         2) j_iofailed=$((j_iofailed + 1)) ;;
+        # Socket handles numbered otherwise after a `net_close`, and only
+        # them, as one renumbering: the Rust interpreter never gives a
+        # handle out twice (docs/known-issues.md, S3; the coordinator's
+        # decision, §6.22). Counted and printed.
+        3)
+            j_handles=$((j_handles + 1))
+            J_HANDLES+=("$src -- $why")
+            ;;
         *)
             fail "GRASM_RECORD grasm run $src -- the journals differ: $why"
             continue
@@ -1511,7 +1521,10 @@ if want journal; then
             diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
         fi
     done <"$WORK/jrich"
-    echo "journal: $j_runs programs recorded   the same: $j_same, $j_files of them with a journal ($j_iofailed differing only in the IoFailed wording)   replays alike: $j_replayed   printed alike: $j_shown   mangled journals alike: $j_mangled   native recordings replayed alike: $j_native_same of $j_native"
+    echo "journal: $j_runs programs recorded   the same: $j_same, $j_files of them with a journal ($j_iofailed differing only in the IoFailed wording, $j_handles only in socket handles after a net_close)   replays alike: $j_replayed   printed alike: $j_shown   mangled journals alike: $j_mangled   native recordings replayed alike: $j_native_same of $j_native"
+    if [ ${#J_HANDLES[@]} -gt 0 ]; then
+        printf '  socket handles after a net_close: %s\n' "${J_HANDLES[@]}"
+    fi
 fi
 
 # dap: the sessions scripts/lib/dapscript.py writes -- every corpus program

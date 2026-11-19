@@ -10,10 +10,11 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
-ten, four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
+eleven, four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
 records unread in silence, a breakpoint by another path's
 spelling never stopping, positions as bytes, a diagnostic at the end of
-the buffer dropped -- a block whose value is a map literal and a statement `if` whose
+the buffer dropped -- `grasm run` numbering sockets otherwise than a native
+build after a `net_close`, a block whose value is a map literal and a statement `if` whose
 branches' values differ, refused natively, and four in the manifest reader
 (`grasm_pkg::toml`, and the Grasm toolchain's `packages/toml` with it): a
 string cut at an escaped quote, escapes not undone, a multi-line string
@@ -133,6 +134,39 @@ didOpen file://e.gr  "fn main() {\n  print(1)\n"
 (`grasm check` of the same text reports the error.) In a source bundle,
 whose first file is its first module, every diagnostic past that module is
 dropped the same way.
+
+**`grasm run` never gives a closed socket's handle out again, where a
+native build does -- *open, S3*.** The Rust interpreter keeps its sockets in
+a list it only pushes to (`self.sockets.push`,
+`crates/grasm_interp/src/interp.rs` lines 1330 to 1429), so after a
+`net_close` the next socket gets a new handle; the Rust runtime and the
+Grasm one take the lowest free handle (`crates/grasm_rt/src/lib.rs`, a
+`BinaryHeap` of free ones; `compiler/rt/src/net.gr`). The interpreter's own
+comment says the two "keep the same table shape so a handle means the same
+thing". Measured 2026-11-17:
+
+```
+fn main() / {net, io} {
+    let a = tcp_listen(0) ?? -1
+    net_close(a)
+    let b = tcp_listen(0) ?? -1
+    print("first {a}, second {b}")
+}
+```
+
+prints `first 0, second 1` under the Rust `grasm run` and `first 0, second
+0` built with `--native`, and under the Grasm command's `grasm run`, whose
+interpreter has its sockets from the runtime it runs on. Rated S3 by the
+coordinator (2026-11-17; the owner may move it): a value a program can see
+differs between `run` and `--native` with no error. Not copied: no corpus
+program prints a handle after a `net_close`, but a journal records the
+handles (`spec/conformance/L-LIB-NET-WORKERS.gr` recorded `Ok(3)` by Rust
+where the Grasm command records `Ok(0)`), so `clidiff`'s journal comparison
+counts and prints a journal that differs only in socket handles after the
+run's first `net_close`, as one renumbering (`scripts/lib/jnorm.py`; the
+coordinator's decision, docs/self-hosting.md §6.22), and `clicontrols`'
+`net-handle` holds that a handle differing before any `net_close` is still
+caught.
 
 **`😀` in a request reads as two U+FFFD -- *open, S4*.** Both
 servers' JSON reader (`json.rs`, one copy in each crate) decodes `\u`
