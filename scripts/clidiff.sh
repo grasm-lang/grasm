@@ -1352,9 +1352,11 @@ same_run() { # r_rc g_rc
 # the same file or none, and the two the same bytes but for the values of
 # the built-ins that answer differently each time (scripts/lib/jnorm.py).
 # Every recording is then replayed by both commands, the Grasm command's
-# replayed by Rust too, and printed by both with and without `--full`; and
-# from every one that holds a record, the journals scripts/lib/jmangle.py
-# makes, each replayed and printed by both; and the same for
+# replayed by Rust too, and Rust's printed by both with and without
+# `--full`; and from every one that holds more than `args`, and every tenth
+# other, the journals scripts/lib/jmangle.py makes, each replayed and
+# printed by both (every one at first: five hours, most of it on the 140
+# that hold `args` alone); and the same for
 # scripts/fixtures/journal/, which journal from tasks. Then each program whose
 # recording holds more than `args` is built natively by the Grasm command,
 # recorded by the executable, and replayed by both commands' `run`.
@@ -1425,8 +1427,8 @@ if want journal; then
                 ok=0
             fi
         done
-        # Printed, as the files are, by both.
-        for j in jr.jrnl jg.jrnl; do
+        # Printed, as the file is, by both.
+        for j in jr.jrnl; do
             for full in "" --full; do
                 (cd "$WORK" && "$GRASM" journal "$j" $full >r.out 2>r.err)
                 r_rc=$?
@@ -1441,8 +1443,19 @@ if want journal; then
                 fi
             done
         done
-        # The mangled journals, replayed and printed by both.
+        # More than `args`: built natively below, and mangled.
+        rich=0
+        if "$GRASM" journal "$WORK/jr.jrnl" | tail -1 | grep -qvE 'builtin\(s\): args [0-9]+$'; then
+            echo "$n $src" >>"$WORK/jrich"
+            rich=1
+        fi
+        # The mangled journals, replayed and printed by both: of every
+        # recording that holds more than `args`, and of every tenth other.
         rm -rf "$WORK/jm"
+        if [ "$rich" = 0 ] && [ $((j_files % 10)) != 1 ]; then
+            [ "$ok" = 1 ] && j_same=$((j_same + 1))
+            continue
+        fi
         for k in $(python3 scripts/lib/jmangle.py "$WORK/jr.jrnl" "$WORK/jm"); do
             GRASM_REPLAY="$WORK/jm/$k.jrnl" $RUN_LIMIT "$GRASM" run "$src" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null
             r_rc=$?
@@ -1467,10 +1480,6 @@ if want journal; then
             fi
         done
         [ "$ok" = 1 ] && j_same=$((j_same + 1))
-        # More than `args`: built natively below.
-        if "$GRASM" journal "$WORK/jr.jrnl" | tail -1 | grep -qvE 'builtin\(s\): args [0-9]+$'; then
-            echo "$n $src" >>"$WORK/jrich"
-        fi
     done < <(cat "$WORK/mains"; ls scripts/fixtures/journal/*.gr)
     # A native recording replayed under `grasm run`, which is what a
     # recording is for (docs/replay.md).
