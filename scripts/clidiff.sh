@@ -1634,7 +1634,11 @@ dap_compare() { # label input
     if [ -n "${3:-}" ] && [[ " step next bp " == *" ${1%% *} "* ]]; then
         rm -f "$WORK/once.jrnl"
         GRASM_RECORD="$WORK/once.jrnl" timeout $((DAP_LIMIT * 4)) "$GRASM" run "$3" >/dev/null 2>&1 </dev/null
-        if [ -s "$WORK/once.jrnl" ] && ! "$GRASM" journal "$WORK/once.jrnl" 2>/dev/null | head -1 | grep -q ' 0 record(s)'; then
+        local jhead=""
+        if [ -s "$WORK/once.jrnl" ]; then
+            jhead=$("$GRASM" journal "$WORK/once.jrnl" 2>/dev/null | head -1)
+        fi
+        if [ -s "$WORK/once.jrnl" ] && [[ "$jhead" != *" 0 record(s)"* ]]; then
             python3 scripts/lib/dapscript.py "${1%% *}" "$3" "$WORK/once.in" "$WORK/once.jrnl"
             timeout "$DAP_LIMIT" "$GRASM" dap <"$WORK/once.in" 2>"$WORK/r.err" | python3 scripts/lib/streamsum.py >"$WORK/r.sum"
             r_rc=${PIPESTATUS[0]}
