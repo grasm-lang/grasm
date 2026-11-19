@@ -81,7 +81,8 @@ declare -a MISSED=()
 
 # plant NAME FILE OLD NEW: the sources copied to $WORK/NAME, with OLD in FILE
 # (a path in the tree) replaced by NEW, exactly once; then the command built
-# from them into $WORK/NAME/cli, the clean runtime object beside it.
+# from them into $WORK/NAME/cli, the clean runtime object beside it, or with
+# PLANT_RT set, compiler/rt copied too and its object built from the copy.
 plant() {
     local name=$1 file=$2 d
     shift 2
@@ -90,6 +91,11 @@ plant() {
         mkdir -p "$WORK/$name/$(dirname "$d")"
         cp -R "$d" "$WORK/$name/$d" || return 1
     done <"$WORK/dirs"
+    # The runtime is not one of the command's sources; a control that
+    # plants into it has it copied too.
+    if [ -n "${PLANT_RT:-}" ] && [ ! -d "$WORK/$name/compiler/rt" ]; then
+        cp -R compiler/rt "$WORK/$name/compiler/rt" || return 1
+    fi
     python3 - "$WORK/$name/$file" "$@" <<'EOF' || return 1
 import sys
 path = sys.argv[1]
