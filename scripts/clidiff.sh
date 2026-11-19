@@ -1942,5 +1942,22 @@ if [ -n "$whole" ]; then
         echo "too little compared in registry, deps, add or publish: $reg_runs registry commands, $reg_refused refused; $packages packages, $deps_written lockfiles written, $deps_refused refused; $add_same added; $pub_done published"
         exit 1
     fi
+    # The floors of §6.22's sections, a margin below the runs of 2026-11-17
+    # to 19 (the stage-1 and stage-2 commands): `journal` 652 programs, 185
+    # with a journal, 370 replays and prints, 330 mangled journals, 45 native
+    # recordings, 7 in the IoFailed wording and 1 in socket handles; `dap`
+    # 1,002 and 1,004 sessions (the count moves with how many Rust sessions
+    # pass 60 s or 10 s), 51 fixed, 25 run otherwise by the Rust adapter, 13
+    # the same under one recording, 4 ended by the host's channel panic, none
+    # in the variables pane alone; `lsp` 2,036 sessions, 17 fixed. The
+    # exceptions are held from above, as `test`'s host panics are.
+    if [ "$j_runs" -lt 640 ] || [ "$j_files" -lt 170 ] || [ "$j_replayed" -lt 340 ] || [ "$j_shown" -lt 340 ] ||
+        [ "$j_mangled" -lt 300 ] || [ "$j_native" -lt 40 ] || [ "$j_iofailed" -gt 10 ] || [ "$j_handles" -gt 2 ] ||
+        [ "$d_runs" -lt 950 ] || [ "$d_fixed" -lt 45 ] || [ "$d_rust_otherwise" -gt 30 ] || [ "$d_replayed" -gt 20 ] ||
+        [ "$d_host" -gt 4 ] || [ "$d_pane_only" -gt 2 ] ||
+        [ "$l_runs" -lt 1900 ] || [ "$l_fixed" -lt 15 ]; then
+        echo "too little compared in journal, dap or lsp, or too many exceptions: $j_runs recorded, $j_files with a journal, $j_replayed replays, $j_shown printed, $j_mangled mangled, $j_native native, $j_iofailed IoFailed, $j_handles socket handles; $d_runs sessions, $d_fixed fixed, $d_rust_otherwise run otherwise by Rust, $d_replayed under one recording, $d_host host panics, $d_pane_only pane only; $l_runs lsp sessions, $l_fixed fixed"
+        exit 1
+    fi
 fi
 exit 0
