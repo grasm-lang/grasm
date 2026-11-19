@@ -108,6 +108,13 @@
 # control.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# The journal section builds the corpus natively, and the SDL2 packages
+# link a library a shell started without Homebrew's environment does not
+# find: the search path scripts/sdltest.sh gives it.
+if [ -z "${LIBRARY_PATH:-}" ] && command -v brew >/dev/null 2>&1; then
+    LIBRARY_PATH="$(brew --prefix)/lib"
+    export LIBRARY_PATH
+fi
 ROOT=$(pwd)
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
