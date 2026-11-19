@@ -201,10 +201,11 @@ fn loaded(path: str) -> (str, Loaded, TirProg, Map[i64, i64]) {
 /// Where each TIR statement starts: its block lined up with the AST block
 /// of the same span and the same number of statements, as coverage lines
 /// them up (`testing.stmt_offsets`). A contract's wrapper and its body are
-/// two blocks of one span, told apart by their statements; two that still
-/// tie are taken in order.
+/// two blocks of one span; of those the one whose statements are of the
+/// same kinds is taken, and a tie in order.
 fn statement_starts(p: TirProg, l: Loaded) -> Map[i64, i64] {
     var spans: Map[str, [[i64]]] = map()
+    var kinds: Map[str, [[i64]]] = map()
     for f in 0..l.mods.len() {
         let a = l.mods[f].a
         let base = l.bases[f]
@@ -212,13 +213,18 @@ fn statement_starts(p: TirProg, l: Loaded) -> Map[i64, i64] {
             if a.k[id] == ast.A_BLOCK and a.s[id] >= 0 {
                 let v = a.pool[a.off[id]]
                 var ss: [i64] = []
+                var ks: [i64] = []
                 for st in a.pool.slice(a.off[v], a.off[v] + a.n[v]) {
                     ss.push(testing.stmt_start(a, st) + base)
+                    ks.push(a.k[st])
                 }
                 let key = "{a.s[id] + base}:{a.e[id] + base}"
                 var have = spans.get(key) ?? []
                 have.push(ss)
                 spans.set(key, have)
+                var hk = kinds.get(key) ?? []
+                hk.push(ks)
+                kinds.set(key, hk)
             }
         }
     }
@@ -228,18 +234,71 @@ fn statement_starts(p: TirProg, l: Loaded) -> Map[i64, i64] {
         let node = p.blk_node[b]
         let key = "{p.blk_s[b]}:{p.blk_e[b]}"
         let cands = spans.get(key) ?? []
+        let ckinds = kinds.get(key) ?? []
+        var best = -1
+        var best_score = -1
         for c in 0..cands.len() {
-            let ss = cands[c]
-            if ss.len() == p.nk[node] and not used.has(key + "#{c}") {
-                used.set(key + "#{c}", true)
-                for i in 0..ss.len() {
-                    out.set(p.kids[p.k0[node] + i], ss[i])
+            if cands[c].len() != p.nk[node] or used.has(key + "#{c}") {
+                continue
+            }
+            var score = 0
+            for i in 0..cands[c].len() {
+                if ast_kind_of(p.op[p.kids[p.k0[node] + i]]) == ckinds[c][i] {
+                    score += 1
                 }
-                break
+            }
+            if score > best_score {
+                best = c
+                best_score = score
+            }
+        }
+        if best >= 0 {
+            used.set(key + "#{best}", true)
+            let ss = cands[best]
+            for i in 0..ss.len() {
+                out.set(p.kids[p.k0[node] + i], ss[i])
             }
         }
     }
     out
+}
+
+/// The AST statement kind a TIR statement node is.
+fn ast_kind_of(op: i64) -> i64 {
+    if op == load.OP_LET {
+        return ast.S_LET
+    }
+    if op == load.OP_LETTUPLE {
+        return ast.S_LET_TUPLE
+    }
+    if op == load.OP_ASSIGN {
+        return ast.S_ASSIGN
+    }
+    if op == load.OP_RETURN {
+        return ast.S_RETURN
+    }
+    if op == load.OP_WHILE {
+        return ast.S_WHILE
+    }
+    if op == load.OP_FOR {
+        return ast.S_FOR
+    }
+    if op == load.OP_BREAK {
+        return ast.S_BREAK
+    }
+    if op == load.OP_CONTINUE {
+        return ast.S_CONTINUE
+    }
+    if op == load.OP_PARALLEL {
+        return ast.S_PARALLEL
+    }
+    if op == load.OP_SPAWN {
+        return ast.S_SPAWN
+    }
+    if op == load.OP_WITH {
+        return ast.S_WITH
+    }
+    ast.S_EXPR
 }
 
 fn line_starts(b: bytes) -> [i64] {
