@@ -1,0 +1,23 @@
+// An `export fn` that no Grasm code calls, found by C through `dlsym`
+// ([T-EXPORT]). The Grasm backend once left such a function out of the
+// object, and the link then refused to export it: "cannot export
+// _fixture_uncalled: it is not defined" (docs/self-hosting.md §6.22).
+// `scripts/linktest.sh` builds it with both backends and runs both.
+extern fn dlsym(handle: addr, name: str) -> addr
+
+type Answer = fn() -> i64
+
+export fn fixture_uncalled() -> i64 {
+    42
+}
+
+fn main() / {io, unsafe, mem} {
+    // RTLD_MAIN_ONLY: the executable's own exports.
+    let p = unsafe { dlsym(mem_addr(0 - 5), "fixture_uncalled") }
+    if unsafe { p.as_i64() } == 0 {
+        print("fixture_uncalled: not exported")
+        exit(1)
+    }
+    let v = unsafe { p.call_c(Answer) }
+    print("fixture_uncalled through dlsym: {v}")
+}

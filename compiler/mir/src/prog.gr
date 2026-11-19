@@ -164,6 +164,16 @@ pub fn index(t: TirTree, lib: bool) -> TirInfo ! str {
             fail("`main` names `{main_name}`, which is not a function")
         }
         roots.push(info.main_c)
+        // An `export fn` is a root too, called or not: C finds it by name
+        // ([T-EXPORT]), so leaving one out because no Grasm code calls it
+        // made the link refuse its export ("it is not defined").
+        for name in exported {
+            let c = info.fn_ix.get(name) ?? -1
+            if c < 0 {
+                fail("`export` names `{name}`, which is not a function")
+            }
+            roots.push(c)
+        }
     }
     let n = info.c_name.len()
     for c in 0..n {

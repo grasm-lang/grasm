@@ -19,6 +19,9 @@
 #   * the Grasm backend's objects (`compiler/s3`, the programs in its subset,
 #     `scripts/s3_subset.py`), linked with `cc` as `scripts/lib/s3.sh` links
 #     them and by `compiler/link`, run and compared the same way;
+#   * an `export fn` nothing in Grasm calls, `scripts/fixtures/link/*.gr`,
+#     through both backends: it must be in the executable and callable
+#     through `dlsym`;
 #   * thread-local variables, which neither backend nor the runtime emits:
 #     `scripts/fixtures/link/tlv_*.c`, built with `cc -c`, linked both ways,
 #     run and compared.
@@ -221,12 +224,43 @@ for entry in "${LINK_FIXTURES[@]}"; do
     fi
 done
 
+# The Grasm fixtures: an `export fn` nothing in Grasm calls, which the Grasm
+# backend once left out of the object (docs/self-hosting.md §6.22). Built by
+# the Cranelift backend (the reference) and by `compiler/s3`, linked by
+# `compiler/link`, run: the same output, and the one the fixture expects.
+GRASM_FIXTURES=(export_uncalled)
+gx_pass=0
+for name in "${GRASM_FIXTURES[@]}"; do
+    src="scripts/fixtures/link/$name.gr"
+    rm -rf "$WORK/gx"
+    mkdir -p "$WORK/gx"
+    if ! "$GRASM" build "$src" --native -o "$WORK/gx/ref" >"$WORK/gx.log" 2>&1 ||
+        ! "$GRASM" tir "$src" >"$WORK/gx/p.tir" 2>>"$WORK/gx.log" ||
+        ! "$S3" "$WORK/gx/p.tir" -o "$WORK/gx/p.o" >>"$WORK/gx.log" 2>&1; then
+        FAILED+=("fixture $name — does not build: $(head -2 "$WORK/gx.log" | tr '\n' ' ')")
+        continue
+    fi
+    # Exported as `grasm build --native` exports an `export fn`.
+    if ! why=$(link_twice "$WORK/gx/p.o" "$S3_RT" -dead_strip -exported_symbol _fixture_uncalled); then
+        note_failure "$why" "fixture $name" s3
+    elif linked=$((linked + 2)) && why=$(compare_runs "$WORK/gx/ref" ""); then
+        if [ "$(cat "$WORK/o.out")" = "fixture_uncalled through dlsym: 42" ]; then
+            gx_pass=$((gx_pass + 1))
+        else
+            FAILED+=("fixture $name — printed $(head -1 "$WORK/o.out")")
+        fi
+    else
+        note_failure "$why" "fixture $name" s3
+    fi
+done
+
 echo
 total=$considered
 echo "programs with a main: $total   external set aside: $external (SDL2 present: $SDL)"
 echo "Cranelift objects: identical: $cl_pass   failed: $cl_fail"
 echo "Grasm backend objects: in the subset: $in_subset   identical: $s3_pass   failed: $s3_fail"
 echo "C fixtures: identical: $fx_pass of ${#LINK_FIXTURES[@]}"
+echo "Grasm fixtures (s3): as expected: $gx_pass of ${#GRASM_FIXTURES[@]}"
 echo "links by compiler/link (each made twice, compared): $linked   timed out: $timedout   no TIR: ${#S3_NOTIR[@]}"
 if [ "$external" -gt 0 ]; then
     corpus_external_covered "${EXTERNAL[@]}" || exit 1
@@ -253,7 +287,7 @@ if [ $((cl_pass + external)) -ne "$total" ]; then
     echo "the counts do not add up: $cl_pass + $external is not $total"
     exit 1
 fi
-if [ "$s3_pass" -ne "$in_subset" ] || [ "$fx_pass" -ne ${#LINK_FIXTURES[@]} ]; then
+if [ "$s3_pass" -ne "$in_subset" ] || [ "$fx_pass" -ne ${#LINK_FIXTURES[@]} ] || [ "$gx_pass" -ne ${#GRASM_FIXTURES[@]} ]; then
     exit 1
 fi
 if [ "$timedout" -ne 0 ] || [ ${#S3_NOTIR[@]} -ne 0 ]; then
