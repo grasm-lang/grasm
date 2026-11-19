@@ -1514,7 +1514,9 @@ d_rust_abort=0
 d_fixed=0
 d_skipped=0
 d_rust_otherwise=0
+d_pane_only=0
 declare -a D_OTHERWISE=()
+declare -a D_PANE=()
 DAP_LIMIT=${DAP_LIMIT:-60}
 dap_compare() { # label input
     local t0 t1
@@ -1552,6 +1554,21 @@ dap_compare() { # label input
         fi
         fail "grasm dap $1 -- the Grasm adapter runs it otherwise than grasm run"
         return 1
+    fi
+    # A difference in the variables pane alone -- a `u64` the Rust adapter
+    # shows as an `i64`, for the same reason -- is a counted, printed
+    # exception (the coordinator's decision, §6.22); the answers are kept
+    # for this, up to 100 MB each.
+    if [ "$r_rc" = "$g_rc" ] && cmp -s "$WORK/r.err" "$WORK/g.err"; then
+        timeout "$DAP_LIMIT" "$GRASM" dap <"$2" 2>/dev/null | head -c 100000000 >"$WORK/r.ans"
+        timeout $((DAP_LIMIT * 4)) sandbox-exec -p "$NORUST" "$G" dap <"$2" 2>/dev/null | head -c 100000000 >"$WORK/g.ans"
+        if why=$(python3 scripts/lib/dapmask.py "$WORK/r.ans" "$WORK/g.ans"); then
+            d_pane_only=$((d_pane_only + 1))
+            D_PANE+=("$1 -- $why")
+            rm -f "$WORK/r.ans" "$WORK/g.ans"
+            return 0
+        fi
+        rm -f "$WORK/r.ans" "$WORK/g.ans"
     fi
     fail "grasm dap $1 -- exit $r_rc (Rust) and $g_rc (Grasm), $(cat "$WORK/r.sum") and $(cat "$WORK/g.sum")"
     diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
@@ -1614,9 +1631,12 @@ if want dap; then
         python3 scripts/lib/dapscript.py fixed journal "$src" "$WORK/d.in" "$WORK/jrec/$jn.jrnl"
         dap_compare "journal $src" "$WORK/d.in" "$src" && d_fixed=$((d_fixed + 1))
     done <"$WORK/jrich"
-    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
+    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
     if [ ${#D_OTHERWISE[@]} -gt 0 ]; then
         printf '  run otherwise by the Rust adapter: %s\n' $(printf '%s\n' "${D_OTHERWISE[@]}" | sort -u)
+    fi
+    if [ ${#D_PANE[@]} -gt 0 ]; then
+        printf '  the variables pane alone: %s\n' "${D_PANE[@]}"
     fi
 fi
 
@@ -1753,7 +1773,7 @@ if want journal && [ "$j_same" -ne "$j_runs" ]; then
     echo "journal: $j_same of $j_runs programs compared"
     exit 1
 fi
-if want dap && [ $((d_same + d_rust_otherwise)) -ne "$d_runs" ]; then
+if want dap && [ $((d_same + d_rust_otherwise + d_pane_only)) -ne "$d_runs" ]; then
     echo "dap: $d_same of $d_runs sessions compared"
     exit 1
 fi
