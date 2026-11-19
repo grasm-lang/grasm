@@ -6574,6 +6574,215 @@ other than the launch's -- an absolute path, as editors send, for a program
 launched by a relative one -- is answered `verified` and never stops
 (checked 2026-11-15).
 
+**Not copied: the Rust adapter runs a program without the checker's facts**
+(docs/known-issues.md, S2 by the coordinator, 2026-11-15). Found at step
+three: `grasm_dap::serve` makes its interpreter with `Interp::new_program`
+and never hands it the checker's facts that `grasm run` hands it -- the
+literal a `[f64]` stores, an integer's width, raw memory, `call_c`,
+interface calls -- so under `grasm dap` a program computes other values than
+under `grasm run`, with no error. The Grasm adapter runs it as `grasm run`
+does. Nor copied, found by the journal section: the Rust interpreter never
+gives a closed socket's handle out again, where the Rust runtime and the
+Grasm one take the lowest free (docs/known-issues.md, S3 by the coordinator,
+2026-11-17), so `grasm run` and `--native` number sockets otherwise after a
+`net_close`; the Grasm command's `run` numbers them as `--native` does.
+
+**Steps two to five, as built** (2026-11-15 to 19; the main checkout's
+compiler; other programs' swap held the disk between 2.6 and 10 GB, the
+gates were stopped at the disk guard six times -- once by the coordinator's
+hand, five times by the guard -- and run again from the step, or later the
+section, they stopped in; loads of 3 to 10, so no time here is to be
+quoted).
+
+- **The backend's `export fn`** (decision (2)'s condition), first and in its
+  own commit (`6427283a`): every `export fn` is a root of the program
+  (`compiler/mir/src/prog.gr`), and `linktest` builds
+  `scripts/fixtures/link/export_uncalled.gr` with both backends, links each
+  and runs it: "Grasm fixtures (s3): as expected: 1 of 1" (with the old rule,
+  "compiler/link failed: cannot export _fixture_uncalled: it is not
+  defined"). On that commit `s3subset` "identical: 648 mismatched: 0",
+  `objtest` "objects: 648 reproducible: 648 ... with problems: 0",
+  `linktest` "Cranelift objects: identical: 651 ... Grasm backend objects: in
+  the subset: 648 identical: 648 ... C fixtures: identical: 3 of 3", and on
+  `5c17b142` `s3controls` "controls: 42 caught: 42 missed: 0".
+- **The journal** (`tools/tirinterp/src/journal.gr`, `builtins.journaled`,
+  the refusal in `cabi.gr`, `compiler/grasm/src/journalcmd.gr`). The mode is
+  off when neither variable is set and is otherwise chosen at the first
+  question, as the reference chooses it; under a journal `journal.mark`
+  turns the calls of the forty recorded built-ins into a node of their own,
+  so a run with no journal tests for one nowhere. The journal -- mode, file,
+  records, cursor -- travels with the slab the tasks of a `concurrent` block
+  hand on, so they share one in the order they call: the first build gave
+  each task its own cursor, and a replay whose tasks reached outside the
+  program diverged at call 2, found by the check the coordinator asked for;
+  `scripts/fixtures/journal/tasks.gr` is in the gate since. `compiler/rt`
+  looks for `unjournaled_host` through `os.RTLD_MAIN` (RTLD_MAIN_ONLY on
+  Darwin; RTLD_DEFAULT on Linux, which has none).
+- **The language server** (`compiler/grasm/src/lsp.gr`, over
+  `tools/tirinterp/src/json.gr` and `rpc.gr`, and `front`'s `load_text` and
+  `single_module`) agreed on every session from its first build.
+- **The debug adapter** (`compiler/grasm/src/dap.gr`,
+  `tools/tirinterp/src/debug.gr`, the variables' names and closures' reads
+  loaded from TIR in `load.gr`). `debug.rewrite` turns the program's nodes
+  into the debugger's before `main` runs -- blocks, `match`es, `let`s,
+  closures, `inout` calls and `print`s become opcodes of their own, and every
+  function body, `for` body and closure body is put under a node that keeps
+  the reference's frames and scopes -- so a run without the debugger tests
+  for it nowhere; a task of a `concurrent` block runs the nodes as they
+  were, but for its prints. What the corpus taught it: an `inout` argument
+  must keep its value while the other arguments run (a stop inside one of
+  them showed `()`) and still be moved before the call (a copy made every
+  write in the callee copy the whole value: `scheme-demo` stepped past its
+  limit); a function with contracts is a wrapper and a body whose blocks
+  share one span, so a TIR block is paired with the AST block of its span,
+  its number of statements and their kinds; each debugger node is a call of
+  its own, and a debugged call's body moves to a fresh stack halfway between
+  `body`'s hops (with the handlers inline, `scheme-demo`'s step session
+  overflowed a fiber); and the debugger's lists are taken out of the
+  context, changed and put back, never changed in place -- a method call on
+  a field of a struct finds the field by name at run time, the debugger's
+  41 fields are the last of `Cx`'s 87, and under the stage-2 command
+  `structs.field_named` and `memcmp` were 60% of a step session's samples.
+- **The timing of `run`** (the owner's rule, through the coordinator,
+  2026-11-17: twelve rounds of the seven serial benchmarks, master, the
+  build and the build with every `cx.dbg` test made false interleaved; under
+  1.01 of master's geometric mean, the gap accepted, else the op-code
+  rewrite). The first build, with the debugger's state saved in each call's
+  locals, was 4.6 to 5.4% slower on four of the nine benchmarks; with it in
+  the context, 1.0168 of master (the tests made false: 1.0117), so the
+  rewrite was made: 1.0036. On the final tree, 0.9969 of master (fib 1.0036,
+  sort 0.9877, wordfreq 0.9903, tree 0.9992, sieve 1.0022, matmul 0.9936,
+  mandelbrot 1.0016), output byte-identical.
+- **The coordinator's decisions on the gates**, the owner's to reverse: a
+  session whose Rust adapter prints or ends otherwise than `grasm run` holds
+  the Grasm adapter to `grasm run` (`scripts/lib/dapran.py`, 2026-11-15); one
+  that differs only in the variables pane is a counted, printed exception
+  (`dapmask.py`, 2026-11-15), now none, since a corpus session that differs
+  is run again by both adapters launched on one recording of the program by
+  the Rust command (the agent's, 2026-11-17: `L-LIB-RANDOM`'s rejection
+  sampling stopped at a breakpoint as often as it drew again); a session
+  ended by the host's channel panic (`E-CHANNEL`, `E-DEADLOCK`) is counted
+  as §6.19's decision (3) counts it under `test` (2026-11-16); a journal
+  that differs only in socket handles after the run's first `net_close`, as
+  one renumbering, is counted (`jnorm.py`, 2026-11-17), with the control
+  `net-handle`; and a session the Grasm adapter does not end in its limit is
+  run once more given the program's own run time -- that command's plain
+  `grasm run` of it, timed in the gate -- on top of the limit, must then
+  match, and is counted on a line of its own and held to at most three, with
+  the control `dap-hang` for a session that never ends (2026-11-19). Why:
+  most of a heavy program's session is the program running to its end once
+  the input stops. The four step sessions the stage-2 dap section first
+  timed out on, alone (Rust; stage 1 before and after the lists were taken
+  out; stage 2 before and after):
+
+  | session | Rust | s1 | s1 after | s2 | s2 after |
+  |---|---|---|---|---|---|
+  | `benchmarks/grasm/parmap.gr` | 56.7 s | 168.5 s | 151.5 s | 279.0 s | 240.5 s |
+  | `packages/accounts-demo` | 55.5 s | 163.9 s | 99.5 s | 316.2 s | 161.5 s |
+  | `packages/observe-demo` | 55.9 s | 154.8 s | 91.2 s | 300.6 s | 146.7 s |
+  | `packages/postgres-demo` | 44.2 s | 126.1 s | 73.1 s | 242.9 s | 118.4 s |
+
+  every stream the same bytes as Rust's. `parmap`'s plain `run` takes 55.0 s
+  (Rust), 118.3 s (stage 1) and 156.7 s (stage 2): the stage-2 adapter adds
+  about 84 s to it, the Rust adapter about 2 s.
+- **Why `grasm-j` is slow.** The journal section runs on the stage-1 command
+  relinked with the Grasm runtime (decision (2)), and that build takes about
+  25 minutes on `examples/parallel_map.gr`: `sample` puts 87% of its time in
+  the Grasm runtime's struct-field and reference-count entry points
+  (`grt_struct_get_at` alone 21%), which the Cranelift-compiled interpreter
+  calls on every read of its context.
+- **The gates.** The final tree is `9f12e7b1`; each line below names the commit it ran on.
+  - On `cc4dd645` (the tree but the gatecheck fix and the floors):
+    `tirinterp` "identical: 651 mismatched: 0 timed out: 0 skipped: 0",
+    "round trip: 1671 identical, 0 not", "panics: 25 identical, 0 not";
+    `clidiff` `dap` with stage 1, "dap: 1002 sessions compared the same:
+    960, 51 of them fixed the Rust adapter running it otherwise than grasm
+    run: 25 differing in the variables pane alone: 0 the same under one
+    recording: 13 the host's channel panic: 4 reading stdin, left out: 3
+    past 60s for Rust: 6 the Rust adapter's own stack: 1 long, not stepped
+    again: 14", "given the program's own run time: 0"; with stage 2, "dap:
+    1004 sessions compared the same: 961, 51 of them fixed ... the same under
+    one recording: 13 the host's channel panic: 4 ... past 60s for Rust: 4
+    ... long, not stepped again: 14", "given the program's own run time: 1
+    (slowest: benchmarks/grasm/parmap.gr step 245 s, run 159 s)" (the count
+    of sessions moves with how many Rust sessions pass 60 s and 10 s); `run`
+    with stage 2, "run: 651 programs with a main the same: 651 timed out:
+    0"; `clicontrols` "controls: 30 caught: 30 missed: 0" (§6.21's 22 and
+    eight: `journal-lost`, `exempt-gone`, `dap-field`, `dap-line`,
+    `lsp-diag`, `lsp-hover`, `net-handle`, `dap-hang`); `fmttest`
+    "formatted: 2013 unformatted: 0 does not parse: 5 exempt: 1";
+    `gfmttest` "checked: 1537 disagreeing: 0"; `linttest` "linted: 2014
+    findings: 994 does not parse: 5 broke: 0".
+  - On `9f12e7b1`: `gatecheck` "gate helpers checked: 587 undefined: 0
+    corpus copied: 0 grep -q under pipefail: 0 gates not executable: 0" (on
+    `cc4dd645` it found one, the recording's first line grepped under
+    pipefail in the dap section's replay path; `c12deea3` reads it into a
+    variable, the same condition, checked by the dap section on the eight
+    programs that take that path with stage 1: "the same under one
+    recording: 9", the rest the same); the litter check, against lists
+    taken before the first gate: no new untracked or ignored file and no new
+    top-level entry in the worktree, the gate worktree or the main checkout.
+  - On `086d58f3`: `fixpoint` "programs: 6 and the grasm command artifacts
+    per stage: 16 and 2 compared: 54 ... identical: 54 differ: 0", "stage
+    2's TIR the same as grasm tir's: 6 of 6", "the command's build the stage
+    pipeline's (its rt.o and the 4 programs): 5 of 5"; the command's stage 2
+    is 4,616,696 bytes, SHA-256
+    `8c0296fef7fedaaaccc10ae89445e79b987ed948beb619bb7588ed49df851fb4`;
+    `clicontrols` with `CONTROLS=dap-field,dap-line` "controls: 2 caught: 2
+    missed: 0".
+  - On `8e4b8915`, and not run again (the diff since is `debug.gr`, the
+    dap section's retry rule, the gatecheck fix and the floors; the
+    coordinator's decision): the `journal` section with stage 1 and the
+    Grasm-runtime command, "journal: 652 programs recorded the same: 652,
+    185 of them with a journal (7 differing only in the IoFailed wording, 1
+    only in socket handles after a net_close) replays alike: 370 printed
+    alike: 370 mangled journals alike: 330 native recordings replayed alike:
+    45 of 45", and with stage 2 the same line; with stage 2, `deps` "1448
+    packages, 4344 commands the same, lockfiles and all: 4344, 1447 of them
+    refusals lockfiles written: 1448", `add` "1448 packages the same,
+    manifests and all: 1448, 0 of them refusals", `publish` "1448 packages
+    the same, registries and all: 1448, 635 of them published", `lsp` "2036
+    sessions the same: 2036, 17 of them fixed"; and the sections before them
+    -- `lines` to `registry` -- in a whole run the guard stopped in `deps`,
+    whose log the next start wrote over: their lines are the coordinator's,
+    copied from the screen while it ran (`lines: 272 the same: 267`, `corpus
+    ... the same: 8685`, `toml ... the same: 1474`, `run ... the same: 651`,
+    `fmt ... the same: 20190`, `lint ... the same: 5445`, `test ... the same:
+    1960 ... both timed out, --contracts: 1`, `test, main as a test ... the
+    same: 649, 13 of them failing the host's panic: 2`, `bench ... the same:
+    1743`, `doc ... the same: 3168`, `api ... the same: 10793`, `bundle ...
+    the same output: 651`, `source ... the same output and file: 1737`,
+    `build ... the same output: 648`, `target ... 195 of 195`, `registry ...
+    the same, files and all: 129`), not a file the gate wrote.
+  - The floors of the three sections (`9f12e7b1`, the agent's), a margin
+    below these runs: `journal` 640 programs, 170 journals, 340 replays and
+    prints, 300 mangled, 40 native, at most 10 in the IoFailed wording and 2
+    in socket handles; `dap` 950 sessions, 45 fixed, at most 30 run otherwise
+    by the Rust adapter, 20 under one recording, 4 host panics, 2 in the
+    variables pane alone, and 3 given their program's run time; `lsp` 1,900
+    sessions, 15 fixed. They hold only on a whole run, and no whole run has
+    been made with them.
+
+Not run on this branch: the rest of `allgates.sh`, `fuzz_rtsys`, and a
+whole `clidiff` run of one command on one tree.
+
+**What is left for S8 after this part.** In the backend, `lower.gr`'s
+`take_child` finds a struct field by name for every method call that
+changes a field in place (`grasm_struct_take`, `grasm_struct_get`): a
+by-index take where the field's position is known would remove what the
+profile of a stage-2 step session put at 50% (`field_named`) and 10%
+(`memcmp`), and 21% (`memcmp`) under stage 1 -- left, by the coordinator's
+decision, as a backend item. The debugger's own cost per statement on
+stage 2, about 84 s over parmap's 157 s run where the Rust adapter's is
+about 2 s. The Grasm-runtime command's struct-field and reference-count
+entry points (`grasm-j`, above). The rest as §6.21 left it -- `test
+--schedules` and `--schedule-seed` for a test that starts tasks, a panic
+inside a `concurrent` task under `test`, one the runtime's channel
+operations raise, the interpreter's own stack, the `IoFailed` wording; the
+LSP on the query engine and the wasm32 backend; the Rust TOML reader's
+misreadings, kept until S9; and the Rust defects this part copied or
+declined (docs/known-issues.md).
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
