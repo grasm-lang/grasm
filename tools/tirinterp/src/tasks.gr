@@ -1,0 +1,847 @@
+// Concurrent tasks and channels, as the reference interpreter has them
+// (`crates/grasm_interp/src/tasks.rs`; docs/self-hosting.md §6.23).
+//
+// The scheduler is the reference's, step for step, so that `grasm test
+// --schedules` draws the same orders from the same seeds: a `concurrent`
+// block runs in rounds, a round being whatever is runnable at its start; a
+// task runs until it ends or a channel operation has to wait; one that
+// waits joins that channel's queue and is runnable again only when an
+// operation wakes it; when nothing is runnable and a task is alive, that is
+// a deadlock. With a schedule seed each round of two or more is shuffled by
+// Fisher-Yates over SplitMix64 (`round_order`). Channels are this table's,
+// one for the whole run, as the reference's are, so a channel made inside a
+// task is every task's.
+//
+// The host's tasks are only stacks here. A program block is one host
+// `concurrent` block of a scheduler and one host task per program task,
+// each waiting on a host channel of its own for its turn; only the task
+// holding a turn runs, so the host's own order decides nothing, and no host
+// channel operation waits where the reference would not. The shared state
+// -- the slab, raw memory, the journal and this table -- travels with the
+// turn. A task that has to go deeper than one host stack holds hands its
+// evaluation to a spare host task of the same block (`hop`); a nested block
+// cannot be used, as its task could not wait on a sibling outside it.
+import eval
+import value
+import debug
+
+/// The reference's `Chans`: every channel, the wake-ups not yet taken, the
+/// open blocks' waiting flags, which slot is running, and the schedule.
+/// A waiter, a (block, slot) pair, is one integer: block * 2^32 + slot.
+type Sched = {
+    buf: [[Value]],
+    bh: [i64],
+    cap: [i64],
+    closed: [bool],
+    sent: [i64],
+    taken: [i64],
+    room: [[i64]],
+    rh: [i64],
+    val: [[i64]],
+    vh: [i64],
+    sched_on: bool,
+    sched: i64,
+    running: i64,
+    wb_id: [i64],
+    wb_flags: [[bool]],
+    ready: [i64],
+    next_block: i64,
+    // Each open block's spare host stacks not in use.
+    sp_blk: [i64],
+    sp_free: [[i64]],
+    // Each open block's place in the reference's loop (`run_tasks`): its id,
+    // the round being run and how far, what is runnable for the next round,
+    // which slots have ended, how many are alive, and the slot that was
+    // running when the block started.
+    bk_id: [i64],
+    bk_round: [[i64]],
+    bk_pos: [i64],
+    bk_next: [[i64]],
+    bk_done: [[bool]],
+    bk_alive: [i64],
+    bk_outer: [i64],
+}
+
+pub fn new_sched() -> Sched {
+    Sched{
+        buf: [],
+        bh: [],
+        cap: [],
+        closed: [],
+        sent: [],
+        taken: [],
+        room: [],
+        rh: [],
+        val: [],
+        vh: [],
+        sched_on: false,
+        sched: 0,
+        running: 0,
+        wb_id: [],
+        wb_flags: [],
+        ready: [],
+        next_block: 0,
+        sp_blk: [],
+        sp_free: [],
+        bk_id: [],
+        bk_round: [],
+        bk_pos: [],
+        bk_next: [],
+        bk_done: [],
+        bk_alive: [],
+        bk_outer: [],
+    }
+}
+
+let SLOTS = 4294967296
+let SIDE_ROOM = 0
+let SIDE_VALUE = 1
+let GOLDEN = -7046029254386353131
+
+let DEADLOCK = "deadlock: every task is waiting on a channel, and nothing left can send or receive"
+
+// ----- the schedule ------------------------------------------------------------------
+
+/// SplitMix64 (`tasks.rs`' `next`).
+fn next(inout sc: Sched) -> i64 {
+    sc.sched = sc.sched + GOLDEN
+    var z = sc.sched
+    z = z.bit_xor(z.ushr(30)) * -4658895280553007687
+    z = z.bit_xor(z.ushr(27)) * -7723592293110705685
+    z.bit_xor(z.ushr(31))
+}
+
+/// The order a round visits `n` runnable slots: as given, unless a seed is
+/// set, then a Fisher-Yates shuffle drawn from it.
+fn round_order(inout sc: Sched, n: i64) -> [i64] {
+    var order: [i64] = []
+    for i in 0..n {
+        order.push(i)
+    }
+    if sc.sched_on {
+        var i = n - 1
+        while i >= 1 {
+            let r = next(sc)
+            let j = (r.as_u64() % (i + 1).as_u64()).as_i64()
+            let t = order[i]
+            order[i] = order[j]
+            order[j] = t
+            i -= 1
+        }
+    }
+    order
+}
+
+/// `grasm test --schedules`: the seed of the `k`th schedule tried, a
+/// function of `--seed` (`testing::schedule_seed`).
+pub fn schedule_seed(seed: i64, k: i64) -> i64 {
+    var z = seed.bit_xor((k + 1) * GOLDEN)
+    z = z.bit_xor(z.ushr(30)) * -4658895280553007687
+    z = z.bit_xor(z.ushr(27)) * -7723592293110705685
+    z.bit_xor(z.ushr(31))
+}
+
+/// Sets the schedule a run draws from, or none (`set_schedule`).
+pub fn set_schedule(inout cx: Cx, on: bool, seed: i64) {
+    cx.sc.sched_on = on
+    cx.sc.sched = seed
+}
+
+// ----- waiting flags and wake-ups -------------------------------------------------------
+
+fn block_at(sc: Sched, block: i64) -> i64 {
+    for i in 0..sc.wb_id.len() {
+        if sc.wb_id[i] == block {
+            return i
+        }
+    }
+    -1
+}
+
+/// Whether waiter `who` is in some channel's queue, and clears it: false
+/// for an entry a retry left behind, or one whose block has returned.
+fn take_waiting(inout sc: Sched, who: i64) -> bool {
+    let b = block_at(sc, who / SLOTS)
+    if b < 0 {
+        return false
+    }
+    let slot = who % SLOTS
+    if slot >= sc.wb_flags[b].len() or not sc.wb_flags[b][slot] {
+        return false
+    }
+    sc.wb_flags[b][slot] = false
+    true
+}
+
+fn is_waiting(sc: Sched, who: i64) -> bool {
+    let b = block_at(sc, who / SLOTS)
+    if b < 0 {
+        return false
+    }
+    let slot = who % SLOTS
+    slot < sc.wb_flags[b].len() and sc.wb_flags[b][slot]
+}
+
+fn set_waiting(inout sc: Sched, who: i64) {
+    let b = block_at(sc, who / SLOTS)
+    if b < 0 {
+        return
+    }
+    let slot = who % SLOTS
+    if slot < sc.wb_flags[b].len() {
+        sc.wb_flags[b][slot] = true
+    }
+}
+
+/// The longest-waiting task on `id`'s `side` that is really waiting, moved
+/// to the ready list; a stale entry is passed over (`wake_one`).
+fn wake_one(inout sc: Sched, id: i64, side: i64) {
+    while true {
+        var who = -1
+        if side == SIDE_ROOM {
+            if sc.rh[id] >= sc.room[id].len() {
+                return
+            }
+            who = sc.room[id][sc.rh[id]]
+            sc.rh[id] += 1
+            compact_room(sc, id)
+        } else {
+            if sc.vh[id] >= sc.val[id].len() {
+                return
+            }
+            who = sc.val[id][sc.vh[id]]
+            sc.vh[id] += 1
+            compact_val(sc, id)
+        }
+        if take_waiting(sc, who) {
+            sc.ready.push(who)
+            return
+        }
+    }
+}
+
+// A queue is a list and the index of its head; the taken part is dropped
+// once it is the larger half, so a queue costs what it holds.
+fn compact_room(inout sc: Sched, id: i64) {
+    let h = sc.rh[id]
+    if h > 32 and h * 2 > sc.room[id].len() {
+        sc.room[id] = sc.room[id].slice(h, sc.room[id].len())
+        sc.rh[id] = 0
+    }
+}
+
+fn compact_val(inout sc: Sched, id: i64) {
+    let h = sc.vh[id]
+    if h > 32 and h * 2 > sc.val[id].len() {
+        sc.val[id] = sc.val[id].slice(h, sc.val[id].len())
+        sc.vh[id] = 0
+    }
+}
+
+fn compact_buf(inout sc: Sched, id: i64) {
+    let h = sc.bh[id]
+    if h > 32 and h * 2 > sc.buf[id].len() {
+        sc.buf[id] = sc.buf[id].slice(h, sc.buf[id].len())
+        sc.bh[id] = 0
+    }
+}
+
+// ----- channels --------------------------------------------------------------------------
+//
+// Each operation takes the table out of the context for its length (`sc`),
+// works on it there and puts it back: a field of a field of the context
+// changed in place is a search by name in a build of the reference's
+// compiler, and the context is a long struct.
+
+/// The table, moved out of the context, which keeps an empty one meanwhile.
+fn take_sc(inout cx: Cx) -> Sched {
+    let s = cx.sc
+    cx.sc = cx.sc_none
+    s
+}
+
+/// The channel a value names, or -1 when it names none.
+fn chan_id(sc: Sched, v: Value) -> i64 {
+    match v {
+        VInt(i) -> if i >= 0 and i < sc.cap.len() { i } else { -1 }
+        _ -> -1
+    }
+}
+
+/// `chan_new(n)`: room for `n` values, none for a rendezvous.
+pub fn prog_make(inout cx: Cx, cap: i64) -> Value {
+    var sc = take_sc(cx)
+    sc.buf.push([])
+    sc.bh.push(0)
+    sc.cap.push(cap.max(0))
+    sc.closed.push(false)
+    sc.sent.push(0)
+    sc.taken.push(0)
+    sc.room.push([])
+    sc.rh.push(0)
+    sc.val.push([])
+    sc.vh.push(0)
+    let id = sc.cap.len() - 1
+    cx.sc = sc
+    VInt(id)
+}
+
+/// Gives way until one of `on` moves: the slot joins each channel's queue
+/// on `side` and the turn goes to the next task. Outside every task there
+/// is nobody to give way to. The table goes back into the context, and is
+/// taken out again when the turn comes back; false when the block is over
+/// and this task is to unwind.
+fn wait(inout cx: Cx, inout sc: Sched, on: [i64], side: i64) -> bool {
+    if not in_task(cx) {
+        cx.sc = sc
+        sc = cx.sc_none
+        let _ = eval.fault(cx, "{DEADLOCK} -- a channel operation outside every `go` cannot wait for one; move it into a task")
+        return false
+    }
+    let me = sc.running
+    set_waiting(sc, me)
+    for id in on {
+        if side == SIDE_ROOM {
+            sc.room[id].push(me)
+        } else {
+            sc.val[id].push(me)
+        }
+    }
+    let go = give_way(cx, sc)
+    if go {
+        sc = take_sc(cx)
+    }
+    go
+}
+
+/// A failure of the operation: the table back in the context, the fault
+/// raised.
+fn fail_with(inout cx: Cx, inout sc: Sched, msg: str) -> Value {
+    cx.sc = sc
+    sc = cx.sc_none
+    eval.fault(cx, msg)
+}
+
+/// `chan_send(ch, v)`: a buffered send returns once its value is stored, a
+/// rendezvous once its value is taken.
+pub fn prog_send(inout cx: Cx, ch: Value, v: Value) -> Value {
+    var sc = take_sc(cx)
+    let id = chan_id(sc, ch)
+    if id < 0 {
+        return fail_with(cx, sc, "not a channel")
+    }
+    var x = v
+    var ticket = -1
+    while true {
+        if ticket >= 0 {
+            if sc.taken[id] > ticket {
+                cx.sc = sc
+                return VUnit
+            }
+        } else {
+            if sc.closed[id] {
+                return fail_with(cx, sc, "send on a closed channel")
+            }
+            let cap = sc.cap[id]
+            if cap == 0 or sc.buf[id].len() - sc.bh[id] < cap {
+                sc.buf[id].push(value.take(x))
+                sc.sent[id] += 1
+                wake_one(sc, id, SIDE_VALUE)
+                if cap > 0 {
+                    cx.sc = sc
+                    return VUnit
+                }
+                ticket = sc.sent[id] - 1
+                continue
+            }
+        }
+        if not wait(cx, sc, [id], SIDE_ROOM) {
+            return VUnit
+        }
+    }
+    VUnit
+}
+
+/// `chan_recv(ch)`: `Some(v)` in the order sent, `None` once closed and
+/// drained.
+pub fn prog_recv(inout cx: Cx, ch: Value) -> Value {
+    var sc = take_sc(cx)
+    let id = chan_id(sc, ch)
+    if id < 0 {
+        return fail_with(cx, sc, "not a channel")
+    }
+    while true {
+        let h = sc.bh[id]
+        if h < sc.buf[id].len() {
+            let got = value.take(sc.buf[id][h])
+            sc.bh[id] = h + 1
+            compact_buf(sc, id)
+            sc.taken[id] += 1
+            wake_one(sc, id, SIDE_ROOM)
+            cx.sc = sc
+            return value.some_v(cx.p, got)
+        }
+        if sc.closed[id] {
+            cx.sc = sc
+            return value.none_v(cx.p)
+        }
+        if not wait(cx, sc, [id], SIDE_VALUE) {
+            return VUnit
+        }
+    }
+    VUnit
+}
+
+/// `chan_select(chs)`: the index of the first channel a `chan_recv` would
+/// not wait on, waiting on all of them until there is one.
+pub fn prog_select(inout cx: Cx, chs: Value) -> Value {
+    var sc = take_sc(cx)
+    var ids: [i64] = []
+    for c in value.list_of(chs) {
+        let id = chan_id(sc, c)
+        if id < 0 {
+            return fail_with(cx, sc, "not a channel")
+        }
+        ids.push(id)
+    }
+    if ids.is_empty() {
+        return fail_with(cx, sc, "`chan_select` of no channels would wait forever")
+    }
+    while true {
+        for i in 0..ids.len() {
+            let id = ids[i]
+            if sc.bh[id] < sc.buf[id].len() or sc.closed[id] {
+                cx.sc = sc
+                return VInt(i)
+            }
+        }
+        if not wait(cx, sc, ids, SIDE_VALUE) {
+            return VUnit
+        }
+    }
+    VUnit
+}
+
+/// `chan_close(ch)`: every waiter on it woken, room side first.
+pub fn prog_close(inout cx: Cx, ch: Value) -> Value {
+    var sc = take_sc(cx)
+    let id = chan_id(sc, ch)
+    if id < 0 {
+        return fail_with(cx, sc, "not a channel")
+    }
+    if sc.closed[id] {
+        return fail_with(cx, sc, "closing a channel that is already closed")
+    }
+    sc.closed[id] = true
+    var woken: [i64] = []
+    for k in sc.rh[id]..sc.room[id].len() {
+        woken.push(sc.room[id][k])
+    }
+    for k in sc.vh[id]..sc.val[id].len() {
+        woken.push(sc.val[id][k])
+    }
+    sc.room[id] = []
+    sc.rh[id] = 0
+    sc.val[id] = []
+    sc.vh[id] = 0
+    for who in woken {
+        if take_waiting(sc, who) {
+            sc.ready.push(who)
+        }
+    }
+    cx.sc = sc
+    VUnit
+}
+
+// ----- tasks -------------------------------------------------------------------------------
+//
+// There is no scheduler task: the reference's loop is a state per open
+// block (`bk_*`), and whichever task gives way or ends runs it on to the
+// next slot and hands that task the turn -- the shared state -- directly,
+// one host switch a turn. When the loop ends the block (every task done, a
+// task failed, or a deadlock), that task tells every other to unwind,
+// lets the spares go and hands the state to the block's parent.
+
+/// Whether this context is a task of a `concurrent` block, the only place a
+/// channel operation may wait.
+pub fn in_task(cx: Cx) -> bool {
+    not cx.turns.is_empty()
+}
+
+fn bk_at(sc: Sched, block: i64) -> i64 {
+    var i = sc.bk_id.len() - 1
+    while i >= 0 {
+        if sc.bk_id[i] == block {
+            return i
+        }
+        i -= 1
+    }
+    -1
+}
+
+/// What the loop does next: run a slot (>= 0), or end the block: all done
+/// (-1), a deadlock (-2). A task's failure ends it where it is reported.
+let END_OK = -1
+let END_DEADLOCK = -2
+
+/// The reference's loop from where it stands to the next slot to resume:
+/// the rest of the round; then, with someone alive, the wake-ups meant for
+/// this block taken, and a new round of them in the order the schedule
+/// gives; or the end.
+fn advance(inout sc: Sched, b: i64, block: i64) -> i64 {
+    while true {
+        while sc.bk_pos[b] < sc.bk_round[b].len() {
+            let i = sc.bk_round[b][sc.bk_pos[b]]
+            sc.bk_pos[b] += 1
+            if sc.bk_done[b][i] {
+                continue
+            }
+            sc.running = block * SLOTS + i
+            let _ = take_waiting(sc, block * SLOTS + i)
+            return i
+        }
+        if sc.bk_alive[b] == 0 {
+            return END_OK
+        }
+        var keep: [i64] = []
+        for who in sc.ready {
+            if who / SLOTS == block {
+                sc.bk_next[b].push(who % SLOTS)
+            } else {
+                keep.push(who)
+            }
+        }
+        sc.ready = keep
+        if sc.bk_next[b].is_empty() {
+            return END_DEADLOCK
+        }
+        new_round(sc, b)
+    }
+    END_OK
+}
+
+/// The runnable slots become the round, in the schedule's order.
+fn new_round(inout sc: Sched, b: i64) {
+    let runnable = sc.bk_next[b]
+    sc.bk_next[b] = []
+    let order = round_order(sc, runnable.len())
+    var round: [i64] = []
+    for o in order {
+        round.push(runnable[o])
+    }
+    sc.bk_round[b] = round
+    sc.bk_pos[b] = 0
+}
+
+/// This task gives way, holding the table out of the context (`sc`): the
+/// next slot gets the turn and this one waits for its own, the table then
+/// back in the context. False when the block is over: the task then
+/// unwinds without running another statement.
+fn give_way(inout cx: Cx, inout sc: Sched) -> bool {
+    let block = cx.blk
+    let b = bk_at(sc, block)
+    let me = cx.slot
+    // It joined a queue, or it is runnable again at once.
+    if not is_waiting(sc, block * SLOTS + me) {
+        sc.bk_next[b].push(me)
+    }
+    let next = advance(sc, b, block)
+    cx.sc = sc
+    sc = cx.sc_none
+    if next == me {
+        return true
+    }
+    if next < 0 {
+        end_block(cx, b, next, 0, VUnit)
+        abort(cx)
+        return false
+    }
+    chan_send(cx.turns[next], eval.slab_out(cx))
+    take_turn(cx)
+}
+
+/// Waits for this task's turn and takes the shared state it brings.
+fn take_turn(inout cx: Cx) -> bool {
+    var go = false
+    match chan_recv(cx.turns[cx.slot]) {
+        Some(s) -> if not s.abort {
+            eval.slab_in(cx, s)
+            go = true
+        }
+        None -> ()
+    }
+    if not go {
+        abort(cx)
+    }
+    go
+}
+
+/// The block is over: this task unwinds and runs nothing more.
+fn abort(inout cx: Cx) {
+    cx.aborted = true
+    cx.ctl = eval.CTL_PANIC
+    cx.carry = VStr("")
+}
+
+/// This task has ended, `ctl` and `carry` saying how: the next slot gets
+/// the turn, or, if it failed or was the last, the block ends.
+fn task_ended(inout cx: Cx, ctl: i64, carry: Value) {
+    let block = cx.blk
+    var sc = take_sc(cx)
+    let b = bk_at(sc, block)
+    sc.bk_alive[b] -= 1
+    sc.bk_done[b][cx.slot] = true
+    if ctl != 0 and ctl != eval.CTL_RETURN {
+        cx.sc = sc
+        end_block(cx, b, END_OK, ctl, carry)
+        return
+    }
+    let next = advance(sc, b, block)
+    cx.sc = sc
+    if next < 0 {
+        end_block(cx, b, next, 0, VUnit)
+        return
+    }
+    chan_send(cx.turns[next], eval.slab_out(cx))
+}
+
+/// Ends block `b` (`how`: all done or a deadlock; `ctl`, a task's
+/// failure): its state put away as the reference's `run_tasks` puts it,
+/// every task still suspended or never started told to unwind, the spares
+/// let go, and the shared state handed to the parent.
+fn end_block(inout cx: Cx, b: i64, how: i64, ctl: i64, carry: Value) {
+    let block = cx.blk
+    cx.sc.running = cx.sc.bk_outer[b]
+    let done = cx.sc.bk_done[b]
+    cx.sc.bk_id.remove(b)
+    cx.sc.bk_round.remove(b)
+    cx.sc.bk_pos.remove(b)
+    cx.sc.bk_next.remove(b)
+    cx.sc.bk_done.remove(b)
+    cx.sc.bk_alive.remove(b)
+    cx.sc.bk_outer.remove(b)
+    let wb = block_at(cx.sc, block)
+    if wb >= 0 {
+        cx.sc.wb_id.remove(wb)
+        cx.sc.wb_flags.remove(wb)
+    }
+    var keep: [i64] = []
+    for who in cx.sc.ready {
+        if who / SLOTS != block {
+            keep.push(who)
+        }
+    }
+    cx.sc.ready = keep
+    for j in 0..cx.sc.sp_blk.len() {
+        if cx.sc.sp_blk[j] == block {
+            cx.sc.sp_blk.remove(j)
+            cx.sc.sp_free.remove(j)
+            break
+        }
+    }
+    for i in 0..done.len() {
+        if i != cx.slot and not done[i] {
+            var s = eval.empty_slab()
+            s.abort = true
+            chan_send(cx.turns[i], s)
+        }
+    }
+    for q in cx.sp_req {
+        chan_close(q)
+    }
+    chan_send(cx.done[0], Done{ s: eval.slab_out(cx), ctl: ctl, carry: carry, deadlock: how == END_DEADLOCK })
+}
+
+/// A hop to a spare host stack: the context, and the shared state apart
+/// from it, so that neither side holds the other's copy.
+type Hop = {
+    c: Cx,
+    s: Slab,
+}
+
+/// How a block ended, for its parent: the shared state, a task's failure
+/// (its control code and what it carried), or a deadlock.
+type Done = {
+    s: Slab,
+    ctl: i64,
+    carry: Value,
+    deadlock: bool,
+}
+
+/// How many spare host stacks a block has, shared by its tasks.
+pub let SPARES = 21
+
+/// Runs a `concurrent` block's tasks to their end, as the reference's
+/// `run_tasks` does: `bodies` are the `go` bodies in the order they ran,
+/// `frames` the frame each saw. The block counts as run already.
+pub fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
+    let n = bodies.len()
+    if n == 0 {
+        return
+    }
+    cx.sc.next_block += 1
+    let block = cx.sc.next_block
+    var flags: [bool] = []
+    var done_flags: [bool] = []
+    var all: [i64] = []
+    for i in 0..n {
+        flags.push(false)
+        done_flags.push(false)
+        all.push(i)
+    }
+    cx.sc.wb_id.push(block)
+    cx.sc.wb_flags.push(flags)
+    cx.sc.bk_id.push(block)
+    cx.sc.bk_round.push([])
+    cx.sc.bk_pos.push(0)
+    cx.sc.bk_next.push(all)
+    cx.sc.bk_done.push(done_flags)
+    cx.sc.bk_alive.push(n)
+    cx.sc.bk_outer.push(cx.sc.running)
+    let nsp = SPARES
+    var free: [i64] = []
+    var k = nsp - 1
+    while k >= 0 {
+        free.push(k)
+        k -= 1
+    }
+    cx.sc.sp_blk.push(block)
+    cx.sc.sp_free.push(free)
+    let b = cx.sc.bk_id.len() - 1
+    new_round(cx.sc, b)
+    let first = advance(cx.sc, b, block)
+    var turns: [Chan[Slab]] = []
+    for _ in 0..n {
+        let t: Chan[Slab] = chan_new(1)
+        turns.push(t)
+    }
+    var sp_req: [Chan[Hop]] = []
+    var sp_resp: [Chan[Hop]] = []
+    for _ in 0..nsp {
+        let q: Chan[Hop] = chan_new(1)
+        let r: Chan[Hop] = chan_new(1)
+        sp_req.push(q)
+        sp_resp.push(r)
+    }
+    let done: Chan[Done] = chan_new(1)
+    let tout: Chan[str] = chan_new(1048576)
+    chan_send(turns[first], eval.slab_out(cx))
+    let base = cx
+    concurrent {
+        for i in 0..n {
+            go {
+                var mine = base
+                mine.fr = value.list_of(frames[i])
+                mine.turns = turns
+                mine.slot = i
+                mine.done = [done]
+                mine.sp_req = sp_req
+                mine.sp_resp = sp_resp
+                mine.blk = block
+                mine.depth = 0
+                // A task never stops under the debugger, as the reference's
+                // task interpreters have none; its prints come back through
+                // `tout`, in the order written.
+                if base.dbg {
+                    mine.dbg = false
+                    mine.d_tout = [tout]
+                    mine.op = base.d_task_op
+                    mine.kids = base.d_task_kids
+                    var tp = mine.p
+                    tp.fn_body = base.d_task_body
+                    mine.p = tp
+                }
+                if take_turn(mine) {
+                    eval.ev(mine, bodies[i])
+                    if not mine.aborted {
+                        task_ended(mine, mine.ctl, value.take(mine.carry))
+                    }
+                }
+            }
+        }
+        for j in 0..nsp {
+            go {
+                while true {
+                    match chan_recv(sp_req[j]) {
+                        Some(h) -> {
+                            var mine = h.c
+                            eval.slab_in(mine, h.s)
+                            mine.hop_result = eval.ev(mine, mine.hop_node)
+                            let back_s = eval.slab_out(mine)
+                            chan_send(sp_resp[j], Hop{ c: mine, s: back_s })
+                        }
+                        None -> break
+                    }
+                }
+            }
+        }
+    }
+    var d = Done{ s: eval.empty_slab(), ctl: 0, carry: VUnit, deadlock: false }
+    match chan_recv(done) {
+        Some(x) -> d = x
+        None -> ()
+    }
+    eval.slab_in(cx, d.s)
+    if cx.dbg {
+        chan_close(tout)
+        while true {
+            match chan_recv(tout) {
+                Some(text) -> debug.out(cx, text)
+                None -> break
+            }
+        }
+    }
+    if d.deadlock {
+        let _ = eval.fault(cx, DEADLOCK)
+    } else if d.ctl == eval.CTL_PANIC {
+        let m = match d.carry {
+            VStr(t) -> t
+            _ -> ""
+        }
+        let _ = eval.fault(cx, m)
+    } else if d.ctl == eval.CTL_EXIT {
+        let c = match d.carry {
+            VInt(x) -> x
+            _ -> 0
+        }
+        let _ = eval.exit_with(cx, c)
+    } else if d.ctl != 0 and cx.ctl == 0 {
+        cx.ctl = d.ctl
+        cx.carry = d.carry
+    }
+}
+
+/// `ev(node)` one host stack further down, inside a task: on a spare host
+/// task of this block, which runs it and hands the context back. With no
+/// spare free, the recursion is as deep as this block allows.
+pub fn hop(inout cx: Cx, node: i64) -> Value {
+    var j = -1
+    for b in 0..cx.sc.sp_blk.len() {
+        if cx.sc.sp_blk[b] == cx.blk {
+            j = cx.sc.sp_free[b].pop() ?? -1
+            break
+        }
+    }
+    if j < 0 {
+        return eval.fault(cx, "stack overflow: recursion too deep")
+    }
+    cx.hop_node = node
+    let req = cx.sp_req[j]
+    let resp = cx.sp_resp[j]
+    let s = eval.slab_out(cx)
+    chan_send(req, Hop{ c: cx, s: s })
+    match chan_recv(resp) {
+        Some(h) -> {
+            cx = h.c
+            eval.slab_in(cx, h.s)
+        }
+        None -> ()
+    }
+    for b in 0..cx.sc.sp_blk.len() {
+        if cx.sc.sp_blk[b] == cx.blk {
+            cx.sc.sp_free[b].push(j)
+            break
+        }
+    }
+    value.take(cx.hop_result)
+}

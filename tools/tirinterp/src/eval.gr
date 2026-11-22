@@ -31,6 +31,7 @@ import rawmem
 import journal
 import debug
 import rpc
+import tasks
 
 /// Why evaluation is unwinding: nothing, a loop exit, a return, or an error
 /// propagating to the nearest function that can fail.
@@ -72,8 +73,6 @@ type Cx = {
     spawns: [[i64]],
     go_bodies: [[i64]],
     go_frames: [[Value]],
-    chans: [Chan[Value]],
-    baton: [Chan[Slab]],
     wb: [Value],
     serial: i64,
     depth: i64,
@@ -161,6 +160,25 @@ type Cx = {
     d_strdebug: fn(str) -> str,
     // A `concurrent` task's prints under the debugger, for its block to send.
     d_tout: [Chan[str]],
+    // Last, after everything `run` reads: a field is found by its name in a
+    // build of the reference's compiler, and every field put before the
+    // evaluator's would lengthen its searches.
+    // The program's channels and the scheduler's state (`tasks`), and,
+    // inside a task of a `concurrent` block, the host channels its turns
+    // come in on and go back by, its block's spare host stacks, which block
+    // it is of, and whether the block is over and the task unwinding.
+    sc: Sched,
+    // An empty table, made once: what a context holds while another task
+    // has the shared state, so that handing it on allocates nothing.
+    sc_none: Sched,
+    turns: [Chan[Slab]],
+    slot: i64,
+    done: [Chan[Done]],
+    sp_req: [Chan[Hop]],
+    sp_resp: [Chan[Hop]],
+    blk: i64,
+    aborted: bool,
+    hop_node: i64,
 }
 
 /// A string as itself: the placeholder for the debugger's `{:?}`.
@@ -200,8 +218,6 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         spawns: [],
         go_bodies: [],
         go_frames: [],
-        chans: [],
-        baton: [],
         wb: [],
         serial: 0,
         depth: 0,
@@ -264,6 +280,16 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         d_trace_at: [],
         d_strdebug: same_text,
         d_tout: [],
+        sc: tasks.new_sched(),
+        sc_none: tasks.new_sched(),
+        turns: [],
+        slot: 0,
+        done: [],
+        sp_req: [],
+        sp_resp: [],
+        blk: 0,
+        aborted: false,
+        hop_node: 0,
     }
     journal.mark(cx)
     cx
@@ -272,12 +298,11 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
 /// A panic of the program, saying `msg`. Under `run` the host's own, which
 /// prints `panic: msg` and exits 101 as the reference does. Under `test` and
 /// `bench` it unwinds as an error does, carrying the message, for the runner
-/// to report -- but not inside a task of a `concurrent` block, whose
-/// siblings the host's scheduler cannot abort ([E-TASK-PANIC];
-/// docs/known-issues.md). A fault while one is already unwinding is not a
-/// second one.
+/// to report; inside a task of a `concurrent` block it ends the task, and
+/// the block with it ([E-TASK-PANIC], `tasks`). A fault while one is already
+/// unwinding is not a second one.
 pub fn fault(inout cx: Cx, msg: str) -> Value {
-    if not cx.trap or not cx.baton.is_empty() {
+    if not cx.trap {
         panic(msg)
     }
     if cx.ctl == 0 {
@@ -293,7 +318,7 @@ pub fn fault(inout cx: Cx, msg: str) -> Value {
 /// `exit(code)`: the host's under `run`; under `test` and `bench` a way out
 /// the runner reports, as the reference's `Flow::Exit` is.
 pub fn exit_with(inout cx: Cx, code: i64) -> Value {
-    if not cx.trap or not cx.baton.is_empty() {
+    if not cx.trap {
         exit(code)
     }
     // The low eight bits, as the reference's `Flow::Exit` carries them.
@@ -523,7 +548,7 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
 /// halfway between `body`'s hops, as each call of the program costs more
 /// host frames under the debugger (`scheme-demo` overflowed a fiber).
 fn dbg_inner(inout cx: Cx, e: i64) -> Value {
-    if cx.depth % HOP == HOP / 2 and cx.baton.is_empty() {
+    if cx.depth % HOP == HOP / 2 and not tasks.in_task(cx) {
         return ev_elsewhere(cx, kid(cx, e, 0))
     }
     ev(cx, kid(cx, e, 0))
@@ -1947,8 +1972,8 @@ fn assign(inout cx: Cx, e: i64) -> Value {
 // unchanged. At 100,000 calls, the reference's own bound, the recursion
 // stops with the panic every engine words the same way.
 
-let HOP = 500
-let MAX_DEPTH = 100000
+pub let HOP = 500
+pub let MAX_DEPTH = 100000
 
 /// A function's or a closure's body, one call deeper.
 fn body(inout cx: Cx, node: i64) -> Value {
@@ -1956,11 +1981,17 @@ fn body(inout cx: Cx, node: i64) -> Value {
         return fault(cx, "stack overflow: recursion too deep")
     }
     cx.depth += 1
-    // Not inside a task of a `concurrent` block: the host runs a nested
-    // block's tasks by themselves, so a task of the program waiting on a
-    // channel there could not be woken by its siblings outside it.
-    let hop = cx.depth % HOP == 0 and cx.baton.is_empty()
-    let r = if hop { ev_elsewhere(cx, node) } else { ev(cx, node) }
+    // Inside a task of a `concurrent` block, onto a spare host stack of its
+    // block (`tasks.hop`): a nested host block's task could not wait on a
+    // channel its siblings outside it serve.
+    var r = VUnit
+    if cx.depth % HOP != 0 {
+        r = ev(cx, node)
+    } else if tasks.in_task(cx) {
+        r = tasks.hop(cx, node)
+    } else {
+        r = ev_elsewhere(cx, node)
+    }
     cx.depth -= 1
     r
 }
@@ -2398,11 +2429,11 @@ fn parallel(inout cx: Cx, e: i64) -> Value {
     }
     cx.spawns.push([])
     ev(cx, kid(cx, e, 0))
-    let tasks = cx.spawns.pop() ?? []
+    let spawned = cx.spawns.pop() ?? []
     if cx.ctl != 0 {
         return VUnit
     }
-    for t in tasks {
+    for t in spawned {
         ev(cx, t)
         if cx.ctl != 0 {
             return VUnit
@@ -2412,20 +2443,14 @@ fn parallel(inout cx: Cx, e: i64) -> Value {
 }
 
 // A `concurrent` block's tasks take turns at channel operations
-// ([E-SCHEDULE]), which means a task that has to wait is put aside in the
-// middle of evaluating an expression. This evaluator recurses on the host's
-// stack, so each task of the program runs as a task of the host: the host
-// gives it a stack of its own, puts it aside where it waits, and chooses
-// who runs next by the same rules, so the program's tasks take their turns
-// in the order every engine gives them.
+// ([E-SCHEDULE]), as the reference's scheduler gives them, which `tasks`
+// ports; this evaluator recurses on the host's stack, so each task of the
+// program runs on a task of the host, as a stack only.
 //
-// What tasks share is the slab -- an actor's state is a `ref` every handle
-// reaches -- and each host task has its own copy of the context. So the
-// slab is handed on through a channel of capacity one, as the reference
-// hands it between its task interpreters (`park_slab`): a task holds it
-// while it runs, and puts it back before any operation that may wait and
-// when it ends. Neither handing it back nor taking it ever waits, so the
-// hand-over adds no turn of its own.
+// What tasks share -- the slab, an actor's state being a `ref` every handle
+// reaches; raw memory's sandbox; the journal; the channels and the
+// scheduler's state -- travels with the turn (`Slab`), as the reference
+// hands the slab between its task interpreters (`park_slab`).
 
 /// The `go` bodies of each open `concurrent` block, with the frame each saw
 /// when its `go` ran: a task sees its surroundings by value ([E-CONCURRENT]).
@@ -2449,12 +2474,11 @@ fn concurrent_block(inout cx: Cx, e: i64) -> Value {
         return VUnit
     }
     cx.blocks_run += 1
-    run_tasks(cx, bodies, frames)
+    tasks.run_tasks(cx, bodies, frames)
     VUnit
 }
 
-/// The shared slab, as it is handed from task to task, and raw memory's
-/// sandbox with it: every task of a run sees the same allocations.
+/// The shared state, as it is handed from task to task.
 type Slab = {
     slab: [Value],
     gens: [i64],
@@ -2475,9 +2499,36 @@ type Slab = {
     jnames: [str],
     jvals: [Wire],
     jat: i64,
+    sc: Sched,
+    // A turn that tells a task its block is over.
+    abort: bool,
 }
 
-fn slab_out(inout cx: Cx) -> Slab {
+pub fn empty_slab() -> Slab {
+    Slab{
+        slab: [],
+        gens: [],
+        live: [],
+        free: [],
+        mem_base: [],
+        mem_len: [],
+        mem_state: [],
+        mem_data: [],
+        mem_next: 0,
+        mem_freed: [],
+        mem_forgot: 0,
+        jstate: 0,
+        jpath: "",
+        jnames: [],
+        jvals: [],
+        jat: 0,
+        sc: tasks.new_sched(),
+        abort: false,
+    }
+}
+
+/// The shared state moved out of `cx`, which is left without it.
+pub fn slab_out(inout cx: Cx) -> Slab {
     let s = Slab{
         slab: cx.slab,
         gens: cx.gens,
@@ -2495,6 +2546,8 @@ fn slab_out(inout cx: Cx) -> Slab {
         jnames: cx.jnames,
         jvals: cx.jvals,
         jat: cx.jat,
+        sc: cx.sc,
+        abort: false,
     }
     cx.slab = []
     cx.gens = []
@@ -2505,10 +2558,13 @@ fn slab_out(inout cx: Cx) -> Slab {
     cx.mem_state = []
     cx.mem_data = []
     cx.mem_freed = []
+    cx.jnames = []
+    cx.jvals = []
+    cx.sc = cx.sc_none
     s
 }
 
-fn slab_in(inout cx: Cx, s: Slab) {
+pub fn slab_in(inout cx: Cx, s: Slab) {
     cx.slab = s.slab
     cx.gens = s.gens
     cx.live = s.live
@@ -2525,80 +2581,5 @@ fn slab_in(inout cx: Cx, s: Slab) {
     cx.jnames = s.jnames
     cx.jvals = s.jvals
     cx.jat = s.jat
-}
-
-/// Before a channel operation that may wait: a task puts the slab back for
-/// whichever runs next.
-pub fn park_slab(inout cx: Cx) {
-    if not cx.baton.is_empty() {
-        chan_send(cx.baton[0], slab_out(cx))
-    }
-}
-
-/// After it: the slab is taken back, from whoever had it last.
-pub fn take_slab(inout cx: Cx) {
-    if not cx.baton.is_empty() {
-        match chan_recv(cx.baton[0]) {
-            Some(s) -> slab_in(cx, s)
-            None -> ()
-        }
-    }
-}
-
-fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
-    let tout: Chan[str] = chan_new(1048576)
-    let baton: Chan[Slab] = chan_new(1)
-    chan_send(baton, slab_out(cx))
-    let outcomes: Chan[Value] = chan_new(bodies.len())
-    let base = cx
-    concurrent {
-        for i in 0..bodies.len() {
-            go {
-                var mine = base
-                mine.fr = value.list_of(frames[i])
-                mine.baton = [baton]
-                // A task never stops under the debugger, as the reference's
-                // task interpreters have none; its prints come back through
-                // `tout`, in the order written.
-                if base.dbg {
-                    mine.dbg = false
-                    mine.d_tout = [tout]
-                    mine.op = base.d_task_op
-                    mine.kids = base.d_task_kids
-                    var tp = mine.p
-                    tp.fn_body = base.d_task_body
-                    mine.p = tp
-                }
-                take_slab(mine)
-                ev(mine, bodies[i])
-                // A `return` ends the task; an error leaves the block
-                // through it, as the reference's `run_tasks` has it.
-                let outcome = if mine.ctl == CTL_ERR { VErr(mine.carry) } else { VUnit }
-                park_slab(mine)
-                chan_send(outcomes, outcome)
-            }
-        }
-    }
-    match chan_recv(baton) {
-        Some(s) -> slab_in(cx, s)
-        None -> ()
-    }
-    if cx.dbg {
-        chan_close(tout)
-        while true {
-            match chan_recv(tout) {
-                Some(text) -> debug.out(cx, text)
-                None -> break
-            }
-        }
-    }
-    for _ in 0..bodies.len() {
-        match chan_recv(outcomes) {
-            Some(VErr(x)) -> if cx.ctl == 0 {
-                cx.ctl = CTL_ERR
-                cx.carry = x
-            }
-            _ -> ()
-        }
-    }
+    cx.sc = s.sc
 }

@@ -21,6 +21,7 @@ import tirinterp.sexp
 import tirinterp.load
 import tirinterp.eval
 import tirinterp.value
+import tirinterp.tasks
 import build
 
 /// `--seed`'s default, `0x5eed`.
@@ -43,6 +44,7 @@ type TestOpts = {
     contracts: bool,
     schedules: i64,
     has_schedule_seed: bool,
+    schedule_seed: i64,
 }
 
 /// A program ready to run: its TIR loaded, the context it runs in, and what
@@ -119,7 +121,7 @@ fn max_u32() -> u64 {
 
 /// `parse_test_opts`: the options, or the first one that is wrong, worded.
 fn parse_opts(a: [str]) -> TestOpts {
-    var o = TestOpts{ seed: DEFAULT_SEED, cases: 100, coverage: a.contains("--coverage"), filter: "", contracts: a.contains("--contracts"), schedules: 0, has_schedule_seed: false }
+    var o = TestOpts{ seed: DEFAULT_SEED, cases: 100, coverage: a.contains("--coverage"), filter: "", contracts: a.contains("--contracts"), schedules: 0, has_schedule_seed: false, schedule_seed: 0 }
     let f = flag_value(a, "--filter")
     if f != "\0" {
         o.filter = f
@@ -157,12 +159,13 @@ fn parse_opts(a: [str]) -> TestOpts {
     }
     let ss = flag_value(a, "--schedule-seed")
     if ss != "\0" {
-        let (ok, _v) = parse_unsigned(ss, max_u64())
+        let (ok, v) = parse_unsigned(ss, max_u64())
         if not ok {
             eprint("error: --schedule-seed expects a number, got `{ss}`")
             exit(1)
         }
         o.has_schedule_seed = true
+        o.schedule_seed = v
     }
     o
 }
@@ -714,16 +717,6 @@ fn file_at(p: TirProg, at: i64) -> i64 {
     k
 }
 
-/// What a test the default schedule ran with tasks would need: a seeded
-/// scheduler, which the TIR interpreter's tasks do not have (§6.19,
-/// decision 4). Said, and exit 1.
-fn schedules_not_here(o: TestOpts) {
-    let flag = if o.has_schedule_seed { "--schedule-seed" } else { "--schedules" }
-    eprint("error: `grasm test {flag}` is not in the Grasm toolchain yet")
-    eprint("  help: it runs `version`, `tokens`, `ast`, `toml`, `check`, `tir`, `run`, `build`, `links`, `fmt`, `lint`, `test`, `bench`, `doc`, `api`, `deps`, `add` and `publish`; the rest are S8's to come (docs/self-hosting.md §6.17, §6.19, §6.20, §6.21)")
-    exit(1)
-}
-
 /// The AST of every `test` in the program, in the TIR's order: (module,
 /// declaration).
 fn ast_tests(l: Loaded) -> [(i64, i64)] {
@@ -762,13 +755,32 @@ pub fn cmd_test(a: [str]) {
         }
         let vars = p.test_params[ti]
         if vars.is_empty() {
+            // Once under `--schedule-seed`'s schedule, or none; then, if it
+            // held and started tasks, again under `--schedules` other
+            // orders, each named by a seed drawn from `--seed`, stopping
+            // at the first that fails (`test_program_with`).
             let before = r.cx.blocks_run
-            let m = try_case(r, p.test_body[ti], p.test_frame[ti], [], [])
-            let ran_tasks = r.cx.blocks_run > before
-            if ran_tasks and (o.has_schedule_seed or (m == "\0" and o.schedules > 0)) {
-                schedules_not_here(o)
+            tasks.set_schedule(r.cx, o.has_schedule_seed, o.schedule_seed)
+            var m = try_case(r, p.test_body[ti], p.test_frame[ti], [], [])
+            tasks.set_schedule(r.cx, false, 0)
+            var tried = 0
+            if m == "\0" and not o.has_schedule_seed and r.cx.blocks_run > before {
+                for k in 0..o.schedules {
+                    let s = tasks.schedule_seed(o.seed, k)
+                    tasks.set_schedule(r.cx, true, s)
+                    let m2 = try_case(r, p.test_body[ti], p.test_frame[ti], [], [])
+                    tasks.set_schedule(r.cx, false, 0)
+                    tried += 1
+                    if m2 != "\0" {
+                        m = "{m2}\n  under schedule {k + 1} of {o.schedules}\n  replay: --schedule-seed {s.as_u64()}"
+                        break
+                    }
+                }
             }
-            if m == "\0" {
+            if m == "\0" and tried > 0 {
+                print("test \"{label}\" ... ok ({tried} schedules)")
+                r.passed += 1
+            } else if m == "\0" {
                 print("test \"{label}\" ... ok")
                 r.passed += 1
             } else {

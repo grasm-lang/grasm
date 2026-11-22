@@ -1,0 +1,49 @@
+// A test that holds under the default order and fails under some others:
+// `--schedules` must find the same failing schedule, name the same seed,
+// and `--schedule-seed` that seed must fail it again (docs/self-hosting.md
+// §6.23).
+
+test "the first sender wins" {
+    let c = chan_new(2)
+    concurrent {
+        go {
+            chan_send(c, "a")
+        }
+        go {
+            chan_send(c, "b")
+        }
+        go {
+            print("third")
+        }
+    }
+    let first = chan_recv(c) ?? ""
+    print("first {first}")
+    assert(first == "a")
+}
+
+test "no order matters here" {
+    let c = chan_new()
+    var total = 0
+    concurrent {
+        go {
+            for i in 0..5 {
+                chan_send(c, i)
+            }
+            chan_close(c)
+        }
+        go {
+            var sum = 0
+            while true {
+                match chan_recv(c) {
+                    Some(x) -> sum += x
+                    None -> break
+                }
+            }
+            print("sum {sum}")
+        }
+    }
+    let _ = total
+}
+
+fn main() {
+}

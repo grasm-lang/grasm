@@ -1,0 +1,26 @@
+// A channel made inside a task and handed to a sibling, which sends on it:
+// channels are the program's, one table for every task ([E-CHANNEL]). The
+// Grasm command once gave each task its own list of channels, so the
+// sibling's send ended "not a channel" (docs/known-issues.md).
+
+fn main() / {io, async} {
+    let via: Chan[Chan[i64]] = chan_new(1)
+    concurrent {
+        go {
+            let mine: Chan[i64] = chan_new(1)
+            chan_send(via, mine)
+            print("a got {chan_recv(mine) ?? -1}")
+        }
+        go {
+            match chan_recv(via) {
+                Some(c) -> chan_send(c, 42)
+                None -> print("none")
+            }
+            print("b sent")
+        }
+    }
+}
+
+test "handed on" {
+    main()
+}

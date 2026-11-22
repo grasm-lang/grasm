@@ -1,0 +1,49 @@
+// Nested blocks whose tasks wait on one another, and a task that recurses
+// deeper than one host stack holds before it waits (docs/self-hosting.md
+// §6.23).
+
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() / {io, async} {
+    let out = chan_new(4)
+    concurrent {
+        go {
+            let inner = chan_new()
+            concurrent {
+                go {
+                    for i in 0..3 {
+                        chan_send(inner, i)
+                    }
+                    chan_close(inner)
+                }
+                go {
+                    while true {
+                        match chan_recv(inner) {
+                            Some(x) -> print("inner {x}")
+                            None -> break
+                        }
+                    }
+                }
+            }
+            chan_send(out, 1)
+        }
+        go {
+            print("deep {depth(10000)}")
+            chan_send(out, 2)
+        }
+        go {
+            let a = chan_recv(out) ?? 0
+            let b = chan_recv(out) ?? 0
+            print("got {a} {b}")
+        }
+    }
+}
+
+test "nested" {
+    main()
+}

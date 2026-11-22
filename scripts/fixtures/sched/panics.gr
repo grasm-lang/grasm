@@ -1,0 +1,146 @@
+// Tasks that end otherwise than well, under `grasm test`: each test's
+// failure is the task's, its siblings do not run on, and the next test runs
+// ([E-TASK-PANIC], [E-CHANNEL], [E-DEADLOCK]; docs/self-hosting.md §6.23).
+
+test "a task panics" {
+    concurrent {
+        go {
+            print("one")
+        }
+        go {
+            panic("boom")
+        }
+        go {
+            print("never")
+        }
+    }
+    print("never after")
+}
+
+test "a task panics after waiting" {
+    let c = chan_new()
+    concurrent {
+        go {
+            let x = chan_recv(c) ?? 0
+            print("got {x}")
+            panic("late {x}")
+        }
+        go {
+            chan_send(c, 7)
+            print("sent")
+            chan_send(c, 8)
+            print("never")
+        }
+    }
+}
+
+test "a task exits" {
+    concurrent {
+        go {
+            exit(3)
+        }
+        go {
+            print("never")
+        }
+    }
+}
+
+test "a send on a closed channel in a task" {
+    let c = chan_new(1)
+    chan_close(c)
+    concurrent {
+        go {
+            chan_send(c, 1)
+        }
+    }
+}
+
+test "a close of a closed channel in a task" {
+    let c: Chan[i64] = chan_new(1)
+    concurrent {
+        go {
+            chan_close(c)
+            chan_close(c)
+        }
+    }
+}
+
+test "a select of no channels" {
+    let none: [Chan[i64]] = []
+    concurrent {
+        go {
+            print("{chan_select(none)}")
+        }
+    }
+}
+
+test "a receive outside every task" {
+    let c: Chan[i64] = chan_new()
+    print("{chan_recv(c)}")
+}
+
+test "a deadlock" {
+    let a: Chan[i64] = chan_new()
+    let b: Chan[i64] = chan_new()
+    concurrent {
+        go {
+            chan_send(a, chan_recv(b) ?? 0)
+        }
+        go {
+            chan_send(b, chan_recv(a) ?? 0)
+        }
+    }
+}
+
+test "a deadlock inside a nested block" {
+    let c: Chan[i64] = chan_new()
+    concurrent {
+        go {
+            concurrent {
+                go {
+                    // Only the outer sibling sends, and a nested block's
+                    // tasks are scheduled by themselves.
+                    print("inner got {chan_recv(c) ?? 0}")
+                }
+            }
+        }
+        go {
+            chan_send(c, 1)
+        }
+    }
+}
+
+test "a recursion with no end in a task" {
+    concurrent {
+        go {
+            print("{forever(0)}")
+        }
+    }
+}
+
+test "a send on a closed channel outside every task" {
+    let c = chan_new(1)
+    chan_close(c)
+    chan_send(c, 1)
+}
+
+test "a close of a closed channel outside every task" {
+    let c: Chan[i64] = chan_new(1)
+    chan_close(c)
+    chan_close(c)
+}
+
+test "a recursion with no end outside every task" {
+    print("{forever(0)}")
+}
+
+test "after them all" {
+    print("still running")
+}
+
+fn forever(n: i64) -> i64 {
+    1 + forever(n + 1)
+}
+
+fn main() {
+}

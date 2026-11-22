@@ -10,6 +10,7 @@ import eval
 import load
 import value
 import journal
+import tasks
 
 /// The largest string or buffer the reference will build (`MAX_ALLOC`).
 let MAX_ALLOC = 8589934592
@@ -447,49 +448,24 @@ pub fn builtin(inout cx: Cx, e: i64) -> Value {
     }
 }
 
-/// A channel is an integer naming one of the host's channels, as it is in
-/// the reference ([E-CHANNEL]). An operation that may wait puts the shared
-/// slab back first, since another task may run before it returns.
+/// A channel is an integer naming one of the program's channels, as it is
+/// in the reference ([E-CHANNEL]); the table and the waiting are `tasks`'.
 fn channel(inout cx: Cx, code: i64, inout args: [Value]) -> Value {
     if code == 46 {
-        let cap = if args.is_empty() { 0 } else { int_of(args[0]).max(0) }
-        let c: Chan[Value] = chan_new(cap)
-        cx.chans.push(c)
-        return VInt(cx.chans.len() - 1)
+        let cap = if args.is_empty() { 0 } else { int_of(args[0]) }
+        return tasks.prog_make(cx, cap)
     }
     if code == 56 {
-        var cs: [Chan[Value]] = []
-        for x in value.list_of(args[0]) {
-            cs.push(chan_at(cx, x))
-        }
-        eval.park_slab(cx)
-        let i = chan_select(cs)
-        eval.take_slab(cx)
-        return VInt(i)
+        return tasks.prog_select(cx, args[0])
     }
-    let c = chan_at(cx, args[0])
     if code == 52 {
-        chan_close(c)
-        return VUnit
+        return tasks.prog_close(cx, args[0])
     }
     if code == 43 {
-        eval.park_slab(cx)
-        chan_send(c, value.take(args[1]))
-        eval.take_slab(cx)
-        return VUnit
+        let v = value.take(args[1])
+        return tasks.prog_send(cx, args[0], v)
     }
-    eval.park_slab(cx)
-    let got = chan_recv(c)
-    eval.take_slab(cx)
-    opt(cx.p, got)
-}
-
-fn chan_at(cx: Cx, v: Value) -> Chan[Value] {
-    let i = int_of(v)
-    if i < 0 or i >= cx.chans.len() {
-        panic("not a channel")
-    }
-    cx.chans[i]
+    tasks.prog_recv(cx, args[0])
 }
 
 /// `ref(v)`: a slot in the slab, reusing the last one released
