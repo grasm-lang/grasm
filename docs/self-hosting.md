@@ -6783,6 +6783,375 @@ LSP on the query engine and the wasm32 backend; the Rust TOML reader's
 misreadings, kept until S9; and the Rust defects this part copied or
 declined (docs/known-issues.md).
 
+### 6.23 S8 part six: `test --schedules`, a panic in a task, the interpreter's own stack, the `IoFailed` wording, and the by-index field take
+
+Written 2026-11-19, before any code, as the design to build to. Parts two to
+five (§6.19-§6.22) left five things in the `grasm` command in Grasm
+answering otherwise than the Rust one, or not at all: `test --schedules N`
+and `--schedule-seed S` for a test that starts tasks (refused, decision (4)
+of §6.19); a panic inside a `concurrent` task under `test`, and one the
+runtime's channel operations raise (the host's panic, decision (3)); the
+TIR interpreter's own stack (the host's); the `IoFailed` text (the
+runtime's, not the Rust interpreter's); and, from §6.22, `lower.gr`'s
+`take_child`, which finds a field by name where its position is known. The
+Rust toolchain stays stage 0 and the oracle and is not changed; where its
+behaviour is wrong it is reproduced and recorded in docs/known-issues.md,
+or, where it aborts, recorded and not copied. The decisions are numbered
+(1) to (8); each is proposed by the agent implementing this part, and is
+the coordinator's to accept and the owner's to reverse. Where there is a
+choice the alternatives are written under the decision; (1), (2), (5) and
+(6) wait for the coordinator's.
+
+#### What was measured
+
+Measured 2026-11-19 with the main checkout's `grasm` (stage 0, the release
+of 2026-11-01), the command built from this branch's base by it (stage 1)
+and part five's stage 2 (`fixpoint`'s, the same sources), from the
+worktree's root, at a load of 3 to 6 from other work.
+
+**Tests that start tasks.** None of the corpus's 43 programs with a
+`test` has one that runs a `concurrent` block: the Rust command with
+`--schedules 1` reports `(1 schedules)` on none, and no file with a `test`
+mentions `concurrent` or a channel. Five corpus programs use tasks or
+channels at all, all conformance programs with a `main`: `E-ACTOR`,
+`E-CHANNEL`, `E-CONCURRENT`, `E-DEADLOCK` and `E-SCHEDULE`, which
+`clidiff`'s mains-as-tests run (`test "main" { main() }` appended). Under
+the Rust command three pass -- `ok (3 schedules)` with `--schedules 3`,
+`ok` with `--schedule-seed 5` -- and two fail on every schedule, `E-CHANNEL`
+("send on a closed channel") and `E-DEADLOCK` ("deadlock: ..."); under the
+Grasm command the three say "`grasm test --schedules` is not in the Grasm
+toolchain yet" (exit 1) and the two end on the host's panic (101). None of
+the five prints differently under any of the seeds 1 to 20, so the corpus
+alone cannot tell a scheduler that honours the seed from one that ignores
+it. `compiler/rttasks/taskfuzz.gr` (`fuzz_rttasks`' program: random tasks
+over random channels, each printing what it does) can: wrapped as a test of
+ten rounds, each of three fuzz seeds prints otherwise under every one of
+the schedule seeds 1 to 10, and `--schedules 20` takes the Rust command 1.0
+to 1.5 s. Under `run` the two commands already agree on it: 5 fuzz seeds,
+each plain and in five of its panic modes, the same bytes and status.
+
+**Panics in tasks and channels.** No corpus program panics inside a task.
+The runtime's channel panics in the corpus are `E-CHANNEL`'s (a send on a
+closed channel, outside every task) and `E-DEADLOCK`'s (every task
+waiting): they are `clidiff`'s "host's panic: 2" under `test` and its 4
+under `dap`. Found while measuring: a channel made inside a task cannot be
+used by a sibling under the Grasm command -- each task's context has its
+own copy of the channel list -- so a program in which a task makes a
+channel and hands it to another ends "panic: not a channel" (101), where
+the Rust command runs it. No corpus program does that.
+
+**Recursion.** The Rust interpreter stops a recursion at 100,000 calls or
+when its own stack passes a 448 MiB budget (`STACK_BUDGET`, on a 512 MiB
+thread), whichever comes first, and the stack comes first for every shape
+measured: the deepest call that still ran, by shape --
+
+| recursion | Rust | stage 1 | stage 2 |
+|---|---:|---:|---:|
+| `1 + depth(n - 1)` | 41,941 (41,943 under `test`) | 99,998 | 99,998 |
+| `d(n - 1)` as a statement | 36,653 | 99,998 | 99,998 |
+| `[n - 1].map(down)` | 42,426 | 99,998 | 99,998 |
+| `f(d(n - 1, f))`, `f` a closure | 29,775 | 99,998 | 99,998 |
+| `1 + depth(n - 1)` inside a `go` | 41,941 | 8,733 | 15,724 |
+
+So outside a task the Grasm command runs every recursion the Rust one runs,
+and runs on where Rust refuses, up to the count; inside a task it stops
+below [E-RECURSION-DEPTH]'s guaranteed 10,000 on stage 1, at a depth that
+differs between stages (each task is a host task with the host's 6.5 MiB
+stack, and the interpreter's hop to a fresh stack every 500 calls is off
+inside a task), with the host's panic -- the same words, so `run` agrees,
+but `test` ends there.
+
+**The interpreter's other recursions.** Walks over a value the program's
+depth does not count: for a variant list nested `n` deep, the Rust
+interpreter compares (`==`) and prints (`"{l}"`) one 1,000,000 deep, and at
+3,000,000 its `==` overflows its own stack and aborts ("thread '<unknown>'
+has overflowed its stack", SIGABRT, exit 134); stage 1 compares 20,000 and
+not 40,000, prints 15,000 and not 20,000; stage 2 does both at 20,000 and
+neither at 40,000 -- `value.show`, `equal`, `compare` and `key_text` in
+`tools/tirinterp` recurse. Dropping a list 3,000,000 deep ends well under the
+Rust command and stage 1. And expressions nested deep without a call: a `^` chain of 10,000 or
+50,000 terms and an `else if` chain of 10,000 run under the Rust command;
+under the Grasm command a `^` chain of 8,000 runs and one of 10,000 ends on
+the host's stack (the loader's `expr` and `ev` recurse per node), and an
+`else if` chain of 50,000 ends "a builder would need more memory than one
+can hold", because the TIR text the command writes for itself to read back
+indents every level: 200 MB for the 10,000-term `^` chain and 1.8 GB for
+10,000 `else if`s (`grasm tir` writes the same bytes under both commands).
+`+` chains and parentheses are refused by both parsers ("code is nested
+too deeply").
+
+**The `IoFailed` wording.** Every corpus program with a `main` recorded
+by the Rust command (`GRASM_RECORD`, 120 s each; the four programs §6.22
+names ran past it): 11 journals hold an `IoFailed`, and recorded again by the stage-2
+command (the Grasm runtime, exempt from its own journal) 7 of them differ
+only there -- `clidiff`'s "7 differing only in the IoFailed wording" -- with
+the same output and status. What differs, by builtin: `list_dir` on a file
+(`fs-demo` 76 times, `lsm-demo` 4, `walkdir-demo` 2), `write_bytes` into a
+missing directory (`sysfile-demo`), `make_dir_new` under a missing one
+(`tempdir-demo` 8), `tcp_connect` refused (`L-LIB-NET`): each Rust's
+`<message> (os error N)` -- `Not a directory (os error 20)` -- and the
+Grasm command's message alone;
+`proc_run` and `proc_pipeline` of a missing program (`L-LIB-PROC`):
+`no-such-program-anywhere: No such file or directory (os error 2)` against
+the same without the number; and `tcp_connect` to `no.such.host.invalid`
+(`L-LIB-NET`): Rust's `failed to lookup address information: nodename nor
+servname provided, or not known` (`std`'s words around `gai_strerror`)
+against `No such file or directory`, because both runtimes report a failed
+`getaddrinfo` as `ENOENT` and drop its own code (`grasm_sys`, `net.gr`). The
+other 4 (`tlsdiff`, `L-LIB-NET-PEER`, `L-LIB-RANDOM`, `L-LIB-UDP`) record
+socket errors both runtimes already word as `std` does. No `run` of the
+corpus prints an `IoFailed` (`clidiff`'s `run` and `bundle` sections). The
+system's messages are distinct for every error number on this Mac (1 to
+107).
+
+#### What the Rust side does
+
+`crates/grasm_interp/src/tasks.rs`. Each task of a `concurrent` block is an
+interpreter of its own (depth 0, empty call stack) on a fiber with the
+interpreter thread's budget (`TASK_STACK`); they share the channel table,
+one output buffer drained after every resume, and the slab. The block runs
+in rounds: a round is whatever is runnable at its start; in order, each
+slot not yet finished is marked running, cleared from the waiting flags,
+started (a fiber made at its first turn) or resumed, and its output
+drained; a task that ends with an error or a panic ends the round and the
+block (`failed`), its siblings abandoned with their fibers; a task that gave
+way without joining a queue is runnable again, else it waits for a wake.
+After the round the wakes meant for this block are taken (others are left
+for the block around it); none runnable and some alive is
+`deadlock: every task is waiting on a channel, and nothing left can send or
+receive`. A channel keeps two queues, waiting for room and for a value;
+`wake_one` passes over stale entries; close wakes every waiter, room side
+first; a rendezvous send returns once its value is taken (`sent`/`taken`
+tickets); `chan_select` joins every queue. A channel operation that must
+wait outside every task panics with the deadlock text and "-- a channel
+operation outside every `go` cannot wait for one; move it into a task".
+With `--schedules`, `Chans::schedule` holds a SplitMix64 state, and each
+round of two or more is permuted by a Fisher-Yates shuffle drawing from it
+(`round_order`): the queue decides who is in a round, the seed their order;
+one state per run of a test, shared by nested blocks.
+
+`test_program_with` (`grasm_interp/src/lib.rs`): for each unit test, the
+schedule set to `--schedule-seed` (or none) for one run; then, if that run
+passed, no `--schedule-seed` was given and the run started a block
+(`blocks_run` grew), the same test run again `--schedules` times in the same
+interpreter, the `k`th under `schedule_seed(--seed, k)` (a SplitMix64 step
+of `seed ^ (k + 1) * 0x9e3779b97f4a7c15`), stopping at the first failure:
+`test "t" ... FAILED: <m>\n  under schedule k of N\n  replay:
+--schedule-seed <s>`, or `test "t" ... ok (N schedules)`. Each run prints
+what the test prints. Property tests, contracts and doc examples run with no
+schedule. A panic, error or `exit` inside a task is that test's failure, in
+the task's words, and the next test runs.
+
+#### What Grasm has, and what has to be written
+
+`tools/tirinterp` runs each program task as a task of the host -- a host
+`concurrent` block around the program's -- on a copy of the context, with
+the program's channels the host's channels, so the host runtime's scheduler
+(a third implementation of [E-SCHEDULE], §6.11) picks who runs, and the
+interpreter cannot give it a seed, abort a task's siblings, or see a
+deadlock before the host does. The slab, raw memory's sandbox and the
+journal are handed from task to task through a host channel of capacity one
+(the baton). `fault` and `exit_with` unwind under `test`, `bench` and `dap`
+everywhere but inside a task. `testing.gr` counts blocks (`blocks_run`) and
+refuses the flags where Rust would act on them.
+
+**(1) A scheduler of the interpreter's own, a port of `tasks.rs`, with the
+host's tasks as stacks only.** Proposed. The seeded orders are a property of
+the reference's own scheduler -- its rounds, and a shuffle of each round of
+two or more drawn from one state in a fixed order -- which [E-SCHEDULE]
+does not describe ("N other orders, each named by a seed"). The TIR
+interpreter cannot give the same orders without doing what `tasks.rs` does,
+step for step; that is the decision the brief asks to be stopped for. The
+design: `tools/tirinterp/src/tasks.gr` holds the reference's state --
+channels (buffer, capacity, closed, two wait queues, tickets), the ready
+list, the per-block waiting flags, the running slot, block ids, the
+schedule state -- in the slab that is handed with each turn, so every task
+sees one table. A program block becomes one host block of host tasks: a
+scheduler, which runs the reference's loop and `round_order`, and one host
+task per program task, each waiting on a host channel of its own for its
+turn (which carries the slab) and answering on one back to the scheduler
+when it ends or gives way. Only the task holding a turn can run, so the
+host's own order decides nothing; a host channel operation never waits
+where the reference would not, so the host never sees a deadlock. The
+channel builtins become the reference's, with its words; `fault` and
+`exit_with` unwind inside a task under a trap, and the task's outcome ends
+the block as the reference's does, the scheduler sending every suspended
+sibling a turn that tells it to unwind without running another statement,
+so the host block ends. Under `run` nothing visible changes -- the default
+order is [E-SCHEDULE]'s, which the host already gives (`fuzz_rttasks`
+holds all three to it) -- and a panic stays the host's.
+
+What it buys: `--schedules` and `--schedule-seed` as Rust gives them (the
+runner's loop and lines are a dozen lines of `testing.gr` on top);
+[E-TASK-PANIC] under `test`, `bench` and `dap`; the channel panics and the
+deadlock as test failures; channels shared by every task. What it costs:
+every turn is two host channel operations and two host switches more than
+today, to be measured on `E-SCHEDULE`, `fuzz_rttasks`' rounds and the
+`run` timing of §6.22; an estimated 500 lines in `tools/tirinterp`; and the TIR
+interpreter's task model becomes the reference's, so a change to one is a
+change to both (the Rust interpreter is frozen until S9).
+
+The alternatives: **(1b)** keep the host's scheduler and decision (4) of
+§6.19 -- `--schedules` stays refused -- and do item four in part inside it:
+a task's panic unwinds its task and leaves a flag in the slab that every
+sibling obeys when it next takes the slab (only one runs at a time and they
+switch only at channel operations, so none runs another statement); a
+closed channel checked by the interpreter before the host's operation; the
+channels moved into the slab. A deadlock stays the host's to see (it alone
+knows who is waiting), so `E-DEADLOCK` keeps ending `test` on the host's
+panic. **(1c)** seeded orders of the interpreter's own design: refused, as
+nothing could hold them to Rust's replay lines.
+
+**(2) Inside a task, the interpreter hops to spare host stacks.** Proposed,
+with (1); not possible without it. Today a hop is a nested host block, and
+a host task in a nested block cannot wait on its siblings outside it (the
+host reports a deadlock), so the hop is off inside a task. Under (1) a
+program block's host block also holds spare host tasks, each waiting for a
+body to run; a task at its 500th call hands the evaluation to a spare in the
+same block and waits on it, and a give-way from inside a spare goes to the
+scheduler as from the task itself (its turns are sent to the deepest
+stack it is running on). So a task recurses as deep as the main program,
+to the reference's count of 100,000 -- counted from the task's start, as the
+reference's task interpreter starts at depth 0. The number of spares is
+fixed when the block starts: enough for the count, `(100,000 - depth) /
+500`, at most 200, each costing a host task that starts, waits and ends
+(its stack mapped, not touched, and kept by the host's pool for the next).
+To be measured; if it costs too much on `fuzz_rttasks`, fewer, with the
+in-task bound then set to what they hold and recorded. The alternatives:
+**(2b)** a fixed count inside a task, 500 calls (what one host stack is
+known to hold of the costliest shape), worded as the reference words it --
+the same on both stages, but below the guaranteed 10,000; **(2c)** leave it
+to the host, as today.
+
+**(3) The count stays 100,000; the window below it is recorded, not
+copied.** Proposed. The Rust interpreter refuses past its stack, between
+29,775 and 42,426 calls for the shapes measured; the bound depends on its
+frames' sizes, so reproducing it would mean modelling a Rust build's stack
+use per construct. [E-RECURSION-DEPTH] makes the bound the
+implementation's, from 10,000 up; the Grasm command keeps the reference's
+own count, runs everything the Rust one runs, and refuses past 100,000 in
+the same words and status. A recursion between Rust's stack bound and
+100,000 calls runs under the Grasm command and is refused under the Rust
+one; recorded in docs/known-issues.md as a difference the clause allows,
+with the measured bounds. The alternative, a lower count, would refuse
+programs the Rust command runs.
+
+**(4) The interpreter's walks over values and expressions run off the host
+stack.** Proposed. `value.show`, `equal`, `compare` and `key_text` become
+loops over an explicit stack, so no value the Rust interpreter walks is too
+deep for them; where Rust aborts (an `==` 3,000,000 deep), the Grasm command
+answers, and the abort is recorded as a Rust defect, not copied (§6.22's
+decision (7) did the same for the adapter's). The loader's `expr` and `ev`
+count nested nodes as `body` counts calls and hop to a fresh host stack
+every 500 levels of either (inside a task, to a spare). The alternative is
+to leave these to the host and record them.
+
+**(5) The TIR the command reads back is written without indentation.**
+Proposed, with (4), and left out if the coordinator prefers: it is
+`compiler/front`'s printer, not the interpreter. `run`, `test`, `bench` and
+`dap` print the program's TIR and read it back (`build.tir_to_run`,
+`sexp.read`); the printer indents each nested node, so the text grows with
+the square of the nesting -- 1.8 GB for an `else if` chain of 10,000 -- and
+an `else if` chain of 50,000, which the Rust command runs, cannot be run.
+The printer gains an unindented form for the command's own use; `grasm tir`
+and `front tir` keep today's bytes (`tirdiff`). The alternative: record it
+(docs/known-issues.md already has `front tir` printing nothing for a TIR of
+4 GB, open, S1).
+
+**(6) The `IoFailed` text is the Rust interpreter's.** Proposed. `io_err`
+(`tools/tirinterp/src/builtins.gr`) is the one place a host `IoError`
+becomes the program's, and it words an `IoFailed` as the Rust interpreter's
+`std` does: a text that is the system's message for an error number N
+(`strerror(N)`, N from 1 to the system's last), or ends with `": "` and that
+message (`proc_run`'s), gains ` (os error N)`; other texts stay as they
+are. And `tcp_connect` (and every builtin that resolves a name) answering
+the `ENOENT` text, which only a failed lookup gives there, is `failed to
+lookup address information: <gai_strerror(code)>`. The code is the one
+thing the runtimes threw away; two ways to it: **(6a)** ask `getaddrinfo`
+for the same name again, through `extern fn`, only on that failure (the
+name the program already asked for, so no new host is asked, and the
+command's own call, which no journal sees); or **(6b)** take `EAI_NONAME`,
+the code for a name that does not exist, and accept another text on any
+other lookup failure. (6a) is proposed, being exact. The conversion runs
+before the journal records the answer, so a recording is Rust's bytes. The
+native build keeps the runtime's text: the S1 entry (the Rust interpreter and
+the Rust runtime disagree) stays open for the specification to settle, and
+the Grasm `run` now sides with the Rust `run`. Recorded as a Rust runtime
+defect: a native program cannot tell an unknown host from a missing file.
+On Linux, where the command does not run yet, a static executable has no
+`strerror`; it will need the table then.
+
+**(7) The by-index field take.** `take_child` (`compiler/mir/src/lower.gr`)
+calls `grasm_struct_take(c, name)` and, when that answers null,
+`grasm_struct_get(c, name)`: both find the field by comparing names
+(`field_named`, `memcmp`), and `mut_method` calls it for every struct on the
+path to a receiver changed in place, which the profile of a stage-2 step
+session put at 60% of its samples (§6.22). The field's position is the
+path's key (`kv`), as `read_child` and `write_child` already use it. Neither
+runtime has a take by position, and the Rust runtime is not to change, so
+the take is lowered as `struct_scalar_update` lowers a scalar store: when
+`c` is laid out as a struct of its type's field count (`expect_struct`) and
+nothing else holds it (`unique`), the field's word is loaded from its slot
+and `grasm_box_bool(0)` -- the interned `false` both runtimes' takes leave --
+stored in its place; otherwise `grasm_struct_get_at(c, k)`, which both
+runtimes have. A field its type does not box takes that slow path too, as
+the runtimes' take answers null for one. No other call in the backend finds
+a field by name.
+Held by `s3subset`, `objtest`, `fixpoint` (stage 3 still stage 2) and
+`tirinterp`; measured before and after on the stage-2 command -- a `dap`
+step session of `benchmarks/grasm/parmap.gr` and the whole `run` section --
+interleaved, as a ratio.
+
+**(8) What `--schedules` reports where Rust's would not run.** Nothing new:
+property tests, contracts and doc examples run with no schedule, as in the
+reference, and the flags are read as today (`parse_opts`).
+
+#### How each is held to Rust
+
+`clidiff` gains a section, `schedules`, both commands on the same input, the
+counts asserted, a floor on a whole run:
+
+- the five corpus programs with tasks, each with `test "main" { main() }`
+  appended: `--schedules 20`, and `--schedule-seed` with five seeds,
+  among them 0 and `u64`'s maximum;
+- `taskfuzz.gr` wrapped as tests (`scripts/fixtures/sched/`): ten fuzz
+  seeds of ten rounds each, plain, with `--schedules 20` and with three
+  `--schedule-seed`s; its panic modes as tests of their own (a deadlock, a
+  send and a close on a closed channel, a select of none, a recursion that
+  never ends, each inside and outside a task);
+- fixtures written for what the corpus lacks: a test that fails only under
+  some orders (two senders racing to a buffered channel and an `assert` on
+  who came first), so the `under schedule k of N` and `replay:` lines are
+  compared and replayed; a panic, an error and an `exit` inside a task,
+  with tests after them; a task that makes a channel and hands it on;
+  nested blocks with waits across them; `--schedules 0`; a filtered run.
+
+Cost, estimated from the Rust half (about a second a command): 150
+commands, 5 to 10 minutes. `test`'s mains-as-tests and `dap`'s host panics
+are then asserted zero, not counted (today 2 and 4). A section `stack`:
+fixtures at the depths above, each by both commands under `run` and as a
+test -- inside a task and outside, a value walked 1,000,000 deep, `^` and
+`else if` chains of 10,000 and 50,000 -- with the window of (3) counted and
+printed, never hidden; a few minutes. `journal`'s and `bundle`'s `IoFailed`
+counts asserted zero, and a fixture that prints an `IoFailed` in `run`.
+`scripts/lib/clicases.txt` gains the flags' edge cases (`--schedules 0`,
+`--schedule-seed +5`, `u64`'s maximum and past it).
+
+`clicontrols` gains: `sched-seed` (the scheduler ignores the seed: caught by
+the fuzz tests' seeded orders), `task-panic-pass` (a task's panic reported
+as the task ending well), `stack-frame` (the count one call higher: caught
+by a fixture that recurses to exactly the count, refused by both),
+`task-stack` (no spares: caught by a 30,000-deep recursion in a task),
+`iofailed-old` (the runtime's text back). `fixpoint` must still find stage
+3 the same as stage 2, `tirinterp`, `frontsmoke` and `clidiff`'s `run`
+section hold `run`, and `run`'s time is measured against master as §6.22
+measured it (twelve interleaved rounds of the seven serial benchmarks,
+under 1.01 of master's geometric mean or the cause found).
+
+**Order**: step two, the field take, alone and measured; then the
+scheduler (steps three and four together, since (1) is both); then the
+stack; then the wording; then the gates.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
