@@ -6799,8 +6799,8 @@ behaviour is wrong it is reproduced and recorded in docs/known-issues.md,
 or, where it aborts, recorded and not copied. The decisions are numbered
 (1) to (8); each is proposed by the agent implementing this part, and is
 the coordinator's to accept and the owner's to reverse. Where there is a
-choice the alternatives are written under the decision; (1), (2), (5) and
-(6) wait for the coordinator's.
+choice the alternatives are written under the decision. The coordinator's
+answers (2026-11-19) are under "The coordinator's decisions" below.
 
 #### What was measured
 
@@ -7105,6 +7105,48 @@ interleaved, as a ratio.
 **(8) What `--schedules` reports where Rust's would not run.** Nothing new:
 property tests, contracts and doc examples run with no schedule, as in the
 reference, and the flags are read as today (`parse_opts`).
+
+#### The coordinator's decisions
+
+Taken by the coordinator on 2026-11-19, on the note above; the owner may
+reverse any of them.
+
+- (1): (1a), the port of the reference's seeded scheduler -- a deterministic
+  algorithm whose output (the replay lines) the gate must hold. On the
+  conditions that `run` stays the same bytes on the whole corpus; that the
+  two host switches more per turn are measured, A/B interleaved, on
+  `taskfuzz`, `fuzz_rttasks` and the task and `par_map` benchmarks, the
+  ratios reported, and the work stopped and reported if `run` of a
+  task-heavy program is more than 10% slower on stage 1; and that the
+  channel made in a task and handed on is fixed by it, with a fixture in the
+  `schedules` section and an entry in docs/known-issues.md, found and fixed.
+- (2): (2a), with spare host stacks made when a hop needs one and reused,
+  not 200 made at the start of every block, unless making them on demand is
+  measured to cost more; peak memory measured on `fuzz_rttasks` and
+  `parmap` before and after; inside a task both stages must reach the
+  guaranteed 10,000 calls, the count outside a task being the aim and not
+  the requirement; stopped and reported above 10% on a task-heavy row.
+- (3): accepted; the window recorded in docs/known-issues.md and here as a
+  difference [E-RECURSION-DEPTH] allows.
+- (4): accepted; the Rust interpreter's abort on an `==` 3,000,000 deep
+  recorded as its defect, not copied.
+- (5): accepted, since TIR text that grows with the square of the nesting
+  is a defect and not a limit to record: `grasm tir` stays the same bytes,
+  every reader of the command's own TIR is held by a round-trip gate or a
+  check in the `stack` section, `fixpoint` holds, and whether an `else if`
+  chain of 50,000 then runs is reported, with the reason if it does not.
+- (6): the " (os error N)" text accepted for the six cases; **both (6a) and
+  (6b) refused** -- a second lookup is a network query the program did not
+  make, whose answer may differ and which breaks the rule of no network
+  under the gates and under replay, and `EAI_NONAME` is a guess. A failed
+  lookup stays the one counted exception, at most 1, recorded in
+  docs/known-issues.md as the runtime ABI dropping `getaddrinfo`'s code
+  (both runtimes), to be fixed in the Grasm runtime at or after S9. The
+  floors: that case at most 1, every other `IoFailed` difference 0.
+- (7): accepted; stage 2's `parmap` step session and the whole `run`
+  section measured before and after, interleaved, as ratios.
+- (8): accepted. The gate plan below accepted, its five controls added to
+  `clicontrols`' count.
 
 #### How each is held to Rust
 
