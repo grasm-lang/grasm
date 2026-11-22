@@ -136,6 +136,116 @@ pub fn show(p: TirProg, v: Value) -> str {
     }
 }
 
+/// How deep the walks below recurse on the host's stack before they go on
+/// with stacks of their own (`show_deep`, `equal_deep`): a value nested
+/// deeper than the host's stack holds frames prints and compares as the
+/// reference's does (docs/self-hosting.md §6.23), and every other value is
+/// walked as fast as before.
+let WALK_DEPTH = 64
+
+fn show_into(p: TirProg, v: Value, inout out: [str]) {
+    show_rec(p, v, out, 0)
+}
+
+fn show_seq(p: TirProg, items: [Value], inout out: [str], depth: i64) {
+    var first = true
+    for x in items {
+        if not first {
+            out.push(", ")
+        }
+        first = false
+        show_rec(p, x, out, depth + 1)
+    }
+}
+
+fn show_rec(p: TirProg, v: Value, inout out: [str], depth: i64) {
+    if depth >= WALK_DEPTH {
+        show_deep(p, v, out)
+        return
+    }
+    match v {
+        VStr(s) -> out.push(s)
+        VInt(n) -> out.push("{n}")
+        VBool(b) -> out.push(if b { "true" } else { "false" })
+        VList(items) -> {
+            out.push("[")
+            show_seq(p, items, out, depth)
+            out.push("]")
+        }
+        VStruct(ty, fields) -> {
+            out.push(p.ty_name[ty])
+            out.push("\{")
+            let names = p.ty_fields[ty]
+            for i in 0..fields.len() {
+                if i > 0 {
+                    out.push(", ")
+                }
+                out.push(names.get(i) ?? "?")
+                out.push(": ")
+                show_rec(p, fields[i], out, depth + 1)
+            }
+            out.push("}")
+        }
+        VVariant(ty, idx, fields) -> {
+            out.push(p.ty_variants[ty].get(idx) ?? "?")
+            if not fields.is_empty() {
+                out.push("(")
+                show_seq(p, fields, out, depth)
+                out.push(")")
+            }
+        }
+        VFloat(f) -> out.push("{f}")
+        VUnit -> out.push("()")
+        VTuple(items) -> {
+            out.push("(")
+            show_seq(p, items, out, depth)
+            out.push(")")
+        }
+        VBytes(b) -> show_hex(b, out)
+        VOk(x) -> {
+            out.push("Ok(")
+            show_rec(p, x, out, depth + 1)
+            out.push(")")
+        }
+        VErr(x) -> {
+            out.push("Err(")
+            show_rec(p, x, out, depth + 1)
+            out.push(")")
+        }
+        VMap(_, _, _, _, _) -> show_map(p, v, out, depth)
+        VRange(lo, hi, incl) -> {
+            out.push("{lo}..")
+            if incl {
+                out.push("=")
+            }
+            out.push("{hi}")
+        }
+        VRef(slot, gen) -> out.push("ref#{slot}.{gen}")
+        VClosure(_, _, _) -> out.push("<closure>")
+        VFn(id) -> out.push("<fn {p.fn_name[id]}>")
+        VU64(u) -> out.push("{u}")
+        // A builder prints as the `str` or `bytes` it would become.
+        VStrB(b) -> out.push(b.to_str())
+        VByteB(b) -> show_hex(b.to_bytes(), out)
+    }
+}
+
+/// `{k: v, ...}` in key order; a map holds keys of one type only.
+fn show_map(p: TirProg, m: Value, inout out: [str], depth: i64) {
+    out.push("\{")
+    let keys = map_keys(m)
+    let vals = map_values(m)
+    for i in 0..keys.len() {
+        if i > 0 {
+            out.push(", ")
+        }
+        show_rec(p, keys[i], out, depth + 1)
+        out.push(": ")
+        show_rec(p, vals[i], out, depth + 1)
+    }
+    out.push("}")
+}
+
 // The walk keeps its own stack (`ShowWalk`), so a value nested deeper than the
 // host's stack holds frames for prints as the reference prints it
 // (docs/self-hosting.md §6.23): each entry is text to write or a value to
@@ -172,7 +282,7 @@ fn walk_seq(inout w: ShowWalk, items: [Value], close: str) {
     }
 }
 
-fn show_into(p: TirProg, v0: Value, inout out: [str]) {
+fn show_deep(p: TirProg, v0: Value, inout out: [str]) {
     var w = ShowWalk{ is_text: [false], vals: [v0], texts: [""] }
     while not w.is_text.is_empty() {
         let is_text = w.is_text.pop() ?? true
@@ -375,11 +485,118 @@ fn key_text_into(k: Value, inout out: [str]) {
 
 // ----- equality ------------------------------------------------------------
 
-/// Structural equality, `==` and `assert_eq` (`Value::eq_value`). Pairs
-/// still to compare are kept on a stack of the walk's own, so a value nested
-/// deeper than the host's stack holds frames compares as the reference
-/// compares it (docs/self-hosting.md §6.23).
+/// Structural equality, `==` and `assert_eq` (`Value::eq_value`).
 pub fn equal(a: Value, b: Value) -> bool {
+    equal_rec(a, b, 0)
+}
+
+/// Structural equality to `WALK_DEPTH` levels on the host's stack.
+fn equal_rec(a: Value, b: Value, depth: i64) -> bool {
+    if depth >= WALK_DEPTH {
+        return equal_deep(a, b)
+    }
+    match a {
+        VInt(x) -> match b {
+            VInt(y) -> x == y
+            VFloat(y) -> x.as_f64() == y
+            _ -> false
+        }
+        VStr(x) -> match b {
+            VStr(y) -> x == y
+            _ -> false
+        }
+        VBool(x) -> match b {
+            VBool(y) -> x == y
+            _ -> false
+        }
+        VVariant(t1, i1, f1) -> match b {
+            VVariant(t2, i2, f2) -> t1 == t2 and i1 == i2 and equal_seq_rec(f1, f2, depth + 1)
+            _ -> false
+        }
+        VList(x) -> match b {
+            VList(y) -> equal_seq_rec(x, y, depth + 1)
+            _ -> false
+        }
+        VStruct(t1, f1) -> match b {
+            VStruct(t2, f2) -> t1 == t2 and equal_seq_rec(f1, f2, depth + 1)
+            _ -> false
+        }
+        VFloat(x) -> match b {
+            VFloat(y) -> x == y
+            VInt(y) -> x == y.as_f64()
+            _ -> false
+        }
+        VUnit -> match b {
+            VUnit -> true
+            _ -> false
+        }
+        VTuple(x) -> match b {
+            VTuple(y) -> equal_seq_rec(x, y, depth + 1)
+            _ -> false
+        }
+        VBytes(x) -> match b {
+            VBytes(y) -> x == y
+            _ -> false
+        }
+        VOk(x) -> match b {
+            VOk(y) -> equal_rec(x, y, depth + 1)
+            _ -> false
+        }
+        VErr(x) -> match b {
+            VErr(y) -> equal_rec(x, y, depth + 1)
+            _ -> false
+        }
+        VMap(_, _, _, _, _) -> match b {
+            VMap(_, _, _, _, _) -> equal_seq_rec(map_keys(a), map_keys(b), depth + 1) and equal_seq_rec(map_values(a), map_values(b), depth + 1)
+            _ -> false
+        }
+        VRange(a1, a2, a3) -> match b {
+            VRange(b1, b2, b3) -> a1 == b1 and a2 == b2 and a3 == b3
+            _ -> false
+        }
+        VRef(s1, g1) -> match b {
+            VRef(s2, g2) -> s1 == s2 and g1 == g2
+            _ -> false
+        }
+        VFn(x) -> match b {
+            VFn(y) -> x == y
+            _ -> false
+        }
+        VClosure(n1, s1, c1) -> match b {
+            VClosure(n2, s2, c2) -> n1 == n2 and s1 == s2 and equal_seq_rec(c1, c2, depth + 1)
+            _ -> false
+        }
+        VU64(x) -> match b {
+            VU64(y) -> x == y
+            _ -> false
+        }
+        // Two builders are equal when their contents are.
+        VStrB(x) -> match b {
+            VStrB(y) -> x.to_str() == y.to_str()
+            _ -> false
+        }
+        VByteB(x) -> match b {
+            VByteB(y) -> x.to_bytes() == y.to_bytes()
+            _ -> false
+        }
+    }
+}
+
+fn equal_seq_rec(x: [Value], y: [Value], depth: i64) -> bool {
+    if x.len() != y.len() {
+        return false
+    }
+    for i in 0..x.len() {
+        if not equal_rec(x[i], y[i], depth) {
+            return false
+        }
+    }
+    true
+}
+
+/// Structural equality past `WALK_DEPTH`: pairs still to compare are kept on
+/// a stack of the walk's own.
+fn equal_deep(a: Value, b: Value) -> bool {
     var xs: [Value] = []
     var ys: [Value] = []
     if not equal_one(a, b, xs, ys) {
