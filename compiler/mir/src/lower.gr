@@ -5032,7 +5032,7 @@ fn inout_place(info: TirInfo, inout v: Vir, a: i64, ks: [i64], i: i64, pte: i64)
     pl.cs = [rp.root]
     for j in 1..n {
         if take {
-            pl.cs.push(take_child(v, pl.cs[j - 1], rp.fields[j - 1], pl.kv[j - 1], rp.names[j - 1]))
+            pl.cs.push(take_child(info, v, pl.cs[j - 1], rp.fields[j - 1], pl.kv[j - 1], rp.names[j - 1], rp.tes[j - 1], rp.tes[j]))
         } else {
             pl.cs.push(read_child(v, t, pl.cs[j - 1], rp.fields[j - 1], pl.kv[j - 1], rp.tes[j]))
         }
@@ -5040,7 +5040,7 @@ fn inout_place(info: TirInfo, inout v: Vir, a: i64, ks: [i64], i: i64, pte: i64)
     let lk = ty_kind(t, rp.tes[n])
     var leaf = -1
     if take and ir.ty_boxed(lk) {
-        leaf = take_child(v, pl.cs[n - 1], rp.fields[n - 1], pl.kv[n - 1], rp.names[n - 1])
+        leaf = take_child(info, v, pl.cs[n - 1], rp.fields[n - 1], pl.kv[n - 1], rp.names[n - 1], rp.tes[n - 1], rp.tes[n])
     } else {
         leaf = read_child(v, t, pl.cs[n - 1], rp.fields[n - 1], pl.kv[n - 1], rp.tes[n])
     }
@@ -5162,7 +5162,7 @@ fn mut_method(info: TirInfo, inout v: Vir, e: i64, fname: str, codes: str, extra
     }
     let from = if l < 0 { 0 } else { l + 1 }
     for j in (from + 1)..(n + 1) {
-        cs.push(take_child(v, cs[cs.len() - 1], pp.kinds[j - 1] == STEP_FIELD, kv[j - 1], pp.names[j - 1]))
+        cs.push(take_child(info, v, cs[cs.len() - 1], pp.kinds[j - 1] == STEP_FIELD, kv[j - 1], pp.names[j - 1], pp.tes[j - 1], pp.tes[j]))
     }
     let leaf = cs[cs.len() - 1]
     if is_temp(v, leaf) {
@@ -5215,9 +5215,18 @@ fn mut_method(info: TirInfo, inout v: Vir, e: i64, fname: str, codes: str, extra
     -1
 }
 
-/// The child of container `c` (struct field `name`, or list element `key`),
-/// moved out of it when `c` has no other holder, else retained.
-fn take_child(inout v: Vir, c: i64, is_field: bool, key: i64, name: str) -> i64 {
+/// The child of container `c` (struct field `name` at position `key`, or
+/// list element `key`), moved out of it when `c` has no other holder, else
+/// retained. `cte` and `fte` are the container's and the child's type
+/// elements: a field of a struct whose declaration this lowering sees is
+/// found by its position (`take_field_at`), never by its name.
+fn take_child(info: TirInfo, inout v: Vir, c: i64, is_field: bool, key: i64, name: str, cte: i64, fte: i64) -> i64 {
+    if is_field {
+        let nf = struct_nfields(info, cte)
+        if nf >= 0 {
+            return take_field_at(v, c, key, nf, ir.ty_boxed(ty_kind(info.t, fte)))
+        }
+    }
     var tk = -1
     if is_field {
         let fa = text_args(v, name)
@@ -5240,6 +5249,49 @@ fn take_child(inout v: Vir, c: i64, is_field: bool, key: i64, name: str) -> i64 
     } else {
         g = rt(v, "grasm_list_get", [c, key], R_BOX)
     }
+    copy_to(v, r, g)
+    forget_temp(v, g)
+    term_jump(v, join)
+    switch_to(v, join)
+    own_temp(v, r)
+    r
+}
+
+/// Field `k` of struct `c` (of `nfields` fields), as `grasm_struct_take`
+/// and then `grasm_struct_get` give it but by position: when `c` is laid out
+/// as such a struct is and nothing else holds it, a boxed field's pointer is
+/// moved out of its slot and the interned `false` both runtimes' takes leave
+/// put in its place; otherwise, or for a field the type does not box,
+/// `grasm_struct_get_at`, retained (a scalar boxed). Owned by the caller.
+fn take_field_at(inout v: Vir, c: i64, k: i64, nfields: i64, boxed: bool) -> i64 {
+    let r = new_var(v, ir.TY_BOX)
+    let slow = new_block(v)
+    let join = new_block(v)
+    if boxed {
+        expect_struct(v, c, nfields, slow)
+        let u = unique(v, c)
+        when(v, u, slow)
+        var at = -1
+        if nfields <= 4 {
+            at = box_at(v, c, layout.STRUCT_VALS + 8 * k)
+        } else {
+            let pa = box_at(v, c, layout.STRUCT_VEC + layout.VEC_PTR)
+            let p = op1(v, ir.M_LOAD, pa)
+            at = box_at(v, p, 8 * k)
+        }
+        let w = op1(v, ir.M_LOAD, at)
+        copy_to(v, r, w)
+        let z = konst(v, 0)
+        let hole = rt(v, "grasm_box_bool", [z], R_BOX)
+        forget_temp(v, hole)
+        emit(v, ir.M_STORE, -1, at, hole, 0)
+        term_jump(v, join)
+    } else {
+        term_jump(v, slow)
+    }
+    switch_to(v, slow)
+    let kc = konst(v, k)
+    let g = rt(v, "grasm_struct_get_at", [c, kc], R_BOX)
     copy_to(v, r, g)
     forget_temp(v, g)
     term_jump(v, join)
@@ -6223,7 +6275,7 @@ fn write_steps(info: TirInfo, inout v: Vir, t: TirTree, pp: PlacePath, kv: [i64]
     let n = pp.kinds.len()
     var cs: [i64] = [base]
     for j in (from + 1)..n {
-        cs.push(take_child(v, cs[cs.len() - 1], pp.kinds[j - 1] == STEP_FIELD, kv[j - 1], pp.names[j - 1]))
+        cs.push(take_child(info, v, cs[cs.len() - 1], pp.kinds[j - 1] == STEP_FIELD, kv[j - 1], pp.names[j - 1], pp.tes[j - 1], pp.tes[j]))
     }
     let leafc = cs[cs.len() - 1]
     var nv = -1
