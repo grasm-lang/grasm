@@ -2081,6 +2081,17 @@ if [ -n "$whole" ]; then
         echo "too little compared in fmt, lint, test or bench: $fmt_files files, $fmt_rewritten rewritten, $fmt_refused refused; $lint_files linted, $lint_findings findings; $test_props, $test_contracts, $test_cov, $test_failed failing; $tm_runs mains as tests, $tm_failed failing; $bench_files with a benchmark, $bench_timed timing lines"
         exit 1
     fi
+    # The floors of §6.23's sections, from their first run (2026-11-19, the
+    # stage-1 command, the five corpus programs with tasks): `schedules` 19
+    # programs, 115 commands, 24 with a failing test, 16 with a test held
+    # under every schedule tried, 1 failing schedule replayed; `stack` 13
+    # programs, and its two allowed differences twice each, run and test.
+    if [ "$sch_programs" -lt 19 ] || [ "$sch_runs" -lt 110 ] || [ "$sch_failed" -lt 20 ] ||
+        [ "$sch_tried" -lt 12 ] || [ "$sch_replayed" -lt 1 ] ||
+        [ "$st_files" -lt 13 ] || [ "$st_window" -ne 2 ] || [ "$st_task" -ne 2 ]; then
+        echo "too little compared in schedules or stack: $sch_programs programs, $sch_runs commands, $sch_failed failing, $sch_tried held, $sch_replayed replayed; $st_files programs, $st_window past Rust's stack, $st_task past a task's spares"
+        exit 1
+    fi
     # The floors of §6.20's sections, a margin below the first runs of the
     # whole corpus (2026-11-13 and 14, the stage-1 command): `doc` 1,426
     # documents written and 66,515 items, 71 refusals; `api` 1,132 programs
