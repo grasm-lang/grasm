@@ -136,82 +136,132 @@ pub fn show(p: TirProg, v: Value) -> str {
     }
 }
 
-fn show_seq(p: TirProg, items: [Value], inout out: [str]) {
-    var first = true
-    for x in items {
-        if not first {
-            out.push(", ")
+// The walk keeps its own stack (`ShowWalk`), so a value nested deeper than the
+// host's stack holds frames for prints as the reference prints it
+// (docs/self-hosting.md §6.23): each entry is text to write or a value to
+// show, taken from the end.
+
+type ShowWalk = {
+    is_text: [bool],
+    vals: [Value],
+    texts: [str],
+}
+
+fn walk_text(inout w: ShowWalk, s: str) {
+    w.is_text.push(true)
+    w.vals.push(VUnit)
+    w.texts.push(s)
+}
+
+fn walk_val(inout w: ShowWalk, v: Value) {
+    w.is_text.push(false)
+    w.vals.push(v)
+    w.texts.push("")
+}
+
+/// `items` separated by ", ", then `close`, to come next: pushed last first.
+fn walk_seq(inout w: ShowWalk, items: [Value], close: str) {
+    walk_text(w, close)
+    var i = items.len() - 1
+    while i >= 0 {
+        walk_val(w, items[i])
+        if i > 0 {
+            walk_text(w, ", ")
         }
-        first = false
-        show_into(p, x, out)
+        i -= 1
     }
 }
 
-fn show_into(p: TirProg, v: Value, inout out: [str]) {
-    match v {
-        VStr(s) -> out.push(s)
-        VInt(n) -> out.push("{n}")
-        VBool(b) -> out.push(if b { "true" } else { "false" })
-        VList(items) -> {
-            out.push("[")
-            show_seq(p, items, out)
-            out.push("]")
+fn show_into(p: TirProg, v0: Value, inout out: [str]) {
+    var w = ShowWalk{ is_text: [false], vals: [v0], texts: [""] }
+    while not w.is_text.is_empty() {
+        let is_text = w.is_text.pop() ?? true
+        let v = w.vals.pop() ?? VUnit
+        let text = w.texts.pop() ?? ""
+        if is_text {
+            out.push(text)
+            continue
         }
-        VStruct(ty, fields) -> {
-            out.push(p.ty_name[ty])
-            out.push("\{")
-            let names = p.ty_fields[ty]
-            for i in 0..fields.len() {
-                if i > 0 {
-                    out.push(", ")
+        match v {
+            VStr(s) -> out.push(s)
+            VInt(n) -> out.push("{n}")
+            VBool(b) -> out.push(if b { "true" } else { "false" })
+            VList(items) -> {
+                out.push("[")
+                walk_seq(w, items, "]")
+            }
+            VStruct(ty, fields) -> {
+                out.push(p.ty_name[ty])
+                out.push("\{")
+                let names = p.ty_fields[ty]
+                walk_text(w, "}")
+                var i = fields.len() - 1
+                while i >= 0 {
+                    walk_val(w, fields[i])
+                    walk_text(w, (names.get(i) ?? "?") + ": ")
+                    if i > 0 {
+                        walk_text(w, ", ")
+                    }
+                    i -= 1
                 }
-                out.push(names.get(i) ?? "?")
-                out.push(": ")
-                show_into(p, fields[i], out)
             }
-            out.push("}")
-        }
-        VVariant(ty, idx, fields) -> {
-            out.push(p.ty_variants[ty].get(idx) ?? "?")
-            if not fields.is_empty() {
+            VVariant(ty, idx, fields) -> {
+                out.push(p.ty_variants[ty].get(idx) ?? "?")
+                if not fields.is_empty() {
+                    out.push("(")
+                    walk_seq(w, fields, ")")
+                }
+            }
+            VFloat(f) -> out.push("{f}")
+            VUnit -> out.push("()")
+            VTuple(items) -> {
                 out.push("(")
-                show_seq(p, fields, out)
-                out.push(")")
+                walk_seq(w, items, ")")
             }
-        }
-        VFloat(f) -> out.push("{f}")
-        VUnit -> out.push("()")
-        VTuple(items) -> {
-            out.push("(")
-            show_seq(p, items, out)
-            out.push(")")
-        }
-        VBytes(b) -> show_hex(b, out)
-        VOk(x) -> {
-            out.push("Ok(")
-            show_into(p, x, out)
-            out.push(")")
-        }
-        VErr(x) -> {
-            out.push("Err(")
-            show_into(p, x, out)
-            out.push(")")
-        }
-        VMap(_, _, _, _, _) -> show_map(p, v, out)
-        VRange(lo, hi, incl) -> {
-            out.push("{lo}..")
-            if incl {
-                out.push("=")
+            VBytes(b) -> show_hex(b, out)
+            VOk(x) -> {
+                out.push("Ok(")
+                walk_text(w, ")")
+                walk_val(w, x)
             }
-            out.push("{hi}")
+            VErr(x) -> {
+                out.push("Err(")
+                walk_text(w, ")")
+                walk_val(w, x)
+            }
+            VMap(_, _, _, _, _) -> {
+                // `{k: v, ...}` in key order; a map holds keys of one type
+                // only.
+                out.push("\{")
+                let keys = map_keys(v)
+                let vals = map_values(v)
+                walk_text(w, "}")
+                var i = keys.len() - 1
+                while i >= 0 {
+                    walk_val(w, vals[i])
+                    walk_text(w, ": ")
+                    walk_val(w, keys[i])
+                    if i > 0 {
+                        walk_text(w, ", ")
+                    }
+                    i -= 1
+                }
+            }
+            VRange(lo, hi, incl) -> {
+                out.push("{lo}..")
+                if incl {
+                    out.push("=")
+                }
+                out.push("{hi}")
+            }
+            VRef(slot, gen) -> out.push("ref#{slot}.{gen}")
+            VClosure(_, _, _) -> out.push("<closure>")
+            VFn(id) -> out.push("<fn {p.fn_name[id]}>")
+            VU64(u) -> out.push("{u}")
+            // A builder prints as the `str` or `bytes` it would become.
+            VStrB(b) -> out.push(b.to_str())
+            VByteB(b) -> show_hex(b.to_bytes(), out)
         }
-        VRef(slot, gen) -> out.push("ref#{slot}.{gen}")
-        VClosure(_, _, _) -> out.push("<closure>")
-        VFn(id) -> out.push("<fn {p.fn_name[id]}>")
-        VU64(u) -> out.push("{u}")
-        // A builder prints as the `str` or `bytes` it would become.
-        VStrB(b) -> out.push(b.to_str())
-        VByteB(b) -> show_hex(b.to_bytes(), out)
     }
 }
 
@@ -226,22 +276,6 @@ fn show_hex(b: bytes, inout out: [str]) {
         hex.push(digits.substr(x.bit_and(15), 1))
     }
     out.push(hex.join(""))
-}
-
-/// `{k: v, ...}` in key order; a map holds keys of one type only.
-fn show_map(p: TirProg, m: Value, inout out: [str]) {
-    out.push("\{")
-    let keys = map_keys(m)
-    let vals = map_values(m)
-    for i in 0..keys.len() {
-        if i > 0 {
-            out.push(", ")
-        }
-        show_into(p, keys[i], out)
-        out.push(": ")
-        show_into(p, vals[i], out)
-    }
-    out.push("}")
 }
 
 /// A map's keys in [E-MAP-ORDER]: `false` before `true`, integers ascending
@@ -341,8 +375,29 @@ fn key_text_into(k: Value, inout out: [str]) {
 
 // ----- equality ------------------------------------------------------------
 
-/// Structural equality, `==` and `assert_eq` (`Value::eq_value`).
+/// Structural equality, `==` and `assert_eq` (`Value::eq_value`). Pairs
+/// still to compare are kept on a stack of the walk's own, so a value nested
+/// deeper than the host's stack holds frames compares as the reference
+/// compares it (docs/self-hosting.md §6.23).
 pub fn equal(a: Value, b: Value) -> bool {
+    var xs: [Value] = []
+    var ys: [Value] = []
+    if not equal_one(a, b, xs, ys) {
+        return false
+    }
+    while not xs.is_empty() {
+        let x = xs.pop() ?? VUnit
+        let y = ys.pop() ?? VUnit
+        if not equal_one(x, y, xs, ys) {
+            return false
+        }
+    }
+    true
+}
+
+/// Whether `a` and `b` can be equal as far as their outsides go; what is
+/// inside them is pushed onto `xs` and `ys` to compare in turn.
+fn equal_one(a: Value, b: Value, inout xs: [Value], inout ys: [Value]) -> bool {
     match a {
         VInt(x) -> match b {
             VInt(y) -> x == y
@@ -358,15 +413,15 @@ pub fn equal(a: Value, b: Value) -> bool {
             _ -> false
         }
         VVariant(t1, i1, f1) -> match b {
-            VVariant(t2, i2, f2) -> t1 == t2 and i1 == i2 and equal_seq(f1, f2)
+            VVariant(t2, i2, f2) -> t1 == t2 and i1 == i2 and push_seq(f1, f2, xs, ys)
             _ -> false
         }
         VList(x) -> match b {
-            VList(y) -> equal_seq(x, y)
+            VList(y) -> push_seq(x, y, xs, ys)
             _ -> false
         }
         VStruct(t1, f1) -> match b {
-            VStruct(t2, f2) -> t1 == t2 and equal_seq(f1, f2)
+            VStruct(t2, f2) -> t1 == t2 and push_seq(f1, f2, xs, ys)
             _ -> false
         }
         VFloat(x) -> match b {
@@ -379,7 +434,7 @@ pub fn equal(a: Value, b: Value) -> bool {
             _ -> false
         }
         VTuple(x) -> match b {
-            VTuple(y) -> equal_seq(x, y)
+            VTuple(y) -> push_seq(x, y, xs, ys)
             _ -> false
         }
         VBytes(x) -> match b {
@@ -387,15 +442,15 @@ pub fn equal(a: Value, b: Value) -> bool {
             _ -> false
         }
         VOk(x) -> match b {
-            VOk(y) -> equal(x, y)
+            VOk(y) -> push_seq([x], [y], xs, ys)
             _ -> false
         }
         VErr(x) -> match b {
-            VErr(y) -> equal(x, y)
+            VErr(y) -> push_seq([x], [y], xs, ys)
             _ -> false
         }
         VMap(_, _, _, _, _) -> match b {
-            VMap(_, _, _, _, _) -> equal_seq(map_keys(a), map_keys(b)) and equal_seq(map_values(a), map_values(b))
+            VMap(_, _, _, _, _) -> push_seq(map_keys(a), map_keys(b), xs, ys) and push_seq(map_values(a), map_values(b), xs, ys)
             _ -> false
         }
         VRange(a1, a2, a3) -> match b {
@@ -411,7 +466,7 @@ pub fn equal(a: Value, b: Value) -> bool {
             _ -> false
         }
         VClosure(n1, s1, c1) -> match b {
-            VClosure(n2, s2, c2) -> n1 == n2 and s1 == s2 and equal_seq(c1, c2)
+            VClosure(n2, s2, c2) -> n1 == n2 and s1 == s2 and push_seq(c1, c2, xs, ys)
             _ -> false
         }
         VU64(x) -> match b {
@@ -430,16 +485,23 @@ pub fn equal(a: Value, b: Value) -> bool {
     }
 }
 
-pub fn equal_seq(x: [Value], y: [Value]) -> bool {
+/// False when the lengths differ; else every pair pushed, the first last,
+/// so the walk compares them in order.
+fn push_seq(x: [Value], y: [Value], inout xs: [Value], inout ys: [Value]) -> bool {
     if x.len() != y.len() {
         return false
     }
-    for i in 0..x.len() {
-        if not equal(x[i], y[i]) {
-            return false
-        }
+    var i = x.len() - 1
+    while i >= 0 {
+        xs.push(x[i])
+        ys.push(y[i])
+        i -= 1
     }
     true
+}
+
+pub fn equal_seq(x: [Value], y: [Value]) -> bool {
+    equal(VList(x), VList(y))
 }
 
 // ----- ordering -------------------------------------------------------------
