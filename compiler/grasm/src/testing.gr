@@ -184,7 +184,7 @@ fn prepare(path: str) -> TestRunner {
     if runtime != "" {
         build.refuse_runtime(runtime, "the interpreter")
     }
-    let (text, holes) = emit.emit(c, t, p)
+    let (text, holes) = emit.emit_flat(c, t, p)
     if holes.len() > 0 {
         for h in holes {
             eprint("hole {h}")
@@ -1600,7 +1600,7 @@ fn checked_group(g: Loaded) -> (str, str) {
     if c.d_msg.len() > 0 {
         return ("\0", c.d_msg[0])
     }
-    let (text, holes) = emit.emit(c, t, p)
+    let (text, holes) = emit.emit_flat(c, t, p)
     if holes.len() > 0 {
         return ("\0", "hole {holes[0]}")
     }

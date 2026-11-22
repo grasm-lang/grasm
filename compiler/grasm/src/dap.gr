@@ -172,7 +172,7 @@ fn loaded(path: str) -> (str, Loaded, TirProg, Map[i64, i64]) {
         return ("`{path}` has errors: {c.d_msg[0]}", l, load.empty_prog(), empty)
     }
     var t = t0
-    let (text, holes) = emit.emit(c, t, p)
+    let (text, holes) = emit.emit_flat(c, t, p)
     if holes.len() > 0 {
         return ("the Grasm debug adapter cannot run `{path}`: its TIR has {holes.len()} hole(s)", l, load.empty_prog(), empty)
     }

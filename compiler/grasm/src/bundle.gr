@@ -393,7 +393,7 @@ fn run_bundle(b: Bundle) {
     let l = loader.load_sources_shown(b.names, b.srcs, b.deps, "\0", resolved, shown)
     let (p, c, t0) = front.checked_loaded(l)
     var t = t0
-    let (text, holes) = emit.emit(c, t, p)
+    let (text, holes) = emit.emit_flat(c, t, p)
     if holes.len() > 0 {
         for h in holes {
             eprint("hole {h}")

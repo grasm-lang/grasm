@@ -538,8 +538,19 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
         110 -> dbg_let_tuple(cx, e)
         111 -> dbg_closure(cx, e)
         112 -> builtins.journaled(cx, e)
+        113 -> deep_node(cx, e)
         _ -> panic("tirinterp: node {e} has no evaluation (opcode {cx.op[e]})")
     }
+}
+
+/// An operator chain's every `load.DEEP`th level, evaluated on a fresh host
+/// stack: a spare of the block's inside a task, else a host task's.
+fn deep_node(inout cx: Cx, e: i64) -> Value {
+    let k = kid(cx, e, 0)
+    if tasks.in_task(cx) {
+        return tasks.hop(cx, k)
+    }
+    ev_elsewhere(cx, k)
 }
 
 // ----- the debugger's nodes (`debug.rewrite`) -------------------------------------

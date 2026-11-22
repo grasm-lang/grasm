@@ -104,6 +104,10 @@ pub let OP_DBG_LET = 109
 pub let OP_DBG_LETTUPLE = 110
 pub let OP_DBG_CLOSURE = 111
 pub let OP_J_BUILTIN = 112
+/// Its one child, evaluated on a fresh host stack: put over every `DEEP`th
+/// level of an operator chain, which nests as deep as it is long.
+pub let OP_DEEP = 113
+pub let DEEP = 400
 
 /// The program, ready to run.
 type TirProg = {
@@ -247,6 +251,10 @@ type Loader = {
     ref_log: [i64],
     decl_log: [i64],
     errors: [str],
+    // How deep the expression being read is nested, and what a read on a
+    // fresh host stack answered.
+    nest: i64,
+    hop_id: i64,
 }
 
 // ----- reading the tree ------------------------------------------------------
@@ -453,9 +461,48 @@ fn resolve(inout ld: Loader, table: Map[str, i64], name: str, what: str) -> i64 
     }
 }
 
-/// An expression or a statement. The commonest kinds are here and the
-/// rest in `expr_more`.
+/// An expression or a statement. Read on a fresh host stack every `DEEP`
+/// levels of nesting -- an operator or an `else if` chain nests as deep as
+/// it is long, and the reference runs one of 50,000 -- and an operator
+/// node at such a level put under an `OP_DEEP`, so that evaluating it moves
+/// to a fresh stack too (docs/self-hosting.md §6.23).
 fn expr(inout ld: Loader, e: i64) -> i64 {
+    ld.nest += 1
+    var id = -1
+    if ld.nest % DEEP == 0 {
+        id = expr_elsewhere(ld, e)
+        if ld.op[id] == OP_BINARY {
+            let w = new_node(ld, OP_DEEP)
+            set_kids(ld, w, [id])
+            id = w
+        }
+    } else {
+        id = expr_here(ld, e)
+    }
+    ld.nest -= 1
+    id
+}
+
+/// `expr_here` on a fresh stack: a host task's.
+fn expr_elsewhere(inout ld: Loader, e: i64) -> i64 {
+    let start = ld
+    let back: Chan[Loader] = chan_new(1)
+    concurrent {
+        go {
+            var mine = start
+            mine.hop_id = expr_here(mine, e)
+            chan_send(back, mine)
+        }
+    }
+    match chan_recv(back) {
+        Some(l) -> ld = l
+        None -> ()
+    }
+    ld.hop_id
+}
+
+/// The commonest kinds are here and the rest in `expr_more`.
+fn expr_here(inout ld: Loader, e: i64) -> i64 {
     let t = ld.t
     match kw(t, e) {
         "local" -> {
@@ -1511,6 +1558,8 @@ fn new_loader(t: Tree) -> Loader {
         ref_log: [],
         decl_log: [],
         errors: [],
+        nest: 0,
+        hop_id: -1,
     }
 }
 

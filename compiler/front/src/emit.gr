@@ -57,10 +57,13 @@ fn q(s: str) -> str {
     loader.quote(s)
 }
 
-/// Writes node `id` at `depth`, its children on lines of their own. A
-/// work stack, not recursion: an operator chain or an `else if` chain
-/// nests its nodes as deep as it is long.
-fn write(m: Em, id: i64, depth: i64, inout b: StrBuilder) {
+/// Writes node `id` at `depth`, its children on lines of their own, each
+/// line indented two spaces a level unless `flat`. A work stack, not
+/// recursion: an operator chain or an `else if` chain nests its nodes as
+/// deep as it is long -- which is also why the text the command reads back
+/// itself is written `flat`: indented, it grows with the square of the
+/// nesting (docs/self-hosting.md §6.23).
+fn write(m: Em, id: i64, depth: i64, flat: bool, inout b: StrBuilder) {
     // Each entry: a node and how many of its children are written.
     var ids = [id]
     var done = [0]
@@ -70,8 +73,10 @@ fn write(m: Em, id: i64, depth: i64, inout b: StrBuilder) {
         let n = ids[top]
         if not started[top] {
             started[top] = true
-            for _ in 0..depth + top {
-                b.push_str("  ")
+            if not flat {
+                for _ in 0..depth + top {
+                    b.push_str("  ")
+                }
             }
             b.push_str("(")
             b.push_str(m.nh[n])
@@ -313,7 +318,18 @@ fn var_atom(c: Ck, inout t: Tys, inout m: Em, p: Prog, ident: i64, mutable: bool
 // ---------------------------------------------------------------------
 
 /// The TIR text of a checked program, and its holes.
+/// The program's TIR as `grasm tir` prints it, and the holes.
 pub fn emit(c: Ck, inout t: Tys, p: Prog) -> (str, [str]) {
+    emit_as(c, t, p, false)
+}
+
+/// The same TIR with no indentation: the same tree to `sexp.read`, for the
+/// command's own runs.
+pub fn emit_flat(c: Ck, inout t: Tys, p: Prog) -> (str, [str]) {
+    emit_as(c, t, p, true)
+}
+
+fn emit_as(c: Ck, inout t: Tys, p: Prog, flat: bool) -> (str, [str]) {
     var m = Em{ nh: [], noff: [], nn: [], kpool: [], holes: [], sc_name: [], sc_id: [], sc_start: [], next_var: 0, mi: 0, rb_on: false, rb_name: [], rb_id: [] }
     var tops: [i64] = []
     for mi in 0..p.m_name.len() {
@@ -366,7 +382,7 @@ pub fn emit(c: Ck, inout t: Tys, p: Prog) -> (str, [str]) {
     var b = str_builder()
     b.push_str("(tir 1)\n")
     for n in tops {
-        write(m, n, 0, b)
+        write(m, n, 0, flat, b)
         b.push_str("\n")
     }
     (b.to_str(), m.holes)

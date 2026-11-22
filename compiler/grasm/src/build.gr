@@ -71,7 +71,16 @@ pub fn tir_to_run(path: str) -> str {
     if ch.runtime != "" {
         refuse_runtime(ch.runtime, "the interpreter")
     }
-    tir_of(ch)
+    var t = ch.t
+    let (text, holes) = emit.emit_flat(ch.c, t, ch.p)
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+    text
 }
 
 /// `Program::runtime_refusal`.
