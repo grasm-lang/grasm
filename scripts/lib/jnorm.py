@@ -7,8 +7,11 @@ Exit 0 when they are the same bytes once the values of the built-ins whose
 answer depends on when and where the run happened -- the clock, entropy,
 ports and peers: the only ones that differed between two recordings of the
 corpus by the Rust `grasm` (docs/self-hosting.md §6.22) -- are set aside;
-2 when what differs is an `IoFailed` message, which the engines word
-differently (docs/known-issues.md, S1); 3 when what differs is only socket
+2 when what differs is a failed name lookup's `IoFailed` text -- the Rust
+interpreter's `std` says "failed to lookup address information: ...", and
+both runtimes report the lookup as ENOENT, the code `getaddrinfo` gave
+dropped, so the TIR interpreter's text is "No such file or directory (os
+error 2)" (docs/known-issues.md; docs/self-hosting.md §6.23); 3 when what differs is only socket
 handles numbered otherwise after a `net_close`; 1 otherwise, saying where.
 
 The Rust interpreter never gives a closed socket's handle out again, where
@@ -135,8 +138,8 @@ for i, (x, y) in enumerate(zip(a, b)):
         if hs is not None and ks is not None and len(hs) == len(ks) and all(to_b.get(h) == k for h, k in zip(hs, ks)):
             renumbered += 1
             continue
-    if b"IoFailed" in x[1] or b"IoFailed" in y[1]:
-        iofailed = iofailed or "record %d (%s): an IoFailed message" % (i + 1, name.decode(errors="replace"))
+    if b"failed to lookup address information: " in x[1] and y[1].endswith(b"No such file or directory (os error 2)") and x[1].split(b"IoFailed")[0] == y[1].split(b"IoFailed")[0]:
+        iofailed = iofailed or "record %d (%s): a failed lookup's IoFailed text" % (i + 1, name.decode(errors="replace"))
         continue
     print("record %d (%s) differs" % (i + 1, name.decode(errors="replace")))
     sys.exit(1)

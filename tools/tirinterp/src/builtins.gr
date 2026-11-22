@@ -286,12 +286,48 @@ fn int_list(xs: [i64]) -> Value {
     VList(out)
 }
 
-/// The host's `IoError`, as the program's own.
+/// The host's `IoError`, as the program's own, worded as the reference
+/// words it.
 fn io_err(p: TirProg, e: IoError) -> Value {
     match e {
         NotFound(path) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "NotFound"), [VStr(path)]))
-        IoFailed(msg) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "IoFailed"), [VStr(msg)]))
+        IoFailed(msg) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "IoFailed"), [VStr(os_words(msg))]))
     }
+}
+
+extern fn strerror_r(code: i64, buf: bytes, len: i64) -> i64
+
+/// The system's message for error number `code` (`strerror_r`, as Rust's
+/// `std` reads it); "" for none.
+fn errno_text(code: i64) -> str {
+    let buf = bytes_filled(256, 0)
+    if unsafe { strerror_r(code, buf, 256) } != 0 {
+        return ""
+    }
+    var n = 0
+    while n < 256 and buf.at(n) != 0 {
+        n += 1
+    }
+    buf.slice(0, n).to_str()
+}
+
+/// A failed operation's text as the reference's `std` words it
+/// (docs/known-issues.md): both runtimes give the system's message alone,
+/// `std` adds " (os error N)". So a text that is the message for an error
+/// number, or ends with ": " and one (a process's, after the program's
+/// name), gains it; the system's messages are distinct, one number each. A
+/// text that is not -- a runtime's own words -- stays as it is.
+fn os_words(msg: str) -> str {
+    for code in 1..256 {
+        let t = errno_text(code)
+        if t == "" or t.starts_with("Unknown error") {
+            continue
+        }
+        if msg == t or msg.ends_with(": " + t) {
+            return "{msg} (os error {code})"
+        }
+    }
+    msg
 }
 
 /// The index of variant `name` of sum type `ty`, as the program declares it.
