@@ -10,7 +10,9 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
-eleven, four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
+thirteen, the Rust interpreter aborting on an `==` of a value nested
+3,000,000 deep, both runtimes reporting a failed name lookup as `ENOENT`,
+four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
 records unread in silence, a breakpoint by another path's
 spelling never stopping, positions as bytes, a diagnostic at the end of
 the buffer dropped -- `grasm run` numbering sockets otherwise than a native
@@ -33,13 +35,99 @@ check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
 a type shown as `_`, a contract's row breach reported twice, a ceiling
 refusal without its reason, and a `match`'s names unbound after an error;
 and one in `compiler/s3`, which no release ships yet, an object naming the
-directory it was compiled in. Three differences the Grasm `grasm test` keeps
-from the Rust one, by decision (§6.19): a panic inside a `concurrent` task,
-one the runtime's channel operations raise, and the TIR interpreter's own
-stack running out, each end the command.
+directory it was compiled in. Two differences [E-RECURSION-DEPTH] allows
+between the Grasm command and the Rust one (§6.23): a recursion between the
+Rust interpreter's stack and 100,000 calls runs under the Grasm command, and
+one inside a task past 10,999 calls is refused by it.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
+
+## Found on 2026-11-19 by S8 part six (the scheduler and the stack in Grasm)
+
+**A channel made inside a task could not be used by its siblings under the
+Grasm command -- *closed, 2026-11-19*.** Each task of a `concurrent` block
+ran on a copy of the TIR interpreter's context, and with it a copy of the
+list of the program's channels, so a channel a task made and handed to
+another named nothing there: `panic: not a channel`, exit 101, where the
+Rust command runs the program. Found while measuring for S8 part six;
+fixed by it (docs/self-hosting.md §6.23): the channels are one table the
+tasks hand on with their turns, as the reference's are.
+`scripts/fixtures/sched/handoff.gr` is the reproducer, in `clidiff`'s
+`schedules` section.
+
+**The Rust interpreter aborts comparing a value nested 3,000,000 deep --
+*open, S3 (the agent's)*.** `==` walks a value on the interpreter thread's
+own stack, past the recursion budget it keeps for calls, and a list nested
+3,000,000 deep overflows it: "thread '<unknown>' has overflowed its stack",
+"fatal runtime error: stack overflow, aborting", SIGABRT, exit 134
+(1,000,000 deep compares and prints). An abort is what [E-RECURSION-DEPTH]
+says a program never meets; not copied: the Grasm command walks values with
+a stack of its own and answers (§6.23).
+
+```
+type L = | Nil | Cons(h: i64, t: L)
+
+fn main() {
+    var l = Nil
+    for i in 0..3000000 {
+        l = Cons(i, l)
+    }
+    print("{l == l}")
+}
+```
+
+**A recursion between the Rust interpreter's stack and 100,000 calls runs
+under the Grasm command and is refused by the Rust one -- *a difference
+[E-RECURSION-DEPTH] allows*.** The Rust interpreter stops a recursion at
+100,000 calls or when its 448 MiB of stack run out, and for every shape
+measured the stack comes first: 41,941 calls of `1 + depth(n - 1)` (41,943
+under `test`), 36,653 of `d(n - 1)` as a statement, 42,426 through a `map`,
+29,775 through a closure argument. The bound depends on its frames' sizes.
+The Grasm command keeps the reference's own count, 100,000, and refuses
+past it in the same words and status, so a recursion in between runs under
+it; `scripts/fixtures/stack/window-50000.gr`, counted by `clidiff`'s
+`stack` section. The clause guarantees 10,000 and leaves the bound to the
+implementation (the coordinator's decision, §6.23).
+
+**Inside a task, the Grasm command's recursion stops at 10,999 calls --
+*a difference [E-RECURSION-DEPTH] allows*.** A task of a `concurrent` block
+runs on a host task, and goes deeper than one host stack holds on spare
+host stacks of its block, made when the block starts, 21 of them, 500
+calls each, shared by the block's tasks, and only for a program that may
+recurse (§6.23, the coordinator's decision (b)); past them the recursion is
+refused in the reference's words: 500 calls on the task's own stack and 500
+on each spare, both stages alike. 21 is the largest of the counts measured
+(21, 50, 100, 200) that kept every real task program within 10% of the old
+command on both stages (the coordinator's rule; §6.23). The Rust
+interpreter's task has the same stack as its main thread (41,941 calls of
+`1 + depth(n - 1)`), so a recursion between the two runs there and is
+refused here.
+`scripts/fixtures/stack/task-past.gr`, counted by `clidiff`'s `stack`
+section.
+
+**Both runtimes report a failed name lookup as `ENOENT` -- *open, S3 (the
+agent's); the runtime ABI*.** `tcp_connect` to a name that does not
+resolve answers `IoFailed("No such file or directory")` from a native
+program, built by either toolchain: `grasm_sys` and `compiler/rt/src/net.gr`
+turn any `getaddrinfo` failure into `ENOENT` and drop the code
+`getaddrinfo` returned, so a program cannot tell an unknown host from a
+missing file. The Rust interpreter, on `std`, says "failed to lookup
+address information: nodename nor servname provided, or not known". The
+Grasm command's `run`, on the runtime, says "No such file or directory (os
+error 2)": the one `IoFailed` text the two commands still word otherwise,
+counted by `clidiff`'s `journal` section and held to one
+(`spec/conformance/L-LIB-NET.gr`). The fix belongs to the Grasm runtime,
+at or after S9 (the coordinator's decision, §6.23).
+
+```
+fn main() / {io, net} {
+    match tcp_connect("no.such.host.invalid", 80) {
+        Ok(_) -> print("connected")
+        Err(e) -> print("{e}")
+    }
+}
+```
 
 ## Found on 2026-11-15 by S8 part five (`lsp`, `dap` and the journal)
 
@@ -349,8 +437,12 @@ where three would hold the longest name. The Grasm command (§6.19) pads the
 same way, so the two stay comparable and are fixed together; the fix is to
 count `r.name.chars()`.
 
-**The Grasm `grasm test` ends on a panic inside a `concurrent` task -- *open,
-by decision*.** The Rust runner reports a test whose task panics as failed
+**The Grasm `grasm test` ended on a panic inside a `concurrent` task --
+*closed, 2026-11-19*.** Closed by S8 part six (docs/self-hosting.md §6.23):
+the TIR interpreter schedules a block's tasks itself, as the reference
+does, so a task's panic ends its block and is the test's failure, and the
+next test runs; `scripts/fixtures/sched/panics.gr` in `clidiff`'s
+`schedules` section. As it was: The Rust runner reports a test whose task panics as failed
 and goes on to the next; the TIR interpreter runs a program's tasks as the
 host's own tasks, whose scheduler cannot abort a task's siblings as
 [E-TASK-PANIC] asks, so there the panic stays the host's: `panic: <message>`
@@ -373,8 +465,10 @@ fn main() {
 }
 ```
 
-**The Grasm `grasm test` ends on a panic the runtime's channel operations
-raise -- *open, by decision*.** The TIR interpreter's
+**The Grasm `grasm test` ended on a panic the runtime's channel operations
+raise -- *closed, 2026-11-19*.** Closed with the one above: the program's
+channels are the interpreter's, and their panics and a deadlock are a
+test's failure in the reference's words. As it was: The TIR interpreter's
 channels are the host runtime's, so sending on or closing a closed channel,
 and a channel operation outside every task that would have to wait, panic
 in the host, where the Rust runner reports the test failed and goes on.
@@ -387,8 +481,12 @@ the interpreter's channels and tasks are the host's -- and goes with it:
 accepted as a difference by the coordinator (2026-11-05, §6.19, with
 decision (3)); its fix is a scheduler of the TIR interpreter's own.
 
-**The Grasm `grasm test` ends when the TIR interpreter's own stack runs out
--- *open, by decision*.** The interpreter stops a program's recursion at
+**The Grasm `grasm test` ended when the TIR interpreter's own stack ran out
+-- *closed, 2026-11-19*.** Closed by S8 part six (§6.23): a value is
+printed and compared with stacks of the walk's own, an operator or `else
+if` chain is read and evaluated on a fresh host stack every 400 levels, and
+a task recurses on spare host stacks; what is left is the bound a task's
+spare stacks set, below (§6.23). As it was: The interpreter stops a program's recursion at
 100,000 calls with the panic every engine words the same way, and that panic
 is a test's failure under `test`; but a recursion of the interpreter's that
 the program's depth does not count (a value nested deep enough to exhaust a
@@ -439,8 +537,11 @@ plain words where a write's directory is missing -- while `NotFound(path)`
 reads the same in both. It is a disagreement between the engines that
 [E-PANIC-TRACE] does not license, so S1; `difftest` has not reported it, so
 no corpus program it compares prints one. The TIR interpreter, a native
-program, prints the runtime's text, so the Grasm `grasm run` (§6.17) answers
-as the native build does and not as the Rust `grasm run`. Not fixed: which
+program, printed the runtime's text, so the Grasm `grasm run` (§6.17)
+answered as the native build does and not as the Rust `grasm run`; since S8
+part six (§6.23, 2026-11-19) it words an `IoFailed` as the Rust interpreter
+does, the system's message and " (os error N)" (`scripts/fixtures/io`), but
+for a failed name lookup (below, in the part-six section). Not fixed: which
 text is right is the specification's to say first ([L-LIB-IO] names the
 variants, not their text).
 

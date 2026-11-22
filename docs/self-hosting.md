@@ -7148,6 +7148,96 @@ reverse any of them.
 - (8): accepted. The gate plan below accepted, its five controls added to
   `clicontrols`' count.
 
+The coordinator's second decision (2026-11-19), on the stop the agent made
+at step three under (1)'s condition. Measured on stage 1, the old command
+against the new, three interleaved rounds, at a load of 4 to 5 from the
+step-two gates -- median seconds of `grasm run`:
+
+| program | old | new | new/old |
+|---|---:|---:|---:|
+| `pingpong` (the agent's: 200,000 rendezvous messages between two tasks, 200,000 into one buffered channel from eight) | 1.055 | 1.727 | 1.6375 |
+| `blocks` (the agent's: 2,000 `concurrent` blocks of one task) | 0.032 | 0.067 | 2.0691 |
+| `taskfuzz.gr -- 1 40` | 0.111 | 0.113 | 1.0231 |
+| `taskfuzz.gr -- 2 40 flat` | 0.091 | 0.095 | 1.0440 |
+| `taskfuzz.gr -- 3 40` | 0.109 | 0.112 | 1.0262 |
+| `E-SCHEDULE` | 0.028 | 0.027 | 0.9853 |
+| `E-ACTOR` | 0.029 | 0.028 | 0.9721 |
+| `benchmarks/grasm/parmap.gr` | 120.276 | 119.847 | 0.9964 |
+| `benchmarks/grasm/parwords.gr` | 2.955 | 2.845 | 0.9630 |
+
+- (a) accepted: the port buys what the host's scheduler could not give --
+  the reference's seeded orders, a task's panic as a test's failure,
+  channels shared between tasks -- and the real task programs are within
+  2 to 4%, `parmap` and `parwords` unchanged. The cost on the two
+  switch-bound programs the agent wrote is a known cost, written here; they
+  stay out of the gates.
+- (b) accepted: spare host stacks only for a program that may recurse, the
+  analysis conservative -- any cycle in the call graph, any call through a
+  function or method value or anything the loader cannot resolve counts as
+  possibly recursive; the `stack` section with a recursion through a
+  function value and one through an interface's method, and a control that
+  plants a too-optimistic analysis; the spare count for a program that may
+  recurse chosen by measurement (21, 50, 100, 200 on both stages, against
+  `taskfuzz`, the `E-` programs, `parmap` and `parwords`, interleaved): the
+  largest that keeps every one within 10% of the old command on both
+  stages; an in-task bound below the reference's recorded in
+  docs/known-issues.md as a difference [E-RECURSION-DEPTH] allows.
+- (c) not now: stage 2 measured on the same table first, stopped again only
+  if a real task program is more than 10% slower there than on the old
+  stage 2; the remaining cost per switch goes into "What is left for S8".
+
+**The spare count, by measurement** (2026-11-19, the agent's, under (b)'s
+rule). Each count built as stage 1 (by the Rust command) and stage 2 (by
+that stage 1); three interleaved rounds against the old command of the same
+stage, the order of the five commands rotated round to round; median
+seconds of `grasm run`, and each count's ratio to the old command:
+
+| stage 1 | old | 21 | 50 | 100 | 200 |
+|---|---:|---:|---:|---:|---:|
+| `taskfuzz.gr -- 1 40` | 0.126 | 1.0668 | 1.1429 | 1.1848 | 1.4423 |
+| `taskfuzz.gr -- 2 40 flat` | 0.093 | 1.0039 | 1.0222 | 1.1780 | 1.6151 |
+| `taskfuzz.gr -- 3 40` | 0.112 | 0.9766 | 1.0325 | 1.1701 | 1.5177 |
+| `E-ACTOR` | 0.029 | 1.0616 | 0.9734 | 0.9844 | 0.9830 |
+| `E-CONCURRENT` | 0.029 | 0.9918 | 1.0826 | 1.0771 | 0.9269 |
+| `E-SCHEDULE` | 0.032 | 0.9412 | 0.8640 | 0.8963 | 1.0242 |
+| `E-CHANNEL` | 0.031 | 1.0057 | 0.9702 | 1.0075 | 1.0347 |
+| `E-DEADLOCK` | 0.029 | 1.0886 | 0.9507 | 0.9614 | 0.9207 |
+| `parwords` | 2.954 | 0.9704 | 1.0611 | 0.9624 | 0.9710 |
+| `parmap` | 118.906 | 1.0066 | 1.0014 | 0.9925 | 1.0231 |
+| `pingpong` (the agent's) | 1.080 | 1.5878 | 1.6011 | 1.6487 | 1.6537 |
+| `blocks` (the agent's) | 0.033 | 1.5056 | 1.4046 | 1.3330 | 1.5696 |
+
+| stage 2 | old | 21 | 50 | 100 | 200 |
+|---|---:|---:|---:|---:|---:|
+| `taskfuzz.gr -- 1 40` | 0.129 | 1.0253 | 1.0543 | 1.3747 | 1.6525 |
+| `taskfuzz.gr -- 2 40 flat` | 0.112 | 0.9605 | 0.9457 | 1.0453 | 1.3389 |
+| `taskfuzz.gr -- 3 40` | 0.122 | 0.9891 | 1.0400 | 1.1680 | 1.5293 |
+| `E-ACTOR` | 0.031 | 0.9560 | 0.9590 | 0.9604 | 1.0225 |
+| `E-CONCURRENT` | 0.030 | 0.9552 | 1.3546 | 1.0094 | 1.0453 |
+| `E-SCHEDULE` | 0.032 | 0.9576 | 0.9144 | 1.0847 | 1.0392 |
+| `E-CHANNEL` | 0.032 | 0.9488 | 0.9632 | 1.0067 | 0.9185 |
+| `E-DEADLOCK` | 0.034 | 0.8938 | 0.8662 | 0.8490 | 0.8527 |
+| `parwords` | 4.308 | 0.9131 | 0.9313 | 0.9217 | 0.9181 |
+| `parmap` | 171.673 | 0.8575 | 0.8538 | 0.9261 | 0.9176 |
+| `pingpong` (the agent's) | 1.469 | 1.0718 | 1.0772 | 1.0808 | 1.0835 |
+| `blocks` (the agent's) | 0.038 | 1.1221 | 1.1816 | 1.2045 | 1.1622 |
+
+21 is the count: 50 puts `taskfuzz.gr -- 1 40` at 1.14 on stage 1. The
+`E-` programs take a few tens of milliseconds, most of it the process's
+start, and their ratios move by 10% from round to round either way (50's
+1.35 on `E-CONCURRENT`, stage 2, among them); none of them recurses, so no
+count gives them a spare. With 21, a task recurses to 10,999 calls on both
+stages (500 on its own stack and 500 on each spare), below the Rust
+interpreter's 41,941: recorded in docs/known-issues.md as a difference the
+clause allows. On stage 2 no real task program is slower than on the old
+stage 2 by more than 10% -- (c)'s condition -- and the two switch-bound
+programs cost 1.07 and 1.12 of the old stage 2, where stage 1 pays 1.59 and
+1.51: the remaining cost per switch is mostly the stage-1 build's search for
+fields by name, which the Grasm backend's take by position (step two)
+removes. `parmap` on stage 2 is 0.86 of the old stage 2 here, the field take
+among the changes. The `blocks` program has no recursion, and so no spares;
+its cost is the handing on of the shared state at a block's start and end.
+
 #### How each is held to Rust
 
 `clidiff` gains a section, `schedules`, both commands on the same input, the
@@ -7193,6 +7283,95 @@ under 1.01 of master's geometric mean or the cause found).
 **Order**: step two, the field take, alone and measured; then the
 scheduler (steps three and four together, since (1) is both); then the
 stack; then the wording; then the gates.
+
+#### Steps two to seven, as built
+
+(2026-11-19 and 20, this branch, the main checkout's compiler; loads of 3
+to 6 from other work, so no time here is to be quoted but the interleaved
+ratios; who decided what is said where it was decided.)
+
+- **The by-index field take** (`0e04d168`, decision (7)): `take_field_at`
+  in `compiler/mir/src/lower.gr`. On that commit `s3subset` "identical:
+  648 mismatched: 0 timed out: 0 no TIR: 0" and `objtest` "objects: 648
+  reproducible: 648 ... with problems: 0" (its `xs3subset` was stopped by
+  hand when the agent stopped at step three, and run again on the final
+  tree). Measured on stage 2, the base's against this commit's, three
+  interleaved rounds: a `dap` step session of `benchmarks/grasm/parmap.gr`
+  (`scripts/lib/dapscript.py step`), median 237.8 s against 228.0 s, 0.959,
+  the same answer stream; and the whole `run` section, the corpus's 651
+  programs with a `main` run by each, the two alternating which goes first
+  program by program: 3,130.9 s against 2,542.8 s, 0.812, every output
+  and status the same (`password-demo` 349 s to 132 s, `observe-demo` 391
+  s to 234 s, `examples/parallel_map.gr` 403 s to 373 s).
+- **The scheduler** (`tools/tirinterp/src/tasks.gr`, decision (1a)): the
+  reference's rounds and seeded shuffle, its channel table, its rules for
+  waiting and waking, `run_tasks`' ending. One change from the design,
+  found while measuring: there is no scheduler task. The reference's loop is
+  a state per open block in the shared table, and the task that gives way
+  or ends runs it on and hands the next task its turn directly, one host
+  switch a turn where a scheduler task made two. The table is taken out of
+  the context for the length of each channel operation, and the context's
+  new fields are its last: a build of the reference's compiler finds a field
+  changed in place by its name, and a first build with them in the middle of
+  the context spent four times the old command's share of samples in
+  `memcmp` (and pushed every field `run` reads further down its search).
+  `grasm test --schedules` and `--schedule-seed` run as the reference's
+  runner does. The channel made in a task and handed on runs
+  (`scripts/fixtures/sched/handoff.gr`).
+- **The stack** (decisions (2) of the second, (3), (4), (5)): `value.show`
+  and `value.equal` recurse on the host's stack as before to 64 levels and
+  below that walk with stacks of their own (`d636ea31`; the first build
+  walked every value so, which made printing a list of a million booleans
+  about four times slower and timed out the `dap` section's step session of
+  `sieve` -- found by the final stage-1 run; three interleaved rounds, the base's
+  recursive walk, `71f47f6e`'s walk with its own stack all the way and
+  `d636ea31`'s, median seconds: printing a list of a million booleans five
+  times 1.596, 3.980 and 1.409, the `dap` step session of `sieve` 70.2,
+  276.7 and 72.4, every output the same; a value nested a million deep
+  still compares and prints) (`compare` and
+  `key_text` recurse only through tuples, which the program's text bounds);
+  the loader reads an expression on a fresh host stack every 400 levels and
+  puts an operator node at such a level under an `OP_DEEP` node, which the
+  evaluator runs on a fresh stack; `emit_flat` in `compiler/front` writes the
+  TIR the command reads back unindented (`run`, `test`, `bench`, `dap` and a
+  bundle's run), read by `sexp.read` as before -- `grasm tir`, `front tir`
+  and the native build's TIR are the same bytes; and a block of a program
+  that may recurse (`load.may_recurse`, conservative as the coordinator
+  asked) has 21 spare host stacks (by measurement, above); a task recurses to
+  10,999 calls on both stages. Peak memory (`/usr/bin/time -l`'s maximum
+  resident set, in KiB): `taskfuzz.gr -- 1 40` 2,288 old and 2,352 new on
+  stage 1, 2,128 and 2,160 on stage 2; `parmap` 44,384 and 46,960 on stage 1, 45,280 and 46,816 on stage 2. The `^` chain and the `else if`
+  chain of 50,000 now run, and so do the values a million deep.
+- **The `IoFailed` text** (decision (6), as the coordinator decided it):
+  `os_words` in `tools/tirinterp/src/builtins.gr`, by `strerror_r` through
+  `extern fn`.
+- **The gates** (step seven, decisions as the coordinator accepted them):
+  `clidiff` gains `schedules` and `stack`; the `test` section's and the
+  `dap` section's host panics are gone, asserted by every comparison
+  (nothing is allowed for them any more); the `journal` section allows a
+  failed lookup's `IoFailed` text alone, at most once (`jnorm.py` exits 2 for
+  it and 1 for any other); `scripts/lib/clicases.txt` gains the schedule
+  flags' edges; `clicontrols` gains six controls (the coordinator's five and
+  the one for the recursion analysis), its floor 36.
+
+- **The timing of `run`** (§6.22's rule, the owner's): twelve interleaved
+  rounds of the seven serial benchmarks, the base's stage 1 against this
+  tree's, median ratios fib 0.970, sort 0.976, wordfreq 0.956, tree 1.027,
+  sieve 0.995, matmul 0.955, mandelbrot 0.995 -- a geometric mean of 0.982,
+  outputs the same.
+
+**What is left for S8 after this part.** The scheduler's cost per switch:
+on stage 1 the two switch-bound programs the agent wrote take 1.59 and 1.51
+times the old command's time, on stage 2 1.07 and 1.12 (above) -- next to
+the debugger's own cost per statement on stage 2 (about 84 s over parmap's
+run, §6.22). A task's recursion bound of 10,999 calls, below the Rust
+interpreter's (docs/known-issues.md). The failed lookup's `IoFailed` text,
+the runtime ABI's, for the Grasm runtime at or after S9. The Grasm-runtime
+command's struct-field and reference-count entry points (`grasm-j`,
+§6.22). The LSP on the query engine and the wasm32 backend and its
+playground. The Rust TOML reader's misreadings, kept until S9, and the Rust
+defects this part and the ones before it copied or declined
+(docs/known-issues.md).
 
 ## 8. Gates this adds
 
