@@ -7360,6 +7360,62 @@ ratios; who decided what is said where it was decided.)
   sieve 0.995, matmul 0.955, mandelbrot 0.995 -- a geometric mean of 0.982,
   outputs the same.
 
+- **The final runs** (2026-11-21 and 22, by the agent's resumable runner,
+  `nice -n 10`, one gate at a time, no network; other apps held swap at 15
+  to 18 GB throughout). On `c97650a7`, the final tree but for the control
+  fixed below: `s3subset` "identical: 648 mismatched: 0 timed out: 0 no
+  TIR: 0"; `objtest` "objects: 648 reproducible: 648 ... with problems:
+  0"; `tirinterp` "identical: 651 mismatched: 0 timed out: 0 skipped: 0",
+  "round trip: 1671 identical, 0 not", "panics: 25 identical, 0 not";
+  `frontsmoke` "programs: 47 through tirinterp as grasm run: 47 compiled by
+  s3, linked by grasm-link, as grasm run: 47 outside s3's subset: 0";
+  `fixpoint` "identical: 54 differ: 0", "stage 2's TIR the same as grasm
+  tir's: 6 of 6", "the command's build the stage pipeline's (its rt.o and
+  the 4 programs): 5 of 5" (stage 2's `grasm` 4,732,408 bytes). The stage-1
+  command, `stack`: "stack: 13 programs, 26 commands the same: 22 past the
+  Rust interpreter's stack, within the count: 2 past a task's spare stacks:
+  2"; `dap`: "dap: 1004 sessions compared the same: 966, 51 of them fixed
+  ... the Rust adapter's own stack: 1 long, not stepped again: 14", "given
+  the program's own run time: 0" (run alone, so without the `journal`
+  section's recordings to launch: 45 fewer fixed sessions than a whole run).
+  The whole `clidiff` with fixpoint's stage-2 command, 873 minutes, exit 0,
+  every floor held: among its lines "run: 651 programs with a main the
+  same: 651 timed out: 0", "test: 1737 programs, 1961 commands ... the
+  same: 1960, 12 of them with a failing test both timed out, --contracts:
+  1", "test, main as a test: 651 programs the same: 651, 15 of them
+  failing", "schedules: 20 programs, 121 commands the same: 121, 24 of
+  them with a failing test, 16 with a test held under every schedule tried
+  a failing schedule's seed replayed alike: 1", the `stack` line as on
+  stage 1, "bundle: 651 ... run alike, plain and with arguments: 651 (0
+  run(s) differing only in the IoFailed wording) built twice the same:
+  651", "journal: 652 programs recorded the same: 652, 185 of them with a
+  journal (1 differing only in a failed lookup's IoFailed text, 1 only in
+  socket handles after a net_close) ... native recordings replayed alike:
+  45 of 45", "dap: 1043 sessions compared the same: 1001, 96 of them fixed
+  ... the Rust adapter's own stack: 1 long, not stepped again: 18", "given
+  the program's own run time: 1 (slowest: packages/gc-demo/src/main.gr step
+  351 s, run 358 s)" and "lsp: 2050 sessions the same: 2050, 17 of them
+  fixed". `fmttest` "formatted: 2027 unformatted: 0 does not parse: 5
+  exempt: 1"; `gfmttest` "checked: 1538 disagreeing: 0"; `linttest`
+  "linted: 2028 findings: 996 does not parse: 5 broke: 0". `clicontrols`
+  "controls: 36 caught: 35 missed: 1": the six new controls caught, and
+  `test-inverted` could not be planted, because the schedules loop had moved
+  the line it changes; `38f44f71` plants it in the result's plain branch,
+  and run alone there it is caught: "controls: 1 caught: 1 missed: 0"
+  (the whole run, and so the floor of 36, was not repeated). `gatecheck` on `38f44f71`: "gate helpers checked: 587 undefined: 0
+  corpus copied: 0 grep -q under pipefail: 0 gates not executable: 0".
+  On stage 1, the sections `lines` to `bundle` and then `journal` passed
+  on `71f47f6e` (`lines` "lines: 280 the same: 275 ...", `run` 651 the
+  same, the `test` and `schedules` lines as above), and so did `xs3subset`,
+  run again after it was stopped by hand at step three: "identical: 648
+  mismatched: 0 timed out: 0 no TIR: 0". Those stage-1 runs came before
+  the value walks' fix, which changes the code that prints and compares
+  every value; on the final tree those sections ran on stage 2, above. The first final
+  run on `71f47f6e` was hard-stopped twice by other apps' swap (free disk
+  3,123 MB and 3,191 MB, 2026-11-20) and resumed per section, and stopped by
+  hand when `dap` timed out on `sieve` (the walks' fix). Not run: the rest
+  of `allgates.sh`, the Linux ELF gates.
+
 **What is left for S8 after this part.** The scheduler's cost per switch:
 on stage 1 the two switch-bound programs the agent wrote take 1.59 and 1.51
 times the old command's time, on stage 2 1.07 and 1.12 (above) -- next to
