@@ -1,0 +1,17 @@
+// A recursion 20,000 calls deep, which both commands run (docs/self-hosting.md
+// §6.23).
+
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    print("deep {depth(20000)}")
+}
+
+test "main" {
+    main()
+}

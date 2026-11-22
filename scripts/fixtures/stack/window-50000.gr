@@ -1,0 +1,19 @@
+// 50,000 calls: past the Rust interpreter's own stack (448 MiB, about 42,000
+// calls of this shape), within the count the Grasm command keeps -- a
+// difference [E-RECURSION-DEPTH] allows, counted by clidiff's `stack` section
+// (docs/self-hosting.md §6.23, docs/known-issues.md).
+
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    print("deep {depth(50000)}")
+}
+
+test "main" {
+    main()
+}

@@ -1,0 +1,35 @@
+// A failed operation's `IoFailed` text, printed: the Rust interpreter words
+// it as `std` does, the system's message and " (os error N)", and so does
+// the Grasm command's (docs/known-issues.md; docs/self-hosting.md §6.23).
+// A native build prints the system's message alone.
+
+fn show(what: str, e: IoError) {
+    print("{what}: {e}")
+}
+
+fn main() / {io, proc} {
+    match read_bytes("/") {
+        Ok(_) -> print("read /")
+        Err(e) -> show("read_bytes of a directory", e)
+    }
+    match list_dir("scripts/fixtures/io/iofailed.gr") {
+        Ok(_) -> print("listed a file")
+        Err(e) -> show("list_dir of a file", e)
+    }
+    match write_bytes("scripts/fixtures/io/no-such-dir/x", "x".to_bytes()) {
+        Ok(_) -> print("wrote")
+        Err(e) -> show("write_bytes into a missing directory", e)
+    }
+    match make_dir_new("scripts/fixtures/io/no-such-dir/y") {
+        Ok(_) -> print("made")
+        Err(e) -> show("make_dir_new under a missing directory", e)
+    }
+    match proc_run("no-such-program-anywhere", []) {
+        Ok(_) -> print("ran")
+        Err(e) -> show("proc_run of a missing program", e)
+    }
+}
+
+test "main" {
+    main()
+}

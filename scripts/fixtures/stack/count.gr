@@ -1,0 +1,18 @@
+// 100,000 calls, `main` among them: past the reference's count, refused by both
+// commands -- the Rust one by its stack before that, the Grasm one by the
+// count (docs/self-hosting.md §6.23). One frame more allowed would run it.
+
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    print("deep {depth(99999)}")
+}
+
+test "main" {
+    main()
+}

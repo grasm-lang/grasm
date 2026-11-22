@@ -45,9 +45,16 @@
 #   net-handle     every `tcp_connect` leaks a listener first, so each
 #                  socket's handle is one higher before any `net_close`,
 #                  outside the journal's renumbering exception     the journals differ
+#   sched-seed     the scheduler ignores the schedule seed         a schedule differs
+#   task-panic-pass a task's panic taken for the task ending well  a test differs
+#   stack-frame    the count of calls one higher                   a recursion differs
+#   task-stack     no spare host stacks for a task                 a recursion differs
+#   recursion-seen the analysis does not see a call through an
+#                  interface's method, and finds no recursion      a recursion differs
+#   iofailed-old   an `IoFailed` worded as the runtime words it    an IoFailed differs
 #
 # `CONTROLS=a,b` runs only the controls named, for trying one; the floor of
-# 30 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
+# 36 holds only on a whole run. `PLANT_RT=1` in a control's variables builds
 # its runtime object from the planted sources too.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -375,6 +382,35 @@ control lsp-hover '^DIFF: grasm lsp on examples/hello.gr ' "ONLY=lsp FILES=$WORK
     '        s.push_str(" -> " + type_text(a, ret))' \
     '        s.push_str("->" + type_text(a, ret))'
 
+# §6.23: the scheduler, the interpreter's stack and the IoFailed text.
+TASKS=tools/tirinterp/src/tasks.gr
+EVAL=tools/tirinterp/src/eval.gr
+LOAD=tools/tirinterp/src/load.gr
+
+control sched-seed '^DIFF: grasm test fuzz[0-9]+\.gr --schedules 20 \(schedules\)' "ONLY=schedules FILES=$WORK/hello" "$TASKS" \
+    '    if sc.sched_on {' \
+    '    if false and sc.sched_on {'
+
+control task-panic-pass '^DIFF: grasm test scripts/fixtures/sched/panics\.gr \(schedules\)' "ONLY=schedules FILES=$WORK/hello" "$TASKS" \
+    '    if ctl != 0 and ctl != eval.CTL_RETURN {' \
+    '    if ctl != 0 and ctl != eval.CTL_RETURN and ctl != eval.CTL_PANIC {'
+
+control stack-frame '^DIFF: grasm (run|test) scripts/fixtures/stack/count\.gr \(stack\)' ONLY=stack "$EVAL" \
+    'pub let MAX_DEPTH = 100000' \
+    'pub let MAX_DEPTH = 100001'
+
+control task-stack '^DIFF: grasm (run|test) scripts/fixtures/stack/task-limit\.gr \(stack\)' ONLY=stack "$TASKS" \
+    '    let nsp = if cx.p.may_recurse { SPARES } else { 0 }' \
+    '    let nsp = 0'
+
+control recursion-seen '^DIFF: grasm (run|test) scripts/fixtures/stack/iface\.gr \(stack\)' ONLY=stack "$LOAD" \
+    ' or o == OP_BOUNDCALL' \
+    ''
+
+control iofailed-old '^DIFF: grasm (run|test) scripts/fixtures/io/iofailed\.gr \(stack\)' ONLY=stack "$BUILTINS" \
+    '[VStr(os_words(msg))]' \
+    '[VStr(msg)]'
+
 echo
 echo "controls: $ran   caught: $caught   missed: $missed"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -387,4 +423,4 @@ if [ -n "${CONTROLS:-}" ]; then
     [ "$caught" = "$ran" ] && [ "$ran" -gt 0 ]
     exit
 fi
-[ "$ran" -ge 30 ] && [ "$caught" = "$ran" ]
+[ "$ran" -ge 36 ] && [ "$caught" = "$ran" ]

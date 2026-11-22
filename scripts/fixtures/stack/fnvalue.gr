@@ -1,0 +1,23 @@
+// A recursion through a function value, inside a task: the interpreter's
+// analysis must call the program one that may recurse, or the task has no
+// spare stacks to go deeper than one holds (docs/self-hosting.md §6.23).
+
+fn down(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let again = down
+    1 + again(n - 1)
+}
+
+fn main() / {io, async} {
+    concurrent {
+        go {
+            print("deep {down(3000)}")
+        }
+    }
+}
+
+test "main" {
+    main()
+}

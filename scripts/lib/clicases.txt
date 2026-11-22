@@ -275,6 +275,14 @@ test examples/testing_tour.gr --cases 4294967296
 test examples/testing_tour.gr --schedules x
 test examples/testing_tour.gr --schedule-seed -3
 test examples/testing_tour.gr --schedules 2
+test examples/testing_tour.gr --schedules 0
+test examples/testing_tour.gr --schedules +3
+test examples/testing_tour.gr --schedules 4294967296
+test examples/testing_tour.gr --schedule-seed +5
+test examples/testing_tour.gr --schedule-seed 18446744073709551615
+test examples/testing_tour.gr --schedule-seed 18446744073709551616
+test scripts/fixtures/sched/race.gr --schedules 20 --seed 9
+test scripts/fixtures/sched/race.gr --schedule-seed 13899076551742739803
 test examples/testing_tour.gr --filter round --cases 7 --seed 3
 test --coverage examples/testing_tour.gr
 test spec/conformance/E-TEST-SHRINK.gr

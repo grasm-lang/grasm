@@ -1,0 +1,32 @@
+// A recursion through an interface's method, inside a task: `step` calls
+// `down` through the bound, which only the run resolves, and `down` calls
+// `step` back (docs/self-hosting.md §6.23).
+
+interface Down {
+    fn down(self, n: i64) -> i64
+}
+
+impl Down for i64 {
+    fn down(self, n: i64) -> i64 {
+        if n == 0 {
+            return self
+        }
+        1 + step(self, n - 1)
+    }
+}
+
+fn step[T: Down](x: T, n: i64) -> i64 {
+    x.down(n)
+}
+
+fn main() / {io, async} {
+    concurrent {
+        go {
+            print("deep {step(0, 3000)}")
+        }
+    }
+}
+
+test "main" {
+    main()
+}

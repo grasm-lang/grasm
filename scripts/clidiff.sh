@@ -43,12 +43,20 @@
 #           contract, `--coverage` where it has a test and on every tenth;
 #           then every program with a `main`, from a copy of the corpus,
 #           with `test "main" { main() }` appended, so a test fails wherever
-#           `run` panics or exits. A program with tasks or channels may end
-#           on the host's panic where Rust reports the test failed -- the one
-#           difference §6.19 allows (decision 3) -- and is counted as such
+#           `run` panics or exits. A program with tasks or channels ends
+#           as Rust's does: the TIR interpreter's scheduler is the
+#           reference's (§6.23), so the host's panic §6.19 allowed is gone
 #   bench   every corpus program, each timing line with its time and count
 #           taken out and held to the format (scripts/lib/benchnorm.py); one
 #           with a benchmark filtered to its first and to none
+#
+# and two for S8 part six (§6.23), the TIR interpreter's scheduler and stack:
+#
+#   schedules  `test --schedules` and `--schedule-seed` on the corpus
+#              programs with tasks, `compiler/rttasks/taskfuzz.gr` as tests,
+#              and scripts/fixtures/sched
+#   stack      scripts/fixtures/stack and scripts/fixtures/io, and deep
+#              operator and `else if` chains, under `run` and as tests
 #
 # and four for the subcommands of S8 part three (§6.20):
 #
@@ -126,7 +134,7 @@ corpus_require
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-ALL=lines,corpus,toml,run,fmt,lint,test,bench,doc,api,bundle,source,build,target,registry,deps,add,publish,journal,dap,lsp
+ALL=lines,corpus,toml,run,fmt,lint,test,schedules,stack,bench,doc,api,bundle,source,build,target,registry,deps,add,publish,journal,dap,lsp
 ONLY=${ONLY:-$ALL}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
@@ -535,21 +543,6 @@ if want lint; then
     echo "lint: $lint_files files, $lint_runs commands ($lint_only with --only)   the same: $lint_same   findings: $lint_findings"
 fi
 
-# A difference §6.19 allows (decision 3): the Grasm command ended by the
-# host's panic where the Rust runner reported the test failed -- only in a
-# program that has tasks or channels, and with everything before it the
-# same.
-host_panic() { # src
-    local m
-    [ "$g_rc" = 101 ] || return 1
-    [ "$(grep -c . "$WORK/g.err")" = 1 ] || return 1
-    m=$(sed -n 's/^panic: //p' "$WORK/g.err")
-    [ -n "$m" ] || return 1
-    grep -F -- "... FAILED: $m" "$WORK/r.out" >/dev/null || return 1
-    cmp -s "$WORK/g.out" <(head -c "$(wc -c <"$WORK/g.out")" "$WORK/r.out") || return 1
-    grep -lE '\bconcurrent\b|\bchan_' "$1" >/dev/null
-}
-
 # test: every corpus program; with a property test, again with a seed, a
 # number of cases and a filter; with a contract, `--contracts`; with a test,
 # and every tenth, `--coverage`. Then every program with a `main`, copied
@@ -561,11 +554,9 @@ test_props=0
 test_cov=0
 test_contracts=0
 test_timed_out=0
-test_host=0
 tm_runs=0
 tm_same=0
 tm_failed=0
-tm_host=0
 if want test; then
     k=0
     while IFS= read -r src; do
@@ -603,16 +594,13 @@ if want test; then
             elif same3 "$r_rc" "$g_rc"; then
                 test_same=$((test_same + 1))
                 [ "$r_rc" = 1 ] && grep -c ' FAILED' "$WORK/r.out" >/dev/null && test_failed=$((test_failed + 1))
-            elif host_panic "$src"; then
-                test_host=$((test_host + 1))
-                echo "  the host's panic, as §6.19 allows: grasm test $l"
             else
                 fail "grasm test $l -- exit $r_rc (Rust) and $g_rc (Grasm)"
                 show3
             fi
         done
     done <"$WORK/programs"
-    echo "test: $listed programs, $test_runs commands ($test_props with a property test, $test_contracts with a contract, $test_cov with --coverage)   the same: $test_same, $test_failed of them with a failing test   the host's panic: $test_host   both timed out, --contracts: $test_timed_out"
+    echo "test: $listed programs, $test_runs commands ($test_props with a property test, $test_contracts with a contract, $test_cov with --coverage)   the same: $test_same, $test_failed of them with a failing test   both timed out, --contracts: $test_timed_out"
 
     mkdir -p "$WORK/tm"
     for d in $CORPUS_DIRS; do
@@ -629,16 +617,184 @@ if want test; then
         if same3 "$r_rc" "$g_rc"; then
             tm_same=$((tm_same + 1))
             grep -c '^test "main" \.\.\. FAILED' "$WORK/r.out" >/dev/null && tm_failed=$((tm_failed + 1))
-        elif host_panic "$WORK/tm/$src"; then
-            tm_host=$((tm_host + 1))
-            echo "  the host's panic, as §6.19 allows: grasm test $src, main as a test"
         else
             fail "grasm test $src, main as a test -- exit $r_rc (Rust) and $g_rc (Grasm)"
             show3
         fi
     done <"$WORK/mains"
     rm -rf "$WORK/tm"
-    echo "test, main as a test: $tm_runs programs   the same: $tm_same, $tm_failed of them failing   the host's panic: $tm_host"
+    echo "test, main as a test: $tm_runs programs   the same: $tm_same, $tm_failed of them failing"
+fi
+
+# -------------------------------------------------------------------------
+# schedules and stack (docs/self-hosting.md §6.23)
+# -------------------------------------------------------------------------
+
+# Runs `$@` by both commands from directory $1 (the rest the command line),
+# the Rust trace stripped under `run`; true when the two are the same bytes.
+both_from() { # dir args...
+    local dir=$1
+    shift
+    (cd "$dir" && $RUN_LIMIT "$GRASM" "$@" >"$WORK/r.out" 2>"$WORK/r.err" </dev/null)
+    r_rc=$?
+    (cd "$dir" && $RUN_LIMIT sandbox-exec -p "$NORUST" "$G" "$@" >"$WORK/g.out" 2>"$WORK/g.err" </dev/null)
+    g_rc=$?
+    if [ "$1" = run ]; then
+        cmp -s "$WORK/r.out" "$WORK/g.out" && [ "$r_rc" = "$g_rc" ] &&
+            [ "$(strip_trace "$(cat "$WORK/r.err")")" == "$(cat "$WORK/g.err")" ]
+    else
+        same3 "$r_rc" "$g_rc"
+    fi
+}
+
+# schedules: `grasm test --schedules N` and `--schedule-seed S`. The five
+# corpus programs whose tasks or channels clidiff's mains-as-tests run, each
+# with `test "main" { main() }` appended; `compiler/rttasks/taskfuzz.gr` as
+# a test of ten rounds for ten of its seeds, whose output changes with every
+# schedule seed (none of the five's does); and `scripts/fixtures/sched`: a
+# task's panic, exit and failures of channels, inside a task and outside;
+# a test that fails only under some orders, whose replay seed is replayed by
+# both; a channel made in a task and handed on; nested blocks. Each with
+# `--schedules 20` and five `--schedule-seed`s, the fixtures plain and under
+# `run` too.
+SCHED_SEEDS="0 1 5 77 18446744073709551615"
+sch_runs=0
+sch_same=0
+sch_programs=0
+sch_failed=0
+sch_tried=0
+sch_replayed=0
+sched_cmp() { # dir args...
+    sch_runs=$((sch_runs + 1))
+    if both_from "$@"; then
+        sch_same=$((sch_same + 1))
+        grep -c ' \.\.\. FAILED' "$WORK/r.out" >/dev/null && sch_failed=$((sch_failed + 1))
+        grep -cE ' \.\.\. ok \([0-9]+ schedules\)$' "$WORK/r.out" >/dev/null && sch_tried=$((sch_tried + 1))
+        return 0
+    fi
+    shift
+    fail "grasm $* (schedules) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+    show3
+    return 1
+}
+if want schedules; then
+    mkdir -p "$WORK/sch"
+    while IFS= read -r src; do
+        grep -cE '\bconcurrent\b|\bchan_(new|send|recv|close|select)\b' "$src" >/dev/null || continue
+        if grep -c '^import ' "$src" >/dev/null; then
+            fail "schedules: $src imports a module, which a copy of the file alone cannot resolve"
+            continue
+        fi
+        f="main-$(echo "$src" | tr '/' '_')"
+        cp "$src" "$WORK/sch/$f"
+        printf '\ntest "main" {\n    main()\n}\n' >>"$WORK/sch/$f"
+        sch_programs=$((sch_programs + 1))
+        sched_cmp "$WORK/sch" test "$f" --schedules 20
+        for s in $SCHED_SEEDS; do
+            sched_cmp "$WORK/sch" test "$f" --schedule-seed "$s"
+        done
+    done <"$WORK/mains"
+    for fs in 1 2 3 4 5 6 7 8 9 10; do
+        f="fuzz$fs.gr"
+        cp compiler/rttasks/taskfuzz.gr "$WORK/sch/$f"
+        printf '\ntest "rounds" {\n    var s = %d * 7919 + 43\n    for r in 0..10 {\n        scenario(s, r, true)\n    }\n}\n' "$fs" >>"$WORK/sch/$f"
+        sch_programs=$((sch_programs + 1))
+        sched_cmp "$WORK/sch" test "$f"
+        sched_cmp "$WORK/sch" test "$f" --schedules 20
+        for s in 1 77 18446744073709551615; do
+            sched_cmp "$WORK/sch" test "$f" --schedule-seed "$s"
+        done
+    done
+    for src in scripts/fixtures/sched/*.gr; do
+        sch_programs=$((sch_programs + 1))
+        sched_cmp . test "$src"
+        sched_cmp . run "$src"
+        sched_cmp . test "$src" --schedules 20
+        replay=$(sed -n 's/^  replay: --schedule-seed //p' "$WORK/r.out" | head -1)
+        for s in $SCHED_SEEDS; do
+            sched_cmp . test "$src" --schedule-seed "$s"
+        done
+        if [ -n "$replay" ]; then
+            sched_cmp . test "$src" --schedule-seed "$replay" && grep -c ' \.\.\. FAILED' "$WORK/r.out" >/dev/null && sch_replayed=$((sch_replayed + 1))
+            sched_cmp . test "$src" --schedules 0
+            sched_cmp . test "$src" --schedules 20 --filter first
+        fi
+    done
+    echo "schedules: $sch_programs programs, $sch_runs commands   the same: $sch_same, $sch_failed of them with a failing test, $sch_tried with a test held under every schedule tried   a failing schedule's seed replayed alike: $sch_replayed"
+fi
+
+# stack: the depths the interpreter's own stack used to set (§6.23), each by
+# both commands under `run` and as a test (`test "main"` in the file):
+# `scripts/fixtures/stack` -- recursions inside a task and out, through a
+# function value and an interface's method, the count, a value walked a
+# million deep -- `scripts/fixtures/io` (an `IoFailed` printed, worded as
+# the reference words it), and operator and `else if` chains of 10,000 and
+# 50,000 written here. Two kinds of fixture differ as §6.23 allows, each in
+# one shape only and counted: `window-*` runs under the Grasm command and is
+# refused by the Rust one, past its stack and within the count; `task-past`
+# is refused by the Grasm command in the reference's words, past a task's
+# spare stacks and within the Rust interpreter's stack.
+st_runs=0
+st_same=0
+st_window=0
+st_task=0
+st_files=0
+DEEP_MSG="stack overflow: recursion too deep"
+if want stack; then
+    mkdir -p "$WORK/stk"
+    python3 - "$WORK/stk" <<'PY'
+import sys
+d = sys.argv[1]
+for n in (10000, 50000):
+    with open("%s/chain-xor-%d.gr" % (d, n), "w") as f:
+        f.write("fn main() {\n    let x = " + " ^ ".join(["1"] * n) + "\n    print(\"{x}\")\n}\n\ntest \"main\" {\n    main()\n}\n")
+    with open("%s/chain-elseif-%d.gr" % (d, n), "w") as f:
+        f.write("fn main() {\n    var x = 0\n    if x == 1 {\n        x = 1\n    }" + "".join(" else if x == %d {\n        x = %d\n    }" % (i, i) for i in range(2, n)) + "\n    print(\"{x}\")\n}\n\ntest \"main\" {\n    main()\n}\n")
+PY
+    for src in scripts/fixtures/stack/*.gr scripts/fixtures/io/*.gr "$WORK"/stk/*.gr; do
+        st_files=$((st_files + 1))
+        name=$(basename "$src" .gr)
+        for how in run test; do
+            st_runs=$((st_runs + 1))
+            if both_from . "$how" "$src"; then
+                st_same=$((st_same + 1))
+                continue
+            fi
+            case "$name:$how" in
+            window-*:run)
+                if [ "$r_rc" = 101 ] && [ "$(head -1 "$WORK/r.err")" = "panic: $DEEP_MSG" ] && [ "$g_rc" = 0 ] && [ -s "$WORK/g.out" ]; then
+                    st_window=$((st_window + 1))
+                    echo "  past the Rust interpreter's stack, within the count: grasm run $src"
+                    continue
+                fi
+                ;;
+            window-*:test)
+                if [ "$r_rc" = 1 ] && grep -cF "... FAILED: $DEEP_MSG" "$WORK/r.out" >/dev/null && [ "$g_rc" = 0 ]; then
+                    st_window=$((st_window + 1))
+                    echo "  past the Rust interpreter's stack, within the count: grasm test $src"
+                    continue
+                fi
+                ;;
+            task-past:run)
+                if [ "$r_rc" = 0 ] && [ "$g_rc" = 101 ] && [ "$(cat "$WORK/g.err")" = "panic: $DEEP_MSG" ]; then
+                    st_task=$((st_task + 1))
+                    echo "  past a task's spare stacks, within the Rust interpreter's: grasm run $src"
+                    continue
+                fi
+                ;;
+            task-past:test)
+                if [ "$r_rc" = 0 ] && [ "$g_rc" = 1 ] && grep -cF "... FAILED: $DEEP_MSG" "$WORK/g.out" >/dev/null; then
+                    st_task=$((st_task + 1))
+                    echo "  past a task's spare stacks, within the Rust interpreter's: grasm test $src"
+                    continue
+                fi
+                ;;
+            esac
+            fail "grasm $how $src (stack) -- exit $r_rc (Rust) and $g_rc (Grasm)"
+            show3
+        done
+    done
+    echo "stack: $st_files programs, $st_runs commands   the same: $st_same   past the Rust interpreter's stack, within the count: $st_window   past a task's spare stacks: $st_task"
 fi
 
 # bench: every corpus program, its timing lines compared with the time and
@@ -1408,7 +1564,15 @@ if want journal; then
         why=$(python3 scripts/lib/jnorm.py "$WORK/jr.jrnl" "$WORK/jg.jrnl")
         case $? in
         0) ;;
-        2) j_iofailed=$((j_iofailed + 1)) ;;
+        # A failed name lookup, which both runtimes report as ENOENT, the
+        # code `getaddrinfo` gave dropped, where the Rust interpreter says
+        # `std`'s "failed to lookup address information: ..."
+        # (docs/known-issues.md; the coordinator's decision, §6.23): counted,
+        # printed, held to one. Every other IoFailed text is the reference's.
+        2)
+            j_iofailed=$((j_iofailed + 1))
+            echo "  a failed lookup's IoFailed text: $src -- $why"
+            ;;
         # Socket handles numbered otherwise after a `net_close`, and only
         # them, as one renumbering: the Rust interpreter never gives a
         # handle out twice (docs/known-issues.md, S3; the coordinator's
@@ -1521,7 +1685,7 @@ if want journal; then
             diff "$WORK/r.err" "$WORK/g.err" | head -4 | sed 's/^/  /'
         fi
     done <"$WORK/jrich"
-    echo "journal: $j_runs programs recorded   the same: $j_same, $j_files of them with a journal ($j_iofailed differing only in the IoFailed wording, $j_handles only in socket handles after a net_close)   replays alike: $j_replayed   printed alike: $j_shown   mangled journals alike: $j_mangled   native recordings replayed alike: $j_native_same of $j_native"
+    echo "journal: $j_runs programs recorded   the same: $j_same, $j_files of them with a journal ($j_iofailed differing only in a failed lookup's IoFailed text, $j_handles only in socket handles after a net_close)   replays alike: $j_replayed   printed alike: $j_shown   mangled journals alike: $j_mangled   native recordings replayed alike: $j_native_same of $j_native"
     if [ ${#J_HANDLES[@]} -gt 0 ]; then
         printf '  socket handles after a net_close: %s\n' "${J_HANDLES[@]}"
     fi
@@ -1549,9 +1713,7 @@ d_replayed=0
 d_slow=0
 d_slow_s=0
 d_slow_at=""
-d_host=0
 declare -a D_REPLAYED=()
-declare -a D_HOST=()
 declare -a D_OTHERWISE=()
 declare -a D_PANE=()
 DAP_LIMIT=${DAP_LIMIT:-60}
@@ -1601,14 +1763,6 @@ dap_compare() { # label input
             fi
             return 0
         fi
-    fi
-    # A panic the host's channel operations raise ends the Grasm command
-    # there, under `dap` as under `test` (§6.19, decision (3): the
-    # interpreter's channels are the host's): counted, as `test` counts it.
-    if [ "$g_rc" = 101 ] && grep -qE '^panic: (send on a closed channel|close of a closed channel|deadlock: )' "$WORK/g.err"; then
-        d_host=$((d_host + 1))
-        D_HOST+=("$1")
-        return 0
     fi
     # The Rust adapter runs a program without the checker's facts -- the
     # literal a `[f64]` stores, a `u64`'s or a `u8`'s width, raw memory,
@@ -1730,12 +1884,9 @@ if want dap; then
         python3 scripts/lib/dapscript.py fixed journal "$src" "$WORK/d.in" "$WORK/jrec/$jn.jrnl"
         dap_compare "journal $src" "$WORK/d.in" "$src" && d_fixed=$((d_fixed + 1))
     done <"$WORK/jrich"
-    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   the same under one recording: $d_replayed   the host's channel panic: $d_host   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
+    echo "dap: $d_runs sessions compared   the same: $d_same, $d_fixed of them fixed   the Rust adapter running it otherwise than grasm run: $d_rust_otherwise   differing in the variables pane alone: $d_pane_only   the same under one recording: $d_replayed   reading stdin, left out: $d_reads_stdin   past ${DAP_LIMIT}s for Rust: $d_rust_long   the Rust adapter's own stack: $d_rust_abort   long, not stepped again: $d_skipped"
     if [ ${#D_OTHERWISE[@]} -gt 0 ]; then
         printf '  run otherwise by the Rust adapter: %s\n' $(printf '%s\n' "${D_OTHERWISE[@]}" | sort -u)
-    fi
-    if [ ${#D_HOST[@]} -gt 0 ]; then
-        printf '  the host channel panic: %s\n' "${D_HOST[@]}"
     fi
     if [ ${#D_REPLAYED[@]} -gt 0 ]; then
         printf '  the same under one recording: %s\n' "${D_REPLAYED[@]}"
@@ -1832,8 +1983,16 @@ if want lint && { [ "$lint_same" -ne "$lint_runs" ] || [ "$lint_runs" -ne $((2 *
     echo "lint: the counts do not add up ($lint_same of $lint_runs, $lint_files files, $lint_only with --only)"
     exit 1
 fi
-if want test && { [ $((test_same + test_host + test_timed_out)) -ne "$test_runs" ] || [ $((tm_same + tm_host)) -ne "$tm_runs" ] || [ "$tm_runs" -ne "$mains" ]; }; then
-    echo "test: the counts do not add up ($test_same + $test_host + $test_timed_out of $test_runs; $tm_same + $tm_host of $tm_runs, $mains with a main)"
+if want test && { [ $((test_same + test_timed_out)) -ne "$test_runs" ] || [ "$tm_same" -ne "$tm_runs" ] || [ "$tm_runs" -ne "$mains" ]; }; then
+    echo "test: the counts do not add up ($test_same + $test_timed_out of $test_runs; $tm_same of $tm_runs, $mains with a main)"
+    exit 1
+fi
+if want schedules && [ "$sch_same" -ne "$sch_runs" ]; then
+    echo "schedules: $sch_same of $sch_runs commands compared"
+    exit 1
+fi
+if want stack && { [ $((st_same + st_window + st_task)) -ne "$st_runs" ] || [ "$st_window" -gt 2 ] || [ "$st_task" -gt 2 ]; }; then
+    echo "stack: the counts do not add up, or too many differences of the kinds §6.23 allows ($st_same + $st_window + $st_task of $st_runs)"
     exit 1
 fi
 if want bench && [ "$bench_same" -ne "$bench_runs" ]; then
@@ -1883,7 +2042,11 @@ if want journal && [ "$j_same" -ne "$j_runs" ]; then
     echo "journal: $j_same of $j_runs programs compared"
     exit 1
 fi
-if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_replayed + d_slow + d_host)) -ne "$d_runs" ]; then
+if want journal && [ "$j_iofailed" -gt 1 ]; then
+    echo "journal: $j_iofailed programs whose journals differ in a failed lookup's IoFailed text -- more than the one (§6.23)"
+    exit 1
+fi
+if want dap && [ $((d_same + d_rust_otherwise + d_pane_only + d_replayed + d_slow)) -ne "$d_runs" ]; then
     echo "dap: $d_same of $d_runs sessions compared"
     exit 1
 fi
@@ -1907,14 +2070,15 @@ if [ -n "$whole" ]; then
     # (2026-11-06): 2,007 files tracked, 7,638 rewrites formatted alike and
     # 385 refused alike; 1,001 findings; 6 programs with a property test, 3
     # with a contract, 209 with --coverage, 12 with a failing test; 651 mains
-    # as tests, 13 failing and 2 ended by the host's panic (E-CHANNEL,
-    # E-DEADLOCK); 3 programs with a benchmark, 6 timing lines.
+    # as tests, 13 failing (2 of them ended by the host's panic then,
+    # E-CHANNEL and E-DEADLOCK, reported as Rust reports them since §6.23);
+    # 3 programs with a benchmark, 6 timing lines.
     if [ "$fmt_files" -lt 1900 ] || [ "$fmt_rewritten" -lt 7000 ] || [ "$fmt_refused" -lt 300 ] ||
         [ "$lint_files" -lt 1900 ] || [ "$lint_findings" -lt 900 ] ||
         [ "$test_props" -lt 6 ] || [ "$test_contracts" -lt 3 ] || [ "$test_cov" -lt 200 ] || [ "$test_failed" -lt 10 ] ||
-        [ "$tm_runs" -lt 640 ] || [ "$tm_failed" -lt 11 ] || [ "$tm_host" -gt 4 ] ||
+        [ "$tm_runs" -lt 640 ] || [ "$tm_failed" -lt 11 ] ||
         [ "$bench_files" -lt 3 ] || [ "$bench_timed" -lt 6 ]; then
-        echo "too little compared in fmt, lint, test or bench: $fmt_files files, $fmt_rewritten rewritten, $fmt_refused refused; $lint_files linted, $lint_findings findings; $test_props, $test_contracts, $test_cov, $test_failed failing; $tm_runs mains as tests, $tm_failed failing, $tm_host the host's; $bench_files with a benchmark, $bench_timed timing lines"
+        echo "too little compared in fmt, lint, test or bench: $fmt_files files, $fmt_rewritten rewritten, $fmt_refused refused; $lint_files linted, $lint_findings findings; $test_props, $test_contracts, $test_cov, $test_failed failing; $tm_runs mains as tests, $tm_failed failing; $bench_files with a benchmark, $bench_timed timing lines"
         exit 1
     fi
     # The floors of §6.20's sections, a margin below the first runs of the
@@ -1948,15 +2112,16 @@ if [ -n "$whole" ]; then
     # recordings, 7 in the IoFailed wording and 1 in socket handles; `dap`
     # 1,002 and 1,004 sessions (the count moves with how many Rust sessions
     # pass 60 s or 10 s), 51 fixed, 25 run otherwise by the Rust adapter, 13
-    # the same under one recording, 4 ended by the host's channel panic, none
-    # in the variables pane alone; `lsp` 2,036 sessions, 17 fixed. The
-    # exceptions are held from above, as `test`'s host panics are.
+    # the same under one recording, 4 ended by the host's channel panic (0
+    # since §6.23, which also took the IoFailed wording to the one failed
+    # lookup, held to at most 1 below), none in the variables pane alone;
+    # `lsp` 2,036 sessions, 17 fixed. The exceptions are held from above.
     if [ "$j_runs" -lt 640 ] || [ "$j_files" -lt 170 ] || [ "$j_replayed" -lt 340 ] || [ "$j_shown" -lt 340 ] ||
-        [ "$j_mangled" -lt 300 ] || [ "$j_native" -lt 40 ] || [ "$j_iofailed" -gt 10 ] || [ "$j_handles" -gt 2 ] ||
+        [ "$j_mangled" -lt 300 ] || [ "$j_native" -lt 40 ] || [ "$j_handles" -gt 2 ] ||
         [ "$d_runs" -lt 950 ] || [ "$d_fixed" -lt 45 ] || [ "$d_rust_otherwise" -gt 30 ] || [ "$d_replayed" -gt 20 ] ||
-        [ "$d_host" -gt 4 ] || [ "$d_pane_only" -gt 2 ] ||
+        [ "$d_pane_only" -gt 2 ] ||
         [ "$l_runs" -lt 1900 ] || [ "$l_fixed" -lt 15 ]; then
-        echo "too little compared in journal, dap or lsp, or too many exceptions: $j_runs recorded, $j_files with a journal, $j_replayed replays, $j_shown printed, $j_mangled mangled, $j_native native, $j_iofailed IoFailed, $j_handles socket handles; $d_runs sessions, $d_fixed fixed, $d_rust_otherwise run otherwise by Rust, $d_replayed under one recording, $d_host host panics, $d_pane_only pane only; $l_runs lsp sessions, $l_fixed fixed"
+        echo "too little compared in journal, dap or lsp, or too many exceptions: $j_runs recorded, $j_files with a journal, $j_replayed replays, $j_shown printed, $j_mangled mangled, $j_native native, $j_handles socket handles; $d_runs sessions, $d_fixed fixed, $d_rust_otherwise run otherwise by Rust, $d_replayed under one recording, $d_pane_only pane only; $l_runs lsp sessions, $l_fixed fixed"
         exit 1
     fi
 fi

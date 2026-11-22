@@ -1,0 +1,24 @@
+// 30,000 calls inside a task: within the Rust interpreter's stack, past the
+// spare host stacks a task of the Grasm command has, which refuses it in the
+// reference's words -- a difference [E-RECURSION-DEPTH] allows, counted by
+// clidiff's `stack` section (docs/self-hosting.md §6.23,
+// docs/known-issues.md).
+
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() / {io, async} {
+    concurrent {
+        go {
+            print("deep {depth(30000)}")
+        }
+    }
+}
+
+test "main" {
+    main()
+}

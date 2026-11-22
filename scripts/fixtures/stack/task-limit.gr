@@ -1,0 +1,21 @@
+// 10,000 calls inside a task, which [E-RECURSION-DEPTH] guarantees: the task
+// needs spare host stacks (docs/self-hosting.md §6.23).
+
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() / {io, async} {
+    concurrent {
+        go {
+            print("deep {depth(10000)}")
+        }
+    }
+}
+
+test "main" {
+    main()
+}

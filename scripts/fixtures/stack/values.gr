@@ -1,0 +1,25 @@
+// A value nested 1,000,000 deep, compared and printed: the Grasm command's
+// walks over a value keep stacks of their own (docs/self-hosting.md §6.23).
+
+type L = | Nil | Cons(h: i64, t: L)
+
+fn build(n: i64) -> L {
+    var l = Nil
+    for i in 0..n {
+        l = Cons(i, l)
+    }
+    l
+}
+
+fn main() {
+    let a = build(1000000)
+    let b = build(1000000)
+    print("equal: {a == b}")
+    let c = build(999999)
+    print("unequal: {a == Cons(0, c)}")
+    print("printed: {"{a}".len()} bytes")
+}
+
+test "main" {
+    main()
+}
