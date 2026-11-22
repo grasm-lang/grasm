@@ -698,7 +698,9 @@ pub fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
     cx.sc.bk_done.push(done_flags)
     cx.sc.bk_alive.push(n)
     cx.sc.bk_outer.push(cx.sc.running)
-    let nsp = SPARES
+    // A program that cannot recurse needs no spare stacks: no task of it
+    // goes deeper than one host stack holds (`load.may_recurse`).
+    let nsp = if cx.p.may_recurse { SPARES } else { 0 }
     var free: [i64] = []
     var k = nsp - 1
     while k >= 0 {

@@ -172,6 +172,9 @@ type TirProg = {
     fn_vnames: [[str]],
     clo_fid: [i64],
     clo_reads: [[i64]],
+    // Whether the program may recurse (`may_recurse`): only then does a task
+    // of a `concurrent` block need spare host stacks (`tasks`).
+    may_recurse: bool,
 }
 
 /// What loading builds, and what it needs along the way.
@@ -1617,5 +1620,93 @@ fn prog_of(ld: Loader) -> TirProg {
         fn_vnames: ld.fn_vnames,
         clo_fid: ld.clo_fid,
         clo_reads: ld.clo_reads,
+        may_recurse: may_recurse(ld),
     }
+}
+
+/// Whether a call of the program may be reached again while it runs --
+/// answered conservatively, since a wrong "no" is a host stack overflow
+/// inside a task and a wrong "yes" only spare stacks made for nothing
+/// (docs/self-hosting.md §6.23). Yes when anything calls through a value
+/// this reading cannot follow -- a function or closure value called, a
+/// function named as a value, a bound method, an effect's operation or
+/// handler, C (which may call back through a function's address); when the
+/// direct calls between functions and module constants (a constant's
+/// initialiser runs when it is read) have a cycle; and when there are so
+/// many functions that a chain of them alone could go as deep as one host
+/// stack holds.
+fn may_recurse(ld: Loader) -> bool {
+    for o in ld.op {
+        if o == OP_CALLVALUE or o == OP_FNREF or o == OP_CLOSURE or o == OP_BOUNDCALL or o == OP_EFFECTOP or o == OP_WITH or o == OP_CALLEXTERN or o == OP_FNADDR or o == OP_CALLC or o == OP_DEEP {
+            return true
+        }
+    }
+    let nf = ld.fn_body.len()
+    let n = nf + ld.const_init.len()
+    if n >= 400 {
+        return true
+    }
+    // The graph: a function is its number, a constant `nf` after.
+    var edges: [[i64]] = []
+    for g in 0..n {
+        var out: [i64] = []
+        let root = if g < nf { ld.fn_body[g] } else { ld.const_init[g - nf] }
+        if root >= 0 {
+            var todo = [root]
+            while not todo.is_empty() {
+                let e = todo.pop() ?? -1
+                if e < 0 {
+                    continue
+                }
+                if ld.op[e] == OP_CALL {
+                    out.push(ld.a[e])
+                } else if ld.op[e] == OP_CONST {
+                    out.push(nf + ld.a[e])
+                }
+                for k in 0..ld.nk[e] {
+                    todo.push(ld.kids[ld.k0[e] + k])
+                }
+            }
+        }
+        edges.push(out)
+    }
+    // A cycle, by depth-first search with a stack of its own: 1 on the
+    // path, 2 done.
+    var color: [i64] = []
+    for _ in 0..n {
+        color.push(0)
+    }
+    for s in 0..n {
+        if color[s] != 0 {
+            continue
+        }
+        var path = [s]
+        var next = [0]
+        color[s] = 1
+        while not path.is_empty() {
+            let top = path.len() - 1
+            let g = path[top]
+            if next[top] < edges[g].len() {
+                let h = edges[g][next[top]]
+                next[top] = next[top] + 1
+                if h < 0 or h >= n {
+                    // A call this reading could not resolve.
+                    return true
+                }
+                if color[h] == 1 {
+                    return true
+                }
+                if color[h] == 0 {
+                    color[h] = 1
+                    path.push(h)
+                    next.push(0)
+                }
+            } else {
+                color[g] = 2
+                let _ = path.pop()
+                let _ = next.pop()
+            }
+        }
+    }
+    false
 }
