@@ -239,9 +239,9 @@ control lint-dropped '^DIFF: grasm lint spec/conformance/E-LOOP-RANGE.gr ' "ONLY
     ''
 
 control test-inverted '^DIFF: grasm test examples/testing_tour.gr ' "ONLY=test FILES=$WORK/tour" "$TESTING" \
-    '            if m == "\0" {
+    '            } else if m == "\0" {
                 print("test \"{label}\" ... ok")' \
-    '            if m != "\0" {
+    '            } else if m != "\0" {
                 print("test \"{label}\" ... ok")'
 
 control test-no-trap '^DIFF: grasm test spec/conformance/E-TEST-SHRINK.gr ' "ONLY=test FILES=$WORK/shrink" "$TESTING" \
