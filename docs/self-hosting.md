@@ -7429,6 +7429,509 @@ playground. The Rust TOML reader's misreadings, kept until S9, and the Rust
 defects this part and the ones before it copied or declined
 (docs/known-issues.md).
 
+### 6.24 S8 part seven: the wasm32 backend from MIR, and the playground built by it
+
+Written 2026-11-22, before any code, as the design to build to. The plan
+names this work three times: §4's architecture table ("a wasm32 backend from
+MIR | replaces the Rust-built playground and gives a portable bootstrap
+seed (§7)"), S8 ("the wasm32 backend with the playground built by it") and
+§10's first decision ("previous-release binaries, with the wasm seed of §7
+added once the wasm32 backend exists"). There is no §7 in this document
+today: "Bootstrap and trust" was §7 from the plan's first commit
+(`4df66f10`) until `449f2676` (2026-11-03, S7's exit items), which removed it
+with no word in its message; §4 and §10 still point at it, and its last text
+is `449f2676^`'s. The Rust toolchain stays stage 0 and the oracle and is not
+changed; where its behaviour is wrong it is reproduced and recorded in
+docs/known-issues.md, or, where it traps, recorded and not copied. The
+decisions are numbered (1) to (12); each is proposed by the agent
+implementing this part, and is the coordinator's to accept and the owner's
+to reverse. Where there is a choice the alternatives are written under the
+decision.
+
+#### What was measured
+
+Measured 2026-11-22 on this branch's base (`5ae2ad5f`) with the main
+checkout's `grasm` (stage 0, the release of 2026-11-01), its wasm module
+(`target/wasm32-unknown-unknown/release/grasm_wasm.wasm`, built at 08:44
+that day from the crates' last commit, `0509ace4`, and the same bytes as
+`ProjectGold/web/grasm.wasm`), part six's stage-1 and stage-2 binaries
+(`fixpoint`'s, the same compiler sources), and `node` v25.2.1 (V8
+14.1.146.11), the engine `wasmtest` runs. Every wasm module below that is
+not the Rust one was assembled byte by byte by the measuring scripts, in
+scratch; nothing was installed and nothing reached the network.
+
+**The Rust playground.** `crates/grasm_wasm` (316 lines) is not a code
+generator: it is the Rust interpreter -- `grasm_syntax`, `grasm_sema`,
+`grasm_interp` and the journal decoder -- compiled by rustc 1.99.1 for
+`wasm32-unknown-unknown`, with four hand-written exports around
+`run_src_capturing_fault_with_stdin`. The module is 1,939,255 bytes
+(564,375 under `gzip -9`): 1,713 functions, 1,592,298 bytes of code, 95,544
+of data and a 248,326-byte name section. Its target features, as rustc
+records them: bulk memory, multi-value, mutable globals, non-trapping
+float-to-int, reference types, sign extension (and the encoding variants
+`bulk-memory-opt`, `call-indirect-overlong`). Exports, with their types:
+`memory` (18 pages at least), `grasm_alloc (i32) -> i32`, `grasm_free (i32,
+i32)`, `grasm_run (i32, i32) -> i32`, `grasm_run_with_stdin` and
+`grasm_run_with_journal (i32, i32, i32, i32) -> i32`. Imports: three,
+`env.grasm_now_millis () -> f64`, `env.grasm_monotonic_millis () -> f64`,
+`env.grasm_sleep_millis (f64)`; `dlsym`, which every embedder still supplies,
+is no longer imported. The answer is one buffer of little-endian `u32`s --
+its total length, the exit code, stdout's length and bytes, the diagnostic
+text's length and bytes -- which the caller hands back to `grasm_free`.
+V8 compiles it lazily: `WebAssembly.compile` takes 2.8 ms (median of seven).
+Its embedders, the places that instantiate it: `scripts/wasm/run.mjs`
+(wasmtest's and replaytest's), `site/playground.js`, `docs/wasm.md` and
+four pages under `ProjectGold/` (`web/`, `33-`, `36-`, `41-`). The site
+serves `site/grasm.wasm`, which is the module of 2026-10-27, not this one:
+`site/` is regenerated at a release, and `scripts/site.py --check` lists it
+among the files that are behind.
+
+What it does with what it cannot do, measured on probes, each also run by
+`grasm run`:
+
+| program | `grasm run` | the Rust module |
+|---|---|---|
+| `par_map` of four | `[1, 4, 9, 16]` | the same, on one core |
+| `parallel` with `spawn` (`E-PARALLEL-JOIN`, `E-SPAWN-SHARED`) | runs | the same bytes, on one core |
+| `concurrent` (`E-CONCURRENT`) | runs | `panic: \`concurrent\` needs a platform that can switch stacks, which this one cannot`, 101 |
+| `read_file`, `tcp_connect` | reads; `Connection refused (os error 61)` | `Err(IoFailed(operation not supported on this platform))` |
+| `proc_run("echo", ...)` | runs | `IoFailed(echo: operation not supported on this platform)` |
+| `random_bytes(4)` | 4 bytes | `IoFailed(cannot open /dev/urandom: operation not supported on this platform)` |
+| `eprint` then a panic | both lines, then the stack trace | stdout only; the frame's text is the panic's line without the trace; the `eprint` line is lost |
+| `1 + depth(n - 1)` | to 41,941 (§6.23) | to 173; at 174 a trap, `RuntimeError: memory access out of bounds`, no output, `run.mjs` exits 1 |
+
+The last row is the Rust module's stack: it lives in linear memory, 1 MiB
+by rustc's default for this target, and the interpreter's frames fill it at
+174 calls -- a trap, which [E-RECURSION-DEPTH] says a program never meets, at a
+depth 58 times below the 10,000 it guarantees. `wasmtest` sets
+`E-RECURSION-DEPTH`, `E-PANIC-TRACE` and `scheme-demo` aside for it. The
+Rust interpreter keeps a map as a `BTreeMap`, so the module hashes nothing
+and has no seed.
+
+**`wasmtest` today** (the main checkout's module, every program it runs
+compared with `grasm run`, 2026-11-22,
+38 minutes): "identical: 508   mismatched: 0   skipped: 143" of the 651
+programs with a `main`. Set aside, by reason: a filesystem 82, threads
+(`par_map`, `par_filter`, `spawn` named in the code) 24, sockets 21, a C
+function 8, stack switching (`concurrent`) 4, the stack's depth 3, and
+processes 1. The gate compares standard output and the status, not
+standard error.
+
+**The interpreters' speed, as a playground would meet it** (three rounds
+interleaving the three, the order rotated, median seconds of a whole run, at
+a load of 4.4 to 5.1 from other work, so ratios only; every output the
+same): the Rust module under node, and stage 2's `grasm run` (the Grasm
+interpreter built by the Grasm backend, natively), each over the Rust `grasm
+run` --
+
+| program | Rust `grasm run` | stage 2 `grasm run` | the Rust module |
+|---|---:|---:|---:|
+| `fib` | 1.786 | 0.889 | 1.631 |
+| `sieve` | 3.045 | 1.713 | 1.488 |
+| `matmul` | 6.510 | 1.442 | 1.491 |
+| `sort` | 0.413 | 4.250 | 2.003 |
+| `tree` | 1.594 | 1.243 | 1.604 |
+| `wordfreq` | 0.547 | 1.926 | 1.563 |
+| `examples/hello.gr` | 0.014 | 0.951 | 7.007 |
+| `examples/effects.gr` | 0.013 | 0.976 | 9.630 |
+
+The wasm build of the Rust interpreter costs 1.5 to 2.0 times its native
+build; the Grasm interpreter is already up to 4.25 times the Rust one
+natively, on `sort`. If wasm costs it what it costs Rust's, the Grasm-built
+playground will be slower than the Rust module on such programs -- part
+eight's to measure, not this part's to promise. A program that does nothing
+takes 0.10 s under node, most of it node's start and the module's
+compilation.
+
+**The Rust command and `--target wasm32`.** `grasm build --native --target
+wasm32` (or `wasm32-unknown-unknown`) answers "error: unsupported target
+`wasm32`: Support for this target has not been implemented yet", exit 1:
+no command builds a program for wasm today, although the site's front page
+(`scripts/site_pages.py`) shows "Wasm `--target wasm32`" beside the native
+build.
+
+**The engine.** Each feature by a module of a few bytes, validated,
+instantiated and run: accepted, and computing the right answer, are sign
+extension, non-trapping float-to-int (NaN to 0 and saturation, as
+[L-LIB-AS-I64] asks of a conversion), multi-value, bulk memory, reference
+types, tail calls (a `return_call` a million deep), exceptions in both
+encodings (the legacy `try`/`catch` and the standard `try_table` with
+`exnref`), threads (a shared memory and an atomic add), SIMD, memory64,
+extended constants, and JS promise integration (`WebAssembly.Suspending`
+and `promising`). Behind flags that are off: core stack switching
+(`--experimental-wasm-wasmfx`, `--experimental-wasm-stack-switching`) and
+growable JSPI stacks. A browser page cannot set a flag.
+
+- *The native stack.* A function of one `i64` argument and four `i64`
+  locals recurses 10,405 deep under node's default stack (98,304 with
+  `--stack-size=8000`, which a page cannot ask for either), about 94 bytes
+  a frame.
+- *A stack overflow cannot be caught by wasm.* An unbounded recursion inside
+  a `try_table` with `catch_all` is not caught: JS sees `RangeError: Maximum
+  call stack size exceeded`, and the instance can be called again after.
+- *Address width*, the price of a word held as `i64` (a loop doing nothing
+  but loads, five interleaved rounds, medians): `i32` addresses 0.547 ns a
+  load; `i64` words wrapped to `i32` at each access, the 64-bit layout in a
+  32-bit memory, 0.631 (1.154); memory64, 0.533 (0.976).
+- *Mathematics.* 20,000 seeded arguments per function, three libms against
+  each other, bit for bit. macOS's (what `grasm run` and the native builds
+  call) against V8's `Math`: sin 886 differ, cos 916, tan 8,293, exp 1,958,
+  log 56, log2 27, log10 605, asin 1,676, acos 3,412, atan 0, sinh 5,267,
+  cosh 5,012, tanh 1,133, cbrt 2,198, pow 0, atan2 3,567, hypot 6,631. The
+  Rust module's own (Rust's `libm`, a port of musl's, which rustc links into
+  a `wasm32-unknown-unknown` program; measured by a four-function probe
+  rustc built for wasm32 in scratch): against macOS sin 883, tan 8,324, exp
+  1,874, hypot 0; against V8 sin 279, tan 233, exp 11, hypot 6,690. Three
+  libms, each differing from the other two. `wasmtest` agrees today because
+  no corpus program prints a transcendental answer to its last bit.
+- *WASI*: `node:wasi` (preview 1, 46 functions) is built in, and prints an
+  `ExperimentalWarning` to stderr when loaded.
+- *Tools*: no `wasm-tools`, `wabt`, `binaryen` or `wasmtime` on the machine.
+  Homebrew's LLVM 21.1.8, which `elfrtswap` and `objtest_elf` already use,
+  has the `wasm32` target in `llvm-mc` and reads wasm in `llvm-objdump`: an
+  assembler to hold an encoder to and a second decoder, but no validator.
+  musl's mathematics is on the machine as source, as Zig 0.16 ships it
+  (`lib/libc/musl/src/math` and its ports in `lib/compiler_rt` and
+  `lib/std/math`).
+
+**MIR, as the backend would meet it.** A measuring program (in scratch, on
+`compiler/mir`) built every corpus program's MIR as `s3` builds it --
+`mir.build` with inlining at 32 -- and walked it:
+
+| | the 651 programs with a `main` | runtime | `front` | `tirinterp` | `s3` | `link` | the command |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| functions | 36,107 | 1,037 | 731 | 394 | 640 | 211 | 2,096 |
+| blocks | 1,382,292 | 10,623 | 54,563 | 20,175 | 71,498 | 33,097 | 176,187 |
+| irreducible functions | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| most values in one function | not taken | 2,094 | 20,062 | not taken | 128,755 | 273,516 | not taken |
+| most blocks in one function | | 215 | 1,101 | 816 | 2,944 | 4,726 | 2,944 |
+
+Every function is reducible -- 35,132 retreating edges in the corpus, each
+to a block that dominates its source -- so a structuring for reducible
+graphs is enough, and an irreducible one can be refused as the backend's
+own error. The operations wasm has no instruction for, by the programs that
+hold them: the stack pointer for the recursion floor (`getsp`) in 175
+programs, 1,219 functions taking the floor; a frame slot's address
+(`slotaddr`, an `inout` argument's home) in 491, 153,293 times; a call
+through a code address in 98 (530); a function's address in 208; a C
+function's address in 2; atomics in 2 programs and 323 times in the
+runtime; process cells in the runtime alone. The values: V8 refuses a
+function with more than 50,000 locals, and `s3` and `link` each have one
+with more than 128,000 values -- a local per value cannot build the
+compiler, and would make every frame large. The programs call 296 of the
+runtime's functions, and C functions of their own through `extern fn`: SDL
+(the three programs set aside everywhere), and `abs`, `atoi`, `free`,
+`getpid`, `ioctl`, `isatty`, `memcmp`, `pow`, `read`, `sqrt`, `strchr`,
+`strlen`, `system`, `tcgetattr`, `tcsetattr`, `write`, in the programs
+`wasmtest` sets aside as "calls a C function".
+
+**The runtime in Grasm and its host.** `compiler/rt` (23,104 lines) calls
+95 C functions: memory (`malloc`, `calloc`, `realloc`, `free`,
+`posix_memalign`, `mmap`, `munmap`, `mprotect`, `memcpy`, `memset`,
+`memcmp`, `memchr`, `strlen`, `sysconf`); the 24 of libm; clocks
+(`clock_gettime`, `nanosleep`); `getentropy` (the maps' seed, drawn once,
+and nothing else -- `random_bytes` reads `/dev/urandom`); `getenv`;
+`write` and `read` on the standard streams; files and directories (12);
+sockets, name lookup and readiness (18); processes (`fork`, `execvp`,
+`waitpid`, `kill`, `pipe`, `dup2`, `_exit`); threads (`pthread_*`, 10, and
+`sched_yield`); and `dlsym`, `strerror`, `__error`. Fibers switch with
+`grt.ctx_switch`, a leaf each target's backend writes. Compiling it: `grasm
+tir` 3.3 s, then stage 2's `s3 --runtime` 1.8 s. Peak memory of each
+compiler program's build by stage 2 is under 210 MB (`fixpoint`'s
+`cost.tsv`), far inside wasm32's 4 GiB.
+
+#### What the plan asks, and what each half costs
+
+What "a wasm32 backend from MIR" replaces is an interpreter compiled to
+wasm by rustc, so the plan's row holds two things:
+
+**(a) The backend**: any Grasm program in the subset compiled from MIR to a
+wasm module, with the runtime compiled for wasm beside it. New code: a
+target package beside `compiler/aarch64` and `compiler/x86_64` --
+structuring, locals, selection, the module writer, its encoder's cases --
+about 2,500 to 3,000 lines; the runtime's host on wasm, written in Grasm --
+memory over `memory.grow`, the string functions, 21 functions of libm,
+the refusals -- about 3,000, two thirds of it libm; the driver's target and
+the gates. It needs no register allocator: wasm's locals are the virtual
+registers, and the engine allocates.
+
+**(b) The playground**: `compiler/front` and `tools/tirinterp` -- the Grasm
+interpreter, which `grasm run` in Grasm already is -- compiled by (a) into a
+module with the Rust module's exports. On top of (a): a package for the
+exports and the frame, the interpreter taught to run where no stack can be
+switched (it hops to fresh host stacks every 500 calls and runs a program's
+tasks as host tasks, §6.23), the frontend reading the one source from
+memory (`load_sources`, which the language server already uses), about 500
+to 800 lines; and the comparisons with the Rust module.
+
+(b) cannot exist without (a); (a) without (b) leaves the Rust module as the
+playground. The plan's row implies both, and so does the brief.
+
+**The seed** is (a) applied to the compiler: `compiler/grasm`'s build path
+(the frontend, MIR, `s3` with its native targets, `link`) as one wasm
+module, run by any WASI preview-1 runtime -- `node:wasi` here -- that reads
+the compiler's sources and writes a native stage 1 for the machine it runs
+on, whose stage 2 must be the release's stage 2 to the byte. It needs from
+(a) the locals shared by liveness (the 273,516 values of `link`), a host
+over WASI's files, arguments and clock instead of the playground's, and a
+gate that is itself a bootstrap. It is S9's ("the bootstrap documented").
+
+#### The decisions
+
+**(1) Scope: (a) in this part, (b) in the next, the seed in S9.**
+Proposed. This part builds the backend and the runtime for wasm and holds
+every corpus program `wasmtest` can compare, compiled by it, to `grasm run`;
+part eight builds the playground module with it and holds that to the Rust
+module and to `grasm run`; the seed waits for S9. The alternatives:
+**(1b)** (a) and (b) in one part, which doubles a part that is already the
+size of S7's first; **(1c)** (b) alone, the interpreter's module built by a
+backend tested on one program, refused -- a backend is trusted by the
+corpus, not by one program.
+
+**(2) The target: the core features of wasm 2.0 and exception handling,
+nothing else.** Proposed: sign extension, non-trapping float-to-int, bulk
+memory and mutable globals (each among the features rustc already enables
+for the Rust module, so nothing is asked of an engine that it does not ask
+today; MIR returns one value, so multi-value is not needed), and exception
+handling in its standard encoding (`try_table`, `throw`, `exnref`) for one
+thing only: an `exit` or a panic, deep in a program or in the interpreter,
+unwinds to the export that started the run, which writes the frame and
+returns. Not used: tail calls (no Grasm construct needs one), threads (a
+shared memory needs a cross-origin isolated page, and `par_map` runs on one
+core as in the Rust module), SIMD (a later vectorizer's), memory64 (decision
+(3)), GC, JS promise integration and stack switching (decision (4)). The
+alternatives: **(2b)** the legacy encoding of exceptions, which V8 now keeps
+behind a flag that is on by default and the standard has replaced --
+refused; **(2c)** no exceptions: `exit` and a panic call an import that
+throws in JS, and the embedder catches it and asks an export for the frame
+-- every embedder's glue changes, against decision (9), refused. What
+engines other than this V8 accept could not be measured here (no network, no
+other engine), and is the one fact this decision rests on that is not
+measured.
+
+**(3) Addresses: wasm32, with the runtime's 64-bit layout.** Proposed.
+Every word stays eight bytes -- `RtVal`, the 40 layout constants `rtlayout`
+holds, TIR -- and an address is an `i64` whose upper half is zero, wrapped
+to `i32` at each load and store (an offset that fits folded into the
+instruction's own). `compiler/rt` and `compiler/mir` do not change for
+wasm. The cost is a wrap per access: 1.154 on a loop of nothing but loads.
+The alternatives: **(3b)** memory64: no wraps (0.976 on the same loop),
+the same layout, no change anywhere -- but it is wasm64, not the plan's
+wasm32, and whether every browser runs it could not be checked here;
+the owner's to choose, and the backend would differ only in the memory's
+limits and the address type of each access. **(3c)** a 32-bit layout:
+every layout constant, `rtlayout` and the runtime's arithmetic on words
+change for one target -- refused.
+
+**(4) Tasks: refused as the Rust module refuses them.** Proposed. A
+`concurrent` block ends the program with the Rust module's words, `panic:
+\`concurrent\` needs a platform that can switch stacks, which this one
+cannot`, exit 101: the wasm backend writes the context switch's leaves
+(`grt.ctx_switch`, `grt.ctx_init`), as each target does, as a panic with
+that text, so `compiler/rt` does not change; whether anything is printed
+between a block's start and its first task's start, where the two would
+differ, is checked by a fixture. `par_map` and `par_filter` run on one core,
+as in the Rust module: with one processor the runtime's `workers_for`
+answers one worker and no thread is started. A `parallel` block's
+`spawn` runs on one thread in the Rust module; what the Grasm runtime does
+where no thread can start is measured on a fixture, and made the same, before
+the gate runs. (`wasmtest` sets aside every program naming `par_map`,
+`par_filter` or `spawn` as needing threads, which the Rust module runs; the
+new gate keeps the rule, as the brief asks, and the comparison with the Rust
+module in part eight covers them.) The
+alternatives, each for a later part: **(4b)** an asyncify-style lowering in
+our own backend, every function that may reach a switch saving its locals
+to the shadow stack and returning, then re-entered -- tasks everywhere,
+for code size and time to be measured; **(4c)** JS promise integration:
+exports that return promises, an asynchronous ABI, and V8 alone among the
+engines measured; **(4d)** core stack switching, once an engine ships it
+unflagged.
+
+**(5) The stack: a shadow stack in linear memory, and the recursion floor
+on it.** Proposed. A frame slot (`slotaddr`) lives on a shadow stack in
+linear memory, as rustc's own, its pointer a global; `getsp` reads that
+pointer and the stack floor ([E-RECURSION-DEPTH]) is checked against it, so
+a recursion too deep ends in the runtime's panic with its words and status
+-- never a trap -- provided the shadow stack runs out before V8's own: a
+function that takes the floor reserves a shadow frame at least as large as
+the native frame it will cost (its locals' count, by a rule measured on the
+`stack` fixtures under node's default stack), and the shadow stack's size
+is chosen so that its floor comes first. The depth each shape then reaches
+is measured, printed by the gate and recorded in docs/known-issues.md as a
+difference the clause allows (the Rust module: 173 calls and a trap). The
+three programs `wasmtest` sets aside for depth stay aside, for the same
+reason. The alternative: **(5b)** no floor, a RangeError as the Rust
+module's trap -- refused, a trap is what the clause rules out.
+
+**(6) The runtime's host on wasm: a C library in Grasm, inside the
+module.** Proposed. `compiler/rt` is compiled for wasm unchanged but for
+`os.gr`, replaced as `os/linux.gr` replaces it for Linux (§6.18), and its
+`extern fn` calls are bound by the backend to a package of Grasm functions
+of the same names, `compiler/rtwasm`, compiled into the same module -- a
+name it lacks is a build error naming it, never an import. In it:
+
+- *memory*: `malloc` and its family and `mmap`, `munmap`, `mprotect` over
+  pages taken by `memory.grow` (never given back, as wasm cannot);
+  `memcpy` and `memset` as `memory.copy` and `memory.fill`; `memcmp`,
+  `memchr`, `strlen` as loops; `sysconf` answers one processor;
+- *mathematics*: of the 24 functions of libm the runtime calls, `floor`,
+  `ceil` and `sqrt` are instructions; the other 21 as musl writes them,
+  ported to Grasm from the source on the machine, and held bit for bit to
+  the Rust module's own (a probe module rustc builds in the gate's scratch,
+  the playground's libm by construction), so the playground answers as it
+  answers today.
+  Decision 2 of §10 (a correctly rounded libm everywhere) is not this; this
+  is the first libm in Grasm, and the one the playground already has;
+- *the seed of the maps*: `getentropy` asks a fourth import,
+  `env.grasm_entropy(ptr, len) -> i32`, which every embedder answers from
+  `crypto.getRandomValues` (a browser's and node's); its failure is the
+  runtime's existing refusal to run without a seed. No seed from a clock and
+  no fixed seed: the maps stay resistant to flooding. Seven embedders gain
+  that line, and `wasmtest`'s import check finds any that does not;
+- *clocks*: the three imports the Rust module has, unchanged;
+- *the standard streams*: a program's output goes to an import,
+  `env.grasm_write(fd, ptr, len)`, for a program built by (a); the
+  playground of part eight keeps it in memory for the frame instead;
+  standard input is the lines the embedder hands over;
+- *what wasm cannot do*: files, directories, sockets, name lookup,
+  processes, threads and `dlsym` fail with one error number of the
+  package's own, which `strerror` words "operation not supported on this
+  platform", so every `IoFailed` the program sees is the Rust module's text
+  (`random_bytes` included: the runtime already words its failure "cannot
+  open /dev/urandom: " and the system's message, as the Rust module's
+  reads); `pthread_create` fails; thread-local and process cells are plain
+  linear memory, one thread having them all;
+- *`exit` and the end of a panic*: `_exit` throws the exception of (2) with
+  the status, which the module's export catches.
+
+The alternatives: **(6b)** the C library as imports in JavaScript -- every
+embedder carries it, and `Math`'s answers are V8's, which differ from both
+the Rust module's and `grasm run`'s (above); refused. **(6c)** WASI for
+the host from the start: the seed's host, but a browser has no WASI and
+the playground's page would carry a shim; for S9.
+
+**(7) One module per program, linked by the backend.** Proposed. `s3
+--target wasm32` reads the program's TIR, the runtime's (`--runtime-tir`)
+and `compiler/rtwasm`'s, builds their MIR, binds every runtime call and
+`extern fn` by name, keeps what the exports reach and writes one module.
+The runtime is compiled with every program: about 5 s each (3.3 s of `grasm
+tir`, which a gate does once and reuses, and 1.8 s of MIR and code). The
+alternative, **(7b)**, a relocatable wasm object for the runtime and a
+wasm linker in `compiler/link`, waits until that time is measured to
+matter.
+
+**(8) The command: not in this part.** Proposed. Part seven adds `s3
+--target wasm32` and the gates; `grasm build --native --target
+wasm32-unknown-unknown` in the Grasm command comes with the playground in
+part eight, which is built by it, with `clidiff` gaining a category as
+`runtime` was (§6.17): the Grasm command writes a module where the Rust one
+refuses the target. The alternative: the command now, with the wasm
+runtime's TIR beside the command as `rt.o` is.
+
+**(9) The playground's ABI, for part eight: the Rust module's, byte for
+byte, but one import.** Proposed now so that part seven builds toward it:
+the five exports with the Rust module's types, `memory` exported, the
+frame's layout, the exit codes and the frame's text as the Rust module
+gives them (a panic's line alone). One import more, `grasm_entropy`
+(decision (6)). Two things the Rust module does that part eight must decide
+on, recorded now as the Rust module's defects: an `eprint`'s text is lost,
+and a recursion of 174 calls traps.
+
+**(10) The structure, the locals, and what wasm lacks.** Proposed, as the
+backend's design. Structured control from the reducible graph by the
+dominator tree (Ramsey, "Beyond Relooper", ICFP 2022): a loop header opens a
+`loop`, a block reached by two or more forward edges is placed just after
+the end of a `block` that those edges leave by `br`, every other branch is a
+`br` or `br_if` to its enclosing label, and an irreducible function is the
+backend's own error. The dominator tree is the backend's own (the iterative
+algorithm of Cooper, Harvey and Kennedy, as the measuring program used;
+`compiler/mir` builds SSA without one). Locals shared by liveness, per class
+(`i64`, `f64`), so that no function nears V8's 50,000 and frames stay small.
+Block arguments as parallel copies, a cycle broken through a spare local.
+What wasm lacks, by MIR operation: `sdiv` of the most negative number by -1
+is tested first (wasm traps; [E-ARITH-INT] answers the number), as x86-64's
+selection does; `rbit` and `bswap16/32/64` are shifts and masks;
+`fcvtzs`/`fcvtzu` need nothing, the saturating instructions being exactly
+what [L-LIB-AS-I64] asks; atomics as plain loads, stores and adds, one
+thread being all there is; `fnaddr` and `gotaddr` as an index into the
+module's table, `callind` as `call_indirect` with the call's type; strings,
+descriptors and cells as data at fixed addresses. The functions are named in
+the module's name section, so a trap's stack names Grasm functions.
+
+**(11) Held by four checkers of every module.** Proposed: V8 validating
+it whole (`new WebAssembly.Module`, which validates every function before
+any runs); a validator written for the gate in Python, the specification's
+validation algorithm for every instruction the backend emits, typing every
+function body, independent of V8; `llvm-objdump` decoding it; and the
+encoder's every form held to `llvm-mc -triple=wasm32` as `encodetest`
+holds arm64's to `clang` and `encodetest_x64` x86-64's to `as`.
+
+**(12) §7 restored.** Proposed: `449f2676^`'s "Bootstrap and trust" put
+back as §7, word for word, with its "Any platform, any commit (later)"
+bullet pointing here and to S9, so that §4's and §10's references point at
+what they meant. The alternative: point them here.
+
+#### How it is held
+
+- **`wasmsubset`**, new: every corpus program `wasmtest` compares -- the 508
+  of its run above, every one in `s3`'s subset of 648 -- compiled by `s3
+  --target wasm32` from `grasm tir`, checked by the four checkers of (11),
+  run by node through `scripts/wasm/runprog.mjs` (the imports of (6)), its
+  stdout and status compared with `grasm run`'s (as `wasmtest` compares) and
+  its stdout, stderr and status with the same program built by the Grasm
+  backend for arm64 (the same runtime, so the same panic text), built twice
+  and the two modules compared. The programs set aside are exactly
+  `wasmtest`'s, for its reasons -- the rules moved into
+  `scripts/lib/wasmskip.sh`, which both gates source, so they cannot drift
+  -- the three SDL programs among its eight that call C; no new reason.
+  Counts asserted, the floor the 508 compared today. Estimated at 30 to 50
+  minutes (the runtime's TIR made once; about 3 s of compiling and a run per
+  program), to be measured.
+- **`encodetest_wasm`**: the encoder's forms against `llvm-mc`, a minute.
+- **`fuzz_wasmmath`**: the 21 functions against the Rust module's libm, bit
+  for bit, a million arguments each from seeded generators that reach
+  every branch (the reductions of `sin` far from zero, `pow` near
+  overflow, subnormals, NaNs and infinities).
+- **`fuzz_wasm`**: `fuzz_s3` and the generators with the Grasm backend as an
+  engine, pointed at the wasm target, as `fuzz_x64` points them at x86-64.
+- **The stack**: fixtures recursing until refused, by shape, under node's
+  default stack: each must end in the runtime's panic, never a RangeError,
+  the depth reached printed.
+- **Speed and size**, measured, not claimed: the serial benchmarks
+  compiled to wasm run by node, against the same programs built by the Grasm
+  backend for arm64 and against `grasm run`, interleaved, as ratios; the
+  modules' sizes.
+- **`wasmcontrols`**, each a planted fault the gates must catch: an
+  instruction miscoded (`i64.sub` for `add` in one selection), a branch's
+  label one level off in the structuring, a refused feature run anyway (the
+  leaf of (4) switching nothing and returning), a host error worded
+  otherwise than the Rust module's, a module built twice differently (the
+  build's clock written into a custom section), a module the validators must
+  refuse (a local's type changed), and the floor of (5) removed (a
+  RangeError, not the panic). The frame's layout off by a field is part
+  eight's control.
+- **What must not move**: `s3subset`, `objtest`, `xs3subset`, `fixpoint`
+  and `tirinterp` as today, and every arm64 and x86-64 object the subset
+  and the runtime compile to the same bytes from this part's `s3` as from
+  master's, as S7 held its refactor.
+
+#### Where the first part ends
+
+Part seven ends when (a) holds: `s3 --target wasm32`, `compiler/rtwasm`, the
+runtime compiled for wasm, and every corpus program `wasmtest`'s rules let
+run, compiled by it, agreeing with `grasm run` under node, with the gates and
+controls above, and the native targets unchanged. Part eight is the
+playground: the module of (b) with the ABI of (9), built by `grasm build
+--native --target wasm32-unknown-unknown`, held to the Rust module on every
+program and to `grasm run` on `wasmtest`'s set, its size and speed against
+the Rust module's, and `site/` and `ProjectGold/` switched to it only on the
+owner's word. The seed is S9's.
+
+**What is left for S8 after this part, if it ends there**: the playground
+(part eight); the LSP on the query engine; the debugger's cost per
+statement; `grasm-j`; the scheduler's cost per switch; a task's recursion
+bound of 10,999 calls (§6.23).
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against

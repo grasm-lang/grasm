@@ -10,7 +10,8 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
-thirteen, the Rust interpreter aborting on an `==` of a value nested
+fifteen, two in the Rust-built playground module -- a recursion of 174
+calls trapping and an `eprint`'s text lost -- the Rust interpreter aborting on an `==` of a value nested
 3,000,000 deep, both runtimes reporting a failed name lookup as `ENOENT`,
 four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
 records unread in silence, a breakpoint by another path's
@@ -42,6 +43,50 @@ one inside a task past 10,999 calls is refused by it.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
+
+## Found on 2026-11-22 by S8 part seven (the wasm32 backend)
+
+**The playground module traps on a recursion of 174 calls -- *open, S3
+(the agent's)*.** `grasm_wasm.wasm`, the Rust interpreter built by rustc for
+`wasm32-unknown-unknown`, keeps its stack in linear memory (rustc's default
+for that target, 1 MiB), and the interpreter's frames fill it at the 174th
+call of `1 + depth(n - 1)`: `RuntimeError: memory access out of bounds`,
+no output, and `scripts/wasm/run.mjs` exits 1 (the page says "The engine
+trapped"). [E-RECURSION-DEPTH] guarantees 10,000 calls and a panic past the
+bound, never a trap; `wasmtest` sets aside the three corpus programs that
+recurse deep. Not copied by the wasm backend in Grasm, which checks the
+floor on its own shadow stack (docs/self-hosting.md §6.24, decision (5)).
+Severity is the agent's: `docs/release-scope.md` names the three engines,
+not the playground.
+
+```
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    print("{depth(174)}")
+}
+```
+
+**The playground module loses what a program writes to standard error --
+*open, S3 (the agent's)*.** On `wasm32-unknown-unknown` Rust's standard
+error writes nowhere, and the module's answer has room for standard output
+and one diagnostic text only, so an `eprint`'s line never reaches the page;
+a panic's text arrives as its first line, without the stack trace `grasm
+run` prints. `wasmtest` compares standard output and the status, so it does
+not see either. Whether the Grasm-built playground copies this is part
+eight's decision (§6.24, decision (9)).
+
+```
+fn main() {
+    print("out one")
+    eprint("err one")
+}
+```
 
 ## Found on 2026-11-19 by S8 part six (the scheduler and the stack in Grasm)
 
