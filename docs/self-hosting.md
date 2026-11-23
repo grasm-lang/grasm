@@ -7979,6 +7979,117 @@ owner's word. The seed is S9's.
 statement; `grasm-j`; the scheduler's cost per switch; a task's recursion
 bound of 10,999 calls (§6.23).
 
+#### Step two, as built
+
+(2026-11-22, this branch, the main checkout's compiler and node v25.2.1;
+loads of 3 to 5 from other work, so no time here is to be quoted but the
+interleaved ratios; who decided what is said where it was decided.)
+
+- **What was built.** `compiler/wasm32` (2,404 lines): the structuring,
+  locals shared by liveness, the selection, the module writer, the link of
+  the three programs' MIR, the encoder's cases. `compiler/rtwasm` (2,514
+  lines): the C library -- memory over `memory.grow` with a free list per
+  size class, the standard streams and clocks through the host, the
+  refusals, and libm (1,867 of the lines). `s3 --target wasm32
+  --runtime-tir R --libc-tir L` (118 lines of the driver), and
+  `scripts/wasm/runprog.mjs`, the runner. The module exports `memory`,
+  `_args` (where the runner writes the argument vector) and `_start(argc)`;
+  its imports are `env.grasm_write`, `grasm_entropy` and, where the program
+  reads a clock, the three the Rust module has.
+- **Found while building, each settled here.** The runtime ends a program
+  through C's `exit`, which it looks up by name (`io.leave`'s
+  `dlsym(RTLD_DEFAULT, "exit")`): the library's `dlsym` answers that one
+  name with a table slot and every other with null. A failed name lookup is
+  worded `ENOENT` by the runtime whatever the lookup answered
+  (docs/known-issues.md), so `strerror` words every number as the refusal:
+  every error here is one. The libm on the machine to port from was the
+  `libm` crate 0.2.16, a copy of the code rustc links: its functions agree
+  with the playground's bit for bit but for `hypot`, where 5 of 2,000 pairs
+  differed by an ulp -- the playground's `hypot` is correctly rounded (20,000
+  random pairs, every answer the exactly rounded one, by an exact BigInt
+  square root), a newer libm's than the copy's -- so `hypot` here is written
+  correctly rounded: a candidate from `sqrt`, each midpoint beside it
+  compared with x^2 + y^2 exactly by a non-overlapping expansion (Shewchuk,
+  1997), a tie to the even neighbour.
+- **The stack, by measurement (decision (5)).** With no shadow frames, V8's
+  frame for a function was about 8 bytes a parameter or local and 55 more
+  (94.6, 157.6, 110 and 126 bytes for four shapes of 5, 13, 7 and 10 slots;
+  10,404 calls of `1 + depth(n - 1)` before the engine's stack overflowed).
+  A shadow frame of 6.5 times that left too little of the engine's stack
+  for the panic itself (`plain` trapped at 10,081); 7.0 is the scale, every
+  recursion fixture then ending in the panic. A recursion through a
+  function value and the runtime's `map` (`closure`) still trapped while
+  only the frames that take the floor or call through a value kept shadow
+  frames -- the runtime's own frames are in every level -- so every frame
+  that calls anything keeps one. The depths each shape then reaches under
+  node's default stack, the floor met first and the panic printed:
+  `mutual` 10,089, `plain` 9,368, `doubles` 8,030, `tree` 7,026, `locals`
+  5,620, `closure` 3,390 -- below the clause's 10,000 for all but one,
+  recorded in docs/known-issues.md as the coordinator's decision asked (the
+  Rust module: 173 on `plain`, and a trap).
+- **The link's cost (decision (7)),** three runs each: a module 0.54 to 0.62
+  s for `hello`, `tree` and `asmcheck`, where their arm64 objects take 0.012
+  to 0.09 s -- the runtime's and the C library's MIR made with every program
+  -- and 3.1 s for `b28-demo` against 5.1 s for its object (no register
+  allocation). Modules: `hello` 119,103 bytes, `tree` 90,414, `b28-demo`
+  1,151,105.
+- **Speed (decision (5)'s frames included),** three rounds interleaving the
+  three, the order rotated, median seconds of a whole run, the serial
+  benchmarks at ten times `bench.sh`'s sizes (`fib(35)`, a sieve to
+  20,000,000, 400 by 400, 4,000,000 sorted and counted, 200 trees) so that
+  node's start -- 0.07 to 0.08 s for `hello`'s module -- weighs less; at a
+  load of 4.3, so ratios only, every output the same: the module under node
+  over the program built for arm64 by the Grasm backend (stage 2's `grasm
+  build --native`) and by Cranelift --
+
+  | program | wasm | Grasm arm64 | Cranelift | wasm / Grasm | wasm / Cranelift |
+  |---|---:|---:|---:|---:|---:|
+  | `fib` | 0.146 | 0.075 | 0.051 | 1.951 | 2.842 |
+  | `sieve` | 0.451 | 0.131 | 0.068 | 3.432 | 6.597 |
+  | `matmul` | 0.417 | 0.106 | 0.032 | 3.945 | 12.963 |
+  | `sort` | 0.273 | 0.094 | 0.110 | 2.895 | 2.489 |
+  | `tree` | 0.559 | 0.534 | 0.177 | 1.047 | 3.160 |
+  | `wordfreq` | 1.474 | 1.022 | 0.143 | 1.442 | 10.284 |
+
+  Geometric means 2.206 over the Grasm backend's arm64 code and 5.195 over
+  Cranelift's. Where the time goes was not measured: every address wrapped,
+  every value a local read and written, no folding of an offset into its
+  load, and node's start are the candidates, and none is promised here. At
+  `bench.sh`'s own sizes the same modules take 0.088 to 0.217 s, against
+  the Rust interpreter's 0.41 to 6.14 s for the same programs.
+- **The native targets, unchanged.** Six programs' objects for arm64 and
+  x86-64 and the runtime's for both, from part six's stage-1 `s3` and from
+  this tree's: the same bytes, 14 of 14 (`s3subset`, `objtest`, `xs3subset`
+  and `fixpoint` below hold the rest). The command built by Cranelift grows
+  by the wasm target's code, which it never calls.
+- **A tool's fact.** llvm-mc 21.1.8 crashes printing `try_table` with
+  `-show-encoding`; `encodetest_wasm` leaves that form to the validators.
+- **The gates, on `bb01d7c0`** (`nice -n 10`, one at a time):
+  `encodetest_wasm` "cases: 234   forms: 91   agreeing: 234   disagreeing:
+  0"; `fuzz_wasmmath` "4800000 calls compared with the Rust playground's
+  libm", every seed "disagreeing: 0"; `wasmsubset`, 50 minutes: "651
+  programs with a main, 121 set aside, 530 compared", "as grasm run: 530
+  as the native build (stdout, stderr, status): 530   timed out: 0", "named
+  par_map, par_filter or spawn and held: 22, the Rust module running them as
+  grasm run does: 21, otherwise: 1" (`E-RECURSION-PARALLEL`, 8,000 calls deep
+  in `par_map`, where the Rust module traps), "modules: 530   built twice the
+  same: 530   V8 validates: 530 (refuses 0)   wasm_validate.py: 530 valid, 0
+  invalid, 145560 bodies checked", "refusals: 4 of 4 as the Rust module's",
+  "stack: 6 of 6 recursions past any depth end in the panic". The 508
+  programs `wasmtest` compares are among the 530; set aside: a filesystem 83,
+  sockets 22, a C function 8, stack switching 4, the stack's depth 3,
+  processes 1 -- `wasmtest`'s 143 less the 22 held, two of its 24 thread
+  programs needing a filesystem or a socket as well. `wasmcontrols`, 24
+  minutes: "controls: 9   caught: 9   missed: 0" -- `add` selected as
+  `i64.sub` (not as `grasm run`), a branch's label one level out and the
+  `i64` locals declared `f64` (each refused by `wasm_validate.py`), the
+  context switch's leaf returning (a `concurrent` block not refused as the
+  Rust module refuses it), a refusal worded otherwise (the same), the clock
+  in every module (built twice, not the same bytes), no shadow frames (a
+  recursion past any depth not ending in the panic), a signed LEB128 ended
+  early (`encodetest_wasm`), `sin`'s first coefficient one bit off
+  (`fuzz_wasmmath`).
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
@@ -8032,7 +8143,11 @@ Grasm), `linkdiff_x64` (the linker against ld's x86-64 output), `fuzz_x64`
 (§6.17), `objtest_elf` (ELF objects against the system's readers),
 `elfsubset` (crosstest for the Linux triples, in the OrbStack machine),
 `elfrtswap`, `elfrtlayout`, `elfrepro`, `linkdiff_elf` (the linker against
-GNU ld) and `elfcontrols` (§6.18), `ddc`,
+GNU ld) and `elfcontrols` (§6.18), `wasmsubset` (the corpus compiled to wasm
+against `grasm run`, the native build and the Rust playground's module, every
+module validated twice), `encodetest_wasm` (the wasm encoder against
+`llvm-mc`), `fuzz_wasmmath` (the wasm C library's libm against the
+playground's) and `wasmcontrols` (§6.24), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
