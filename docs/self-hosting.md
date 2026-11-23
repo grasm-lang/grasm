@@ -7757,8 +7757,8 @@ function that takes the floor reserves a shadow frame at least as large as
 the native frame it will cost (its locals' count, by a rule measured on the
 `stack` fixtures under node's default stack), and the shadow stack's size
 is chosen so that its floor comes first. The depth each shape then reaches
-is measured, printed by the gate and recorded in docs/known-issues.md as a
-difference the clause allows (the Rust module: 173 calls and a trap). The
+is measured, printed by the gate and recorded in docs/known-issues.md (the
+Rust module: 173 calls and a trap). The
 three programs `wasmtest` sets aside for depth stay aside, for the same
 reason. The alternative: **(5b)** no floor, a RangeError as the Rust
 module's trap -- refused, a trap is what the clause rules out.
@@ -7892,7 +7892,10 @@ reverse any of them.
   node's default stack, never node's stack raised by a flag (a page cannot
   raise it); the depth reached measured, and if it falls short, recorded in
   docs/known-issues.md with the number as a difference the clause allows.
-  A recursion too deep is always the panic, never a trap.
+  A recursion too deep is always the panic, never a trap. (Corrected by the
+  coordinator on review: a depth short of 10,000 is not a difference the
+  clause allows -- it guarantees 10,000 -- so the shortfall is recorded as
+  an open S3 defect of `compiler/wasm32`.)
 - (6): accepted: `compiler/rtwasm` in Grasm, libm ported from musl and held
   bit for bit to the rustc-built probe of the Rust module's libm, and
   `env.grasm_entropy` with no fallback. What replaces the musl port in the

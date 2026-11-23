@@ -10,7 +10,9 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
-fifteen, two in the Rust-built playground module -- a recursion of 174
+sixteen, one in `compiler/wasm32`, which no release ships yet -- a module
+refusing a recursion at 3,390 to 9,368 calls, by shape, short of the 10,000
+[E-RECURSION-DEPTH] guarantees -- two in the Rust-built playground module -- a recursion of 174
 calls trapping and an `eprint`'s text lost -- the Rust interpreter aborting on an `==` of a value nested
 3,000,000 deep, both runtimes reporting a failed name lookup as `ENOENT`,
 four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
@@ -39,10 +41,7 @@ and one in `compiler/s3`, which no release ships yet, an object naming the
 directory it was compiled in. Two differences [E-RECURSION-DEPTH] allows
 between the Grasm command and the Rust one (§6.23): a recursion between the
 Rust interpreter's stack and 100,000 calls runs under the Grasm command, and
-one inside a task past 10,999 calls is refused by it. One more it allows in
-a program the Grasm backend compiles to wasm (§6.24): a recursion is refused
-at 3,390 to 10,089 calls, by shape, below the 10,000 the clause guarantees
-for most.
+one inside a task past 10,999 calls is refused by it.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
@@ -50,7 +49,14 @@ Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
 ## Found on 2026-11-22 by S8 part seven (the wasm32 backend)
 
 **A program compiled to wasm refuses a recursion below 10,000 calls --
-*a difference [E-RECURSION-DEPTH] allows, measured*.** A module the Grasm
+*open, S3 (the coordinator's), in `compiler/wasm32`, which no release ships
+yet*.** [E-RECURSION-DEPTH] guarantees at least 10,000 nested calls; five
+of the six shapes below stop short of it. The stop is the clause's panic and
+exit 101, never a trap or wrong output, which is why it is S3 and not S2;
+it blocks the wasm backend from being called conforming until it is fixed.
+This entry was first written as "a difference the clause allows", the
+coordinator's wording in decision (5), corrected on review: the clause
+allows a bound above 10,000 to differ, not one below it. A module the Grasm
 backend writes (`s3 --target wasm32`, docs/self-hosting.md §6.24) runs on the
 engine's own stack, which a page cannot enlarge (V8's 984 KB under node and
 in a browser), and a stack overflow there is a trap wasm cannot catch. So
