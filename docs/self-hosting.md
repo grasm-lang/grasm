@@ -7979,6 +7979,31 @@ owner's word. The seed is S9's.
 statement; `grasm-j`; the scheduler's cost per switch; a task's recursion
 bound of 10,999 calls (§6.23).
 
+## 7. Bootstrap and trust
+
+- **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
+  the stages after it (§6.14): stage 1 is the Grasm compiler --
+  `compiler/front`, `compiler/s3`, `compiler/link` and the runtime
+  `compiler/rt` -- built by stage 0 with Cranelift, the Rust runtime and the
+  system linker; stage 2 is that compiler built by stage 1 alone, on its own
+  runtime; stage 3 is built by stage 2, and `fixpoint` holds it to stage 2's
+  bytes. What stage 0 is did not change: it is the Rust `grasm` until the
+  cutover, and builds nothing of stage 2 but stage 1.
+- **After the cutover:** stage 0 is a pinned previous release, its SHA-256
+  in the repository. Policy as Go's: release 1.N builds with release
+  1.(N-1) or later, so any commit builds from a downloadable binary.
+- **Any platform, any commit (later):** a compressed wasm build of the
+  compiler, committed and runnable by any WASI runtime, as Zig does with
+  `zig1.wasm`. Zig then needs a C compiler to translate it. We do not,
+  because our own wasm backend writes the seed and a WASI runtime (Node,
+  Wasmtime, a browser) runs it. What the seed is, and why it is S9's,
+  is §6.24.
+- **Trusting trust:** diverse double-compiling against the archived Rust
+  implementation, run at the cutover and at every release thereafter that
+  the archive can still build.
+- **Reproducibility:** two independent builders produce identical bytes;
+  release archives list the commit, and their checksums are published.
+
 ## 8. Gates this adds
 
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
