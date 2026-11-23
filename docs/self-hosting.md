@@ -7871,6 +7871,53 @@ back as §7, word for word, with its "Any platform, any commit (later)"
 bullet pointing here and to S9, so that §4's and §10's references point at
 what they meant. The alternative: point them here.
 
+#### The coordinator's decisions
+
+Taken by the coordinator on 2026-11-22, on the note above; the owner may
+reverse any of them.
+
+- (1): accepted. Part seven builds (a) -- the backend, `compiler/rtwasm`
+  and the runtime compiled for wasm; part eight builds (b), the
+  playground; the seed is S9's.
+- (2): accepted: the core features of wasm 2.0 and exception handling in
+  its standard encoding (`try_table`, `throw`), used only to unwind an
+  `exit` or a panic to the export.
+- (3): (3a), wasm32 with the runtime's 64-bit layout, each address wrapped
+  at its access; the 1.154 of the loop of loads recorded as measured.
+  Memory64 (3b) declined for now, the plan saying wasm32, and left as a
+  later option.
+- (4): accepted as proposed; `spawn` measured on a fixture first and made
+  the same as the Rust module's.
+- (5): accepted. The aim is the clause's guaranteed 10,000 calls under
+  node's default stack, never node's stack raised by a flag (a page cannot
+  raise it); the depth reached measured, and if it falls short, recorded in
+  docs/known-issues.md with the number as a difference the clause allows.
+  A recursion too deep is always the panic, never a trap.
+- (6): accepted: `compiler/rtwasm` in Grasm, libm ported from musl and held
+  bit for bit to the rustc-built probe of the Rust module's libm, and
+  `env.grasm_entropy` with no fallback. What replaces the musl port in the
+  end is the plan's own correctly rounded libm in Grasm (§4's Math row,
+  §10's decision 2), which is not this part.
+- (7): accepted, one module per program; its cost per program measured and
+  reported.
+- (8): accepted: `s3 --target wasm32` only, in this part.
+- (9): accepted, for part eight; what becomes of an `eprint`'s text is part
+  eight's to decide.
+- (10): accepted.
+- (11): accepted, on the condition that the Python validator refuses every
+  bad module `wasmcontrols` plants, and that it cannot pass by checking
+  nothing: the count of function bodies it checked is asserted.
+- (12): accepted: §7 restored from `449f2676^` in a commit of its own,
+  whose message says `449f2676` deleted it without a word; then §4's and
+  §10's references checked to resolve.
+- On the gates, one addition: `wasmtest` sets aside every program that
+  names `par_map`, `par_filter` or `spawn`, which the Rust module runs;
+  `wasmsubset` does not inherit that blind spot. Those programs are held
+  too, to `grasm run` and, where the Rust module runs them, to the Rust
+  module, their counts reported apart; the floor of 508 stays. Removing the
+  blind spot from `wasmtest` itself, if done, is a gate change in a commit
+  of its own, its floor moving with it.
+
 #### How it is held
 
 - **`wasmsubset`**, new: every corpus program `wasmtest` compares -- the 508
