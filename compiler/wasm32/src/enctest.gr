@@ -1,0 +1,150 @@
+// The encoder's cases for `scripts/encodetest_wasm.sh` (docs/self-hosting.md
+// §6.24, decision (11)): every instruction form `body.gr` and the link write,
+// with immediates at and around each LEB128 width's edges, written by
+// `enc.gr`'s own functions and held to `llvm-mc -triple=wasm32 -show-encoding`
+// on the same instructions in its assembly syntax.
+//
+// Five forms are not here, because LLVM's assembler writes their index as a
+// relocation's padded five bytes, where a linked module has the plain
+// number: `call`, `call_indirect`, `global.get`, `global.set` and `throw`.
+// `try_table` is not here because llvm-mc 21.1.8 crashes printing it with
+// `-show-encoding`. Those six are held by V8's validation and the Python
+// validator, which decode every one in every module the gates build.
+import enc
+
+type WCases = {
+    form: [str],
+    hex: [str],
+    /// Assembly lines, `;`-separated, whose encodings concatenated are the
+    /// bytes.
+    asm: [str],
+}
+
+fn hex_of(b: bytes) -> str {
+    var s = str_builder()
+    for i in 0..b.len() {
+        let x = b.at(i)
+        if x < 16 {
+            s.push_str("0")
+        }
+        s.push_str(x.to_base(16))
+    }
+    s.to_str()
+}
+
+fn add(inout form: [str], inout hex: [str], inout asm: [str], f: str, b: ByteBuilder, a: str) {
+    form.push(f)
+    hex.push(hex_of(b.to_bytes()))
+    asm.push(a)
+}
+
+/// The plain instructions: opcode and LLVM's name.
+fn plain() -> ([i64], [str]) {
+    let ops = [
+        enc.OP_UNREACHABLE, enc.OP_RETURN, enc.OP_DROP, enc.OP_I32_EQZ, enc.OP_I32_LT_U, enc.OP_I64_EQZ, enc.OP_I64_EQ, enc.OP_I64_NE,
+        enc.OP_I64_LT_S, enc.OP_I64_LT_U, enc.OP_I64_GT_S, enc.OP_I64_GT_U, enc.OP_I64_LE_S, enc.OP_I64_LE_U, enc.OP_I64_GE_S, enc.OP_I64_GE_U,
+        enc.OP_F64_EQ, enc.OP_F64_NE, enc.OP_F64_LT, enc.OP_F64_GT, enc.OP_F64_LE, enc.OP_F64_GE, enc.OP_I32_ADD, enc.OP_I32_SUB, enc.OP_I32_AND,
+        enc.OP_I64_CLZ, enc.OP_I64_ADD, enc.OP_I64_SUB, enc.OP_I64_MUL, enc.OP_I64_DIV_S, enc.OP_I64_DIV_U, enc.OP_I64_REM_S, enc.OP_I64_REM_U,
+        enc.OP_I64_AND, enc.OP_I64_OR, enc.OP_I64_XOR, enc.OP_I64_SHL, enc.OP_I64_SHR_S, enc.OP_I64_SHR_U, enc.OP_I64_ROTR,
+        enc.OP_F64_ABS, enc.OP_F64_NEG, enc.OP_F64_CEIL, enc.OP_F64_FLOOR, enc.OP_F64_SQRT, enc.OP_F64_ADD, enc.OP_F64_SUB, enc.OP_F64_MUL, enc.OP_F64_DIV,
+        enc.OP_I32_WRAP_I64, enc.OP_I64_EXTEND_I32_S, enc.OP_I64_EXTEND_I32_U, enc.OP_F64_CONVERT_I64_S, enc.OP_F64_CONVERT_I64_U,
+        enc.OP_I64_REINTERPRET_F64, enc.OP_F64_REINTERPRET_I64, enc.OP_I64_EXTEND8_S, enc.OP_I64_EXTEND16_S, enc.OP_I64_EXTEND32_S,
+    ]
+    let names = [
+        "unreachable", "return", "drop", "i32.eqz", "i32.lt_u", "i64.eqz", "i64.eq", "i64.ne",
+        "i64.lt_s", "i64.lt_u", "i64.gt_s", "i64.gt_u", "i64.le_s", "i64.le_u", "i64.ge_s", "i64.ge_u",
+        "f64.eq", "f64.ne", "f64.lt", "f64.gt", "f64.le", "f64.ge", "i32.add", "i32.sub", "i32.and",
+        "i64.clz", "i64.add", "i64.sub", "i64.mul", "i64.div_s", "i64.div_u", "i64.rem_s", "i64.rem_u",
+        "i64.and", "i64.or", "i64.xor", "i64.shl", "i64.shr_s", "i64.shr_u", "i64.rotr",
+        "f64.abs", "f64.neg", "f64.ceil", "f64.floor", "f64.sqrt", "f64.add", "f64.sub", "f64.mul", "f64.div",
+        "i32.wrap_i64", "i64.extend_i32_s", "i64.extend_i32_u", "f64.convert_i64_s", "f64.convert_i64_u",
+        "i64.reinterpret_f64", "f64.reinterpret_i64", "i64.extend8_s", "i64.extend16_s", "i64.extend32_s",
+    ]
+    (ops, names)
+}
+
+pub fn cases() -> WCases {
+    var form: [str] = []
+    var hex: [str] = []
+    var asm: [str] = []
+    let (ops, names) = plain()
+    for k in 0..ops.len() {
+        var b = byte_builder()
+        enc.op(b, ops[k])
+        add(form, hex, asm, names[k], b, names[k])
+    }
+    let idxs = [0, 1, 63, 64, 127, 128, 255, 16383, 16384, 300000]
+    for x in idxs {
+        for (o, n) in [(enc.OP_LOCAL_GET, "local.get"), (enc.OP_LOCAL_SET, "local.set"), (enc.OP_LOCAL_TEE, "local.tee")] {
+            var b = byte_builder()
+            enc.op_idx(b, o, x)
+            add(form, hex, asm, n, b, "{n} {x}")
+        }
+    }
+    for d in [0, 1, 2, 63, 64, 127, 128, 1000] {
+        for (o, n) in [(enc.OP_BR, "br"), (enc.OP_BR_IF, "br_if")] {
+            var b = byte_builder()
+            enc.op_idx(b, o, d)
+            add(form, hex, asm, n, b, "{n} {d}")
+        }
+    }
+    let i32s = [0, 1, -1, 63, 64, -64, -65, 8191, 8192, -8192, -8193, 2147483647, -2147483648, 1024, 8388608]
+    for v in i32s {
+        var b = byte_builder()
+        enc.i32_const(b, v)
+        add(form, hex, asm, "i32.const", b, "i32.const {v}")
+    }
+    let i64s = [0, 1, -1, 63, 64, -64, -65, 4294967295, -4294967296, 9223372036854775807, -9223372036854775807 - 1, 255.shl(56), 1.shl(62), 3689348814741910323, 1085102592571150095]
+    for v in i64s {
+        var b = byte_builder()
+        enc.i64_const(b, v)
+        add(form, hex, asm, "i64.const", b, "i64.const {v}")
+    }
+    for (bits, text) in [(0, "0x0p0"), (4609434218613702656, "0x1.8p0"), (-4620693217682128896, "-0x1p-1"), (9218868437227405311, "0x1.fffffffffffffp1023"), (1, "0x0.0000000000001p-1022"), (4598175219545276416, "0x1p-2")] {
+        var b = byte_builder()
+        enc.f64_const(b, bits)
+        add(form, hex, asm, "f64.const", b, "f64.const {text}")
+    }
+    let loads = [(enc.OP_I32_LOAD, "i32.load", 2), (enc.OP_I64_LOAD, "i64.load", 3), (enc.OP_F64_LOAD, "f64.load", 3), (enc.OP_I64_LOAD8_S, "i64.load8_s", 0), (enc.OP_I64_LOAD8_U, "i64.load8_u", 0), (enc.OP_I64_LOAD16_S, "i64.load16_s", 1), (enc.OP_I64_LOAD16_U, "i64.load16_u", 1), (enc.OP_I64_LOAD32_S, "i64.load32_s", 2), (enc.OP_I64_LOAD32_U, "i64.load32_u", 2), (enc.OP_I32_STORE, "i32.store", 2), (enc.OP_I64_STORE, "i64.store", 3), (enc.OP_F64_STORE, "f64.store", 3), (enc.OP_I64_STORE8, "i64.store8", 0), (enc.OP_I64_STORE16, "i64.store16", 1), (enc.OP_I64_STORE32, "i64.store32", 2)]
+    for (o, n, al) in loads {
+        for off in [0, 8, 127, 128, 65536] {
+            var b = byte_builder()
+            enc.mem(b, o, al, off)
+            add(form, hex, asm, n, b, "{n} {off}")
+        }
+    }
+    for (bt, t) in [(enc.BT_EMPTY, ""), (enc.T_I64, " i64"), (enc.T_I32, " i32"), (enc.T_F64, " f64")] {
+        var b = byte_builder()
+        enc.open(b, enc.OP_BLOCK, bt)
+        enc.op(b, enc.OP_END)
+        add(form, hex, asm, "block", b, "block{t};end_block")
+        b = byte_builder()
+        enc.open(b, enc.OP_LOOP, bt)
+        enc.op(b, enc.OP_END)
+        add(form, hex, asm, "loop", b, "loop{t};end_loop")
+        b = byte_builder()
+        enc.open(b, enc.OP_IF, bt)
+        enc.op(b, enc.OP_ELSE)
+        enc.op(b, enc.OP_END)
+        add(form, hex, asm, "if", b, "if{t};else;end_if")
+    }
+    var b = byte_builder()
+    enc.memory_size(b)
+    add(form, hex, asm, "memory.size", b, "memory.size 0")
+    b = byte_builder()
+    enc.memory_grow(b)
+    add(form, hex, asm, "memory.grow", b, "memory.grow 0")
+    b = byte_builder()
+    enc.fc(b, enc.FC_MEMORY_COPY)
+    add(form, hex, asm, "memory.copy", b, "memory.copy 0, 0")
+    b = byte_builder()
+    enc.fc(b, enc.FC_MEMORY_FILL)
+    add(form, hex, asm, "memory.fill", b, "memory.fill 0")
+    b = byte_builder()
+    enc.fc(b, enc.FC_I64_TRUNC_SAT_F64_S)
+    add(form, hex, asm, "i64.trunc_sat_f64_s", b, "i64.trunc_sat_f64_s")
+    b = byte_builder()
+    enc.fc(b, enc.FC_I64_TRUNC_SAT_F64_U)
+    add(form, hex, asm, "i64.trunc_sat_f64_u", b, "i64.trunc_sat_f64_u")
+    WCases{ form: form, hex: hex, asm: asm }
+}

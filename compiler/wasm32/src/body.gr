@@ -1,0 +1,835 @@
+// One MIR function as a WebAssembly function body (docs/self-hosting.md
+// §6.24, decision (10)).
+//
+// Values. Every MIR value is a local of its class -- `i64` for an integer, an
+// address or a boxed value's pointer, `f64` for a double -- values whose
+// lives do not overlap sharing one (`locals.gr`), and the entry block's
+// parameters are the function's parameters. A block argument is a parallel
+// copy made on the operand stack: every source read, then every destination
+// written in the reverse order, which needs no temporary and cannot be
+// broken by a cycle. The engine allocates registers.
+//
+// Addresses. A word holds an address as the runtime's 64-bit layout keeps it
+// (decision (3)): the upper half zero, wrapped to `i32` where it is used.
+//
+// The frame. A function with `inout` slots keeps a frame on the shadow
+// stack in linear memory, whose pointer is global 0: `slotaddr` is an
+// address in it and `getsp` reads the pointer. The recursion floor
+// ([E-RECURSION-DEPTH]) is checked against that pointer, and the shadow
+// stack must reach the floor before the engine's own stack overflows -- a
+// stack overflow is a trap wasm cannot catch, and the clause allows a panic
+// only (decision (5)). So a function that can be a level of a recursion --
+// any that calls something -- also keeps a frame proportional to what the
+// engine's frame for it will be: `floor_scale`
+// hundredths of `8 * (parameters + locals) + 56` bytes, the engine's frame
+// as measured on V8 (§6.24), so that the shadow stack's budget of 6 MiB
+// below the floor's first asking (`compiler/rt/src/fiber.gr`) is spent when
+// the engine's 984 KB are nearly but not wholly spent.
+//
+// Control. The function's blocks are reducible (every corpus function was,
+// measured), and are structured by the dominator tree as Ramsey's "Beyond
+// Relooper" (ICFP 2022) does: a block reached by two or more forward edges
+// follows the end of a `block` those edges leave by `br`; a loop header
+// opens a `loop` its back edges branch to; a block reached by one forward
+// edge is written where that edge is taken. `structure.gr` finds the tree.
+import enc
+import structure
+import locals
+import mir.ir
+
+/// What the link resolved for one instruction (`Aux`): a call of a defined
+/// or imported function, an intrinsic, a constant, the leaf of a context
+/// switch.
+pub let A_NONE = 0
+/// A call of function `idx`, which answers `cls` (0 nothing, 1 `i64`, 2 `f64`).
+pub let A_FUNC = 1
+/// A call of an imported host function, `idx`, of signature `sig`.
+pub let A_IMPORT = 2
+/// An intrinsic of the C library's (`I_*`).
+pub let A_INTRINSIC = 3
+/// A constant `idx`: an address, a table slot, a type's index.
+pub let A_CONST = 4
+/// A context switch, which no wasm engine of this target can make: a call of
+/// function `idx` (the C library's `wasm_no_switch`), which panics.
+pub let A_NOSWITCH = 5
+
+pub let I_MEMORY_GROW = 1
+pub let I_MEMORY_SIZE = 2
+pub let I_THROW = 3
+pub let I_MEMCPY = 4
+pub let I_MEMSET = 5
+pub let I_HEAP_BASE = 6
+
+/// Per instruction of a function: what the link resolved.
+type Aux = {
+    kind: [i64],
+    idx: [i64],
+    cls: [i64],
+    sig: [str],
+}
+
+type BodyOpts = {
+    /// A recursive function's shadow frame, in hundredths of its engine
+    /// frame.
+    floor_scale: i64,
+}
+
+/// The class of a value: 1 `i64`, 2 `f64`.
+fn vcls(f: MirFn, v: i64) -> i64 {
+    if f.vfp[v] { 2 } else { 1 }
+}
+
+/// The function's result class: 0 none, 1 `i64`, 2 `f64`.
+pub fn result_class(f: MirFn) -> i64 {
+    if not f.returns {
+        return 0
+    }
+    for b in 0..ir.nblocks(f) {
+        if f.tk[b] == ir.M_RET and f.tv[b] >= 0 {
+            return vcls(f, f.tv[b])
+        }
+    }
+    1
+}
+
+/// The function's parameters' classes.
+pub fn param_classes(f: MirFn) -> [i64] {
+    var out: [i64] = []
+    for k in 0..f.bnp[0] {
+        out.push(vcls(f, f.bparams[f.bp0[0] + k]))
+    }
+    out
+}
+
+pub fn wasm_type(cls: i64) -> i64 {
+    if cls == 2 { enc.T_F64 } else if cls == 3 { enc.T_I32 } else { enc.T_I64 }
+}
+
+/// Whether a function can be a level of a recursion: it calls something.
+/// Every such frame keeps its share of the shadow stack, not only the frames
+/// that take the floor: a recursion through a function value has the
+/// runtime's frames (`map`'s, a value's entry) in every level too, and with
+/// those left out the engine's stack ran out first (measured, the `closure`
+/// fixture of `scripts/fixtures/wasmstack`). A leaf adds one frame at most.
+fn may_recurse(f: MirFn) -> bool {
+    if f.floor {
+        return true
+    }
+    for i in 0..f.op.len() {
+        let o = f.op[i]
+        if o == ir.M_CALL or o == ir.M_CALLRT or o == ir.M_CALLIND {
+            return true
+        }
+    }
+    false
+}
+
+/// The function's frame on the shadow stack, in bytes, a multiple of 16:
+/// its `inout` slots, or for a function that may recurse, at least its
+/// share of the floor's budget for `slots` parameters and locals.
+pub fn frame_size(f: MirFn, o: BodyOpts, slots: i64) -> i64 {
+    var n = 8 * f.nslots
+    if may_recurse(f) {
+        let r = (8 * slots + 56) * o.floor_scale / 100
+        if r > n {
+            n = r
+        }
+    }
+    (n + 15) / 16 * 16
+}
+
+/// The state of writing one body.
+type BState = {
+    /// Each value's local.
+    loc: [i64],
+    /// The frame pointer's local (`i32`), or -1.
+    fp: i64,
+    frame: i64,
+    rcls: i64,
+}
+
+fn get(inout b: ByteBuilder, s: BState, v: i64) {
+    enc.op_idx(b, enc.OP_LOCAL_GET, s.loc[v])
+}
+
+fn set(inout b: ByteBuilder, s: BState, v: i64) {
+    enc.op_idx(b, enc.OP_LOCAL_SET, s.loc[v])
+}
+
+/// The address in value `v`, as `i32`.
+fn addr(inout b: ByteBuilder, s: BState, v: i64) {
+    get(b, s, v)
+    enc.op(b, enc.OP_I32_WRAP_I64)
+}
+
+/// The whole body: local declarations, code, `end`.
+pub fn body(f: MirFn, aux: Aux, o: BodyOpts) -> bytes ! str {
+    let st = try structure.analyse(f)
+    let np = f.bnp[0]
+    let asg = locals.assign(f, st)
+    let loc = asg.loc
+    let ni = asg.ni
+    let nf = asg.nf
+    // The frame pointer is one local more when there is a frame at all.
+    let frame = frame_size(f, o, np + ni + nf + 1)
+    let fp = if frame > 0 { np + ni + nf } else { -1 }
+    let s = BState{ loc: loc, fp: fp, frame: frame, rcls: result_class(f) }
+    var b = byte_builder()
+    var groups = 0
+    if ni > 0 {
+        groups += 1
+    }
+    if nf > 0 {
+        groups += 1
+    }
+    if fp >= 0 {
+        groups += 1
+    }
+    enc.uleb(b, groups)
+    if ni > 0 {
+        enc.uleb(b, ni)
+        enc.byte(b, enc.T_I64)
+    }
+    if nf > 0 {
+        enc.uleb(b, nf)
+        enc.byte(b, enc.T_F64)
+    }
+    if fp >= 0 {
+        enc.uleb(b, 1)
+        enc.byte(b, enc.T_I32)
+    }
+    if frame > 0 {
+        enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
+        enc.i32_const(b, frame)
+        enc.op(b, enc.OP_I32_SUB)
+        enc.op_idx(b, enc.OP_LOCAL_TEE, fp)
+        enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+    }
+    var ctx: [i64] = []
+    try tree(f, st, s, aux, 0, ctx, b)
+    // Control never falls off the end: every path ends in a `return`, a
+    // branch or a trap, and this keeps the body's type whatever it answers.
+    enc.op(b, enc.OP_UNREACHABLE)
+    enc.op(b, enc.OP_END)
+    b.to_bytes()
+}
+
+// ----- structured control -----------------------------------------------------------
+// `ctx` is the stack of enclosing labels, innermost last: a block's number
+// for the `block` it follows or the `loop` it heads, -1 for an `if`.
+// `ctxk` would be redundant: a block is a loop's label exactly when the
+// branch to it is backward.
+
+fn tree(f: MirFn, st: Structure, s: BState, aux: Aux, x: i64, inout ctx: [i64], inout b: ByteBuilder) -> () ! str {
+    let ms = st.merge_kids[x]
+    if st.loop_head[x] {
+        enc.open(b, enc.OP_LOOP, enc.BT_EMPTY)
+        ctx.push(x)
+        try within(f, st, s, aux, x, ms, 0, ctx, b)
+        ctx.pop()
+        enc.op(b, enc.OP_END)
+    } else {
+        try within(f, st, s, aux, x, ms, 0, ctx, b)
+    }
+    ()
+}
+
+/// Block `x` inside a `block` for each of its merge children from `k` on
+/// (latest first, so the earliest is innermost), each child's tree after
+/// its block's end.
+fn within(f: MirFn, st: Structure, s: BState, aux: Aux, x: i64, ms: [i64], k: i64, inout ctx: [i64], inout b: ByteBuilder) -> () ! str {
+    if k == ms.len() {
+        try code(f, s, aux, x, b)
+        return try term(f, st, s, aux, x, ctx, b)
+    }
+    let y = ms[k]
+    enc.open(b, enc.OP_BLOCK, enc.BT_EMPTY)
+    ctx.push(y)
+    try within(f, st, s, aux, x, ms, k + 1, ctx, b)
+    ctx.pop()
+    enc.op(b, enc.OP_END)
+    try tree(f, st, s, aux, y, ctx, b)
+    ()
+}
+
+/// The depth of the label for block `t` in `ctx`.
+fn label(ctx: [i64], t: i64) -> i64 ! str {
+    var k = ctx.len() - 1
+    while k >= 0 {
+        if ctx[k] == t {
+            return ctx.len() - 1 - k
+        }
+        k -= 1
+    }
+    fail("no enclosing label for block {t}")
+}
+
+fn branch(f: MirFn, st: Structure, s: BState, aux: Aux, x: i64, t: i64, inout ctx: [i64], inout b: ByteBuilder) -> () ! str {
+    if st.order[t] <= st.order[x] or st.merge[t] {
+        enc.op_idx(b, enc.OP_BR, try label(ctx, t))
+        return ()
+    }
+    try tree(f, st, s, aux, t, ctx, b)
+}
+
+fn epilogue(inout b: ByteBuilder, s: BState) {
+    if s.frame > 0 {
+        enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+        enc.i32_const(b, s.frame)
+        enc.op(b, enc.OP_I32_ADD)
+        enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+    }
+}
+
+fn term(f: MirFn, st: Structure, s: BState, aux: Aux, x: i64, inout ctx: [i64], inout b: ByteBuilder) -> () ! str {
+    let k = f.tk[x]
+    if k == ir.M_RET {
+        epilogue(b, s)
+        if f.tv[x] >= 0 {
+            if s.rcls == 0 {
+                fail("a return of a value from a function that answers none")
+            }
+            get(b, s, f.tv[x])
+        } else if s.rcls != 0 {
+            // A function that answers a value, returning none: only on a
+            // path that cannot be taken.
+            enc.op(b, enc.OP_UNREACHABLE)
+            return ()
+        }
+        enc.op(b, enc.OP_RETURN)
+        return ()
+    }
+    if k == ir.M_TRAP {
+        enc.op(b, enc.OP_UNREACHABLE)
+        return ()
+    }
+    if k == ir.M_JUMP {
+        let t = f.tt[x]
+        if f.tan[x] != f.bnp[t] {
+            fail("a jump passes {f.tan[x]} arguments to a block of {f.bnp[t]}")
+        }
+        for q in 0..f.tan[x] {
+            get(b, s, f.targs[f.ta0[x] + q])
+        }
+        var q = f.tan[x] - 1
+        while q >= 0 {
+            set(b, s, f.bparams[f.bp0[t] + q])
+            q -= 1
+        }
+        return try branch(f, st, s, aux, x, t, ctx, b)
+    }
+    if k == ir.M_BRIF {
+        if f.tan[x] > 0 or f.fan[x] > 0 {
+            fail("a conditional branch passes arguments: its edges were not split")
+        }
+        get(b, s, f.tv[x])
+        enc.i64_const(b, 0)
+        enc.op(b, enc.OP_I64_NE)
+        enc.open(b, enc.OP_IF, enc.BT_EMPTY)
+        ctx.push(-1)
+        try branch(f, st, s, aux, x, f.tt[x], ctx, b)
+        enc.op(b, enc.OP_ELSE)
+        try branch(f, st, s, aux, x, f.tf[x], ctx, b)
+        ctx.pop()
+        enc.op(b, enc.OP_END)
+        return ()
+    }
+    fail("unknown terminator {k}")
+}
+
+// ----- instructions ----------------------------------------------------------------
+
+fn binop(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, o: i64) {
+    get(b, s, f.a[i])
+    get(b, s, f.b[i])
+    enc.op(b, o)
+    set(b, s, f.res[i])
+}
+
+fn unop(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, o: i64) {
+    get(b, s, f.a[i])
+    enc.op(b, o)
+    set(b, s, f.res[i])
+}
+
+/// `a & mask` into the result.
+fn masked(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, mask: i64) {
+    get(b, s, f.a[i])
+    enc.i64_const(b, mask)
+    enc.op(b, enc.OP_I64_AND)
+    set(b, s, f.res[i])
+}
+
+fn icmp_op(cc: i64) -> i64 ! str {
+    match cc {
+        0 -> enc.OP_I64_EQ
+        1 -> enc.OP_I64_NE
+        2 -> enc.OP_I64_LT_S
+        3 -> enc.OP_I64_LE_S
+        4 -> enc.OP_I64_GT_S
+        5 -> enc.OP_I64_GE_S
+        6 -> enc.OP_I64_LT_U
+        7 -> enc.OP_I64_LE_U
+        8 -> enc.OP_I64_GT_U
+        9 -> enc.OP_I64_GE_U
+        _ -> fail("unknown condition {cc}")
+    }
+}
+
+fn fcmp_op(cc: i64) -> i64 ! str {
+    match cc {
+        0 -> enc.OP_F64_EQ
+        1 -> enc.OP_F64_NE
+        2 -> enc.OP_F64_LT
+        3 -> enc.OP_F64_LE
+        4 -> enc.OP_F64_GT
+        5 -> enc.OP_F64_GE
+        _ -> fail("unknown condition {cc} on doubles")
+    }
+}
+
+/// The value on the stack, its `width` low bytes reversed into place:
+/// `bswap64` for 8, `bswap32` for 4, `bswap16` for 2, the rest zero. The
+/// value is in local `l`.
+fn bswap(inout b: ByteBuilder, l: i64, width: i64) {
+    // Byte k (from the low end) moves to byte width-1-k.
+    enc.i64_const(b, 0)
+    for k in 0..width {
+        let to = width - 1 - k
+        enc.op_idx(b, enc.OP_LOCAL_GET, l)
+        if k > to {
+            enc.i64_const(b, 8 * (k - to))
+            enc.op(b, enc.OP_I64_SHR_U)
+        } else if to > k {
+            enc.i64_const(b, 8 * (to - k))
+            enc.op(b, enc.OP_I64_SHL)
+        }
+        enc.i64_const(b, 255.shl(8 * to))
+        enc.op(b, enc.OP_I64_AND)
+        enc.op(b, enc.OP_I64_OR)
+    }
+}
+
+/// The bits of the word in local `l` in reverse order: the bytes reversed,
+/// then each byte's bits, by the three swaps of halves.
+fn rbit(inout b: ByteBuilder, l: i64, res: i64) {
+    bswap(b, l, 8)
+    enc.op_idx(b, enc.OP_LOCAL_SET, res)
+    let masks = [1085102592571150095, 3689348814741910323, 6148914691236517205]
+    let shifts = [4, 2, 1]
+    for k in 0..3 {
+        // ((x >> s) & m) | ((x & m) << s)
+        enc.op_idx(b, enc.OP_LOCAL_GET, res)
+        enc.i64_const(b, shifts[k])
+        enc.op(b, enc.OP_I64_SHR_U)
+        enc.i64_const(b, masks[k])
+        enc.op(b, enc.OP_I64_AND)
+        enc.op_idx(b, enc.OP_LOCAL_GET, res)
+        enc.i64_const(b, masks[k])
+        enc.op(b, enc.OP_I64_AND)
+        enc.i64_const(b, shifts[k])
+        enc.op(b, enc.OP_I64_SHL)
+        enc.op(b, enc.OP_I64_OR)
+        enc.op_idx(b, enc.OP_LOCAL_SET, res)
+    }
+}
+
+/// The load opcode, its alignment and the mask of a width's bytes.
+fn load_of(op: i64) -> (i64, i64) {
+    if op == ir.M_LOAD8U or op == ir.M_ALOAD8 {
+        (enc.OP_I64_LOAD8_U, 0)
+    } else if op == ir.M_LOAD8S {
+        (enc.OP_I64_LOAD8_S, 0)
+    } else if op == ir.M_LOAD16U or op == ir.M_ALOAD8 + 1 {
+        (enc.OP_I64_LOAD16_U, 1)
+    } else if op == ir.M_LOAD16S {
+        (enc.OP_I64_LOAD16_S, 1)
+    } else if op == ir.M_LOAD32U or op == ir.M_ALOAD8 + 2 {
+        (enc.OP_I64_LOAD32_U, 2)
+    } else if op == ir.M_LOAD32S {
+        (enc.OP_I64_LOAD32_S, 2)
+    } else {
+        (enc.OP_I64_LOAD, 3)
+    }
+}
+
+/// An atomic's width in bytes: its class's member `k` is 1, 2, 4 or 8 bytes.
+fn atomic_size(op: i64, base: i64) -> i64 {
+    let k = op - base
+    if k == 0 { 1 } else if k == 1 { 2 } else if k == 2 { 4 } else { 8 }
+}
+
+fn store_of(size: i64) -> (i64, i64) {
+    if size == 1 {
+        (enc.OP_I64_STORE8, 0)
+    } else if size == 2 {
+        (enc.OP_I64_STORE16, 1)
+    } else if size == 4 {
+        (enc.OP_I64_STORE32, 2)
+    } else {
+        (enc.OP_I64_STORE, 3)
+    }
+}
+
+fn load_sized(size: i64) -> (i64, i64) {
+    if size == 1 {
+        (enc.OP_I64_LOAD8_U, 0)
+    } else if size == 2 {
+        (enc.OP_I64_LOAD16_U, 1)
+    } else if size == 4 {
+        (enc.OP_I64_LOAD32_U, 2)
+    } else {
+        (enc.OP_I64_LOAD, 3)
+    }
+}
+
+fn size_mask(size: i64) -> i64 {
+    if size == 8 { -1 } else { 1.shl(8 * size) - 1 }
+}
+
+/// A call's arguments. The C library takes `open`'s and `fcntl`'s nine as
+/// they are passed (`compiler/rtwasm`), so nothing is left out.
+fn call_args(f: MirFn, i: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..f.can[i] {
+        out.push(f.cargs[f.ca0[i] + k])
+    }
+    out
+}
+
+/// The result of a call that answers class `cls` into the instruction's
+/// result, or dropped.
+fn call_result(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, cls: i64) -> () ! str {
+    if f.res[i] >= 0 {
+        if cls == 0 {
+            fail("a call's result is read, and the callee answers nothing")
+        }
+        set(b, s, f.res[i])
+    } else if cls != 0 {
+        enc.op(b, enc.OP_DROP)
+    }
+    ()
+}
+
+/// A call of an imported host function of signature `sig` (`"iip>i"`: `i`
+/// an `i32`, `f` an `f64`, `>` then the result, `-` for none), each word
+/// argument wrapped to `i32` and an `i32` result sign-extended.
+fn import_call(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, idx: i64, sig: str) -> () ! str {
+    let parts = sig.split(">")
+    let ps = parts[0]
+    let args = call_args(f, i)
+    if args.len() != ps.len() {
+        fail("a host function of signature {sig} called with {args.len()} arguments")
+    }
+    var k = 0
+    for c in ps.codes() {
+        get(b, s, args[k])
+        if c == 105 {
+            enc.op(b, enc.OP_I32_WRAP_I64)
+        }
+        k += 1
+    }
+    enc.op_idx(b, enc.OP_CALL, idx)
+    let r = parts[1]
+    if r == "i" {
+        enc.op(b, enc.OP_I64_EXTEND_I32_S)
+    }
+    try call_result(b, s, f, i, if r == "-" { 0 } else if r == "f" { 2 } else { 1 })
+}
+
+fn intrinsic(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, which: i64, heap_base: i64) -> () ! str {
+    let args = call_args(f, i)
+    if which == I_MEMORY_GROW {
+        get(b, s, args[0])
+        enc.op(b, enc.OP_I32_WRAP_I64)
+        enc.memory_grow(b)
+        enc.op(b, enc.OP_I64_EXTEND_I32_S)
+        return try call_result(b, s, f, i, 1)
+    }
+    if which == I_MEMORY_SIZE {
+        enc.memory_size(b)
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        return try call_result(b, s, f, i, 1)
+    }
+    if which == I_THROW {
+        get(b, s, args[0])
+        enc.op(b, enc.OP_I32_WRAP_I64)
+        enc.op_idx(b, enc.OP_THROW, 0)
+        return ()
+    }
+    if which == I_MEMCPY or which == I_MEMSET {
+        addr(b, s, args[0])
+        if which == I_MEMCPY {
+            addr(b, s, args[1])
+        } else {
+            get(b, s, args[1])
+            enc.op(b, enc.OP_I32_WRAP_I64)
+        }
+        get(b, s, args[2])
+        enc.op(b, enc.OP_I32_WRAP_I64)
+        enc.fc(b, if which == I_MEMCPY { enc.FC_MEMORY_COPY } else { enc.FC_MEMORY_FILL })
+        return try call_result(b, s, f, i, 0)
+    }
+    if which == I_HEAP_BASE {
+        enc.i64_const(b, heap_base)
+        return try call_result(b, s, f, i, 1)
+    }
+    fail("unknown intrinsic {which}")
+}
+
+fn code(f: MirFn, s: BState, aux: Aux, x: i64, inout b: ByteBuilder) -> () ! str {
+    for i in f.bi0[x]..(f.bi0[x] + f.bni[x]) {
+        try inst(f, s, aux, i, b)
+    }
+    ()
+}
+
+fn inst(f: MirFn, s: BState, aux: Aux, i: i64, inout b: ByteBuilder) -> () ! str {
+    let op = f.op[i]
+    if op == ir.M_ICONST {
+        enc.i64_const(b, f.imm[i])
+        set(b, s, f.res[i])
+    } else if op == ir.M_FCONST {
+        enc.f64_const(b, f.imm[i])
+        set(b, s, f.res[i])
+    } else if op == ir.M_ADD {
+        binop(b, s, f, i, enc.OP_I64_ADD)
+    } else if op == ir.M_SUB {
+        binop(b, s, f, i, enc.OP_I64_SUB)
+    } else if op == ir.M_MUL {
+        binop(b, s, f, i, enc.OP_I64_MUL)
+    } else if op == ir.M_SDIV {
+        // `i64.div_s` traps on the most negative number by -1, where
+        // [E-ARITH-INT] answers the number: by -1, the negation, which
+        // wraps.
+        get(b, s, f.b[i])
+        enc.i64_const(b, -1)
+        enc.op(b, enc.OP_I64_EQ)
+        enc.open(b, enc.OP_IF, enc.T_I64)
+        enc.i64_const(b, 0)
+        get(b, s, f.a[i])
+        enc.op(b, enc.OP_I64_SUB)
+        enc.op(b, enc.OP_ELSE)
+        get(b, s, f.a[i])
+        get(b, s, f.b[i])
+        enc.op(b, enc.OP_I64_DIV_S)
+        enc.op(b, enc.OP_END)
+        set(b, s, f.res[i])
+    } else if op == ir.M_UDIV {
+        binop(b, s, f, i, enc.OP_I64_DIV_U)
+    } else if op == ir.M_SREM {
+        // `i64.rem_s` of the most negative number by -1 is 0, as wanted.
+        binop(b, s, f, i, enc.OP_I64_REM_S)
+    } else if op == ir.M_UREM {
+        binop(b, s, f, i, enc.OP_I64_REM_U)
+    } else if op == ir.M_AND {
+        binop(b, s, f, i, enc.OP_I64_AND)
+    } else if op == ir.M_OR {
+        binop(b, s, f, i, enc.OP_I64_OR)
+    } else if op == ir.M_XOR {
+        binop(b, s, f, i, enc.OP_I64_XOR)
+    } else if op == ir.M_SHL {
+        binop(b, s, f, i, enc.OP_I64_SHL)
+    } else if op == ir.M_SSHR {
+        binop(b, s, f, i, enc.OP_I64_SHR_S)
+    } else if op == ir.M_USHR {
+        binop(b, s, f, i, enc.OP_I64_SHR_U)
+    } else if op == ir.M_ROTR {
+        binop(b, s, f, i, enc.OP_I64_ROTR)
+    } else if op == ir.M_NEG {
+        enc.i64_const(b, 0)
+        get(b, s, f.a[i])
+        enc.op(b, enc.OP_I64_SUB)
+        set(b, s, f.res[i])
+    } else if op == ir.M_NOT {
+        get(b, s, f.a[i])
+        enc.i64_const(b, -1)
+        enc.op(b, enc.OP_I64_XOR)
+        set(b, s, f.res[i])
+    } else if op == ir.M_SEXT8 {
+        unop(b, s, f, i, enc.OP_I64_EXTEND8_S)
+    } else if op == ir.M_SEXT16 {
+        unop(b, s, f, i, enc.OP_I64_EXTEND16_S)
+    } else if op == ir.M_SEXT32 {
+        unop(b, s, f, i, enc.OP_I64_EXTEND32_S)
+    } else if op == ir.M_UEXT8 {
+        masked(b, s, f, i, 255)
+    } else if op == ir.M_UEXT16 {
+        masked(b, s, f, i, 65535)
+    } else if op == ir.M_UEXT32 {
+        masked(b, s, f, i, 4294967295)
+    } else if op == ir.M_ICMP {
+        get(b, s, f.a[i])
+        get(b, s, f.b[i])
+        enc.op(b, try icmp_op(f.imm[i]))
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        set(b, s, f.res[i])
+    } else if op == ir.M_CLZ {
+        unop(b, s, f, i, enc.OP_I64_CLZ)
+    } else if op == ir.M_RBIT {
+        rbit(b, s.loc[f.a[i]], s.loc[f.res[i]])
+    } else if op == ir.M_BSWAP64 or op == ir.M_BSWAP32 or op == ir.M_BSWAP16 {
+        bswap(b, s.loc[f.a[i]], if op == ir.M_BSWAP64 { 8 } else if op == ir.M_BSWAP32 { 4 } else { 2 })
+        set(b, s, f.res[i])
+    } else if op == ir.M_LOAD or (op >= ir.M_LOAD8U and op <= ir.M_LOAD32S) {
+        let (o, al) = load_of(op)
+        addr(b, s, f.a[i])
+        enc.mem(b, o, al, 0)
+        set(b, s, f.res[i])
+    } else if op == ir.M_STORE or op == ir.M_STORE8 or op == ir.M_STORE16 or op == ir.M_STORE32 {
+        let size = if op == ir.M_STORE { 8 } else if op == ir.M_STORE8 { 1 } else if op == ir.M_STORE16 { 2 } else { 4 }
+        let (o, al) = store_of(size)
+        addr(b, s, f.a[i])
+        get(b, s, f.b[i])
+        enc.mem(b, o, al, 0)
+    } else if op == ir.M_FLOAD {
+        addr(b, s, f.a[i])
+        enc.mem(b, enc.OP_F64_LOAD, 3, 0)
+        set(b, s, f.res[i])
+    } else if op == ir.M_FSTORE {
+        addr(b, s, f.a[i])
+        get(b, s, f.b[i])
+        enc.mem(b, enc.OP_F64_STORE, 3, 0)
+    } else if op >= ir.M_ALOAD8 and op <= ir.M_ALOAD64 {
+        // One thread is all there is: an atomic is the plain access.
+        let (o, al) = load_sized(atomic_size(op, ir.M_ALOAD8))
+        addr(b, s, f.a[i])
+        enc.mem(b, o, al, 0)
+        set(b, s, f.res[i])
+    } else if op >= ir.M_ASTORE8 and op <= ir.M_ASTORE64 {
+        let (o, al) = store_of(atomic_size(op, ir.M_ASTORE8))
+        addr(b, s, f.a[i])
+        get(b, s, f.b[i])
+        enc.mem(b, o, al, 0)
+    } else if op >= ir.M_AADD8 and op <= ir.M_AADD64 {
+        let size = atomic_size(op, ir.M_AADD8)
+        let (lo, la) = load_sized(size)
+        let (so, sa) = store_of(size)
+        addr(b, s, f.a[i])
+        enc.mem(b, lo, la, 0)
+        set(b, s, f.res[i])
+        addr(b, s, f.a[i])
+        get(b, s, f.res[i])
+        get(b, s, f.b[i])
+        enc.op(b, enc.OP_I64_ADD)
+        enc.mem(b, so, sa, 0)
+    } else if op >= ir.M_ACAS8 and op <= ir.M_ACAS64 {
+        let size = atomic_size(op, ir.M_ACAS8)
+        let (lo, la) = load_sized(size)
+        let (so, sa) = store_of(size)
+        if f.can[i] < 1 {
+            fail("a compare-and-swap without its new value")
+        }
+        addr(b, s, f.a[i])
+        enc.mem(b, lo, la, 0)
+        set(b, s, f.res[i])
+        get(b, s, f.res[i])
+        get(b, s, f.b[i])
+        enc.i64_const(b, size_mask(size))
+        enc.op(b, enc.OP_I64_AND)
+        enc.op(b, enc.OP_I64_EQ)
+        enc.open(b, enc.OP_IF, enc.BT_EMPTY)
+        addr(b, s, f.a[i])
+        get(b, s, f.cargs[f.ca0[i]])
+        enc.mem(b, so, sa, 0)
+        enc.op(b, enc.OP_END)
+    } else if op == ir.M_FADD {
+        binop(b, s, f, i, enc.OP_F64_ADD)
+    } else if op == ir.M_FSUB {
+        binop(b, s, f, i, enc.OP_F64_SUB)
+    } else if op == ir.M_FMUL {
+        binop(b, s, f, i, enc.OP_F64_MUL)
+    } else if op == ir.M_FDIV {
+        binop(b, s, f, i, enc.OP_F64_DIV)
+    } else if op == ir.M_FNEG {
+        unop(b, s, f, i, enc.OP_F64_NEG)
+    } else if op == ir.M_FABS {
+        unop(b, s, f, i, enc.OP_F64_ABS)
+    } else if op == ir.M_FSQRT {
+        unop(b, s, f, i, enc.OP_F64_SQRT)
+    } else if op == ir.M_FFLOOR {
+        unop(b, s, f, i, enc.OP_F64_FLOOR)
+    } else if op == ir.M_FCEIL {
+        unop(b, s, f, i, enc.OP_F64_CEIL)
+    } else if op == ir.M_FCMP {
+        get(b, s, f.a[i])
+        get(b, s, f.b[i])
+        enc.op(b, try fcmp_op(f.imm[i]))
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        set(b, s, f.res[i])
+    } else if op == ir.M_SCVTF {
+        unop(b, s, f, i, enc.OP_F64_CONVERT_I64_S)
+    } else if op == ir.M_UCVTF {
+        unop(b, s, f, i, enc.OP_F64_CONVERT_I64_U)
+    } else if op == ir.M_FCVTZS or op == ir.M_FCVTZU {
+        get(b, s, f.a[i])
+        enc.fc(b, if op == ir.M_FCVTZS { enc.FC_I64_TRUNC_SAT_F64_S } else { enc.FC_I64_TRUNC_SAT_F64_U })
+        set(b, s, f.res[i])
+    } else if op == ir.M_FBITS {
+        unop(b, s, f, i, enc.OP_I64_REINTERPRET_F64)
+    } else if op == ir.M_FFROMBITS {
+        unop(b, s, f, i, enc.OP_F64_REINTERPRET_I64)
+    } else if op == ir.M_STRADDR or op == ir.M_DATAADDR or op == ir.M_CELLADDR or op == ir.M_FNADDR or op == ir.M_GOTADDR {
+        if aux.kind[i] != A_CONST {
+            fail("`{ir.op_name(op)}` the link did not resolve")
+        }
+        enc.i64_const(b, aux.idx[i])
+        set(b, s, f.res[i])
+    } else if op == ir.M_GETSP {
+        enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        set(b, s, f.res[i])
+    } else if op == ir.M_SLOTADDR {
+        if s.fp < 0 {
+            fail("a slot's address in a function with no frame")
+        }
+        enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        enc.i64_const(b, 8 * f.imm[i])
+        enc.op(b, enc.OP_I64_ADD)
+        set(b, s, f.res[i])
+    } else if op == ir.M_INC or op == ir.M_DEC {
+        if aux.kind[i] != A_FUNC {
+            fail("`{ir.op_name(op)}` the link did not resolve")
+        }
+        get(b, s, f.a[i])
+        enc.op_idx(b, enc.OP_CALL, aux.idx[i])
+        if aux.cls[i] != 0 {
+            enc.op(b, enc.OP_DROP)
+        }
+    } else if op == ir.M_CALL or op == ir.M_CALLRT {
+        let k = aux.kind[i]
+        if k == A_FUNC {
+            for v in call_args(f, i) {
+                get(b, s, v)
+            }
+            enc.op_idx(b, enc.OP_CALL, aux.idx[i])
+            try call_result(b, s, f, i, aux.cls[i])
+        } else if k == A_IMPORT {
+            try import_call(b, s, f, i, aux.idx[i], aux.sig[i])
+        } else if k == A_INTRINSIC {
+            try intrinsic(b, s, f, i, aux.idx[i], aux.cls[i])
+        } else if k == A_CONST {
+            enc.i64_const(b, aux.idx[i])
+            try call_result(b, s, f, i, 1)
+        } else if k == A_NOSWITCH {
+            enc.op_idx(b, enc.OP_CALL, aux.idx[i])
+            enc.op(b, enc.OP_UNREACHABLE)
+        } else {
+            fail("a call the link did not resolve")
+        }
+    } else if op == ir.M_CALLIND {
+        if aux.kind[i] != A_CONST {
+            fail("an indirect call whose type the link did not resolve")
+        }
+        for v in call_args(f, i) {
+            get(b, s, v)
+        }
+        addr(b, s, f.a[i])
+        enc.call_indirect(b, aux.idx[i])
+        try call_result(b, s, f, i, aux.cls[i])
+    } else {
+        fail("no selection for `{ir.op_name(op)}`")
+    }
+    ()
+}

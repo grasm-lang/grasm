@@ -1,0 +1,20 @@
+// `wasmsubset`'s refusals (decision (6)): files and directories fail as the
+// Rust playground's module fails them, with its words.
+fn main() / {io} {
+    match read_file("/etc/hosts") {
+        Ok(t) -> print("read {t.len()}")
+        Err(e) -> print("read_file: {e}")
+    }
+    match write_file("/tmp/grasm-wasm-refusal", "x") {
+        Ok(_) -> print("wrote")
+        Err(e) -> print("write_file: {e}")
+    }
+    match list_dir("/") {
+        Ok(n) -> print("listed")
+        Err(e) -> print("list_dir: {e}")
+    }
+    match random_bytes(4) {
+        Ok(b) -> print("random {b.len()}")
+        Err(e) -> print("random_bytes: {e}")
+    }
+}

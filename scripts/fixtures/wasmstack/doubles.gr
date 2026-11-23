@@ -1,0 +1,15 @@
+// `wasmsubset`'s stack: a recursion of doubles.
+fn f(n: i64, x: f64) -> f64 {
+    if n == 0 {
+        return x
+    }
+    let a = x * 1.5
+    let b = a + 2.25
+    let c = f(n - 1, b / 3.0)
+    c * 0.0 + n.as_f64()
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{f(n, 1.0).as_i64()}")
+}

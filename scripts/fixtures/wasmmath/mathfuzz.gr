@@ -1,0 +1,129 @@
+// The wasm C library's libm (`compiler/rtwasm/src/math.gr`) on seeded
+// arguments, for `scripts/fuzz_wasmmath.sh`: compiled by `s3 --target
+// wasm32`, it calls each function by its C name -- the link binds the
+// program's `extern fn sin` to the library's `sin` -- and prints, one line
+// a call, the function, its arguments' bits and its answer's bits. The gate
+// gives the same arguments to the Rust playground's own libm (a probe module
+// rustc builds) and compares the bits.
+//
+//     mathfuzz <seed> <calls per function>
+//
+// Arguments are drawn from a SplitMix64 stream: a quarter any 64 bits at all
+// (NaNs, infinities, subnormals, both zeros), the rest a double of a random
+// exponent in the range where the function does its work, either sign.
+
+extern fn sin(x: f64) -> f64
+extern fn cos(x: f64) -> f64
+extern fn tan(x: f64) -> f64
+extern fn exp(x: f64) -> f64
+extern fn log(x: f64) -> f64
+extern fn log2(x: f64) -> f64
+extern fn log10(x: f64) -> f64
+extern fn pow(x: f64, y: f64) -> f64
+extern fn asin(x: f64) -> f64
+extern fn acos(x: f64) -> f64
+extern fn atan(x: f64) -> f64
+extern fn atan2(y: f64, x: f64) -> f64
+extern fn sinh(x: f64) -> f64
+extern fn cosh(x: f64) -> f64
+extern fn tanh(x: f64) -> f64
+extern fn cbrt(x: f64) -> f64
+extern fn hypot(x: f64, y: f64) -> f64
+extern fn fmod(x: f64, y: f64) -> f64
+extern fn round(x: f64) -> f64
+extern fn fmin(x: f64, y: f64) -> f64
+extern fn fmax(x: f64, y: f64) -> f64
+extern fn floor(x: f64) -> f64
+extern fn ceil(x: f64) -> f64
+extern fn sqrt(x: f64) -> f64
+
+fn mix(s: u64) -> u64 {
+    let m1: u64 = 13787848793156543929
+    let m2: u64 = 10723151780598845931
+    var z = s
+    z = (z.bit_xor(z.ushr(30))) * m1
+    z = (z.bit_xor(z.ushr(27))) * m2
+    z.bit_xor(z.ushr(31))
+}
+
+/// The next argument: any bits a quarter of the time, else a double whose
+/// exponent is uniform over `lo..hi` (unbiased), sign either way.
+fn arg(inout s: u64, lo: i64, hi: i64) -> f64 {
+    let golden: u64 = 11400714819323198485
+    s = s + golden
+    let r = mix(s)
+    if r.bit_and(3.as_u64()) == 0.as_u64() {
+        return r.as_i64().from_bits()
+    }
+    s = s + golden
+    let m = mix(s)
+    let e = lo + (m.ushr(53).as_i64() % (hi - lo))
+    let bits = (e + 1023).shl(52).bit_or(m.as_i64().bit_and(4503599627370495)).bit_or(r.as_i64().bit_and(1.shl(63)))
+    bits.from_bits()
+}
+
+fn line(name: str, x: f64, y: f64, r: f64) {
+    print("{name} {x.to_bits()} {y.to_bits()} {r.to_bits()}")
+}
+
+fn main() / {io, unsafe} {
+    let a = args()
+    var s = (a[0].parse_int() ?? 1).as_u64()
+    let n = a[1].parse_int() ?? 1000
+    for k in 0..n {
+        var x = arg(s, -30, 30)
+        line("sin", x, 0.0, unsafe { sin(x) })
+        x = arg(s, -30, 30)
+        line("cos", x, 0.0, unsafe { cos(x) })
+        x = arg(s, -30, 30)
+        line("tan", x, 0.0, unsafe { tan(x) })
+        x = arg(s, -10, 10)
+        line("exp", x, 0.0, unsafe { exp(x) })
+        x = arg(s, -1022, 1023)
+        line("log", x, 0.0, unsafe { log(x) })
+        x = arg(s, -1022, 1023)
+        line("log2", x, 0.0, unsafe { log2(x) })
+        x = arg(s, -1022, 1023)
+        line("log10", x, 0.0, unsafe { log10(x) })
+        x = arg(s, -8, 8)
+        var y = arg(s, -6, 8)
+        line("pow", x, y, unsafe { pow(x, y) })
+        x = arg(s, -30, 1)
+        line("asin", x, 0.0, unsafe { asin(x) })
+        x = arg(s, -30, 1)
+        line("acos", x, 0.0, unsafe { acos(x) })
+        x = arg(s, -40, 40)
+        line("atan", x, 0.0, unsafe { atan(x) })
+        x = arg(s, -40, 40)
+        y = arg(s, -40, 40)
+        line("atan2", x, y, unsafe { atan2(x, y) })
+        x = arg(s, -30, 10)
+        line("sinh", x, 0.0, unsafe { sinh(x) })
+        x = arg(s, -30, 10)
+        line("cosh", x, 0.0, unsafe { cosh(x) })
+        x = arg(s, -30, 6)
+        line("tanh", x, 0.0, unsafe { tanh(x) })
+        x = arg(s, -1022, 1023)
+        line("cbrt", x, 0.0, unsafe { cbrt(x) })
+        x = arg(s, -1022, 1023)
+        y = arg(s, -1022, 1023)
+        line("hypot", x, y, unsafe { hypot(x, y) })
+        x = arg(s, -60, 60)
+        y = arg(s, -60, 60)
+        line("fmod", x, y, unsafe { fmod(x, y) })
+        x = arg(s, -4, 60)
+        line("round", x, 0.0, unsafe { round(x) })
+        x = arg(s, -10, 10)
+        y = arg(s, -10, 10)
+        line("fmin", x, y, unsafe { fmin(x, y) })
+        x = arg(s, -10, 10)
+        y = arg(s, -10, 10)
+        line("fmax", x, y, unsafe { fmax(x, y) })
+        x = arg(s, -4, 60)
+        line("floor", x, 0.0, unsafe { floor(x) })
+        x = arg(s, -4, 60)
+        line("ceil", x, 0.0, unsafe { ceil(x) })
+        x = arg(s, -1022, 1023)
+        line("sqrt", x, 0.0, unsafe { sqrt(x) })
+    }
+}

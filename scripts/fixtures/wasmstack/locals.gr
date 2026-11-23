@@ -1,0 +1,20 @@
+// `wasmsubset`'s stack: a recursion with many values live across its call.
+fn d(n: i64, a: i64, b: i64, c: i64) -> i64 {
+    if n == 0 {
+        return a + b + c
+    }
+    let x = a * 3 + 1
+    let y = b * 5 + 2
+    let z = c * 7 + 3
+    let w = x + y * z
+    let r = d(n - 1, x % 1000, y % 1000, z % 1000)
+    if r < 0 {
+        return w
+    }
+    r - r + n
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{d(n, 1, 2, 3)}")
+}

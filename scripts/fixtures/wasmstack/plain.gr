@@ -1,0 +1,14 @@
+// `wasmsubset`'s stack (docs/self-hosting.md §6.24, decision (5)): a plain
+// recursion `n` deep, its argument the program's first; past any depth the
+// runtime's panic, never the engine's own stack overflow.
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{depth(n)}")
+}

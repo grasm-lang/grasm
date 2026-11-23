@@ -1,0 +1,317 @@
+// Values shared among locals by liveness (docs/self-hosting.md §6.24,
+// decision (10)): V8 refuses a function of more than 50,000 locals, and
+// `compiler/s3` and `compiler/link` each have a function of more than
+// 128,000 values (measured); and an engine's frame holds every local, so the
+// fewer there are the deeper a recursion goes on the engine's own stack.
+//
+// The blocks are laid out in reverse postorder, each with a position for its
+// start, three per instruction -- its operands read, its result written, and
+// the operands a compare-and-swap or a fetch-add reads again after it has
+// written its result -- and one for its terminator, whose block arguments
+// are read there and written one past it. Liveness is the usual backward
+// dataflow over the blocks; each value's span runs from the first position
+// it is live or written to the last it is read or live out of a block, and a
+// block argument's includes the end of every block that jumps with it. Two
+// values whose spans do not overlap may share a local of their class; the
+// spans are assigned in order of their starts, each taking a local the last
+// span of its class has finished with. The entry block's parameters keep
+// their own locals, the function's parameters.
+import structure
+import mir.ir
+
+type Assign = {
+    /// Each value's local.
+    loc: [i64],
+    /// The `i64` and `f64` locals beyond the parameters.
+    ni: i64,
+    nf: i64,
+}
+
+fn late_reads(op: i64) -> bool {
+    (op >= ir.M_AADD8 and op <= ir.M_AADD64) or (op >= ir.M_ACAS8 and op <= ir.M_ACAS64)
+}
+
+fn bit_set(inout s: [i64], v: i64) {
+    s[v / 64] = s[v / 64].bit_or(1.shl(v % 64))
+}
+
+fn bit_has(s: [i64], v: i64) -> bool {
+    s[v / 64].ushr(v % 64).bit_and(1) != 0
+}
+
+pub fn assign(f: MirFn, st: Structure) -> Assign {
+    let nv = f.nvals
+    let nb = ir.nblocks(f)
+    let words = (nv + 63) / 64
+    // Positions.
+    var bstart: [i64] = []
+    var bend: [i64] = []
+    for b in 0..nb {
+        bstart.push(-1)
+        bend.push(-1)
+    }
+    var rpo: [i64] = []
+    for b in 0..nb {
+        rpo.push(-1)
+    }
+    var nr = 0
+    for b in 0..nb {
+        if st.order[b] >= 0 {
+            rpo[st.order[b]] = b
+            nr += 1
+        }
+    }
+    var pos = 0
+    for r in 0..nr {
+        let b = rpo[r]
+        bstart[b] = pos
+        pos += 1 + 3 * f.bni[b]
+        bend[b] = pos
+        pos += 2
+    }
+    // Per block: what it reads before writing, and what it writes.
+    var use_s: [[i64]] = []
+    var def_s: [[i64]] = []
+    for b in 0..nb {
+        var u: [i64] = []
+        var d: [i64] = []
+        for w in 0..words {
+            u.push(0)
+            d.push(0)
+        }
+        if st.order[b] >= 0 {
+            for k in 0..f.bnp[b] {
+                bit_set(d, f.bparams[f.bp0[b] + k])
+            }
+            for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+                for v in reads(f, i) {
+                    if not bit_has(d, v) {
+                        bit_set(u, v)
+                    }
+                }
+                if f.res[i] >= 0 {
+                    bit_set(d, f.res[i])
+                }
+            }
+            for v in term_reads(f, b) {
+                if not bit_has(d, v) {
+                    bit_set(u, v)
+                }
+            }
+        }
+        use_s.push(u)
+        def_s.push(d)
+    }
+    var live_in: [[i64]] = []
+    var live_out: [[i64]] = []
+    for b in 0..nb {
+        live_in.push(use_s[b])
+        var z: [i64] = []
+        for w in 0..words {
+            z.push(0)
+        }
+        live_out.push(z)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var r = nr - 1
+        while r >= 0 {
+            let b = rpo[r]
+            var out: [i64] = []
+            for w in 0..words {
+                out.push(0)
+            }
+            for t in succs(f, b) {
+                // A successor's parameters are written on the edge, not live
+                // into it.
+                let li = live_in[t]
+                for w in 0..words {
+                    out[w] = out[w].bit_or(li[w])
+                }
+                for k in 0..f.bnp[t] {
+                    let v = f.bparams[f.bp0[t] + k]
+                    out[v / 64] = out[v / 64].bit_and(1.shl(v % 64).bit_xor(-1))
+                }
+            }
+            var inn: [i64] = []
+            let u = use_s[b]
+            let d = def_s[b]
+            for w in 0..words {
+                inn.push(u[w].bit_or(out[w].bit_and(d[w].bit_xor(-1))))
+            }
+            for w in 0..words {
+                if inn[w] != live_in[b][w] or out[w] != live_out[b][w] {
+                    changed = true
+                }
+            }
+            live_in[b] = inn
+            live_out[b] = out
+            r -= 1
+        }
+    }
+    // Spans.
+    var lo: [i64] = []
+    var hi: [i64] = []
+    for v in 0..nv {
+        lo.push(-1)
+        hi.push(-1)
+    }
+    for r in 0..nr {
+        let b = rpo[r]
+        for k in 0..f.bnp[b] {
+            touch(lo, hi, f.bparams[f.bp0[b] + k], bstart[b])
+        }
+        for v in 0..nv {
+            if bit_has(live_in[b], v) {
+                touch(lo, hi, v, bstart[b])
+            }
+            if bit_has(live_out[b], v) {
+                touch(lo, hi, v, bend[b])
+            }
+        }
+        var p = bstart[b] + 1
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            for v in reads(f, i) {
+                touch(lo, hi, v, if late_reads(f.op[i]) { p + 2 } else { p })
+            }
+            if f.res[i] >= 0 {
+                touch(lo, hi, f.res[i], p + 1)
+            }
+            p += 3
+        }
+        for v in term_reads(f, b) {
+            touch(lo, hi, v, bend[b])
+        }
+        if f.tk[b] == ir.M_JUMP {
+            let t = f.tt[b]
+            for k in 0..f.bnp[t] {
+                touch(lo, hi, f.bparams[f.bp0[t] + k], bend[b] + 1)
+            }
+        }
+    }
+    // Assignment, in order of the spans' starts: a bucket per position.
+    var loc: [i64] = []
+    for v in 0..nv {
+        loc.push(-1)
+    }
+    let np = f.bnp[0]
+    for k in 0..np {
+        loc[f.bparams[f.bp0[0] + k]] = k
+    }
+    var starts: [[i64]] = []
+    for q in 0..(pos + 2) {
+        starts.push([])
+    }
+    for v in 0..nv {
+        if loc[v] < 0 and lo[v] >= 0 {
+            starts[lo[v]].push(v)
+        }
+    }
+    // Per class: the locals and when each falls free.
+    var free_at_i: [i64] = []
+    var free_at_f: [i64] = []
+    for q in 0..starts.len() {
+        for v in starts[q] {
+            if f.vfp[v] {
+                loc[v] = take(free_at_f, q, hi[v])
+            } else {
+                loc[v] = take(free_at_i, q, hi[v])
+            }
+        }
+    }
+    var ni = free_at_i.len()
+    var nf = free_at_f.len()
+    // A value never live -- written and never read, or in a block never
+    // reached -- takes the first local of its class, which is made to exist.
+    for v in 0..nv {
+        if loc[v] < 0 {
+            loc[v] = 0
+            if f.vfp[v] {
+                if nf == 0 {
+                    nf = 1
+                }
+            } else if ni == 0 {
+                ni = 1
+            }
+        }
+    }
+    var params: [bool] = []
+    for v in 0..nv {
+        params.push(false)
+    }
+    for k in 0..np {
+        params[f.bparams[f.bp0[0] + k]] = true
+    }
+    for v in 0..nv {
+        if not params[v] {
+            loc[v] = if f.vfp[v] { np + ni + loc[v] } else { np + loc[v] }
+        }
+    }
+    Assign{ loc: loc, ni: ni, nf: nf }
+}
+
+/// The first local of a class that is free at position `q`, made busy
+/// until `until`.
+fn take(inout free_at: [i64], q: i64, until: i64) -> i64 {
+    for k in 0..free_at.len() {
+        if free_at[k] < q {
+            free_at[k] = until
+            return k
+        }
+    }
+    free_at.push(until)
+    free_at.len() - 1
+}
+
+fn touch(inout lo: [i64], inout hi: [i64], v: i64, p: i64) {
+    if lo[v] < 0 or p < lo[v] {
+        lo[v] = p
+    }
+    if p > hi[v] {
+        hi[v] = p
+    }
+}
+
+fn succs(f: MirFn, b: i64) -> [i64] {
+    let k = f.tk[b]
+    if k == ir.M_JUMP {
+        return [f.tt[b]]
+    }
+    if k == ir.M_BRIF {
+        return [f.tt[b], f.tf[b]]
+    }
+    []
+}
+
+/// The values instruction `i` reads.
+fn reads(f: MirFn, i: i64) -> [i64] {
+    var out: [i64] = []
+    let n = ir.nreads(f.op[i])
+    if n >= 1 and f.a[i] >= 0 {
+        out.push(f.a[i])
+    }
+    if n >= 2 and f.b[i] >= 0 {
+        out.push(f.b[i])
+    }
+    for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+        out.push(f.cargs[j])
+    }
+    out
+}
+
+/// The values a block's terminator reads: its condition, its value, its
+/// jump's arguments.
+fn term_reads(f: MirFn, b: i64) -> [i64] {
+    var out: [i64] = []
+    if f.tv[b] >= 0 {
+        out.push(f.tv[b])
+    }
+    for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+        out.push(f.targs[j])
+    }
+    for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+        out.push(f.targs[j])
+    }
+    out
+}

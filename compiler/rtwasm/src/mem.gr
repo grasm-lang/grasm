@@ -1,0 +1,274 @@
+// Memory: `malloc` and its family over pages `memory.grow` adds, and the
+// byte functions.
+//
+// Every block has a 16-byte header below the address it is given: its size
+// class, and for a block `posix_memalign` aligned past 16, -1 and the block
+// it was cut from. A class holds blocks of 16 to 1,024 bytes in steps of 16
+// (classes 0 to 63), then the powers of two from 2,048 (64 on); a freed
+// block goes to the head of its class's list, its first word the next, and
+// is taken from there first. Memory is never given back: wasm cannot.
+
+extern fn __wasm_memory_grow(pages: i64) -> i64
+extern fn __wasm_memory_size() -> i64
+extern fn __wasm_memcpy(dst: addr, src: addr, n: i64)
+extern fn __wasm_memset(p: addr, c: i64, n: i64)
+extern fn __wasm_heap_base() -> i64
+
+/// The first unused address, and the end of the memory, 0 until the first
+/// allocation; the classes' list heads (a table of `NCLASSES` words).
+process_local TOP: i64
+process_local END: i64
+process_local HEADS: i64
+
+let NCLASSES = 96
+let PAGE = 65536
+
+/// The class of a block of `total` bytes, header included.
+fn class_of(total: i64) -> i64 {
+    if total <= 1024 {
+        return (total + 15) / 16 - 1
+    }
+    var c = 64
+    var size = 2048
+    while size < total {
+        size = size * 2
+        c += 1
+    }
+    c
+}
+
+fn class_size(c: i64) -> i64 {
+    if c < 64 {
+        return 16 * (c + 1)
+    }
+    2048.shl(c - 64)
+}
+
+/// `n` bytes at the top of the heap, the memory grown to hold them; 0 when
+/// it cannot be.
+fn carve(n: i64) -> i64 {
+    unsafe {
+        var top = mem_process(TOP).atomic_load_i64(Acquire)
+        var end = mem_process(END).atomic_load_i64(Acquire)
+        if top == 0 {
+            top = (__wasm_heap_base() + 15) / 16 * 16
+            end = __wasm_memory_size() * PAGE
+            mem_process(END).atomic_store_i64(end, Release)
+        }
+        if top + n > end {
+            let pages = (top + n - end + PAGE - 1) / PAGE
+            if __wasm_memory_grow(pages) < 0 {
+                mem_process(TOP).atomic_store_i64(top, Release)
+                return 0
+            }
+            end = end + pages * PAGE
+            mem_process(END).atomic_store_i64(end, Release)
+        }
+        mem_process(TOP).atomic_store_i64(top + n, Release)
+        top
+    }
+}
+
+/// The list heads' table, made on first use.
+fn heads() -> addr {
+    unsafe {
+        let h = mem_process(HEADS).atomic_load_i64(Acquire)
+        if h != 0 {
+            return mem_addr(h)
+        }
+        let t = carve(8 * NCLASSES)
+        __wasm_memset(mem_addr(t), 0, 8 * NCLASSES)
+        mem_process(HEADS).atomic_store_i64(t, Release)
+        mem_addr(t)
+    }
+}
+
+export fn malloc(n: i64) -> addr {
+    unsafe {
+        if n < 0 or n > 2147483648 {
+            return mem_addr(0)
+        }
+        let c = class_of(n + 16)
+        if c >= NCLASSES {
+            return mem_addr(0)
+        }
+        let h = heads().offset(8 * c)
+        let free = h.load_i64()
+        var block = 0
+        if free != 0 {
+            h.store_i64(mem_addr(free).offset(16).load_i64())
+            block = free
+        } else {
+            block = carve(class_size(c))
+            if block == 0 {
+                return mem_addr(0)
+            }
+        }
+        mem_addr(block).store_i64(c)
+        mem_addr(block).offset(8).store_i64(n)
+        mem_addr(block + 16)
+    }
+}
+
+export fn free(p: addr) {
+    unsafe {
+        if p.as_i64() == 0 {
+            return
+        }
+        let block = p.offset(-16)
+        let c = block.load_i64()
+        if c == -1 {
+            free(mem_addr(block.offset(8).load_i64()))
+            return
+        }
+        let h = heads().offset(8 * c)
+        block.offset(16).store_i64(h.load_i64())
+        h.store_i64(block.as_i64())
+    }
+}
+
+/// `malloc` and `free` for the library's own use (an `export fn` is the C
+/// symbol, not a module's function).
+pub fn take(n: i64) -> addr {
+    malloc(n)
+}
+
+pub fn give(p: addr) {
+    free(p)
+}
+
+export fn calloc(n: i64, size: i64) -> addr {
+    unsafe {
+        let total = n * size
+        let p = malloc(total)
+        if p.as_i64() != 0 {
+            __wasm_memset(p, 0, total)
+        }
+        p
+    }
+}
+
+/// What the block at `p` can hold.
+fn capacity(p: addr) -> i64 {
+    unsafe {
+        let c = p.offset(-16).load_i64()
+        if c == -1 {
+            return p.offset(-8).load_i64()
+        }
+        class_size(c) - 16
+    }
+}
+
+export fn realloc(p: addr, n: i64) -> addr {
+    unsafe {
+        if p.as_i64() == 0 {
+            return malloc(n)
+        }
+        let cap = capacity(p)
+        if n <= cap and p.offset(-16).load_i64() != -1 {
+            p.offset(-8).store_i64(n)
+            return p
+        }
+        let q = malloc(n)
+        if q.as_i64() == 0 {
+            return q
+        }
+        __wasm_memcpy(q, p, if n < cap { n } else { cap })
+        free(p)
+        q
+    }
+}
+
+/// `size` bytes at a multiple of `align` into `*out`: 0, or 12 (`ENOMEM`).
+export fn posix_memalign(out: addr, align: i64, size: i64) -> i32 {
+    unsafe {
+        if align <= 16 {
+            let p = malloc(size)
+            out.store_i64(p.as_i64())
+            return if p.as_i64() == 0 { 12.as_i32() } else { 0.as_i32() }
+        }
+        let raw = malloc(size + align + 16)
+        if raw.as_i64() == 0 {
+            return 12.as_i32()
+        }
+        let at = (raw.as_i64() + 16 + align - 1) / align * align
+        mem_addr(at - 16).store_i64(-1)
+        mem_addr(at - 8).store_i64(raw.as_i64())
+        out.store_i64(at)
+        0.as_i32()
+    }
+}
+
+/// Private anonymous memory, zeroed: the only kind the runtime maps (its
+/// fibers' stacks, which a wasm32 program never starts).
+export fn mmap(a: addr, len: i64, prot: i32, flags: i32, fd: i32, off: i64) -> addr {
+    unsafe {
+        let out = malloc(8)
+        if posix_memalign(out, 16384, len) != 0 {
+            free(out)
+            return mem_addr(-1)
+        }
+        let p = mem_addr(out.load_i64())
+        free(out)
+        __wasm_memset(p, 0, len)
+        p
+    }
+}
+
+export fn munmap(a: addr, len: i64) -> i32 {
+    free(a)
+    0.as_i32()
+}
+
+export fn mprotect(a: addr, len: i64, prot: i32) -> i32 {
+    0.as_i32()
+}
+
+export fn memcpy(dst: addr, src: addr, n: i64) -> addr {
+    unsafe { __wasm_memcpy(dst, src, n) }
+    dst
+}
+
+export fn memset(p: addr, c: i32, n: i64) -> addr {
+    unsafe { __wasm_memset(p, c.as_i64(), n) }
+    p
+}
+
+export fn memcmp(a: addr, b: addr, n: i64) -> i32 {
+    unsafe {
+        var i = 0
+        while i < n {
+            let x = a.offset(i).load_u8().as_i64()
+            let y = b.offset(i).load_u8().as_i64()
+            if x != y {
+                return (x - y).as_i32()
+            }
+            i += 1
+        }
+    }
+    0.as_i32()
+}
+
+export fn memchr(p: addr, c: i32, n: i64) -> addr {
+    unsafe {
+        let want = c.as_i64().bit_and(255)
+        var i = 0
+        while i < n {
+            if p.offset(i).load_u8().as_i64() == want {
+                return p.offset(i)
+            }
+            i += 1
+        }
+        mem_addr(0)
+    }
+}
+
+export fn strlen(p: addr) -> i64 {
+    var n = 0
+    unsafe {
+        while p.offset(n).load_u8().as_i64() != 0 {
+            n += 1
+        }
+    }
+    n
+}

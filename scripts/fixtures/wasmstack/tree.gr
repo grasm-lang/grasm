@@ -1,0 +1,21 @@
+// `wasmsubset`'s stack: a value built and walked `n` deep.
+type T = | Leaf | Node(l: T, v: i64)
+
+fn build(n: i64) -> T {
+    if n == 0 {
+        return Leaf
+    }
+    Node(build(n - 1), n)
+}
+
+fn count(t: T) -> i64 {
+    match t {
+        Leaf -> 0
+        Node(l, v) -> 1 + count(l)
+    }
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{count(build(n))}")
+}

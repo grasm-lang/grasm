@@ -202,6 +202,10 @@ run_gate langdiff      scripts/lang_diff.sh
 run_gate lang2diff     scripts/lang2_diff.sh
 run_gate replaytest    scripts/replaytest.sh
 run_gate wasmtest      scripts/wasmtest.sh
+run_gate wasmsubset    scripts/wasmsubset.sh
+run_gate encodetest_wasm scripts/encodetest_wasm.sh
+run_gate fuzz_wasmmath scripts/fuzz_wasmmath.sh
+run_gate wasmcontrols  scripts/wasmcontrols.sh
 run_gate gatecheck     scripts/gatecheck.sh
 run_gate crosstest     scripts/crosstest.sh
 run_gate fmttest       scripts/fmttest.sh

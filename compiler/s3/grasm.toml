@@ -20,3 +20,6 @@ path = "../x86_64"
 
 [dependencies.elf]
 path = "../elf"
+
+[dependencies.wasm32]
+path = "../wasm32"

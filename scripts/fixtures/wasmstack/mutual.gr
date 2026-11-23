@@ -1,0 +1,19 @@
+// `wasmsubset`'s stack: two functions recursing through each other.
+fn even(n: i64) -> bool {
+    if n == 0 {
+        return true
+    }
+    odd(n - 1)
+}
+
+fn odd(n: i64) -> bool {
+    if n == 0 {
+        return false
+    }
+    even(n - 1)
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{if even(n) { n } else { n }}")
+}

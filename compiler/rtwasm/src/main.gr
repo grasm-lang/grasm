@@ -1,0 +1,27 @@
+// `rtwasm`: the C library the runtime calls, written for the wasm32 target
+// (docs/self-hosting.md §6.24, decision (6)).
+//
+// The runtime in Grasm (`compiler/rt`) is compiled for wasm as it is for
+// macOS, the same TIR, and calls the C functions it calls there by the same
+// names and with Darwin's numbers; the wasm link (`compiler/wasm32`) binds
+// each call to the function of that name here, and refuses a name nothing
+// defines. So this is a C library in the shape the runtime expects:
+//
+//     mem.gr    memory: an allocator over `memory.grow`, `memcpy` and its kin
+//     math.gr   libm: Rust's `libm` crate's functions (musl's, FreeBSD's),
+//               as the Rust playground's module has them
+//     sys.gr    the standard streams, clocks, entropy, the way out, and what
+//               wasm cannot do -- files, sockets, processes, threads -- each
+//               failing with ENOTSUP, which `strerror` words as the Rust
+//               playground's does ("operation not supported on this
+//               platform")
+//
+// The host is reached through imports only (`__host_<name>`, which the link
+// makes `env.<name>`), the machine through intrinsics the backend writes in
+// place (`__wasm_<name>`): `memory.grow`, `memory.size`, `throw`,
+// `memory.copy`, `memory.fill`, and the heap's first address. One thread is
+// all there is: a process cell's every access is still atomic, as
+// `scripts/rtlint.py` asks of a runtime package.
+import mem
+import sys
+import math

@@ -1,0 +1,156 @@
+// A function's blocks as WebAssembly's structured control needs them
+// (docs/self-hosting.md §6.24, decision (10)): reverse postorder, the
+// dominator tree (the iterative algorithm of Cooper, Harvey and Kennedy,
+// "A Simple, Fast Dominance Algorithm", 2001), which blocks head loops, and
+// which are merges -- reached by two or more forward edges -- with each
+// block's merge children in the dominator tree, latest first.
+//
+// An irreducible function -- a retreating edge to a block that does not
+// dominate its source -- is refused: no corpus function, the runtime's or
+// the compiler's own has one (measured, §6.24), and structuring one would
+// need its nodes split.
+import mir.ir
+
+type Structure = {
+    /// Each block's number in reverse postorder; -1 when unreachable.
+    order: [i64],
+    loop_head: [bool],
+    merge: [bool],
+    merge_kids: [[i64]],
+}
+
+fn succs(f: MirFn, b: i64) -> [i64] {
+    let k = f.tk[b]
+    if k == ir.M_JUMP {
+        return [f.tt[b]]
+    }
+    if k == ir.M_BRIF {
+        return [f.tt[b], f.tf[b]]
+    }
+    []
+}
+
+pub fn analyse(f: MirFn) -> Structure ! str {
+    let n = ir.nblocks(f)
+    var seen: [bool] = []
+    var next: [i64] = []
+    var order: [i64] = []
+    for i in 0..n {
+        seen.push(false)
+        next.push(0)
+        order.push(-1)
+    }
+    var post: [i64] = []
+    var stack: [i64] = [0]
+    seen[0] = true
+    while stack.len() > 0 {
+        let top = stack[stack.len() - 1]
+        let ss = succs(f, top)
+        if next[top] < ss.len() {
+            let t = ss[next[top]]
+            next[top] += 1
+            if not seen[t] {
+                seen[t] = true
+                stack.push(t)
+            }
+        } else {
+            post.push(top)
+            let _ = stack.pop()
+        }
+    }
+    var rpo: [i64] = []
+    var k = post.len() - 1
+    while k >= 0 {
+        order[post[k]] = rpo.len()
+        rpo.push(post[k])
+        k -= 1
+    }
+    var preds: [[i64]] = []
+    for i in 0..n {
+        preds.push([])
+    }
+    for u in rpo {
+        for v in succs(f, u) {
+            preds[v].push(u)
+        }
+    }
+    var idom: [i64] = []
+    for i in 0..n {
+        idom.push(-1)
+    }
+    idom[0] = 0
+    var changed = true
+    while changed {
+        changed = false
+        for x in rpo {
+            if x == 0 {
+                continue
+            }
+            var nd = -1
+            for p in preds[x] {
+                if idom[p] < 0 {
+                    continue
+                }
+                if nd < 0 {
+                    nd = p
+                } else {
+                    var a = p
+                    var c = nd
+                    while a != c {
+                        while order[a] > order[c] {
+                            a = idom[a]
+                        }
+                        while order[c] > order[a] {
+                            c = idom[c]
+                        }
+                    }
+                    nd = a
+                }
+            }
+            if nd != idom[x] {
+                idom[x] = nd
+                changed = true
+            }
+        }
+    }
+    var loop_head: [bool] = []
+    var fwd: [i64] = []
+    var merge: [bool] = []
+    var kids: [[i64]] = []
+    for i in 0..n {
+        loop_head.push(false)
+        fwd.push(0)
+        merge.push(false)
+        kids.push([])
+    }
+    for u in rpo {
+        for v in succs(f, u) {
+            if order[v] <= order[u] {
+                var w = u
+                while w != v and w != 0 {
+                    w = idom[w]
+                }
+                if w != v {
+                    fail("an irreducible loop: block {u} branches back to block {v}, which does not dominate it")
+                }
+                loop_head[v] = true
+            } else {
+                fwd[v] += 1
+            }
+        }
+    }
+    for x in rpo {
+        merge[x] = fwd[x] >= 2
+    }
+    // Each block's merge children, latest first: reverse postorder walked
+    // from its end.
+    var j = rpo.len() - 1
+    while j >= 1 {
+        let y = rpo[j]
+        if merge[y] {
+            kids[idom[y]].push(y)
+        }
+        j -= 1
+    }
+    Structure{ order: order, loop_head: loop_head, merge: merge, merge_kids: kids }
+}

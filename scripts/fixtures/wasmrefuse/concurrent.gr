@@ -1,0 +1,20 @@
+// `wasmsubset`'s refusals (docs/self-hosting.md §6.24, decision (4)): a
+// `concurrent` block, which no wasm engine of this target can switch stacks
+// for, ends the program as the Rust playground's module ends it.
+fn main() / {io, async} {
+    print("before the block")
+    let ch = chan_new()
+    concurrent {
+        go {
+            chan_send(ch, 1)
+            chan_close(ch)
+        }
+        go {
+            match chan_recv(ch) {
+                Some(v) -> print("got {v}")
+                None -> print("none")
+            }
+        }
+    }
+    print("after the block")
+}

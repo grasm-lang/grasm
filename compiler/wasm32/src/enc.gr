@@ -1,0 +1,282 @@
+// The WebAssembly binary format's numbers and the encodings the backend
+// writes (the core specification, §5): LEB128 integers, opcodes, block
+// types, memory arguments. Every instruction a function body holds is
+// written through `ins` and its siblings here, so `enctest.gr` can name every
+// form the backend emits and `scripts/encodetest_wasm.sh` can hold each to
+// `llvm-mc -triple=wasm32`.
+
+// ----- value and block types -------------------------------------------------
+
+pub let T_I32 = 127
+pub let T_I64 = 126
+pub let T_F64 = 124
+pub let T_FUNCREF = 112
+pub let T_FUNC = 96
+/// The empty block type.
+pub let BT_EMPTY = 64
+
+// ----- control -------------------------------------------------------------------
+
+pub let OP_UNREACHABLE = 0
+pub let OP_BLOCK = 2
+pub let OP_LOOP = 3
+pub let OP_IF = 4
+pub let OP_ELSE = 5
+pub let OP_THROW = 8
+pub let OP_END = 11
+pub let OP_BR = 12
+pub let OP_BR_IF = 13
+pub let OP_RETURN = 15
+pub let OP_CALL = 16
+pub let OP_CALL_INDIRECT = 17
+pub let OP_DROP = 26
+pub let OP_TRY_TABLE = 31
+
+// ----- variables -----------------------------------------------------------------
+
+pub let OP_LOCAL_GET = 32
+pub let OP_LOCAL_SET = 33
+pub let OP_LOCAL_TEE = 34
+pub let OP_GLOBAL_GET = 35
+pub let OP_GLOBAL_SET = 36
+
+// ----- memory ----------------------------------------------------------------------
+
+pub let OP_I32_LOAD = 40
+pub let OP_I64_LOAD = 41
+pub let OP_F64_LOAD = 43
+pub let OP_I64_LOAD8_S = 48
+pub let OP_I64_LOAD8_U = 49
+pub let OP_I64_LOAD16_S = 50
+pub let OP_I64_LOAD16_U = 51
+pub let OP_I64_LOAD32_S = 52
+pub let OP_I64_LOAD32_U = 53
+pub let OP_I32_STORE = 54
+pub let OP_I64_STORE = 55
+pub let OP_F64_STORE = 57
+pub let OP_I64_STORE8 = 60
+pub let OP_I64_STORE16 = 61
+pub let OP_I64_STORE32 = 62
+pub let OP_MEMORY_SIZE = 63
+pub let OP_MEMORY_GROW = 64
+
+// ----- constants -----------------------------------------------------------------
+
+pub let OP_I32_CONST = 65
+pub let OP_I64_CONST = 66
+pub let OP_F64_CONST = 68
+
+// ----- numbers ---------------------------------------------------------------------
+
+pub let OP_I32_EQZ = 69
+pub let OP_I32_LT_U = 73
+pub let OP_I64_EQZ = 80
+pub let OP_I64_EQ = 81
+pub let OP_I64_NE = 82
+pub let OP_I64_LT_S = 83
+pub let OP_I64_LT_U = 84
+pub let OP_I64_GT_S = 85
+pub let OP_I64_GT_U = 86
+pub let OP_I64_LE_S = 87
+pub let OP_I64_LE_U = 88
+pub let OP_I64_GE_S = 89
+pub let OP_I64_GE_U = 90
+pub let OP_F64_EQ = 97
+pub let OP_F64_NE = 98
+pub let OP_F64_LT = 99
+pub let OP_F64_GT = 100
+pub let OP_F64_LE = 101
+pub let OP_F64_GE = 102
+pub let OP_I32_ADD = 106
+pub let OP_I32_SUB = 107
+pub let OP_I32_AND = 113
+pub let OP_I64_CLZ = 121
+pub let OP_I64_ADD = 124
+pub let OP_I64_SUB = 125
+pub let OP_I64_MUL = 126
+pub let OP_I64_DIV_S = 127
+pub let OP_I64_DIV_U = 128
+pub let OP_I64_REM_S = 129
+pub let OP_I64_REM_U = 130
+pub let OP_I64_AND = 131
+pub let OP_I64_OR = 132
+pub let OP_I64_XOR = 133
+pub let OP_I64_SHL = 134
+pub let OP_I64_SHR_S = 135
+pub let OP_I64_SHR_U = 136
+pub let OP_I64_ROTL = 137
+pub let OP_I64_ROTR = 138
+pub let OP_F64_ABS = 153
+pub let OP_F64_NEG = 154
+pub let OP_F64_CEIL = 155
+pub let OP_F64_FLOOR = 156
+pub let OP_F64_TRUNC = 157
+pub let OP_F64_NEAREST = 158
+pub let OP_F64_SQRT = 159
+pub let OP_F64_ADD = 160
+pub let OP_F64_SUB = 161
+pub let OP_F64_MUL = 162
+pub let OP_F64_DIV = 163
+pub let OP_F64_MIN = 164
+pub let OP_F64_MAX = 165
+pub let OP_F64_COPYSIGN = 166
+pub let OP_I32_WRAP_I64 = 167
+pub let OP_I64_EXTEND_I32_S = 172
+pub let OP_I64_EXTEND_I32_U = 173
+pub let OP_F64_CONVERT_I64_S = 185
+pub let OP_F64_CONVERT_I64_U = 186
+pub let OP_I64_REINTERPRET_F64 = 189
+pub let OP_F64_REINTERPRET_I64 = 191
+pub let OP_I64_EXTEND8_S = 194
+pub let OP_I64_EXTEND16_S = 195
+pub let OP_I64_EXTEND32_S = 196
+/// The prefix of the saturating conversions and the bulk memory operations.
+pub let OP_PREFIX_FC = 252
+pub let FC_I64_TRUNC_SAT_F64_S = 6
+pub let FC_I64_TRUNC_SAT_F64_U = 7
+pub let FC_MEMORY_COPY = 10
+pub let FC_MEMORY_FILL = 11
+
+/// `try_table`'s catch clause that takes the exception's values to a label.
+pub let CATCH_TAG = 0
+
+// ----- integers -------------------------------------------------------------------
+
+pub fn byte(inout b: ByteBuilder, v: i64) {
+    b.push_byte(v.bit_and(255))
+}
+
+pub fn uleb(inout b: ByteBuilder, v: i64) {
+    var x = v
+    while true {
+        let lo = x.bit_and(127)
+        x = x.ushr(7)
+        if x == 0 {
+            b.push_byte(lo)
+            return
+        }
+        b.push_byte(lo.bit_or(128))
+    }
+}
+
+pub fn sleb(inout b: ByteBuilder, v: i64) {
+    var x = v
+    while true {
+        let lo = x.bit_and(127)
+        x = x.shr(7)
+        if (x == 0 and lo.bit_and(64) == 0) or (x == -1 and lo.bit_and(64) != 0) {
+            b.push_byte(lo)
+            return
+        }
+        b.push_byte(lo.bit_or(128))
+    }
+}
+
+pub fn u32le(inout b: ByteBuilder, v: i64) {
+    for k in 0..4 {
+        b.push_byte(v.ushr(8 * k).bit_and(255))
+    }
+}
+
+pub fn u64le(inout b: ByteBuilder, v: i64) {
+    for k in 0..8 {
+        b.push_byte(v.ushr(8 * k).bit_and(255))
+    }
+}
+
+/// A name: its UTF-8 bytes' count, then the bytes.
+pub fn name(inout b: ByteBuilder, s: str) {
+    let bs = s.to_bytes()
+    uleb(b, bs.len())
+    b.push_bytes(bs)
+}
+
+/// A section: its id, its contents' size, its contents.
+pub fn section(inout out: ByteBuilder, id: i64, body: bytes) {
+    out.push_byte(id)
+    uleb(out, body.len())
+    out.push_bytes(body)
+}
+
+// ----- instructions ----------------------------------------------------------------
+
+/// An instruction of no immediate.
+pub fn op(inout b: ByteBuilder, o: i64) {
+    b.push_byte(o)
+}
+
+/// An instruction whose one immediate is an index: a local, a global, a
+/// function, a label, a tag.
+pub fn op_idx(inout b: ByteBuilder, o: i64, x: i64) {
+    b.push_byte(o)
+    uleb(b, x)
+}
+
+pub fn i32_const(inout b: ByteBuilder, v: i64) {
+    b.push_byte(OP_I32_CONST)
+    // The immediate is a signed 32-bit number: the low 32 bits, read signed.
+    let lo = v.bit_and(4294967295)
+    sleb(b, if lo >= 2147483648 { lo - 4294967296 } else { lo })
+}
+
+pub fn i64_const(inout b: ByteBuilder, v: i64) {
+    b.push_byte(OP_I64_CONST)
+    sleb(b, v)
+}
+
+/// `f64.const` of the double whose bits are `bits`.
+pub fn f64_const(inout b: ByteBuilder, bits: i64) {
+    b.push_byte(OP_F64_CONST)
+    u64le(b, bits)
+}
+
+/// A load or store: its natural alignment's log2 and an offset.
+pub fn mem(inout b: ByteBuilder, o: i64, align: i64, offset: i64) {
+    b.push_byte(o)
+    uleb(b, align)
+    uleb(b, offset)
+}
+
+/// `block`, `loop` or `if` with block type `bt`.
+pub fn open(inout b: ByteBuilder, o: i64, bt: i64) {
+    b.push_byte(o)
+    b.push_byte(bt)
+}
+
+/// An instruction under the 0xFC prefix.
+pub fn fc(inout b: ByteBuilder, sub: i64) {
+    b.push_byte(OP_PREFIX_FC)
+    uleb(b, sub)
+    if sub == FC_MEMORY_COPY {
+        b.push_byte(0)
+        b.push_byte(0)
+    } else if sub == FC_MEMORY_FILL {
+        b.push_byte(0)
+    }
+}
+
+pub fn call_indirect(inout b: ByteBuilder, ty: i64) {
+    b.push_byte(OP_CALL_INDIRECT)
+    uleb(b, ty)
+    uleb(b, 0)
+}
+
+pub fn memory_grow(inout b: ByteBuilder) {
+    b.push_byte(OP_MEMORY_GROW)
+    b.push_byte(0)
+}
+
+pub fn memory_size(inout b: ByteBuilder) {
+    b.push_byte(OP_MEMORY_SIZE)
+    b.push_byte(0)
+}
+
+/// `try_table` of block type `bt` with one clause: `catch tag label`.
+pub fn try_table_catch(inout b: ByteBuilder, bt: i64, tag: i64, label: i64) {
+    b.push_byte(OP_TRY_TABLE)
+    b.push_byte(bt)
+    uleb(b, 1)
+    b.push_byte(CATCH_TAG)
+    uleb(b, tag)
+    uleb(b, label)
+}

@@ -1,0 +1,13 @@
+// `wasmsubset`'s stack: a recursion through a function value and the
+// runtime's `map`, so the runtime's own frames are in every level.
+fn down(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + [n - 1].map(down)[0]
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{down(n)}")
+}

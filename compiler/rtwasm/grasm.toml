@@ -1,0 +1,13 @@
+[package]
+name = "rtwasm"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The C library the runtime calls, for the wasm32 target (docs/self-hosting.md
+# §6.24, decision (6)): compiled by the Grasm backend (`s3 --runtime`) and
+# linked into every module beside the runtime, which calls it by the C names
+# it calls on macOS. Raw memory and its own process cells, so a runtime
+# package; it reaches the host only through the imports the wasm link names
+# (`__host_*`) and the backend's intrinsics (`__wasm_*`).
+capabilities = ["io", "unsafe", "mem"]
+runtime = true

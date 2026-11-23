@@ -1,0 +1,8 @@
+// `wasmsubset`'s refusals (decision (6)): a socket fails as the Rust
+// playground's module fails it.
+fn main() / {io, net} {
+    match tcp_connect("127.0.0.1", 9) {
+        Ok(c) -> print("connected")
+        Err(e) -> print("tcp_connect: {e}")
+    }
+}

@@ -1,0 +1,8 @@
+// `wasmsubset`'s refusals (decision (6)): another program fails to start as
+// in the Rust playground's module.
+fn main() / {io, proc} {
+    match proc_run("echo", ["hi"]) {
+        Ok(r) -> print("ran")
+        Err(e) -> print("proc_run: {e}")
+    }
+}

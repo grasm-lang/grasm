@@ -1,0 +1,664 @@
+// `wasm32`: the WebAssembly target of the Grasm backend (docs/self-hosting.md
+// §6.24, S8 part seven): MIR in, one WebAssembly module out.
+//
+//     body.gr       a MIR function as a function body: values as locals, the
+//                   frame on the shadow stack, each instruction's selection
+//     structure.gr  reverse postorder, dominators, loops and merges
+//     enc.gr        the binary format: integers, opcodes, sections
+//     locals.gr     values sharing locals by liveness
+//     enctest.gr    the encoder's cases, for scripts/encodetest_wasm.sh
+//
+// The link. A module is one program with the runtime and the C library it
+// calls (decision (7)), each given as its own MIR -- the program's
+// (`lib = false`), the runtime's and the C library's (`compiler/rtwasm`),
+// both `lib = true` -- and bound here by name, as `compiler/link` binds
+// objects: a runtime call `grasm_<name>` to the runtime's `grt_<name>`, any
+// other to the global function of that name; a C library's `__host_<name>`
+// to the host's import `env.<name>`, and `__wasm_<name>` to an intrinsic the
+// backend writes in place. A name nothing defines is an error naming it,
+// never an import. Only what the entry reaches is kept.
+//
+// Memory. From address 1024: the read-only bytes (string literals, each
+// NUL-terminated), the struct descriptors, the runtime's thread-local and
+// process cells (zero, so not written into the module), the program's
+// argument vector; then the shadow stack, its pointer global 0, growing
+// down from its top; then the heap, which the C library grows by
+// `memory.grow` from `__wasm_heap_base()`.
+//
+// The entry is the export `_start(argc)`, which calls the program's C `main`
+// with `argc` and the argument vector the embedder wrote at the address the
+// export `_args` answers, inside a `try_table` that catches tag 0, the
+// exception `_exit` throws (decision (2)), and answers the exit status.
+import enc
+import body
+import structure
+import enctest
+import mir.ir
+
+type LinkOpts = {
+    /// The shadow stack's size in bytes.
+    stack_size: i64,
+    /// A function that may recurse keeps a shadow frame of this many
+    /// hundredths of its engine frame (`body.gr`).
+    floor_scale: i64,
+}
+
+/// The encoder's cases (`enctest.gr`).
+pub fn encode_cases() -> WCases {
+    enctest.cases()
+}
+
+pub fn default_opts() -> LinkOpts {
+    LinkOpts{ stack_size: 8388608, floor_scale: 700 }
+}
+
+let DATA_BASE = 1024
+/// The arguments' area: the embedder writes the argument vector there --
+/// eight-byte pointers, then the NUL-terminated strings they point at --
+/// and passes `_start` their count.
+let ARGS_SIZE = 65536
+let BIG = 16777216
+
+// Resolution kinds of a runtime call.
+let R_DEF = 1
+let R_IMPORT = 2
+let R_INTR = 3
+let R_CONST = 4
+let R_NOSWITCH = 5
+
+/// The host's imports, by the C library's name for each: the import's own
+/// name and its signature (`body.import_call`).
+fn host_import(name: str) -> (str, str) {
+    match name {
+        "__host_grasm_write" -> ("grasm_write", "iii>i")
+        "__host_grasm_read" -> ("grasm_read", "iii>i")
+        "__host_grasm_entropy" -> ("grasm_entropy", "ii>i")
+        "__host_grasm_now_millis" -> ("grasm_now_millis", ">f")
+        "__host_grasm_monotonic_millis" -> ("grasm_monotonic_millis", ">f")
+        "__host_grasm_sleep_millis" -> ("grasm_sleep_millis", "f>-")
+        _ -> ("", "")
+    }
+}
+
+fn intrinsic_of(name: str) -> i64 {
+    match name {
+        "__wasm_memory_grow" -> body.I_MEMORY_GROW
+        "__wasm_memory_size" -> body.I_MEMORY_SIZE
+        "__wasm_throw" -> body.I_THROW
+        "__wasm_memcpy" -> body.I_MEMCPY
+        "__wasm_memset" -> body.I_MEMSET
+        "__wasm_heap_base" -> body.I_HEAP_BASE
+        _ -> 0
+    }
+}
+
+fn class_char(c: i64) -> str {
+    if c == 2 { "f" } else if c == 3 { "i" } else if c == 1 { "I" } else { "-" }
+}
+
+/// A function type's key: its parameters' classes, `>`, its result's.
+fn sig_key(ps: [i64], r: i64) -> str {
+    var s = str_builder()
+    for c in ps {
+        s.push_str(class_char(c))
+    }
+    s.push_str(">")
+    s.push_str(class_char(r))
+    s.to_str()
+}
+
+/// An import signature (`"iii>i"`) as classes.
+fn import_classes(sig: str) -> ([i64], i64) {
+    let parts = sig.split(">")
+    var ps: [i64] = []
+    for c in parts[0].codes() {
+        ps.push(if c == 102 { 2 } else { 3 })
+    }
+    let r = if parts[1] == "-" { 0 } else if parts[1] == "f" { 2 } else { 3 }
+    (ps, r)
+}
+
+/// The link's state while it walks what the entry reaches.
+type Link = {
+    progs: [MirProg],
+    /// Per program, each function's index by symbol.
+    local: [Map[str, i64]],
+    /// Global symbols: program * BIG + function.
+    global: Map[str, i64],
+    /// The functions kept, in the order found, as program * BIG + function.
+    defs: [i64],
+    def_pos: Map[i64, i64],
+    imports: [str],
+    import_sig: [str],
+    import_pos: Map[str, i64],
+    /// Functions whose address is taken, in the order found: their table
+    /// slots, from 1.
+    table: [i64],
+    table_pos: Map[i64, i64],
+    /// Each program's first string's, descriptor's, process cell's and
+    /// thread-local cell's index in the flat address lists below.
+    str_base: [i64],
+    desc_base: [i64],
+    pcell_base: [i64],
+    tcell_base: [i64],
+    str_addr: [i64],
+    desc_addr: [i64],
+    pcell_addr: [i64],
+    tcell_addr: [i64],
+    heap_base: i64,
+}
+
+/// The kept function `key`'s position, enqueued when first seen.
+fn want(inout l: Link, key: i64) -> i64 {
+    match l.def_pos.get(key) {
+        Some(p) -> p
+        None -> {
+            let p = l.defs.len()
+            l.defs.push(key)
+            l.def_pos.set(key, p)
+            p
+        }
+    }
+}
+
+fn want_import(inout l: Link, name: str, sig: str) -> i64 {
+    match l.import_pos.get(name) {
+        Some(p) -> p
+        None -> {
+            let p = l.imports.len()
+            l.imports.push(name)
+            l.import_sig.push(sig)
+            l.import_pos.set(name, p)
+            p
+        }
+    }
+}
+
+fn want_slot(inout l: Link, key: i64) -> i64 {
+    match l.table_pos.get(key) {
+        Some(p) -> p
+        None -> {
+            let p = l.table.len() + 1
+            l.table.push(key)
+            l.table_pos.set(key, p)
+            p
+        }
+    }
+}
+
+/// What runtime symbol `name`, called from program `k`, is: its kind and
+/// what the kind names (a function's key, an import's name in `sig`'s
+/// company, an intrinsic, an address).
+fn resolve(l: Link, k: i64, name: str) -> (i64, i64, str) ! str {
+    if name == ir.RT_CTX_SWITCH or name == ir.RT_CTX_INIT {
+        match l.global.get("_wasm_no_switch") {
+            Some(key) -> return (R_NOSWITCH, key, "")
+            None -> fail("`{name}`: the C library defines no `wasm_no_switch`")
+        }
+    }
+    if name.starts_with("grt.tlv.") {
+        let p = l.progs[k]
+        for c in 0..p.tcells.len() {
+            if ir.rt_tlv_getter(p.tcells[c]) == name {
+                return (R_CONST, l.tcell_addr[l.tcell_base[k] + c], "")
+            }
+        }
+        fail("`{name}`: no thread-local cell of that name")
+    }
+    let w = intrinsic_of(name)
+    if w > 0 {
+        return (R_INTR, w, "")
+    }
+    let (imp, sig) = host_import(name)
+    if imp != "" {
+        return (R_IMPORT, 0, imp + " " + sig)
+    }
+    var cands: [str] = []
+    if name.starts_with("grasm_") {
+        cands.push("_grt_" + name.substr(6, name.len()))
+    }
+    cands.push("_" + name)
+    for c in cands {
+        match l.global.get(c) {
+            Some(key) -> return (R_DEF, key, "")
+            None -> ()
+        }
+    }
+    fail("`{name}`, called from {if k == 0 { "the program" } else { "the runtime" }}, is defined by nothing linked")
+}
+
+fn key_fn(l: Link, key: i64) -> MirFn {
+    l.progs[key / BIG].fns[key % BIG]
+}
+
+/// A direct call's callee, as a key.
+fn callee(l: Link, k: i64, id: i64) -> i64 ! str {
+    let p = l.progs[k]
+    if id < 0 or id >= p.callee_sym.len() {
+        fail("a call of callable {id}, which program {k} does not have")
+    }
+    let sym = p.callee_sym[id]
+    match l.local[k].get(sym) {
+        Some(fi) -> k * BIG + fi
+        None -> fail("a call of `{sym}`, which program {k} does not define")
+    }
+}
+
+/// Walks every function the entry reaches, keeping each and every import,
+/// table slot and data address it names.
+fn walk(inout l: Link) -> () ! str {
+    var q = 0
+    while q < l.defs.len() {
+        let key = l.defs[q]
+        q += 1
+        let k = key / BIG
+        let f = key_fn(l, key)
+        let p = l.progs[k]
+        for i in 0..f.op.len() {
+            let op = f.op[i]
+            if op == ir.M_CALL {
+                let c = try callee(l, k, f.imm[i])
+                let _ = want(l, c)
+            } else if op == ir.M_FNADDR {
+                let c = try callee(l, k, f.imm[i])
+                let _ = want(l, c)
+                let _ = want_slot(l, c)
+            } else if op == ir.M_CALLRT or op == ir.M_GOTADDR or op == ir.M_INC or op == ir.M_DEC {
+                let id = if op == ir.M_INC { ir.RT_VAL_INC } else if op == ir.M_DEC { ir.RT_VAL_DEC } else { f.imm[i] }
+                let name = p.rt_syms[id]
+                let (rk, rv, rs) = try resolve(l, k, name)
+                if rk == R_DEF or rk == R_NOSWITCH {
+                    let _ = want(l, rv)
+                    if op == ir.M_GOTADDR {
+                        let _ = want_slot(l, rv)
+                    }
+                } else if rk == R_IMPORT {
+                    let parts = rs.split(" ")
+                    let _ = want_import(l, parts[0], parts[1])
+                }
+                if op == ir.M_GOTADDR and rk != R_DEF {
+                    fail("the address of `{name}`, which is not a function here")
+                }
+            }
+        }
+    }
+    ()
+}
+
+/// The data's addresses, program by program, and the bytes of the module's
+/// one data segment.
+fn layout(inout l: Link, o: LinkOpts) -> (bytes, i64, i64) {
+    var at = DATA_BASE
+    var data = byte_builder()
+    // Read-only bytes.
+    for k in 0..l.progs.len() {
+        l.str_base.push(l.str_addr.len())
+        for s in l.progs[k].strs {
+            l.str_addr.push(at)
+            let bs = s.to_bytes()
+            data.push_bytes(bs)
+            data.push_byte(0)
+            at += bs.len() + 1
+        }
+    }
+    while at % 8 != 0 {
+        data.push_byte(0)
+        at += 1
+    }
+    // Descriptors: the runtime's `StructDesc` (`compiler/s3`'s layout), their
+    // name's and fields' text by address.
+    for k in 0..l.progs.len() {
+        l.desc_base.push(l.desc_addr.len())
+        let p = l.progs[k]
+        for d in p.descs {
+            l.desc_addr.push(at)
+            let n = d.fields.len()
+            enc.u64le(data, 0)
+            enc.u64le(data, l.str_addr[l.str_base[k] + d.name_str])
+            enc.u64le(data, d.name.to_bytes().len())
+            enc.u64le(data, n)
+            for i in 0..n {
+                enc.u64le(data, l.str_addr[l.str_base[k] + d.field_strs[i]])
+                enc.u64le(data, d.fields[i].to_bytes().len())
+                enc.u64le(data, d.kinds[i])
+            }
+            for i in 0..n {
+                enc.u64le(data, 0)
+            }
+            at += 32 + 32 * n
+        }
+    }
+    // Cells, and the arguments' area: zero, so past the segment's end.
+    let argv = at
+    at += ARGS_SIZE
+    for k in 0..l.progs.len() {
+        let p = l.progs[k]
+        l.pcell_base.push(l.pcell_addr.len())
+        for c in 0..p.pcells.len() {
+            l.pcell_addr.push(at)
+            at += (p.psize[c] + 15) / 16 * 16
+        }
+        l.tcell_base.push(l.tcell_addr.len())
+        for c in 0..p.tcells.len() {
+            l.tcell_addr.push(at)
+            at += (p.tsize[c] + 15) / 16 * 16
+        }
+    }
+    let stack_bottom = (at + 65535) / 65536 * 65536
+    let stack_top = stack_bottom + o.stack_size
+    l.heap_base = stack_top
+    (data.to_bytes(), argv, stack_top)
+}
+
+/// The resolution of every instruction of function `key` (`body.Aux`); an
+/// indirect call's type is made if no function has it yet.
+fn aux_of(l: Link, key: i64, nimp: i64, inout types: Map[str, i64], inout tlist: [str], inout tps: [[i64]], inout trs: [i64]) -> Aux ! str {
+    let k = key / BIG
+    let f = key_fn(l, key)
+    let p = l.progs[k]
+    var kind: [i64] = []
+    var idx: [i64] = []
+    var cls: [i64] = []
+    var sig: [str] = []
+    for i in 0..f.op.len() {
+        let op = f.op[i]
+        var ak = body.A_NONE
+        var ai = 0
+        var ac = 0
+        var asig = ""
+        if op == ir.M_CALL {
+            let c = try callee(l, k, f.imm[i])
+            ak = body.A_FUNC
+            ai = nimp + (l.def_pos.get(c) ?? 0)
+            ac = body.result_class(key_fn(l, c))
+        } else if op == ir.M_FNADDR {
+            let c = try callee(l, k, f.imm[i])
+            ak = body.A_CONST
+            ai = l.table_pos.get(c) ?? 0
+        } else if op == ir.M_STRADDR {
+            ak = body.A_CONST
+            ai = l.str_addr[l.str_base[k] + f.imm[i]]
+        } else if op == ir.M_DATAADDR {
+            ak = body.A_CONST
+            ai = l.desc_addr[l.desc_base[k] + f.imm[i]]
+        } else if op == ir.M_CELLADDR {
+            ak = body.A_CONST
+            ai = l.pcell_addr[l.pcell_base[k] + f.imm[i]]
+        } else if op == ir.M_CALLRT or op == ir.M_GOTADDR or op == ir.M_INC or op == ir.M_DEC {
+            let id = if op == ir.M_INC { ir.RT_VAL_INC } else if op == ir.M_DEC { ir.RT_VAL_DEC } else { f.imm[i] }
+            let name = p.rt_syms[id]
+            let (rk, rv, rs) = try resolve(l, k, name)
+            if op == ir.M_GOTADDR {
+                ak = body.A_CONST
+                ai = l.table_pos.get(rv) ?? 0
+            } else if rk == R_DEF {
+                ak = body.A_FUNC
+                ai = nimp + (l.def_pos.get(rv) ?? 0)
+                ac = body.result_class(key_fn(l, rv))
+            } else if rk == R_NOSWITCH {
+                ak = body.A_NOSWITCH
+                ai = nimp + (l.def_pos.get(rv) ?? 0)
+            } else if rk == R_IMPORT {
+                let parts = rs.split(" ")
+                ak = body.A_IMPORT
+                ai = l.import_pos.get(parts[0]) ?? 0
+                asig = parts[1]
+            } else if rk == R_INTR {
+                ak = body.A_INTRINSIC
+                ai = rv
+                ac = l.heap_base
+            } else if rk == R_CONST {
+                ak = body.A_CONST
+                ai = rv
+            }
+        } else if op == ir.M_CALLIND {
+            var ps: [i64] = []
+            for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                ps.push(if f.vfp[f.cargs[j]] { 2 } else { 1 })
+            }
+            let r = if f.res[i] < 0 { 0 } else if f.vfp[f.res[i]] { 2 } else { 1 }
+            ak = body.A_CONST
+            ai = intern_type(types, tlist, tps, trs, ps, r)
+            ac = r
+        }
+        kind.push(ak)
+        idx.push(ai)
+        cls.push(ac)
+        sig.push(asig)
+    }
+    Aux{ kind: kind, idx: idx, cls: cls, sig: sig }
+}
+
+/// The module of program `progs[0]` linked with the runtime and C library
+/// `progs[1..]`.
+pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
+    var l = Link{
+        progs: progs, local: [], global: {}, defs: [], def_pos: {}, imports: [], import_sig: [], import_pos: {},
+        table: [], table_pos: {}, str_base: [], desc_base: [], pcell_base: [], tcell_base: [],
+        str_addr: [], desc_addr: [], pcell_addr: [], tcell_addr: [], heap_base: 0,
+    }
+    for k in 0..progs.len() {
+        var m: Map[str, i64] = {}
+        let p = progs[k]
+        for fi in 0..p.fns.len() {
+            let f = p.fns[fi]
+            m.set(f.sym, fi)
+            if f.global {
+                if l.global.has(f.sym) {
+                    fail("`{f.sym}` is defined twice: by program {(l.global.get(f.sym) ?? 0) / BIG} and by program {k}")
+                }
+                l.global.set(f.sym, k * BIG + fi)
+            }
+        }
+        l.local.push(m)
+    }
+    let entry = l.local[0].get("_main") ?? -1
+    if entry < 0 {
+        fail("the program has no C entry (`_main`)")
+    }
+    let (data, argv, stack_top) = layout(l, o)
+    let _ = want(l, entry)
+    try walk(l)
+    let nimp = l.imports.len()
+    // Types: every kept function's, every import's, the tag's, `_start`'s.
+    var types: Map[str, i64] = {}
+    var tlist: [str] = []
+    var tps: [[i64]] = []
+    var trs: [i64] = []
+    var imp_type: [i64] = []
+    for j in 0..nimp {
+        let (ps, r) = import_classes(l.import_sig[j])
+        imp_type.push(intern_type(types, tlist, tps, trs, ps, r))
+    }
+    var def_type: [i64] = []
+    for key in l.defs {
+        let f = key_fn(l, key)
+        def_type.push(intern_type(types, tlist, tps, trs, body.param_classes(f), body.result_class(f)))
+    }
+    let tag_type = intern_type(types, tlist, tps, trs, [3], 0)
+    let start_type = intern_type(types, tlist, tps, trs, [3], 3)
+    let args_type = intern_type(types, tlist, tps, trs, [], 3)
+    var bopts = BodyOpts{ floor_scale: o.floor_scale }
+    // Bodies.
+    var bodies: [bytes] = []
+    for key in l.defs {
+        let f = key_fn(l, key)
+        let aux = try aux_of(l, key, nimp, types, tlist, tps, trs)
+        match body.body(f, aux, bopts) {
+            Ok(bs) -> bodies.push(bs)
+            Err(msg) -> fail("{f.sym} ({f.name}): {msg}")
+        }
+    }
+    // `_start`.
+    var sb = byte_builder()
+    enc.uleb(sb, 0)
+    enc.open(sb, enc.OP_BLOCK, enc.T_I32)
+    enc.try_table_catch(sb, enc.T_I32, 0, 0)
+    enc.op_idx(sb, enc.OP_LOCAL_GET, 0)
+    enc.op(sb, enc.OP_I64_EXTEND_I32_S)
+    enc.i64_const(sb, argv)
+    enc.op_idx(sb, enc.OP_CALL, nimp + (l.def_pos.get(entry) ?? 0))
+    enc.op(sb, enc.OP_I32_WRAP_I64)
+    enc.op(sb, enc.OP_END)
+    enc.op(sb, enc.OP_END)
+    enc.op(sb, enc.OP_END)
+    bodies.push(sb.to_bytes())
+    def_type.push(start_type)
+    let start_idx = nimp + l.defs.len()
+    // `_args`: the arguments' area.
+    var ab = byte_builder()
+    enc.uleb(ab, 0)
+    enc.i32_const(ab, argv)
+    enc.op(ab, enc.OP_END)
+    bodies.push(ab.to_bytes())
+    def_type.push(args_type)
+    // The module.
+    var m = byte_builder()
+    for x in [0, 97, 115, 109, 1, 0, 0, 0] {
+        m.push_byte(x)
+    }
+    // Types.
+    var sec = byte_builder()
+    enc.uleb(sec, tlist.len())
+    for t in 0..tlist.len() {
+        sec.push_byte(enc.T_FUNC)
+        enc.uleb(sec, tps[t].len())
+        for c in tps[t] {
+            sec.push_byte(body.wasm_type(c))
+        }
+        if trs[t] == 0 {
+            enc.uleb(sec, 0)
+        } else {
+            enc.uleb(sec, 1)
+            sec.push_byte(body.wasm_type(trs[t]))
+        }
+    }
+    enc.section(m, 1, sec.to_bytes())
+    // Imports.
+    if nimp > 0 {
+        sec = byte_builder()
+        enc.uleb(sec, nimp)
+        for j in 0..nimp {
+            enc.name(sec, "env")
+            enc.name(sec, l.imports[j])
+            sec.push_byte(0)
+            enc.uleb(sec, imp_type[j])
+        }
+        enc.section(m, 2, sec.to_bytes())
+    }
+    // Functions.
+    sec = byte_builder()
+    enc.uleb(sec, def_type.len())
+    for t in def_type {
+        enc.uleb(sec, t)
+    }
+    enc.section(m, 3, sec.to_bytes())
+    // The table of functions whose address is taken; slot 0 empty.
+    sec = byte_builder()
+    enc.uleb(sec, 1)
+    sec.push_byte(enc.T_FUNCREF)
+    sec.push_byte(1)
+    enc.uleb(sec, l.table.len() + 1)
+    enc.uleb(sec, l.table.len() + 1)
+    enc.section(m, 4, sec.to_bytes())
+    // Memory: the data, the stack and the heap's first page; no maximum.
+    sec = byte_builder()
+    enc.uleb(sec, 1)
+    sec.push_byte(0)
+    enc.uleb(sec, stack_top / 65536 + 1)
+    enc.section(m, 5, sec.to_bytes())
+    // The tag `_exit` throws.
+    sec = byte_builder()
+    enc.uleb(sec, 1)
+    sec.push_byte(0)
+    enc.uleb(sec, tag_type)
+    enc.section(m, 13, sec.to_bytes())
+    // Global 0: the shadow stack's pointer.
+    sec = byte_builder()
+    enc.uleb(sec, 1)
+    sec.push_byte(enc.T_I32)
+    sec.push_byte(1)
+    enc.i32_const(sec, stack_top)
+    sec.push_byte(enc.OP_END)
+    enc.section(m, 6, sec.to_bytes())
+    // Exports.
+    sec = byte_builder()
+    enc.uleb(sec, 3)
+    enc.name(sec, "memory")
+    sec.push_byte(2)
+    enc.uleb(sec, 0)
+    enc.name(sec, "_start")
+    sec.push_byte(0)
+    enc.uleb(sec, start_idx)
+    enc.name(sec, "_args")
+    sec.push_byte(0)
+    enc.uleb(sec, start_idx + 1)
+    enc.section(m, 7, sec.to_bytes())
+    // Elements: the table's slots from 1.
+    if l.table.len() > 0 {
+        sec = byte_builder()
+        enc.uleb(sec, 1)
+        enc.uleb(sec, 0)
+        enc.i32_const(sec, 1)
+        sec.push_byte(enc.OP_END)
+        enc.uleb(sec, l.table.len())
+        for key in l.table {
+            enc.uleb(sec, nimp + (l.def_pos.get(key) ?? 0))
+        }
+        enc.section(m, 9, sec.to_bytes())
+    }
+    // Code.
+    sec = byte_builder()
+    enc.uleb(sec, bodies.len())
+    for bs in bodies {
+        enc.uleb(sec, bs.len())
+        sec.push_bytes(bs)
+    }
+    enc.section(m, 10, sec.to_bytes())
+    // Data: one active segment at DATA_BASE.
+    sec = byte_builder()
+    enc.uleb(sec, 1)
+    enc.uleb(sec, 0)
+    enc.i32_const(sec, DATA_BASE)
+    sec.push_byte(enc.OP_END)
+    enc.uleb(sec, data.len())
+    sec.push_bytes(data)
+    enc.section(m, 11, sec.to_bytes())
+    // Names: every function's, so a trap's stack names Grasm functions.
+    var names = byte_builder()
+    enc.uleb(names, nimp + l.defs.len() + 2)
+    for j in 0..nimp {
+        enc.uleb(names, j)
+        enc.name(names, "env." + l.imports[j])
+    }
+    for d in 0..l.defs.len() {
+        enc.uleb(names, nimp + d)
+        enc.name(names, key_fn(l, l.defs[d]).name)
+    }
+    enc.uleb(names, start_idx)
+    enc.name(names, "_start")
+    enc.uleb(names, start_idx + 1)
+    enc.name(names, "_args")
+    sec = byte_builder()
+    enc.name(sec, "name")
+    sec.push_byte(1)
+    enc.uleb(sec, names.len())
+    sec.push_bytes(names.to_bytes())
+    enc.section(m, 0, sec.to_bytes())
+    m.to_bytes()
+}
+
+fn intern_type(inout types: Map[str, i64], inout tlist: [str], inout tps: [[i64]], inout trs: [i64], ps: [i64], r: i64) -> i64 {
+    let key = sig_key(ps, r)
+    match types.get(key) {
+        Some(t) -> t
+        None -> {
+            let t = tlist.len()
+            types.set(key, t)
+            tlist.push(key)
+            tps.push(ps)
+            trs.push(r)
+            t
+        }
+    }
+}

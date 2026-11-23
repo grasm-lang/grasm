@@ -1,0 +1,346 @@
+// The rest of the C library: the standard streams, clocks, entropy, the
+// error number, the way out, and every call wasm cannot answer.
+//
+// A call this target cannot make -- a file, a directory, a socket, a name
+// lookup, a process, a thread -- fails as the C function fails, with the
+// error number `ENOTSUP_W`, whose `strerror` is the text the Rust
+// playground's `std` gives for the same refusal, "operation not supported on
+// this platform": so the `IoFailed` a program sees is that module's, word
+// for word (docs/self-hosting.md §6.24, the table under "The Rust
+// playground").
+
+extern fn __host_grasm_write(fd: i64, p: addr, n: i64) -> i64
+extern fn __host_grasm_entropy(p: addr, n: i64) -> i64
+extern fn __host_grasm_now_millis() -> f64
+extern fn __host_grasm_monotonic_millis() -> f64
+extern fn __host_grasm_sleep_millis(ms: f64)
+extern fn __wasm_throw(code: i64)
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+/// The error number of the last failed call.
+process_local ERRNO: i64
+
+/// Darwin's `ENOTSUP`, which nothing else here sets.
+let ENOTSUP_W = 45
+/// Darwin's `EAGAIN`: a thread that cannot be made.
+let EAGAIN = 35
+/// Darwin's `CLOCK_MONOTONIC` (`compiler/rt/src/os.gr`).
+let CLOCK_MONOTONIC = 6
+/// Darwin's `_SC_NPROCESSORS_ONLN`.
+let SC_NPROCESSORS_ONLN = 58
+
+fn refuse() -> i32 {
+    unsafe { mem_process(ERRNO).atomic_store_i64(ENOTSUP_W, Release) }
+    -1.as_i32()
+}
+
+fn refuse64() -> i64 {
+    let _ = refuse()
+    -1
+}
+
+fn refuse_null() -> addr {
+    let _ = refuse()
+    unsafe { mem_addr(0) }
+}
+
+export fn __error() -> addr {
+    unsafe { mem_process(ERRNO) }
+}
+
+/// Every error here is a refusal of something wasm cannot do, so every
+/// number is worded as one: the runtime words a failed name lookup as
+/// `ENOENT` whatever the lookup answered (docs/known-issues.md), and on this
+/// target the lookup is refused like the rest.
+export fn strerror(code: i32) -> addr {
+    unsafe { mem_static("operation not supported on this platform") }
+}
+
+/// `exit`'s end: the status thrown to the export that started the run.
+export fn _exit(code: i32) {
+    unsafe { __wasm_throw(code.as_i64().bit_and(255)) }
+}
+
+/// What a context switch's leaf calls (`compiler/wasm32`): a `concurrent`
+/// block cannot run here, and the panic says so in the Rust playground's
+/// words.
+export fn wasm_no_switch() {
+    unsafe { grasm_panic_msg(mem_static("`concurrent` needs a platform that can switch stacks, which this one cannot"), mem_static_len("`concurrent` needs a platform that can switch stacks, which this one cannot")) }
+}
+
+// ----- the standard streams -------------------------------------------------------
+
+export fn write(fd: i32, p: addr, n: i64) -> i64 {
+    let f = fd.as_i64()
+    if f == 1 or f == 2 {
+        return unsafe { __host_grasm_write(f, p, n) }
+    }
+    refuse64()
+}
+
+/// Standard input is empty (a module's program reads none); any other
+/// descriptor is not here.
+export fn read(fd: i32, p: addr, n: i64) -> i64 {
+    if fd.as_i64() == 0 {
+        return 0
+    }
+    refuse64()
+}
+
+export fn close(fd: i32) -> i32 {
+    0.as_i32()
+}
+
+// ----- clocks and entropy ----------------------------------------------------------
+
+/// A `timespec` from the host's milliseconds: the realtime clock, or with
+/// Darwin's `CLOCK_MONOTONIC`, a clock that never goes back.
+export fn clock_gettime(clock: i32, ts: addr) -> i32 {
+    unsafe {
+        let ms = if clock.as_i64() == CLOCK_MONOTONIC { __host_grasm_monotonic_millis() } else { __host_grasm_now_millis() }
+        let ns = (ms * 1000000.0).as_i64()
+        ts.store_i64(ns / 1000000000)
+        ts.offset(8).store_i64(ns % 1000000000)
+    }
+    0.as_i32()
+}
+
+export fn nanosleep(want: addr, left: addr) -> i32 {
+    unsafe {
+        let s = want.load_i64()
+        let ns = want.offset(8).load_i64()
+        __host_grasm_sleep_millis(s.as_f64() * 1000.0 + ns.as_f64() / 1000000.0)
+    }
+    0.as_i32()
+}
+
+export fn getentropy(p: addr, n: i64) -> i32 {
+    if n > 256 {
+        return refuse()
+    }
+    if unsafe { __host_grasm_entropy(p, n) } != 0 {
+        return refuse()
+    }
+    0.as_i32()
+}
+
+export fn getenv(name: addr) -> addr {
+    unsafe { mem_addr(0) }
+}
+
+export fn sysconf(name: i32) -> i64 {
+    if name.as_i64() == SC_NPROCESSORS_ONLN {
+        return 1
+    }
+    -1
+}
+
+/// The C library's `exit`, the one symbol the runtime looks up by name
+/// (`io.leave`, to end the process as C's `exit` does): its table slot. Any
+/// other name is not here.
+export fn dlsym(handle: addr, name: addr) -> addr {
+    unsafe {
+        if name.load_u8().as_i64() == 101 and name.offset(1).load_u8().as_i64() == 120 and name.offset(2).load_u8().as_i64() == 105 and name.offset(3).load_u8().as_i64() == 116 and name.offset(4).load_u8().as_i64() == 0 {
+            return mem_fn_addr(c_exit)
+        }
+        mem_addr(0)
+    }
+}
+
+/// `exit(code)`: the runtime has flushed its buffers; the status thrown.
+fn c_exit(code: i32) {
+    _exit(code)
+}
+
+// ----- threads: one ---------------------------------------------------------------
+
+export fn pthread_create(out: addr, attr: addr, entry: addr, arg: addr) -> i32 {
+    EAGAIN.as_i32()
+}
+
+export fn pthread_join(t: addr, out: addr) -> i32 {
+    ENOTSUP_W.as_i32()
+}
+
+export fn pthread_detach(t: addr) -> i32 {
+    ENOTSUP_W.as_i32()
+}
+
+export fn pthread_attr_init(attr: addr) -> i32 {
+    0.as_i32()
+}
+
+export fn pthread_attr_destroy(attr: addr) -> i32 {
+    0.as_i32()
+}
+
+export fn pthread_attr_setstacksize(attr: addr, size: i64) -> i32 {
+    0.as_i32()
+}
+
+/// A key whose destructor never runs: the one thread never ends before the
+/// program does.
+export fn pthread_key_create(key: addr, dtor: addr) -> i32 {
+    unsafe { key.store_i64(1) }
+    0.as_i32()
+}
+
+export fn pthread_key_delete(key: i64) -> i32 {
+    0.as_i32()
+}
+
+export fn pthread_setspecific(key: i64, v: addr) -> i32 {
+    0.as_i32()
+}
+
+export fn pthread_setname_np(name: addr) -> i32 {
+    0.as_i32()
+}
+
+export fn sched_yield() -> i32 {
+    0.as_i32()
+}
+
+// ----- what wasm cannot do ----------------------------------------------------------
+
+export fn open(path: addr, flags: i32, r2: i64, r3: i64, r4: i64, r5: i64, r6: i64, r7: i64, mode: i64) -> i32 {
+    refuse()
+}
+
+export fn fcntl(fd: i32, cmd: i32, r2: i64, r3: i64, r4: i64, r5: i64, r6: i64, r7: i64, arg: i64) -> i32 {
+    refuse()
+}
+
+export fn lseek(fd: i32, off: i64, whence: i32) -> i64 {
+    refuse64()
+}
+
+export fn fsync(fd: i32) -> i32 {
+    refuse()
+}
+
+export fn access(path: addr, mode: i32) -> i32 {
+    refuse()
+}
+
+export fn mkdir(path: addr, mode: i32) -> i32 {
+    refuse()
+}
+
+export fn rename(from: addr, to: addr) -> i32 {
+    refuse()
+}
+
+export fn unlink(path: addr) -> i32 {
+    refuse()
+}
+
+export fn opendir(path: addr) -> addr {
+    refuse_null()
+}
+
+export fn readdir(dir: addr) -> addr {
+    refuse_null()
+}
+
+export fn closedir(dir: addr) -> i32 {
+    refuse()
+}
+
+export fn pipe(ends: addr) -> i32 {
+    refuse()
+}
+
+export fn dup2(from: i32, to: i32) -> i32 {
+    refuse()
+}
+
+export fn fork() -> i32 {
+    refuse()
+}
+
+export fn execvp(file: addr, argv: addr) -> i32 {
+    refuse()
+}
+
+export fn waitpid(pid: i32, status: addr, flags: i32) -> i32 {
+    refuse()
+}
+
+export fn kill(pid: i32, signal: i32) -> i32 {
+    refuse()
+}
+
+export fn socket(domain: i32, kind: i32, protocol: i32) -> i32 {
+    refuse()
+}
+
+export fn bind(fd: i32, a: addr, len: i32) -> i32 {
+    refuse()
+}
+
+export fn listen(fd: i32, backlog: i32) -> i32 {
+    refuse()
+}
+
+export fn accept(fd: i32, a: addr, len: addr) -> i32 {
+    refuse()
+}
+
+export fn connect(fd: i32, a: addr, len: i32) -> i32 {
+    refuse()
+}
+
+export fn recv(fd: i32, p: addr, n: i64, flags: i32) -> i64 {
+    refuse64()
+}
+
+export fn recvfrom(fd: i32, p: addr, n: i64, flags: i32, a: addr, alen: addr) -> i64 {
+    refuse64()
+}
+
+export fn send(fd: i32, p: addr, n: i64, flags: i32) -> i64 {
+    refuse64()
+}
+
+export fn sendto(fd: i32, p: addr, n: i64, flags: i32, a: addr, alen: i32) -> i64 {
+    refuse64()
+}
+
+export fn setsockopt(fd: i32, level: i32, name: i32, value: addr, len: i32) -> i32 {
+    refuse()
+}
+
+export fn getpeername(fd: i32, a: addr, len: addr) -> i32 {
+    refuse()
+}
+
+export fn getsockname(fd: i32, a: addr, len: addr) -> i32 {
+    refuse()
+}
+
+export fn getaddrinfo(host: addr, service: addr, hint: addr, out: addr) -> i32 {
+    // `EAI_SYSTEM` on Darwin: the error is in `errno`.
+    let _ = refuse()
+    11.as_i32()
+}
+
+export fn freeaddrinfo(a: addr) {
+    ()
+}
+
+export fn inet_ntop(family: i32, a: addr, out: addr, len: i32) -> addr {
+    refuse_null()
+}
+
+export fn poll(fds: addr, n: i32, timeout: i32) -> i32 {
+    refuse()
+}
+
+export fn kqueue() -> i32 {
+    refuse()
+}
+
+export fn kevent(kq: i32, changes: addr, nchanges: i32, events: addr, nevents: i32, timeout: addr) -> i32 {
+    refuse()
+}

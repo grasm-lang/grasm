@@ -1,0 +1,14 @@
+[package]
+name = "wasm32"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The wasm32 target of the Grasm backend (docs/self-hosting.md §6.24, S8 part
+# seven): MIR in, a WebAssembly module out -- the structured control flow,
+# the locals, the instructions and their encodings, the module's sections and
+# the link of a program with the runtime and its C library. Pure
+# computation.
+capabilities = []
+
+[dependencies.mir]
+path = "../mir"

@@ -39,12 +39,32 @@ and one in `compiler/s3`, which no release ships yet, an object naming the
 directory it was compiled in. Two differences [E-RECURSION-DEPTH] allows
 between the Grasm command and the Rust one (§6.23): a recursion between the
 Rust interpreter's stack and 100,000 calls runs under the Grasm command, and
-one inside a task past 10,999 calls is refused by it.
+one inside a task past 10,999 calls is refused by it. One more it allows in
+a program the Grasm backend compiles to wasm (§6.24): a recursion is refused
+at 3,390 to 10,089 calls, by shape, below the 10,000 the clause guarantees
+for most.
 Latent: one, the Rust runtime's region sweep,
 which no compiled program reaches. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
 
 ## Found on 2026-11-22 by S8 part seven (the wasm32 backend)
+
+**A program compiled to wasm refuses a recursion below 10,000 calls --
+*a difference [E-RECURSION-DEPTH] allows, measured*.** A module the Grasm
+backend writes (`s3 --target wasm32`, docs/self-hosting.md §6.24) runs on the
+engine's own stack, which a page cannot enlarge (V8's 984 KB under node and
+in a browser), and a stack overflow there is a trap wasm cannot catch. So
+every function that calls something keeps a frame on the module's shadow
+stack proportional to the engine frame it will cost, and the runtime's
+floor -- 6 MiB below where a recursion first asks for it -- is met on the
+shadow stack first, with the clause's panic and exit 101, never the trap
+(the coordinator's decision (5): the aim 10,000 calls under node's default
+stack, never a flag; what falls short recorded). The deepest each shape of
+`scripts/fixtures/wasmstack/` reaches, measured by `wasmsubset`: `mutual`
+10,089, `plain` (`1 + depth(n - 1)`) 9,368, `doubles` 8,030, `tree` 7,026,
+`locals` 5,620, `closure` (through a function value and `map`) 3,390. The
+Rust playground's module, which traps rather than panics, reaches 173 on
+`plain` (above).
 
 **The playground module traps on a recursion of 174 calls -- *open, S3
 (the agent's)*.** `grasm_wasm.wasm`, the Rust interpreter built by rustc for
