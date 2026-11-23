@@ -8090,6 +8090,39 @@ interleaved ratios; who decided what is said where it was decided.)
   early (`encodetest_wasm`), `sin`'s first coefficient one bit off
   (`fuzz_wasmmath`).
 
+- **The final runs** (2026-11-22 and 23, on `2f8c9782`, the final tree but
+  for this paragraph, by the agent's resumable runner, `nice -n 10`, one gate
+  at a time, no network; other apps held swap at 15 to 17.4 GB; the Mac did
+  not sleep). `encodetest_wasm`, `fuzz_wasmmath`, `wasmsubset` and
+  `wasmcontrols` as on `bb01d7c0` above, line for line. `wasmtest`, its rules
+  moved to `scripts/lib/wasmskip.sh`: "identical: 508   mismatched: 0
+  skipped: 143", its list of what it set aside the same lines as the
+  baseline's. `s3subset` "identical: 648   mismatched: 0   timed out: 0   no
+  TIR: 0"; `objtest` "objects: 648   reproducible: 648 ... with problems:
+  0"; `xs3subset` "identical: 648   mismatched: 0   timed out: 0   no TIR:
+  0"; `fixpoint` "compared: 54 ... identical: 54   differ: 0", "stage 2's TIR
+  the same as grasm tir's: 6 of 6", "the command's build the stage
+  pipeline's (its rt.o and the 4 programs): 5 of 5". The stage-1 command
+  built from this tree, the sections the new files reach: `lines` "lines: 280
+  the same: 275 ... a target refused: 4", `fmt` "2054 files ... 20540
+  commands   the same: 20540", `lint` "2054 files, 5543 commands ... the
+  same: 5543". The whole `clidiff` with fixpoint's stage-2 command (its bytes
+  not part six's: the command carries `s3`, which now links the wasm
+  target), 753 minutes, exit 0, every floor held: among its lines "run: 651
+  programs with a main   the same: 651   timed out: 0", "build: 648 programs
+  ... run alike: 648   built twice the same: 648", "target: 65 programs ...
+  195 of 195", "dap: 1049 sessions compared   the same: 1008", "given the
+  program's own run time: 0", "lsp: 2071 sessions   the same: 2071".
+  `clicontrols` "controls: 36   caught: 36   missed: 0"; `fmttest`
+  "formatted: 2048   unformatted: 0   does not parse: 5   exempt: 1";
+  `gfmttest` "checked: 1538   disagreeing: 0"; `linttest` "linted: 2049
+  findings: 1165   does not parse: 5   broke: 0"; `gatecheck` "gate helpers
+  checked: 603   undefined: 0   corpus copied: 0   grep -q under pipefail: 0
+  gates not executable: 0". Not run: `tirinterp` (the interpreter did not
+  change), the rest of `allgates.sh`, the Linux ELF gates. `wasmtest`'s own
+  blind spot (the programs it sets aside for `par_map`, `par_filter` and
+  `spawn`) is left as it is; `wasmsubset` holds them.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
