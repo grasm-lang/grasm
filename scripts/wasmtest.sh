@@ -88,6 +88,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 . "$(dirname "$0")/lib/corpus.sh"
+. "$(dirname "$0")/lib/wasmskip.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
 corpus_require
 # shellcheck disable=SC2086
@@ -123,85 +124,15 @@ for src in $programs; do
         subject="$bundle"
         run_src="$bundle"
     fi
-    # This list is the harness's model of what the target cannot do, and it
-    # has to grow when the library does. `write_bytes` and `proc_pipeline`
-    # arrived after it was written, so two conformance programs were reported
-    # as *mismatches* rather than skips — the same drift as the committed
-    # module below, in the other direction. It happened again with the five
-    # file calls a store needed: three demos read and wrote real files and were
-    # counted as disagreements. Anything added to `[L-LIB-BYTES]`'s file table
-    # belongs here on the same day.
-    #
-    # A `concurrent` block's tasks are fibers, and wasm32-unknown-unknown has
-    # no way to switch stacks. The pattern is the block, not the word, so
-    # T-EFFECT-BUILTIN's `fn concurrent()` still runs; it holds no colon,
-    # because the reason starts at the first one.
-    for need in par_map:threads par_filter:threads spawn:threads \
-                tcp_listen:sockets tcp_accept:sockets tcp_connect:sockets \
-                udp_bind:sockets net_wait:sockets \
-                read_file:filesystem write_file:filesystem \
-                read_bytes:filesystem write_bytes:filesystem \
-                read_bytes_at:filesystem append_bytes:filesystem \
-                file_size:filesystem sync_file:filesystem \
-                rename_file:filesystem remove_file:filesystem \
-                file_exists:filesystem \
-                random_bytes:filesystem \
-                list_dir:filesystem make_dir:filesystem \
-                proc_run:processes proc_pipeline:processes \
-                'concurrent[^a-z_(]*{:stack-switching'; do
-        # Code, not prose. The name was matched anywhere in the file, so
-        # `T-EXTERN-VALUE.gr` -- which mentions `par_map` in a comment
-        # explaining why a purity proof matters -- was skipped as needing
-        # threads it never asks for. A skip is coverage lost, and one taken
-        # for a facility the program does not use is lost for nothing.
-        # `grep -c … >/dev/null` rather than `grep -q`, and the difference is
-        # not style. `grep -q` exits the moment it matches; the `grep -v`
-        # upstream is then killed by SIGPIPE, and `set -o pipefail` takes the
-        # pipeline's status from *that* — so the pipeline reported failure
-        # exactly when it succeeded. It only bit on inputs long enough that the
-        # upstream was still writing, which is why small programs skipped
-        # correctly and a 1,188-line bundle did not, and why two runs of this
-        # gate disagreed with each other. `grep -c` reads to the end, so there
-        # is no early exit to be killed for.
-        #
-        # `[[:space:]]` rather than `\s`: the second is not POSIX, and which
-        # `grep` a script inherits decides whether it means whitespace, a
-        # literal `s`, or an error. When it meant the wrong thing here the
-        # filter produced nothing, *every* skip check silently stopped firing,
-        # and programs that need a filesystem were run on a target that has
-        # none — reported as disagreements rather than as skips. A gate whose
-        # answer depends on which grep is installed is not a gate.
-        if grep -vE '^[[:space:]]*(//|#)' "$subject" | grep -c "${need%%:*}" >/dev/null; then
-            skip=$((skip + 1))
-            SKIPPED+=("$src — needs ${need##*:}, which wasm32-unknown-unknown has none of")
-            continue 2
-        fi
-    done
-    # `extern fn` reaches a C symbol, which needs a linker and a process that
-    # has one loaded. A wasm module has neither, and says so by name.
-    if grep -qE '^\s*(pub )?extern fn ' "$subject"; then
+    # What the target cannot do, and why: `scripts/lib/wasmskip.sh`, the
+    # rules this gate wrote and `wasmsubset` shares, so the two set aside the
+    # same programs for the same reasons.
+    why=$(wasm_skip_reason "$src" "$subject")
+    if [ -n "$why" ]; then
         skip=$((skip + 1))
-        SKIPPED+=("$src — calls a C function, and a wasm module has no linker")
+        SKIPPED+=("$src — $why")
         continue
     fi
-    # A wasm module's stack is fixed at link time and cannot be enlarged from
-    # inside, so the depth [E-RECURSION-DEPTH] promises is not reachable here.
-    # These two programs exist to recurse until something gives; on this target
-    # the module's stack gives first. It is a smaller number, not a different
-    # meaning — but it is a difference, and it is named rather than absorbed.
-    #
-    # `scheme-demo` is the same limit reached from the other direction: it is an
-    # interpreter written in Grasm, run by the Grasm interpreter, so every
-    # Scheme call costs two stacks. Natively it finishes; in a module whose
-    # stack is fixed at link time it does not. A smaller number, not a
-    # different meaning.
-    case "$src" in
-        */E-RECURSION-DEPTH.gr|*/E-PANIC-TRACE.gr|*/scheme-demo/src/main.gr)
-            skip=$((skip + 1))
-            SKIPPED+=("$src — recurses past the stack a wasm module is given")
-            continue
-            ;;
-    esac
 
     i_err=$(mktemp); w_err=$(mktemp)
     i_out=$("$GRASM" run "$src" 2>"$i_err"); i_code=$?
