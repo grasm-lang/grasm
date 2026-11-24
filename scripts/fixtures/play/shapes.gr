@@ -1,6 +1,6 @@
-// The playground's stack (§6.25 decision (3)): four shapes of recursion. A
-// page passes no arguments, so the gate writes the shape and the depth into
-// a copy, in place of the two lines `main` begins with.
+// The playground's stack (§6.25 decision (3)): four shapes of recursion, in
+// a task or not. A page passes no arguments, so the gate writes the shape,
+// the depth and where into a copy, in place of the lines `main` begins with.
 fn plain(n: i64) -> i64 {
     if n == 0 {
         return 0
@@ -31,9 +31,8 @@ fn through(n: i64) -> i64 {
     1 + again(n - 1)
 }
 
-fn main() {
-    let shape = "plain"
-    let n = 10
+/// The shape, `n` deep, its answer printed.
+fn run_shape(shape: str, n: i64) {
     if shape == "plain" {
         print("{plain(n)}")
     } else if shape == "stmt" {
@@ -43,5 +42,20 @@ fn main() {
         print("{mapped(n)}")
     } else {
         print("{through(n)}")
+    }
+}
+
+fn main() / {io, async} {
+    let shape = "plain"
+    let n = 10
+    let in_task = false
+    if in_task {
+        concurrent {
+            go {
+                run_shape(shape, n)
+            }
+        }
+    } else {
+        run_shape(shape, n)
     }
 }

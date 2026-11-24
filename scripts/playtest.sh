@@ -28,8 +28,10 @@
 #            (`run.mjs --session`), each answer the one a fresh instance
 #            gives (decision (6), the reset)
 #   stack    four shapes of recursion at 10,000 calls (as `grasm run`),
-#            99,998 (run) and 99,999 (the count's panic) under JSPI, and at
-#            10,000 without it (the open defect: the panic, never a trap);
+#            10,997 inside a task (as `grasm run`; the task's count is
+#            10,999, the program's two frames above the shape's own), 99,997
+#            (run: 99,999 calls with those two) and 99,998 (the count's
+#            panic, 100,000 calls) under JSPI, and at 10,000 without it (the open defect: the panic, never a trap);
 #            `scripts/fixtures/stack/` as `grasm run`, with the two
 #            differences §6.23 allows counted as `clidiff`'s `stack` section
 #            counts them; out of memory, in a module capped at 256 MiB:
@@ -229,6 +231,7 @@ show() { # TAG TAG
 # ----- frame --------------------------------------------------------------------
 
 F=scripts/fixtures/play
+printf 'one\ntwo\nthree\n' >"$WORK/in-nl.txt"
 fr_n=0
 fr_rust=0
 fr_run=0
@@ -237,7 +240,6 @@ if want frame; then
     printf 'fn main() {\n    print("a\377b")\n}\n' >"$WORK/badutf8.gr"
     "$GRASM" build examples/multi/app.gr --source -o "$WORK/bundle.gr" >/dev/null 2>&1 ||
         failed "examples/multi/app.gr does not bundle"
-    printf 'one\ntwo\nthree\n' >"$WORK/in-nl.txt"
     printf 'one\n\ntwo' >"$WORK/in-plain.txt"
     printf 'a\r\nb\n' >"$WORK/in-crlf.txt"
     printf 'not a journal' >"$WORK/bad.jrnl"
@@ -333,6 +335,11 @@ if want session; then
                 node scripts/wasm/run.mjs "$PGW" --session "$WORK/single.txt" >>"$WORK/fresh.jsonl" 2>/dev/null
             fi
         done <"$WORK/session.txt"
+        got=$(wc -l <"$WORK/one.jsonl" | tr -d ' ')
+        asked=$(wc -l <"$WORK/session.txt" | tr -d ' ')
+        if [ "$got" != "$asked" ]; then
+            failed "session (mode $mode): one instance answered $got of $asked runs -- state carried from a run to the next broke it: $(tail -2 "$WORK/one.err" | tr '\n' ' ' | head -c 300)"
+        fi
         k=0
         while IFS= read -r a && IFS= read -r b <&3; do
             k=$((k + 1))
@@ -360,6 +367,18 @@ if want stack; then
         sed -e "s/    let shape = \"plain\"/    let shape = \"$1\"/" -e "s/    let n = 10\$/    let n = $2/" "$F/shapes.gr" >"$3"
     }
     for s in plain stmt mapped through; do
+        # Inside a task: the count a command's task keeps, 10,999 calls.
+        shape $s 10997 "$WORK/s.gr"
+        sed -i.bak "s/    let in_task = false/    let in_task = true/" "$WORK/s.gr"
+        grun "$WORK/s.gr" gr
+        play "$PGW" "$WORK/s.gr" 1 "" pg
+        sk_runs=$((sk_runs + 1))
+        if same3 pg gr && [ "$(cat "$WORK/pg.rc")" = 0 ]; then
+            sk_ok=$((sk_ok + 1))
+        else
+            failed "$s 10,997 deep inside a task under JSPI -- not as grasm run"
+            show gr pg
+        fi
         shape $s 10000 "$WORK/s.gr"
         grun "$WORK/s.gr" gr
         play "$PGW" "$WORK/s.gr" 1 "" pg
@@ -371,22 +390,24 @@ if want stack; then
             show gr pg
         fi
         # Past the Rust interpreter's stack: held to the count both Grasm
-        # engines keep (§6.23), the output the depth, then the count's panic.
-        shape $s 99998 "$WORK/s.gr"
+        # engines keep (§6.23), the output the depth, then the count's panic:
+        # `main` and `run_shape` are two calls above the shape's, so 99,997
+        # is 99,999 calls, the last the count allows, and 99,998 is 100,000.
+        shape $s 99997 "$WORK/s.gr"
         play "$PGW" "$WORK/s.gr" 1 "" pg
         sk_runs=$((sk_runs + 1))
-        if [ "$(cat "$WORK/pg.rc")" = 0 ] && [ "$(cat "$WORK/pg.out")" = "$([ $s = stmt ] && echo done || echo 99998)" ]; then
+        if [ "$(cat "$WORK/pg.rc")" = 0 ] && [ "$(cat "$WORK/pg.out")" = "$([ $s = stmt ] && echo done || echo 99997)" ]; then
             sk_ok=$((sk_ok + 1))
         else
-            failed "$s 99,998 deep under JSPI -- exit $(cat "$WORK/pg.rc"): $(head -c 200 "$WORK/pg.err")"
+            failed "$s 99,997 deep (99,999 calls with main's two) under JSPI -- exit $(cat "$WORK/pg.rc"): $(head -c 200 "$WORK/pg.err")"
         fi
-        shape $s 99999 "$WORK/s.gr"
+        shape $s 99998 "$WORK/s.gr"
         play "$PGW" "$WORK/s.gr" 1 "" pg
         sk_runs=$((sk_runs + 1))
         if [ "$(cat "$WORK/pg.rc")" = 101 ] && [ "$(cat "$WORK/pg.err")" = "$DEEP_MSG" ] && [ ! -s "$WORK/pg.out" ]; then
             sk_ok=$((sk_ok + 1))
         else
-            failed "$s 99,999 deep under JSPI -- not the count's panic: exit $(cat "$WORK/pg.rc"): $(head -c 200 "$WORK/pg.err")"
+            failed "$s 99,998 deep (100,000 calls) under JSPI -- not the count's panic: exit $(cat "$WORK/pg.rc"): $(head -c 200 "$WORK/pg.err")"
         fi
         # Without JSPI: the open defect (docs/known-issues.md) -- the
         # recursion ends in the panic, never a trap.
@@ -447,7 +468,7 @@ again zero: true" ]; then
     fi
     echo "stack: $sk_runs runs   as held: $sk_ok   past the Rust interpreter's stack, within the count: $sk_window   past a task's spare stacks: $sk_task"
     [ $((sk_ok + sk_window + sk_task)) = "$sk_runs" ] || failed "stack: $sk_runs runs, $((sk_ok + sk_window + sk_task)) accounted for"
-    [ "$sk_runs" -ge 26 ] || failed "stack: $sk_runs runs, fewer than the 26 written"
+    [ "$sk_runs" -ge 30 ] || failed "stack: $sk_runs runs, fewer than the 30 written"
 fi
 
 # ----- corpus -------------------------------------------------------------------
