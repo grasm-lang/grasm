@@ -8673,6 +8673,155 @@ cost per switch (on wasm too, under (2a)); the in-task recursion bound of
 10,999; the compiled modules' recursion depth, unless (5) is done here; and
 the site's switch, the owner's.
 
+#### The first half, as built
+
+(2026-11-23 and 24, this branch, the main checkout's compiler and node
+v25.2.1; loads of 6 to 16 from other apps, so no time here is to be quoted
+but the interleaved ratios; who decided what is said where it was decided.)
+
+- **What was built.** `compiler/wasm32` and `compiler/s3`: `--target wasm32
+  --exports`, `--export-prefix FROM:TO` and `--max-memory MIB` (the module of
+  `export fn`s, decision (1); a program's module is the same bytes as
+  part seven's, six programs compared). `compiler/rtwasm`: the streams in
+  `src/streams.gr`, the playground's in `play/streams.gr` (which imports
+  nothing: a file outside `src/` cannot name the package's modules, as the
+  capability check reads every file of a package); `realpath` and
+  `strerror_r` refused in the Rust module's words; `stacks.gr`, the switch
+  over JSPI and the room query; `reset.gr`, a run begun from the instance's
+  first state; large mappings cut exact and zeroed but where `memory.grow`
+  has just made them zero; out of memory, the panic "memory allocation of N
+  bytes failed". `tools/tirinterp`: the three ways a run moves to a fresh
+  stack (`STACKS_COUNT`, a command's, unchanged; `STACKS_ROOM`;
+  `STACKS_NONE`), and 48 spare stacks for a task hopping by room.
+  `compiler/front`: `diagnostics_text`. `tools/playground` (the five exports
+  and the run path), `scripts/wasm/run.mjs` (both modules, JSPI by feature
+  detection, `--session`), `scripts/playtest.sh` and nine controls in
+  `scripts/wasmcontrols.sh`.
+- **Found while building, each settled here.** The language keeps the names
+  beginning `grasm_` for the toolchain ([T-EXPORT]) and an `export fn` may
+  not perform `async` ([T-FN-ADDR]): the exports are written `play_*` and
+  renamed by `--export-prefix`, and a run export runs the program's `main`
+  through the C library (`wasm_main`), the coordinator accepting both. The
+  Rust module reads a standard-input line ending `\r\n` with its `\r`, where
+  `grasm run` drops it; the Grasm module reads as `grasm run` does
+  (docs/known-issues.md, not copied). A task hopping by room spends its 21
+  spare stacks well before a command's count of 10,999 calls on a costly
+  shape (about 290 calls of `[n - 1].map(f)` to an engine stack): 48 spares
+  for a task that hops by room, the count the command's.
+- **The stack, by measurement (decisions (3) and C, D).** Under JSPI, with
+  the hop by room, every shape runs 10,000 calls and 99,998 under node's
+  default stack and no flag, and the 100,000th call is the count's panic,
+  as under `grasm run`. Linear memory and resident set (the module, 3.5 MB,
+  and node's own included in the latter), the program `main` calling the
+  shape: `1 + depth(n - 1)` 65 MiB and 119 MB at 10,000, 589 MiB and 608 MB
+  at 99,998; `d(n - 1)` as a statement 52 and 105, 452 and 474; through a
+  function value 146 and 198, 1,396 and 1,346 (8 s); through `[n -
+  1].map(down)` 227 and 270, 2,216 and 1,803 (28 s). Inside a task each
+  shape runs 10,997 calls, the command's count, at 334 to 339 MiB (a
+  block's 48 spare stacks, each 6.5 MiB of the runtime's, linear memory that
+  is reserved and mostly untouched). With no stack switched: 1,314, 1,774,
+  537 and 334 (docs/known-issues.md, open S3). Under a 256 MiB cap the
+  deepest shape ends in "panic: memory allocation of 6848528 bytes failed",
+  101, in half a second; the placeholder text the runtime gave before was
+  found in `compiler/rt/src/fiber.gr`, copied from the Rust runtime, and not
+  reproduced natively (docs/known-issues.md, latent; `compiler/rt` is not
+  changed).
+- **The `\r` of a line.** The Rust module reads a standard-input line ending
+  `\r\n` with its `\r`; `grasm run` and the Grasm module drop it. The
+  coordinator's decision (2026-11-24): the Grasm module drops `\r` as `grasm
+  run` does; the Rust module's behaviour is the S4 defect recorded in
+  docs/known-issues.md, not copied.
+- **Slow programs, measured.** `gc-demo`: the Grasm module 371 s, the Rust
+  module 40 s, `grasm run` 30 s; `examples/parallel_map.gr`: 563 s and 246
+  s, `grasm run` 178 s. `playtest` gives these two 3,600 s each, every other
+  run 600 s.
+- **The final runs** (2026-11-23 and 24, on `ac4f5c5a`, by the agent's
+  resumable runner, `nice -n 10`, one gate at a time, no network; other
+  apps held swap at 17 to 19.7 GB, disk 8.2 to 10.7 GB free; the Mac did not
+  sleep). `playtest`, 112 minutes, exit 0: "build: built twice the same: 1
+  V8: valid   wasm_validate.py: 2036 bodies   link: 13s", the exports
+  "grasm_alloc/1 grasm_free/2 grasm_run/2 grasm_run_with_journal/4
+  grasm_run_with_stdin/4" as the Rust module's, the seven imports, "size:
+  3496479 bytes (821266 under gzip -9), the Rust module's 1939255 (564375)";
+  "frame: 16 cases, 2 modes each   as the Rust module: 27   as grasm run, by
+  decision: 5"; "session: 18 runs in one instance   as a fresh instance:
+  18"; "stack: 30 runs   as held: 28   past the Rust interpreter's stack,
+  within the count: 1   past a task's spare stacks: 1"; "corpus: compared
+  508   as grasm run: 508 (standard error too: 508)   as the Rust module:
+  508   set aside: 114" (filesystem 83, sockets 22, a C function 8,
+  processes 1: `wasmtest`'s reasons, none new), "named par_map, par_filter
+  or spawn and held: 22, the Rust module running them as grasm run does:
+  21", "stack switching, held under JSPI to grasm run: 4", "recursing past
+  what the Rust module's stack holds, held under JSPI to grasm run: 3",
+  "without JSPI, the sample (scripts/lib/playsample.txt): 56   as under JSPI
+  (or refused as the Rust module refuses): 55   deeper than one engine
+  stack, the panic: 1" (`E-RECURSION-PARALLEL`); "replay: identical on every
+  engine"; "speed: geometric mean of this module's time over the Rust
+  module's, three interleaved rounds: 1.451" (`fib` 0.865, `tree` 0.997,
+  `hello` 1.092, `effects` 1.169, `matmul` 1.292, `wordfreq` 1.843, `sieve`
+  1.982, `sort` 3.776). `wasmcontrols` "controls: 18   caught: 18   missed:
+  0". `wasmsubset` "as grasm run: 530   as the native build (stdout,
+  stderr, status): 530   timed out: 0", "modules: 530   built twice the
+  same: 530   V8 validates: 530 (refuses 0)   wasm_validate.py: 530 valid,
+  0 invalid, 147125 bodies checked", "refusals: 4 of 4 as the Rust
+  module's", "stack: 6 of 6 recursions past any depth end in the panic".
+  `wasmtest`, through the new `run.mjs`: "identical: 508   mismatched: 0
+  skipped: 143", the line it gave before the edit. `replaytest` "journaled:
+  44   unhooked: 0   no test program: 0", "a native recording replayed
+  elsewhere: identical on every engine". `s3subset` "identical: 648
+  mismatched: 0   timed out: 0   no TIR: 0"; `objtest` "objects: 648
+  reproducible: 648 ... with problems: 0"; `tirinterp` "round trip: 1671
+  identical, 0 not", "identical: 651   mismatched: 0   timed out: 0
+  skipped: 0", "panics: 25 identical, 0 not"; `fixpoint` "compared: 54 ...
+  identical: 54   differ: 0", "stage 2's TIR the same as grasm tir's: 6 of
+  6", "the command's build the stage pipeline's (its rt.o and the 4
+  programs): 5 of 5". The stage-1 command (5,228,984 bytes), the sections
+  the change reaches: "lines: 280   the same: 275 ... a target refused: 4",
+  "run: 651 programs with a main   the same: 651   timed out: 0", "fmt: 2070
+  files ... 20700 commands   the same: 20700", "lint: 2070 files, 5589
+  commands ...   the same: 5589", "schedules: 20 programs, 121 commands
+  the same: 121 ...", "stack: 13 programs, 26 commands   the same: 22
+  past the Rust interpreter's stack, within the count: 2   past a task's
+  spare stacks: 2" -- the command's 500-call hop unchanged. The whole
+  `clidiff` with fixpoint's stage-2 command, 910 minutes, exit 0, every
+  floor held: among its lines "run: 651 programs with a main   the same:
+  651   timed out: 0", "test: 1737 programs, 1961 commands ...   the same:
+  1960, 12 of them with a failing test   both timed out, --contracts: 1",
+  "schedules: 20 programs, 121 commands   the same: 121 ...", the `stack`
+  line as on stage 1, "bundle: 651 ... run alike, plain and with
+  arguments: 651 ... built twice the same: 651", "journal: 652 programs
+  recorded   the same: 652 ... native recordings replayed alike: 45 of
+  45", "dap: 1047 sessions compared   the same: 1005, 96 of them fixed ...",
+  "given the program's own run time: 1 (slowest:
+  packages/gc-demo/src/main.gr step 262 s, run 356 s)", "lsp: 2087 sessions
+  the same: 2087, 17 of them fixed". `fmttest` "formatted: 2064
+  unformatted: 0   does not parse: 5   exempt: 1"; `gfmttest` "checked:
+  1539   disagreeing: 0"; `linttest` "linted: 2065   findings: 1175   does
+  not parse: 5   broke: 0"; `gatecheck` "gate helpers checked: 609
+  undefined: 0   corpus copied: 0   grep -q under pipefail: 0   gates not
+  executable: 0".
+- **`clicontrols`, missed by the final run and fixed after it.** On
+  `ac4f5c5a` it said "controls: 36   caught: 35   missed: 1": the
+  `task-stack` control could not be planted, because `7befd735` (48 spare
+  stacks for a task hopping by room) had moved the line it plants into --
+  `let nsp = if cx.p.may_recurse { SPARES } else { 0 }` in
+  `tools/tirinterp/src/tasks.gr` became the function `spares` -- without
+  updating the control in the same commit, as the owner's rule asks. Found
+  by the final run, not before. `a6656bc9` plants the same fault into the
+  code as it stands (`let nsp = spares(cx)` made `let nsp = 0`: a command's
+  task with no spare stacks, which `scripts/fixtures/stack/task-limit.gr`
+  shows), run alone first ("controls: 1   caught: 1   missed: 0", 11
+  minutes) and then the whole `clicontrols` on `a6656bc9` (186 minutes,
+  ended 2026-11-24 23:26): "controls: 36   caught: 36   missed: 0". That
+  commit changes `scripts/clicontrols.sh` alone, and is the
+  only one between `ac4f5c5a` and the final tree but for the documents, so
+  every other gate's line above holds on the final tree. The agent's runner
+  had also marked the failed step done (it marked a step whatever its
+  status); it now marks only a step that exits 0.
+- **Not run:** the rest of `allgates.sh`, `xs3subset` (the native targets'
+  code did not change: `s3subset`, `objtest` and `fixpoint` hold it), the
+  Linux ELF gates.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
@@ -8730,7 +8879,9 @@ GNU ld) and `elfcontrols` (§6.18), `wasmsubset` (the corpus compiled to wasm
 against `grasm run`, the native build and the Rust playground's module, every
 module validated twice), `encodetest_wasm` (the wasm encoder against
 `llvm-mc`), `fuzz_wasmmath` (the wasm C library's libm against the
-playground's) and `wasmcontrols` (§6.24), `ddc`,
+playground's) and `wasmcontrols` (§6.24), `playtest` (the playground in
+Grasm against the Rust playground's module and `grasm run`, with and
+without JS promise integration, §6.25), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
