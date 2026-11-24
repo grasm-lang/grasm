@@ -8614,6 +8614,49 @@ reverse any of them.
   playground and every embedder (`ProjectGold/` included) are neither
   switched nor edited.
 
+The coordinator's second decision (2026-11-23), on the stop the agent made
+at (3). Measured first, under JSPI with the 500-call hop of a command: the
+statement and function-value shapes ran to 99,998 calls, but the shape
+through `[n - 1].map(down)` was refused below 10,000 -- one engine stack
+holds only 334 of its calls, fewer than the 500 between hops -- and with
+the hop every 250 calls on wasm every shape reached 99,998 at a cost of
+3,239 to 3,285 MiB of linear memory (331 to 336 MiB at 10,000), each hop
+taking the runtime's 6.5 MiB fiber stack, which the wasm `mmap` cut as an
+8 MiB block and zeroed whole; every 100 calls, 99,998 ran out of memory in
+the runtime's placeholder panic "(message needs formatting)". The
+coordinator's answer:
+
+- (3): C and D. The count stays 100,000 on wasm, as under `grasm run`, so
+  that a program's output does not depend on the engine; B (a lower count
+  on wasm) refused, since the playground and `grasm run` would then
+  disagree on a program between the two bounds; A (a hop every 250 calls)
+  refused for its memory. C: on wasm only, the hop decided by the room the
+  running engine stack has left (the playground's stack-space query), a
+  command's 500-call hop unchanged and shown so by `tirinterp`, `fixpoint`
+  and `clidiff`'s `stack` section; where a hop falls must change no output,
+  the panic still at the reference's count in the reference's words, held
+  with the four shapes and `scripts/fixtures/stack` against `grasm run`.
+  D: exact-size blocks for fibers in the wasm `mmap`, only the pages
+  `memory.grow` has just added left unwritten, every reused block zeroed,
+  with a control that reuses one dirty.
+- Out of memory: when `memory.grow` fails the run ends in a worded panic
+  and exit 101, never the placeholder and never a trap; the placeholder's
+  source found, reproduced natively if native shows it and recorded, fixed
+  on wasm, and the work stopped before any change to `compiler/rt`; the
+  case in `playtest` under a lowered memory cap.
+- Measured and recorded: the four shapes at 10,000 and at 99,998 under
+  JSPI, with linear and resident memory; 10,000 must run for every shape
+  on node's default stack with no flag.
+- `--export-prefix play_:grasm_` accepted. The language keeps the names
+  beginning `grasm_` for the toolchain's own code ([T-EXPORT]: "names
+  beginning `grasm_`, `g_`, ... are the runtime's and the compiler's"), so
+  `tools/playground` cannot write `export fn grasm_run`; it writes
+  `play_run`, and the backend exports it as `grasm_run`. The module's ABI
+  -- the five names, their types, the frame -- is the Rust module's,
+  unchanged. Likewise an `export fn` may not perform `async` ([T-FN-ADDR]),
+  and running a program does, so a run export leaves its inputs with the C
+  library and runs the program's `main` through it (`wasm_main`).
+
 #### Where the first half ends
 
 The first half: (1), (2), (3), (4), (6), (7), (9) -- the module built by
