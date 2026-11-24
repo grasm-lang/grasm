@@ -1,0 +1,6 @@
+// The playground's frame (docs/self-hosting.md §6.25): a program that prints
+// and ends well -- status 0, the output, no text.
+fn main() {
+    let xs = [1, 2, 3]
+    print("hello from {xs.len()} items")
+}

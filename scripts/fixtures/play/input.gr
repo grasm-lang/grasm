@@ -1,0 +1,15 @@
+// `input()` reads the lines the caller handed over, then end of input.
+fn main() {
+    var going = true
+    var n = 0
+    while going and n < 10 {
+        let line = input()
+        if line == "" {
+            going = false
+        } else {
+            print("got [{line}] of {line.len()}")
+        }
+        n += 1
+    }
+    print("read {n}")
+}

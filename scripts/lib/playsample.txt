@@ -1,0 +1,64 @@
+# The programs `scripts/playtest.sh` runs through the Grasm playground with no
+# stack switched (an engine without JS promise integration), beside the
+# whole set it runs with JSPI: running both modes on the whole set would
+# pass the 150 minutes the coordinator set for the gate (docs/self-hosting.md
+# §6.25). Fixed and named, so the count is asserted: every tenth of the
+# programs `wasmtest` compares, in sorted order, and the ones a mode without
+# switching meets differently -- a deep expression, a recursion inside
+# `par_map`, `concurrent` blocks.
+apps/asmcheck/src/main.gr
+examples/errors.gr
+examples/ownership.gr
+packages/accounts2-demo/src/main.gr
+packages/b28-demo/src/main.gr
+packages/b31-demo/src/main.gr
+packages/b36-demo/src/main.gr
+packages/b45-demo/src/main.gr
+packages/b56-demo/src/main.gr
+packages/bloom-demo/src/main.gr
+packages/chachapoly-demo/src/main.gr
+packages/configfiles-demo/src/main.gr
+packages/dftest/src/main.gr
+packages/eatest/src/main.gr
+packages/game-demo/src/main.gr
+packages/gorilla-demo/src/main.gr
+packages/h2-demo/src/main.gr
+packages/japan-demo/src/main.gr
+packages/layout-demo/src/main.gr
+packages/media2-demo/src/main.gr
+packages/mwtest/src/main.gr
+packages/num-demo/src/main.gr
+packages/p256-demo/src/main.gr
+packages/password-demo/src/main.gr
+packages/protobuf-demo/src/main.gr
+packages/raytrace-demo/src/main.gr
+packages/security3-demo/src/main.gr
+packages/sig-demo/src/main.gr
+packages/statistics3-demo/src/main.gr
+packages/textshape-demo/src/main.gr
+packages/tooling3-demo/src/main.gr
+packages/util2-demo/src/main.gr
+packages/x25519-demo/src/main.gr
+projects/beginner/04_unit_converter.gr
+spec/conformance/E-CLOSURE-CAPTURE.gr
+spec/conformance/E-HANDLER-SCOPE.gr
+spec/conformance/E-MAIN-ERR.gr
+spec/conformance/E-POW-NEG.gr
+spec/conformance/E-TEST-SHRINK.gr
+spec/conformance/G-STMT-LAST.gr
+spec/conformance/L-CONTEXTUAL.gr
+spec/conformance/L-LIB-ATOMIC.gr
+spec/conformance/L-LIB-EXIT.gr
+spec/conformance/L-LIB-PARSE.gr
+spec/conformance/L-LIB-TUPLE.gr
+spec/conformance/T-CONST-PUB.gr
+spec/conformance/T-FALLIBLE-COALESCE.gr
+spec/conformance/T-INT-FIXED.gr
+spec/conformance/T-MATCH-NESTED-COVER.gr
+spec/conformance/T-PRIM.gr
+spec/conformance/T-STRUCT.gr
+packages/text4-demo/src/main.gr
+spec/conformance/E-RECURSION-PARALLEL.gr
+spec/conformance/E-CONCURRENT.gr
+spec/conformance/E-SCHEDULE.gr
+spec/conformance/E-ACTOR.gr

@@ -1,0 +1,47 @@
+// The playground's stack (§6.25 decision (3)): four shapes of recursion. A
+// page passes no arguments, so the gate writes the shape and the depth into
+// a copy, in place of the two lines `main` begins with.
+fn plain(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + plain(n - 1)
+}
+
+fn stmt(n: i64) {
+    if n == 0 {
+        return
+    }
+    stmt(n - 1)
+}
+
+fn mapped(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let r = [n - 1].map(mapped)
+    r[0] + 1
+}
+
+fn through(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let again = through
+    1 + again(n - 1)
+}
+
+fn main() {
+    let shape = "plain"
+    let n = 10
+    if shape == "plain" {
+        print("{plain(n)}")
+    } else if shape == "stmt" {
+        stmt(n)
+        print("done")
+    } else if shape == "mapped" {
+        print("{mapped(n)}")
+    } else {
+        print("{through(n)}")
+    }
+}

@@ -1,0 +1,12 @@
+// An error reaching `main` ([E-MAIN-ERR]): reported, status 1.
+type Oops = | Bad(why: str)
+
+fn risky() -> i64 ! Oops {
+    fail(Bad("no"))
+}
+
+fn main() -> () ! Oops {
+    print("before")
+    let v = try risky()
+    print("{v}")
+}

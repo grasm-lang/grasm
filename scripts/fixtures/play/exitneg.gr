@@ -1,0 +1,5 @@
+// `exit(-1)` is 255, as a shell narrows it, in every engine.
+fn main() {
+    print("leaving")
+    exit(-1)
+}

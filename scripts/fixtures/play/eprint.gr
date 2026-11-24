@@ -1,0 +1,10 @@
+// Standard error in the frame's text, in the order written, before a panic's
+// line (§6.25 decision (4)): the Rust module loses the `eprint` lines.
+fn main() {
+    print("out one")
+    eprint("err one")
+    print("out two")
+    eprint("err two")
+    let xs = [1]
+    print("{xs[5]}")
+}

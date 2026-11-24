@@ -1,0 +1,32 @@
+// A program's module (`s3 --target wasm32`) mapping memory as the runtime
+// maps a fiber's stack: anonymous `mmap` promises zeroed bytes, so a block
+// unmapped dirty and mapped again must come back zero (§6.25 decision (3),
+// D). Natively the system's `mmap` answers the same.
+extern fn mmap(a: i64, len: i64, prot: i64, flags: i64, fd: i64, off: i64) -> i64
+extern fn munmap(a: i64, len: i64) -> i64
+
+fn zero(a: i64, len: i64) -> bool {
+    var i = 0
+    while i < len {
+        if unsafe { mem_addr(a + i).load_u8() }.as_i64() != 0 {
+            return false
+        }
+        i += 4093
+    }
+    unsafe { mem_addr(a + len - 1).load_u8() }.as_i64() == 0
+}
+
+fn main() {
+    let len = 6832128
+    // PROT_READ | PROT_WRITE; MAP_PRIVATE | MAP_ANON, Darwin's numbers.
+    let a = unsafe { mmap(0, len, 3, 4098, -1, 0) }
+    print("first zero: {zero(a, len)}")
+    var i = 0
+    while i < len {
+        unsafe { mem_addr(a + i).store_u8(171.as_u8()) }
+        i += 1
+    }
+    let _ = unsafe { munmap(a, len) }
+    let b = unsafe { mmap(0, len, 3, 4098, -1, 0) }
+    print("again zero: {zero(b, len)}")
+}

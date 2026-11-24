@@ -1,0 +1,5 @@
+// A diagnostic: rendered at `<browser>`, no count line, status 1.
+fn main() {
+    let x: i64 = "s"
+    print("{x}")
+}

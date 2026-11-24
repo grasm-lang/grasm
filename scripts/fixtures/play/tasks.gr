@@ -1,0 +1,26 @@
+// A `concurrent` block: run, under JS promise integration, as `grasm run`
+// runs it; refused in the Rust module's words without it.
+fn main() / {io, async} {
+    print("before")
+    let c: Chan[i64] = chan_new(0)
+    concurrent {
+        go {
+            for i in 0..3 {
+                chan_send(c, i * i)
+            }
+            chan_close(c)
+        }
+        go {
+            var sum = 0
+            var going = true
+            while going {
+                match chan_recv(c) {
+                    Some(v) -> sum += v
+                    None -> going = false
+                }
+            }
+            print("sum {sum}")
+        }
+    }
+    print("after")
+}

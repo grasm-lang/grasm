@@ -1,0 +1,4 @@
+// No `main`: "error: no `main` function", status 1.
+fn helper() -> i64 {
+    1
+}

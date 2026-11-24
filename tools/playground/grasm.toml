@@ -1,0 +1,19 @@
+[package]
+name = "playground"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The playground in Grasm (docs/self-hosting.md §6.25, S8 part eight): the
+# frontend and the TIR interpreter, compiled by the Grasm backend into one
+# WebAssembly module (`s3 --target wasm32 --exports`) with the Rust
+# playground's five exports. It performs, for the program it runs, every
+# effect `grasm run` would -- each one wasm cannot make refused by the C
+# library (`compiler/rtwasm`) in the Rust module's words -- and reads and
+# writes its own memory raw at the exports: `unsafe` and `mem`.
+capabilities = ["io", "unsafe", "async", "mem", "net", "proc"]
+
+[dependencies.front]
+path = "../../compiler/front"
+
+[dependencies.tirinterp]
+path = "../tirinterp"

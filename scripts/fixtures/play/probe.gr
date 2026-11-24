@@ -1,0 +1,12 @@
+// What a run sees of the world: entropy refused on wasm, the clock's shape.
+// Run after a replay in one instance, it must not answer from the journal.
+fn main() / {io, proc} {
+    match random_bytes(2) {
+        Ok(b) -> print("bytes {b.len()}")
+        Err(e) -> print("no entropy: {e}")
+    }
+    match proc_run("echo", ["hi"]) {
+        Ok(r) -> print("child {r.1.trim()}")
+        Err(e) -> print("no child: {e}")
+    }
+}

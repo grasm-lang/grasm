@@ -28,7 +28,22 @@
 #   w-libm       `sin`'s kernel's first coefficient one bit off
 #                -> fuzz_wasmmath
 #
-# The frame's layout off by a field, the playground's, is part eight's.
+# And the playground's (§6.25, S8 part eight), each by `playtest` on the
+# sections that show it (`PLAYTEST_ONLY`, written after the gate's name):
+#
+#   w-nondet     (above) -> playtest (built twice, not the same bytes)
+#   p-frame      the answer's status and output length change places
+#                -> playtest frame (not as the Rust module)
+#   p-words      "cannot replay" worded otherwise -> playtest frame
+#   p-journal    a journal handed over and not replayed -> playtest replay
+#   p-reset      a run's reset leaves the cells as the last run left them
+#                -> playtest session (state carried)
+#   p-stderr     standard error dropped -> playtest frame
+#   p-hop        the switch refused under JSPI too -> playtest stack
+#   p-nostack    without JSPI, the interpreter hops by room all the same
+#                -> playtest stack (not the panic)
+#   p-dirty      a large mapping reused without zeroing -> playtest stack
+#                (mapzero)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -49,6 +64,10 @@ control() {
     rm -rf "$WORK/src"
     mkdir -p "$WORK/src"
     cp -R compiler "$WORK/src/"
+    # The playground's sources and what they import, for `playtest`.
+    mkdir -p "$WORK/src/tools" "$WORK/src/packages"
+    cp -R tools/playground tools/tirinterp tools/gfmt "$WORK/src/tools/"
+    cp -R packages/toml "$WORK/src/packages/"
     if ! python3 -B scripts/s3_mutate.py "$WORK/src/$file" "$old" "$new"; then
         MISSED+=("$name: the mutation does not apply")
         return
@@ -60,11 +79,13 @@ control() {
         return
     fi
     while [ $# -ge 2 ]; do
-        local gate=$1 symptom=$2
+        local gate=${1%%:*} only="" symptom=$2
+        [ "$gate" != "$1" ] && only=${1#*:}
         shift 2
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
-        S3="$driver" WASM_LIBC="$WORK/src/compiler/rtwasm" DIRS=examples WASM_SUBSET_STOP=1 \
+        S3="$driver" WASM_LIBC="$WORK/src/compiler/rtwasm" PLAYGROUND="$WORK/src" DIRS=examples \
+            WASM_SUBSET_STOP=1 PLAYTEST_STOP=1 PLAYTEST_ONLY="$only" \
             FUZZ_WASMMATH_SEEDS=1 FUZZ_WASMMATH_CALLS=4000 "$gate" >"$log" 2>&1
         local code=$?
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
@@ -120,7 +141,8 @@ control w-nondet compiler/s3/src/main.gr \
     nb.push_bytes(\"{now_millis()}\".to_bytes())
     match write_bytes(out, nb.to_bytes()) {
         Ok(_) -> 0" -- \
-    scripts/wasmsubset.sh "not the same bytes"
+    scripts/wasmsubset.sh "not the same bytes" \
+    scripts/playtest.sh:build "not the same bytes"
 
 control w-floor compiler/wasm32/src/main.gr \
     "LinkOpts{ stack_size: 8388608, floor_scale: 700," "LinkOpts{ stack_size: 8388608, floor_scale: 0," -- \
@@ -135,6 +157,46 @@ control w-libm compiler/rtwasm/src/math.gr \
     "let S1 = -1.66666666666666324348e-01" "let S1 = -1.66666666666666352103e-01" -- \
     scripts/fuzz_wasmmath.sh "DIFFERS"
 
+P=compiler/rtwasm/play/streams.gr
+G=tools/playground/src/main.gr
+
+control p-frame $P \
+    "        f.offset(4).store_u32(code.bit_and(4294967295).as_u32())
+        f.offset(8).store_u32(on.as_u32())" \
+    "        f.offset(8).store_u32(code.bit_and(4294967295).as_u32())
+        f.offset(4).store_u32(on.as_u32())" -- \
+    scripts/playtest.sh:frame "not as the Rust module answers it"
+
+control p-words $G \
+    '                eprint("cannot replay: {why}")' '                eprint("cannot replay journal: {why}")' -- \
+    scripts/playtest.sh:frame "not as the Rust module answers it"
+
+control p-journal $G \
+    "            tirinterp.run_tree_with(tree, SHOWN, none, stacks, room_left, kind == 3, jr)" \
+    "            tirinterp.run_tree_with(tree, SHOWN, none, stacks, room_left, false, jr)" -- \
+    scripts/playtest.sh:replay "not replayed alike"
+
+control p-reset compiler/rtwasm/src/reset.gr \
+    "        __wasm_memset(mem_addr(cells), 0, __wasm_cells_end() - cells)" "" -- \
+    scripts/playtest.sh:session "state carried"
+
+control p-stderr $P \
+    "            append(mem_process(ERR_P), mem_process(ERR_N), mem_process(ERR_C), p, n)" "" -- \
+    scripts/playtest.sh:frame "not as"
+
+control p-hop compiler/rtwasm/src/stacks.gr \
+    "    if wasm_stacks() != 1 {" "    if wasm_stacks() != 2 {" -- \
+    scripts/playtest.sh:stack "under JSPI -- not as grasm run"
+
+control p-nostack $G \
+    "eval.STACKS_ROOM } else { eval.STACKS_NONE }" "eval.STACKS_ROOM } else { eval.STACKS_ROOM }" -- \
+    scripts/playtest.sh:stack "without JSPI -- not the panic"
+
+control p-dirty compiler/rtwasm/src/mem.gr \
+    "                __wasm_memset(mem_addr(b), 0, len)
+                return mem_addr(b)" "                return mem_addr(b)" -- \
+    scripts/playtest.sh:stack "a mapping not zero"
+
 echo
 echo "controls: $controls   caught: $caught   missed: $((controls - caught))"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -142,7 +204,7 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     exit 1
 fi
 # A floor: a control quietly dropped is a check quietly lost.
-if [ "$controls" -lt 9 ]; then
-    echo "fewer controls than the floor of 9"
+if [ "$controls" -lt 18 ]; then
+    echo "fewer controls than the floor of 18"
     exit 1
 fi

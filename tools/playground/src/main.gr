@@ -1,0 +1,211 @@
+// `playground` -- the Grasm playground's module (docs/self-hosting.md §6.25,
+// S8 part eight): `grasm run` for a page, with the Rust playground's ABI
+// (`crates/grasm_wasm`), byte for byte.
+//
+//     grasm_alloc(len) -> ptr             room for the caller to write
+//     grasm_free(ptr, len)                given back
+//     grasm_run(ptr, len) -> answer       the UTF-8 source at `ptr`, run
+//     grasm_run_with_stdin(ptr, len, in, in_len) -> answer
+//                                          with the text `input()` reads
+//     grasm_run_with_journal(ptr, len, j, j_len) -> answer
+//                                          against a journal `GRASM_RECORD`
+//                                          wrote, its bytes handed over
+//
+// Each answer is little-endian `u32`s: its whole length, the exit status,
+// standard output's length and bytes, a text's length and bytes. The text
+// is what the run wrote to standard error, less one newline at its end --
+// for a program that writes nothing there itself, the Rust module's text:
+// a diagnostic at `<browser>` (no count line), "error: no `main`
+// function", a panic's line, "cannot replay: " and why. The Rust module
+// loses an `eprint`'s text; this one keeps it, before that text (§6.25
+// decision (4)).
+//
+// The language keeps the names beginning `grasm_` for the toolchain's own
+// code ([T-EXPORT]), so the exports are written `play_alloc` to
+// `play_run_with_journal` here and exported under the Rust module's names
+// by `s3 --export-prefix play_:grasm_`.
+//
+// Built by `s3 --target wasm32 --exports` with the C library's
+// `play/streams.gr` (`compiler/rtwasm`), which keeps standard output and
+// error in memory and builds the answer: every run ends through `exit` --
+// the program's own, a panic's, or this module's after `main` returns -- and
+// the module's export hands the status to the C library's `wasm_on_exit`,
+// whose answer the export answers. A run begins from the instance's first
+// state (`wasm_begin`, decision (6)), the run's inputs moved to where the
+// heap begins and everything else begun again, so the caller's buffers are
+// reclaimed then: `grasm_free` gives nothing back early, and no run sees
+// another's leftovers. Where the embedder switches stacks through JS
+// promise integration (`env.grasm_stacks`), the interpreter runs as `grasm
+// run` does, running a program's tasks and hopping to a fresh stack -- when
+// the running one has little room left, not every 500 calls, since a call
+// of the program costs a different share of an engine stack by shape;
+// otherwise it runs with no host stack switched (decisions (2) and (3)).
+import front
+import front.loader
+import front.prog
+import front.sema
+import front.emit
+import tirinterp
+import tirinterp.sexp
+import tirinterp.journal
+import tirinterp.eval
+
+extern fn wasm_begin(a: i64, n: i64, b: i64, m: i64) -> i64
+extern fn wasm_stash(kind: i64, a: i64, n: i64, b: i64, m: i64)
+extern fn wasm_stashed(k: i64) -> i64
+extern fn wasm_main() -> i64
+extern fn wasm_set_input(p: i64, n: i64)
+extern fn wasm_stacks() -> i64
+extern fn wasm_stack_left() -> i64
+extern fn malloc(n: i64) -> i64
+
+/// The file name the Rust module renders a diagnostic against.
+let SHOWN = "<browser>"
+
+export fn play_alloc(len: i32) -> i32 {
+    let n = word(len)
+    unsafe { malloc(if n == 0 { 1 } else { n }) }.as_i32()
+}
+
+/// Nothing is given back until the next run begins, which reclaims every
+/// buffer at once (`wasm_begin`); a buffer handed back after a run is
+/// already where that run moved it from.
+export fn play_free(ptr: i32, len: i32) {
+}
+
+export fn play_run(ptr: i32, len: i32) -> i32 {
+    run(ptr, len, 0.as_i32(), 0.as_i32(), 1)
+}
+
+export fn play_run_with_stdin(ptr: i32, len: i32, in_ptr: i32, in_len: i32) -> i32 {
+    run(ptr, len, in_ptr, in_len, 2)
+}
+
+export fn play_run_with_journal(ptr: i32, len: i32, j_ptr: i32, j_len: i32) -> i32 {
+    run(ptr, len, j_ptr, j_len, 3)
+}
+
+/// An address or a length from the caller: 32 bits, unsigned.
+fn word(x: i32) -> i64 {
+    x.as_i64().bit_and(4294967295)
+}
+
+/// A run: the inputs moved and everything else begun again, then the
+/// source run by `main` as `kind` says (1 plainly, 2 with standard input, 3
+/// against a journal). An `export fn` may not perform `async` and running a
+/// program does, so what the export was handed is left with the C library
+/// and `main` is run through it (`wasm_stash`, `wasm_main`). The run ends
+/// through `exit`, so what it answers is the export's catch's, never this
+/// function's.
+fn run(ptr: i32, len: i32, b: i32, b_len: i32, kind: i64) -> i32 {
+    let n = word(len)
+    let m = word(b_len)
+    let base = unsafe { wasm_begin(word(ptr), n, word(b), m) }
+    if base == 0 {
+        return 0.as_i32()
+    }
+    unsafe {
+        wasm_stash(kind, base, n, base + n, m)
+        let _ = wasm_main()
+    }
+    0.as_i32()
+}
+
+/// `n` bytes at address `p`.
+fn bytes_at(p: i64, n: i64) -> bytes {
+    var out = byte_builder()
+    for i in 0..n {
+        out.push_byte(unsafe { mem_addr(p + i).load_u8() }.as_i64())
+    }
+    out.to_bytes()
+}
+
+/// How much room the running engine stack has left, as the C library
+/// measures it (`wasm_stack_left`): the interpreter's hop by room.
+fn room_left() -> i64 {
+    unsafe { wasm_stack_left() }
+}
+
+/// Diagnostics rendered, each ended by a newline, as the Rust module
+/// answers them: joined by newlines, no count; status 1.
+fn refuse_with(text: str) {
+    let b = text.to_bytes()
+    let k = b.len()
+    eprint(if k > 0 and b.at(k - 1) == 10 { b.slice(0, k - 1).to_str() } else { text })
+    exit(1)
+}
+
+fn run_from(src_at: i64, n: i64, b_at: i64, m: i64, kind: i64) {
+    // The Rust module installs a journal before it reads the source.
+    var jr = bytes_filled(0, 0)
+    if kind == 3 {
+        jr = bytes_at(b_at, m)
+        match journal.parse(jr) {
+            Ok(_) -> ()
+            Err(why) -> {
+                eprint("cannot replay: {why}")
+                exit(7)
+            }
+        }
+    }
+    if kind == 2 {
+        unsafe { wasm_set_input(b_at, m) }
+    }
+    // Invalid UTF-8 replaced, not refused, as the Rust module replaces it.
+    let src = bytes_at(src_at, n).to_str()
+    var resolved: Map[str, str] = map()
+    let l = if src.trim_start().starts_with("//!module ") {
+        loader.load_text(SHOWN, resolved, src)
+    } else {
+        loader.load_sources_shown(["main"], [src], [], "\0", resolved, SHOWN)
+    }
+    if l.fatal != "" {
+        eprint("error: {l.fatal}")
+        exit(1)
+    }
+    if l.diags.len() > 0 {
+        refuse_with(front.diagnostics_text(l.paths, l.srcs, l.bases, l.d_s, l.d_e, l.diags, l.d_help))
+    }
+    let p = prog.build(l)
+    let (c, t0) = sema.check_program(p)
+    if c.d_s.len() > 0 {
+        refuse_with(front.diagnostics_text(p.m_path, p.m_src, p.m_base, c.d_s, c.d_e, c.d_msg, c.d_help))
+    }
+    if sema.fn_of(c, "main::main") < 0 {
+        eprint("error: no `main` function")
+        exit(1)
+    }
+    var t = t0
+    let (text, holes) = emit.emit_flat(c, t, p)
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+    match sexp.read(text.to_bytes()) {
+        Ok(tree) -> {
+            var none: [str] = []
+            let stacks = if unsafe { wasm_stacks() } == 1 { eval.STACKS_ROOM } else { eval.STACKS_NONE }
+            tirinterp.run_tree_with(tree, SHOWN, none, stacks, room_left, kind == 3, jr)
+        }
+        Err(msg) -> {
+            eprint("error: the TIR of the program does not read back: {msg}")
+            exit(1)
+        }
+    }
+    exit(0)
+}
+
+/// The run an export asked for (`run`); run any other way -- as a command
+/// -- it says what it is.
+fn main() {
+    let kind = unsafe { wasm_stashed(0) }
+    if kind == 0 {
+        eprint("usage: the playground is a WebAssembly module (s3 --target wasm32 --exports); see docs/self-hosting.md §6.25")
+        exit(2)
+    }
+    let (a, n, b, m) = unsafe { (wasm_stashed(1), wasm_stashed(2), wasm_stashed(3), wasm_stashed(4)) }
+    run_from(a, n, b, m, kind)
+}
