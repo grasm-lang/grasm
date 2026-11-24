@@ -400,7 +400,7 @@ control stack-frame '^DIFF: grasm (run|test) scripts/fixtures/stack/count\.gr \(
     'pub let MAX_DEPTH = 100001'
 
 control task-stack '^DIFF: grasm (run|test) scripts/fixtures/stack/task-limit\.gr \(stack\)' ONLY=stack "$TASKS" \
-    '    let nsp = if cx.p.may_recurse { SPARES } else { 0 }' \
+    '    let nsp = spares(cx)' \
     '    let nsp = 0'
 
 control recursion-seen '^DIFF: grasm (run|test) scripts/fixtures/stack/iface\.gr \(stack\)' ONLY=stack "$LOAD" \
