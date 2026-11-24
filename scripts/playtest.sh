@@ -42,7 +42,9 @@
 #            it) as `grasm run`'s, and output and status as the Rust
 #            module's; the ones `wasmtest` sets aside only for threads held
 #            as `wasmsubset` holds them; the ones it sets aside for stack
-#            switching held to `grasm run` and counted apart; the set aside
+#            switching, and the three it sets aside for their depth, held to
+#            `grasm run` and counted apart (the Rust module refuses the
+#            first and traps on the second); the set aside
 #            are exactly `wasmtest`'s, for its reasons. Without JSPI, the
 #            sample named in `scripts/lib/playsample.txt`, as `grasm run`
 #            but for a recursion deeper than one engine stack, which must end
@@ -457,6 +459,7 @@ co_err=0
 th_held=0
 th_rust=0
 sw_held=0
+dp_held=0
 nj_n=0
 nj_same=0
 nj_deep=0
@@ -490,6 +493,9 @@ if want corpus; then
             [ -z "$why" ] && kind=threads
         elif [[ "$why" == needs\ stack-switching* ]]; then
             kind=switching
+            why=""
+        elif [[ "$why" == recurses\ past* ]]; then
+            kind=deep
             why=""
         fi
         if [ -n "$why" ]; then
@@ -541,6 +547,13 @@ if want corpus; then
                 show gr pg
             fi
             ;;
+        deep)
+            dp_held=$((dp_held + 1))
+            if ! same3 pg gr; then
+                failed "$src (deep recursion, under JSPI) -- not as grasm run"
+                show gr pg
+            fi
+            ;;
         esac
         if [ -n "${SAMPLE[$src]:-}" ]; then
             nj_n=$((nj_n + 1))
@@ -571,6 +584,7 @@ if want corpus; then
     done | sort
     echo "  named par_map, par_filter or spawn and held: $th_held, the Rust module running them as grasm run does: $th_rust"
     echo "  stack switching, held under JSPI to grasm run: $sw_held"
+    echo "  recursing past what the Rust module's stack holds, held under JSPI to grasm run: $dp_held"
     echo "  without JSPI, the sample (scripts/lib/playsample.txt): $nj_n   as under JSPI (or refused as the Rust module refuses): $nj_same   deeper than one engine stack, the panic: $nj_deep"
     floor=${PLAYTEST_FLOOR:-508}
     [ "$co_compared" -ge "$floor" ] || failed "corpus: $co_compared compared, below the floor of $floor"
