@@ -2028,7 +2028,7 @@ fn body(inout cx: Cx, node: i64) -> Value {
     // channel its siblings outside it serve.
     var r = VUnit
     if cx.stacks == STACKS_ROOM {
-        if tasks.in_task(cx) and cx.depth >= (tasks.spares(cx) + 1) * HOP {
+        if tasks.in_task(cx) and cx.depth >= tasks.task_bound(cx) {
             // Where a command's task has used its last spare stack.
             r = fault(cx, "stack overflow: recursion too deep")
         } else if cx.stack_left() > HOP_ROOM {

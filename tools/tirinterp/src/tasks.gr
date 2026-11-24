@@ -671,9 +671,25 @@ type Done = {
 /// How many spare host stacks a block has, shared by its tasks.
 pub let SPARES = 21
 
+/// The spare stacks a block has where the interpreter hops by room (the
+/// playground's module under JS promise integration, docs/self-hosting.md
+/// §6.25): a hop comes when a stack is nearly spent, which for a costly
+/// call of the program is well before 500 calls (about 290 of
+/// `[n - 1].map(f)`'s), so a task needs more of them to reach the count.
+pub let SPARES_ROOM = 48
+
 /// The spare host stacks a block of this program has.
 pub fn spares(cx: Cx) -> i64 {
-    if cx.p.may_recurse { SPARES } else { 0 }
+    if not cx.p.may_recurse {
+        return 0
+    }
+    if cx.stacks == eval.STACKS_ROOM { SPARES_ROOM } else { SPARES }
+}
+
+/// How deep a task may recur: as deep as a command's task, which has
+/// `SPARES` spare stacks of `eval.HOP` calls each and its own.
+pub fn task_bound(cx: Cx) -> i64 {
+    if cx.p.may_recurse { (SPARES + 1) * eval.HOP } else { eval.HOP }
 }
 
 /// Runs a `concurrent` block's tasks to their end, as the reference's
