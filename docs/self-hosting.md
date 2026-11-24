@@ -8551,6 +8551,69 @@ interpreter, compiled for `wasm32`", the `grasm_wasm` row, the `cargo build
 wasm32`", which the Grasm command's build makes true after (8)); and
 `crates/grasm_wasm` kept until S9 as the oracle.
 
+#### The coordinator's decisions
+
+Taken by the coordinator on 2026-11-23, on the note above; the owner may
+reverse any of them.
+
+- (1): accepted. `tools/playground`, five `export fn`s in the Rust module's
+  `i32` types and frame, built by `s3 --target wasm32 --exports`; `realpath`
+  and `strerror_r` added to `compiler/rtwasm` as refusals in the Rust
+  module's words. `run.mjs` gains `grasm_entropy` (the platform's
+  cryptographic generator, no fallback; an engine without it is refused,
+  never seeded from a clock or a constant). The Rust module ignores imports
+  it does not declare, so `run.mjs` stays one file for both modules, and
+  `wasmtest`'s line is shown unchanged after the edit. (1b) and (1c)
+  refused.
+- (2): (2a), JSPI, for the playground's link, with (2b) as the fallback,
+  chosen by the host by feature detection (`'Suspending' in WebAssembly`)
+  and passed in through the `grasm_stacks` import. The coordinator's
+  reason: JSPI is a standard (phase 4, April 2025) shipping in Chrome and
+  Edge 137, Firefox 153 and Safari 27, so a current browser gets the
+  clause's depth, and an older engine still runs every program
+  synchronously. The fallback's depths are recorded in docs/known-issues.md
+  as an open S3 defect of the no-stack mode, never as a difference the
+  clause allows. That JSPI needs no flag on the pinned node is to be
+  confirmed; if it needs one, the work stops and is reported.
+- (3): accepted. Under JSPI the interpreter's own count of 100,000 calls is
+  the aim and 10,000 is required on node's default stack with no flag; if
+  memory makes 100,000 unreasonable, the work stops and is reported with the
+  numbers, the count not lowered quietly.
+- (4): accepted. Standard error goes in the frame's existing text field in
+  the order the program wrote it, no layout change; `playtest` compares it
+  with `grasm run`'s, the stack-trace lines handled as `clidiff` handles
+  them (said where the gate is described); docs/known-issues.md's
+  playground `eprint` entry says the Grasm module fixes it while the Rust
+  module still loses it.
+- (5): not in this part. The compiled modules' recursion depth is a later
+  part of its own, since it changes how every compiled module starts; the
+  S3 entry in docs/known-issues.md stays open.
+- (6): accepted, with a control that runs two programs in one instance and
+  catches state carried from one to the next.
+- (7): the Rust module's words and exit codes everywhere it has them -- no
+  diagnostic-count line it does not print, "error: no \`main\` function"
+  and exit 1; any place that cannot be matched is stopped at and reported.
+- (8): by `s3` in this part. The command's wasm target only if the Rust
+  command has a behaviour to hold it to byte for byte; measured first.
+  Measured 2026-11-23: the Rust `grasm build --native --target
+  wasm32-unknown-unknown` (and `--target wasm32`) answers "error:
+  unsupported target \`wasm32-unknown-unknown\`: Support for this target
+  has not been implemented yet", exit 1, writing nothing, and without
+  `--native` it refuses `--target` altogether. It has no behaviour to hold
+  a wasm build to, so the second half is dropped, not invented.
+- (9): accepted, with the controls listed and the reset control of (6). It
+  runs both modes on the whole set if the two together stay at or under
+  about 150 minutes; otherwise JSPI on the whole set and the fallback on a
+  fixed, named sample, counts asserted. `gc-demo` and
+  `examples/parallel_map.gr` each get a longer limit for that program alone,
+  never a skip, their times on both modules stated; `text4-demo` and
+  `E-RECURSION-PARALLEL` must match `grasm run` under JSPI.
+- (10): the first half is (1), (2), (3), (4), (6), (7) and (9), built by
+  `s3`; with (8) dropped there is no second half. The work stops and is
+  reported after the first half's final runs. `site/`, the published
+  playground and every embedder (`ProjectGold/` included) are neither
+  switched nor edited.
+
 #### Where the first half ends
 
 The first half: (1), (2), (3), (4), (6), (7), (9) -- the module built by
