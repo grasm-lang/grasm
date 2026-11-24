@@ -7,18 +7,41 @@
 // (classes 0 to 63), then the powers of two from 2,048 (64 on); a freed
 // block goes to the head of its class's list, its first word the next, and
 // is taken from there first. Memory is never given back: wasm cannot.
+//
+// Large private mappings -- `mmap`, which the runtime asks for a fiber's
+// stack, 6.5 MiB -- are cut to their exact size, not to a power of two, and
+// kept on a list of their own when unmapped, for the next of that length.
+// Anonymous `mmap` promises zeroed memory: pages `memory.grow` has just
+// added are zero by the specification and are not written; any other byte of
+// a mapping -- one reused, or memory an earlier run of the playground used --
+// is zeroed.
+//
+// When the memory cannot grow, the allocation is not answered with null,
+// which the runtime would meet as a trap or a placeholder text: the heap
+// moves to a reserve kept for this (`RESERVE`, set aside by
+// `reserve_rescue`), and the program ends in the panic "memory allocation of
+// N bytes failed" -- Rust's words for the same failure -- and exit 101,
+// with room left to say so and to build the answer.
 
 extern fn __wasm_memory_grow(pages: i64) -> i64
 extern fn __wasm_memory_size() -> i64
 extern fn __wasm_memcpy(dst: addr, src: addr, n: i64)
 extern fn __wasm_memset(p: addr, c: i64, n: i64)
 extern fn __wasm_heap_base() -> i64
+extern fn grasm_panic_msg(p: addr, n: i64)
 
 /// The first unused address, and the end of the memory, 0 until the first
 /// allocation; the classes' list heads (a table of `NCLASSES` words).
 process_local TOP: i64
 process_local END: i64
 process_local HEADS: i64
+/// The large mappings unmapped, a list through their headers' second word.
+process_local BIG: i64
+/// The reserve's first address and its end, 0 when none was set aside;
+/// whether the heap has moved into it.
+process_local RESERVE: i64
+process_local RESERVE_END: i64
+process_local RESCUED: i64
 
 let NCLASSES = 96
 let PAGE = 65536
@@ -44,9 +67,87 @@ fn class_size(c: i64) -> i64 {
     2048.shl(c - 64)
 }
 
-/// `n` bytes at the top of the heap, the memory grown to hold them; 0 when
-/// it cannot be.
+/// `n` bytes at the top of the heap, the memory grown to hold them; when it
+/// cannot grow, the heap moved to the reserve and the program ended in the
+/// out-of-memory panic.
 fn carve(n: i64) -> i64 {
+    let at = carve_or_0(n)
+    if at != 0 {
+        return at
+    }
+    out_of_memory(n)
+    0
+}
+
+/// The end of the memory the heap was last given, before `carve` grows it:
+/// what lies below is not known to be zero.
+fn known_end() -> i64 {
+    unsafe {
+        if mem_process(TOP).atomic_load_i64(Acquire) == 0 {
+            return __wasm_memory_size() * PAGE
+        }
+        mem_process(END).atomic_load_i64(Acquire)
+    }
+}
+
+/// The memory cannot hold `n` bytes more. The first time, the heap moves to
+/// the reserve, and the panic is said from there; past that, nothing can be
+/// said.
+fn out_of_memory(n: i64) {
+    unsafe {
+        if mem_process(RESCUED).atomic_load_i64(Acquire) != 0 {
+            return
+        }
+        mem_process(RESCUED).atomic_store_i64(1, Release)
+        let r = mem_process(RESERVE).atomic_load_i64(Acquire)
+        if r != 0 {
+            mem_process(TOP).atomic_store_i64(r, Release)
+            mem_process(END).atomic_store_i64(mem_process(RESERVE_END).atomic_load_i64(Acquire), Release)
+        }
+        // "memory allocation of N bytes failed", N's digits written by hand:
+        // nothing here may need the heap twice.
+        let msg = carve_or_0(64)
+        if msg == 0 {
+            return
+        }
+        let hn = mem_static_len("memory allocation of ")
+        __wasm_memcpy(mem_addr(msg), mem_static("memory allocation of "), hn)
+        var digits = 1
+        var v = n
+        while v >= 10 {
+            v = v / 10
+            digits += 1
+        }
+        var k = digits
+        v = n
+        while k > 0 {
+            mem_addr(msg + hn + k - 1).store_u8((48 + v % 10).as_u8())
+            v = v / 10
+            k -= 1
+        }
+        let tn = mem_static_len(" bytes failed")
+        __wasm_memcpy(mem_addr(msg + hn + digits), mem_static(" bytes failed"), tn)
+        grasm_panic_msg(mem_addr(msg), hn + digits + tn)
+    }
+}
+
+/// `n` bytes set aside at the top of the heap for `out_of_memory` to move
+/// to: a run's first act (`reset.wasm_begin`). False when there is no room
+/// even for that.
+pub fn reserve_rescue(n: i64) -> bool {
+    let r = carve_or_0(n)
+    if r == 0 {
+        return false
+    }
+    unsafe {
+        mem_process(RESERVE).atomic_store_i64(r, Release)
+        mem_process(RESERVE_END).atomic_store_i64(r + n, Release)
+    }
+    true
+}
+
+/// `carve`, answering 0 when the memory cannot grow.
+fn carve_or_0(n: i64) -> i64 {
     unsafe {
         var top = mem_process(TOP).atomic_load_i64(Acquire)
         var end = mem_process(END).atomic_load_i64(Acquire)
@@ -66,6 +167,16 @@ fn carve(n: i64) -> i64 {
         }
         mem_process(TOP).atomic_store_i64(top + n, Release)
         top
+    }
+}
+
+/// The heap begun again at `top`, every block below it the caller's, none
+/// free (`reset.wasm_begin`); the memory already grown kept.
+pub fn restart(top: i64) {
+    unsafe {
+        mem_process(TOP).atomic_store_i64(top, Release)
+        mem_process(END).atomic_store_i64(__wasm_memory_size() * PAGE, Release)
+        mem_process(HEADS).atomic_store_i64(0, Release)
     }
 }
 
@@ -200,8 +311,12 @@ export fn posix_memalign(out: addr, align: i64, size: i64) -> i32 {
 }
 
 /// Private anonymous memory, zeroed: the only kind the runtime maps (its
-/// fibers' stacks, which a wasm32 program never starts).
+/// fibers' stacks; a program's module never starts one, the playground's
+/// does).
 export fn mmap(a: addr, len: i64, prot: i32, flags: i32, fd: i32, off: i64) -> addr {
+    if len >= BIG_MAP {
+        return map_big(len)
+    }
     unsafe {
         let out = malloc(8)
         if posix_memalign(out, 16384, len) != 0 {
@@ -216,8 +331,56 @@ export fn mmap(a: addr, len: i64, prot: i32, flags: i32, fd: i32, off: i64) -> a
 }
 
 export fn munmap(a: addr, len: i64) -> i32 {
+    if len >= BIG_MAP {
+        unsafe {
+            a.offset(-8).store_i64(mem_process(BIG).atomic_load_i64(Acquire))
+            mem_process(BIG).atomic_store_i64(a.as_i64(), Release)
+        }
+        return 0.as_i32()
+    }
     free(a)
     0.as_i32()
+}
+
+/// A mapping this long or longer is a large one.
+let BIG_MAP = 65536
+/// A large mapping's alignment: the runtime's page.
+let BIG_ALIGN = 16384
+
+/// A large mapping of exactly `len` bytes at a multiple of `BIG_ALIGN`,
+/// zeroed: one unmapped before of that length, zeroed again, or new from the
+/// top of the heap, of which only what lay below the memory's last known end
+/// is written -- above it, `memory.grow` has just made it zero. Its header,
+/// the 16 bytes below it: its length, and the list's next.
+fn map_big(len: i64) -> addr {
+    unsafe {
+        var prev = 0
+        var b = mem_process(BIG).atomic_load_i64(Acquire)
+        while b != 0 {
+            let next = mem_addr(b - 8).load_i64()
+            if mem_addr(b - 16).load_i64() == len {
+                if prev == 0 {
+                    mem_process(BIG).atomic_store_i64(next, Release)
+                } else {
+                    mem_addr(prev - 8).store_i64(next)
+                }
+                __wasm_memset(mem_addr(b), 0, len)
+                return mem_addr(b)
+            }
+            prev = b
+            b = next
+        }
+        let fresh_from = known_end()
+        let top = carve(len + BIG_ALIGN + 16)
+        let at = (top + 16 + BIG_ALIGN - 1) / BIG_ALIGN * BIG_ALIGN
+        mem_addr(at - 16).store_i64(len)
+        mem_addr(at - 8).store_i64(0)
+        if fresh_from > at {
+            let dirty = if fresh_from < at + len { fresh_from - at } else { len }
+            __wasm_memset(mem_addr(at), 0, dirty)
+        }
+        mem_addr(at)
+    }
 }
 
 export fn mprotect(a: addr, len: i64, prot: i32) -> i32 {

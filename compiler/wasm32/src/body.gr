@@ -59,6 +59,15 @@ pub let I_THROW = 3
 pub let I_MEMCPY = 4
 pub let I_MEMSET = 5
 pub let I_HEAP_BASE = 6
+/// For a module built `--exports` (docs/self-hosting.md §6.25): the shadow
+/// stack's pointer read and written (the C library's context switch), the
+/// cells' bounds and the data's `memory.init` (a run's reset).
+pub let I_GET_SP = 7
+pub let I_SET_SP = 8
+pub let I_CELLS_BASE = 9
+pub let I_CELLS_END = 10
+pub let I_DATA_INIT = 11
+pub let I_STACK_TOP = 12
 
 /// Per instruction of a function: what the link resolved.
 type Aux = {
@@ -537,6 +546,8 @@ fn import_call(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, idx: i64, sig:
     try call_result(b, s, f, i, if r == "-" { 0 } else if r == "f" { 2 } else { 1 })
 }
 
+/// Intrinsic `which`; `heap_base` is the one constant the link gave it (the
+/// heap's first address, a bound of the cells, the data's length).
 fn intrinsic(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, which: i64, heap_base: i64) -> () ! str {
     let args = call_args(f, i)
     if which == I_MEMORY_GROW {
@@ -570,9 +581,27 @@ fn intrinsic(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, which: i64, heap
         enc.fc(b, if which == I_MEMCPY { enc.FC_MEMORY_COPY } else { enc.FC_MEMORY_FILL })
         return try call_result(b, s, f, i, 0)
     }
-    if which == I_HEAP_BASE {
+    if which == I_HEAP_BASE or which == I_CELLS_BASE or which == I_CELLS_END or which == I_STACK_TOP {
         enc.i64_const(b, heap_base)
         return try call_result(b, s, f, i, 1)
+    }
+    if which == I_GET_SP {
+        enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        return try call_result(b, s, f, i, 1)
+    }
+    if which == I_SET_SP {
+        get(b, s, args[0])
+        enc.op(b, enc.OP_I32_WRAP_I64)
+        enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+        return try call_result(b, s, f, i, 0)
+    }
+    if which == I_DATA_INIT {
+        if heap_base < 0 {
+            fail("`memory.init` in a module whose data is not passive (only `--exports` makes one)")
+        }
+        enc.data_init(b, heap_base)
+        return try call_result(b, s, f, i, 0)
     }
     fail("unknown intrinsic {which}")
 }

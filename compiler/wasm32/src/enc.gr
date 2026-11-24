@@ -136,6 +136,7 @@ pub let FC_I64_TRUNC_SAT_F64_S = 6
 pub let FC_I64_TRUNC_SAT_F64_U = 7
 pub let FC_MEMORY_COPY = 10
 pub let FC_MEMORY_FILL = 11
+pub let FC_MEMORY_INIT = 8
 
 /// `try_table`'s catch clause that takes the exception's values to a label.
 pub let CATCH_TAG = 0
@@ -253,6 +254,18 @@ pub fn fc(inout b: ByteBuilder, sub: i64) {
     } else if sub == FC_MEMORY_FILL {
         b.push_byte(0)
     }
+}
+
+/// The module's one data segment, `n` bytes, copied to its place from
+/// `DATA_BASE` (1024): `memory.init 0` of a passive segment.
+pub fn data_init(inout b: ByteBuilder, n: i64) {
+    i32_const(b, 1024)
+    i32_const(b, 0)
+    i32_const(b, n)
+    b.push_byte(OP_PREFIX_FC)
+    uleb(b, FC_MEMORY_INIT)
+    b.push_byte(0)
+    b.push_byte(0)
 }
 
 pub fn call_indirect(inout b: ByteBuilder, ty: i64) {

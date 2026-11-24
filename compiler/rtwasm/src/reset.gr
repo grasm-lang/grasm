@@ -1,0 +1,103 @@
+// Every run of the playground begins from the instance's first state
+// (docs/self-hosting.md §6.25 decision (6)): a run that ends by `exit` or a
+// panic unwinds past every `free`, and the runtime's process and
+// thread-local cells -- the maps' seed, the output buffers, the journal's
+// state, the fibers' pool, the struct descriptors' caches -- would outlive
+// it. So a run's first act is `wasm_begin`, which keeps the run's inputs and
+// begins everything else again.
+import mem
+
+extern fn __wasm_memcpy(dst: addr, src: addr, n: i64)
+extern fn __wasm_memset(p: addr, c: i64, n: i64)
+extern fn __wasm_heap_base() -> i64
+extern fn __wasm_cells_base() -> i64
+extern fn __wasm_cells_end() -> i64
+extern fn __wasm_data_init()
+/// The program's C entry (`compiler/mir`'s `lower_entry`): its `main`, run
+/// by `wasm_main`.
+extern fn main(argc: i32, argv: addr) -> i32
+
+/// What a run export was handed, for the program's `main` to read
+/// (`wasm_stash`, `wasm_stashed`): the run's kind and its inputs' places.
+process_local STASH: i64
+
+/// The reserve the heap moves to when the memory cannot grow: 2 MiB.
+let RESCUE = 2097152
+
+/// The caller's `n` bytes at `a` and `m` bytes at `b` moved to the heap's
+/// first address, one after the other, and everything else begun again:
+/// every cell zero, the data as the module wrote it, the heap empty above
+/// the moved bytes. Answers their new address (`b`'s follows at `n`), or 0
+/// when they cannot be moved (no memory), in which case nothing changed.
+/// The caller holds no heap value and calls this first.
+export fn wasm_begin(a: addr, n: i64, b: addr, m: i64) -> addr {
+    unsafe {
+        let total = n + m
+        let tmp = mem.take(total + 1)
+        if tmp.as_i64() == 0 {
+            return tmp
+        }
+        if n > 0 {
+            __wasm_memcpy(tmp, a, n)
+        }
+        if m > 0 {
+            __wasm_memcpy(tmp.offset(n), b, m)
+        }
+        let cells = __wasm_cells_base()
+        __wasm_memset(mem_addr(cells), 0, __wasm_cells_end() - cells)
+        __wasm_data_init()
+        let base = (__wasm_heap_base() + 15) / 16 * 16
+        // `memory.copy` copies as if through a buffer, so the two places
+        // may overlap.
+        if total > 0 {
+            __wasm_memcpy(mem_addr(base), tmp, total)
+        }
+        mem.restart(base + (total + 16) / 16 * 16)
+        // Room for the out-of-memory panic and the answer, should the
+        // memory stop growing (`mem.out_of_memory`).
+        let _ = mem.reserve_rescue(RESCUE)
+        mem_addr(base)
+    }
+}
+
+/// An `export fn` may not perform `async` ([T-FN-ADDR]: C calls it outside
+/// the task scheduler), and running a program does: so the playground's
+/// exports leave what they were handed here and call `wasm_main`, which runs
+/// the program's `main` as a program's module's `_start` does -- with no
+/// arguments -- and `main` reads it back.
+export fn wasm_stash(kind: i64, a: i64, n: i64, b: i64, m: i64) {
+    unsafe {
+        var t = mem_addr(mem_process(STASH).atomic_load_i64(Acquire))
+        if t.as_i64() == 0 {
+            t = mem.take(40)
+            mem_process(STASH).atomic_store_i64(t.as_i64(), Release)
+        }
+        t.store_i64(kind)
+        t.offset(8).store_i64(a)
+        t.offset(16).store_i64(n)
+        t.offset(24).store_i64(b)
+        t.offset(32).store_i64(m)
+    }
+}
+
+/// Word `k` of what `wasm_stash` left (0 the kind, then `a`, `n`, `b`,
+/// `m`); 0 when nothing was left -- `main` run not through an export.
+export fn wasm_stashed(k: i64) -> i64 {
+    unsafe {
+        let t = mem_process(STASH).atomic_load_i64(Acquire)
+        if t == 0 {
+            return 0
+        }
+        mem_addr(t + 8 * k).load_i64()
+    }
+}
+
+/// The program's `main`, with no arguments: an argument vector of the
+/// program's name alone, a null pointer.
+export fn wasm_main() -> i64 {
+    unsafe {
+        let argv = mem.take(16)
+        __wasm_memset(argv, 0, 16)
+        main(1.as_i32(), argv).as_i64()
+    }
+}

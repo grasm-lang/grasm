@@ -10,18 +10,28 @@
 //     mem.gr    memory: an allocator over `memory.grow`, `memcpy` and its kin
 //     math.gr   libm: Rust's `libm` crate's functions (musl's, FreeBSD's),
 //               as the Rust playground's module has them
-//     sys.gr    the standard streams, clocks, entropy, the way out, and what
-//               wasm cannot do -- files, sockets, processes, threads -- each
-//               failing with ENOTSUP, which `strerror` words as the Rust
-//               playground's does ("operation not supported on this
-//               platform")
+//     sys.gr    clocks, entropy, the way out, and what wasm cannot do --
+//               files, sockets, processes, threads -- each failing with
+//               ENOTSUP, which `strerror` words as the Rust playground's
+//               does ("operation not supported on this platform")
+//     streams.gr  the standard streams, through the host; a module built
+//               `--exports` takes `play/streams.gr` in its place, which
+//               keeps them in memory (docs/self-hosting.md §6.25)
+//     stacks.gr the context switch over JS promise integration, for a
+//               module built `--exports`
+//     reset.gr  a playground run's beginning: the instance's first state
 //
 // The host is reached through imports only (`__host_<name>`, which the link
 // makes `env.<name>`), the machine through intrinsics the backend writes in
 // place (`__wasm_<name>`): `memory.grow`, `memory.size`, `throw`,
-// `memory.copy`, `memory.fill`, and the heap's first address. One thread is
+// `memory.copy`, `memory.fill`, the heap's first address, and for a module
+// built `--exports` the shadow-stack pointer, the cells' bounds and
+// `memory.init`. One thread is
 // all there is: a process cell's every access is still atomic, as
 // `scripts/rtlint.py` asks of a runtime package.
 import mem
 import sys
 import math
+import streams
+import stacks
+import reset

@@ -123,7 +123,7 @@ control w-nondet compiler/s3/src/main.gr \
     scripts/wasmsubset.sh "not the same bytes"
 
 control w-floor compiler/wasm32/src/main.gr \
-    "LinkOpts{ stack_size: 8388608, floor_scale: 700 }" "LinkOpts{ stack_size: 8388608, floor_scale: 0 }" -- \
+    "LinkOpts{ stack_size: 8388608, floor_scale: 700," "LinkOpts{ stack_size: 8388608, floor_scale: 0," -- \
     scripts/wasmsubset.sh "past any depth"
 
 control w-leb compiler/wasm32/src/enc.gr \

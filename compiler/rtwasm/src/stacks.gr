@@ -1,0 +1,80 @@
+// Switching stacks, for a module built `--exports` (the playground,
+// docs/self-hosting.md §6.25 decision (2)): the runtime's context switch
+// (`grt.ctx_init`, `grt.ctx_switch`), which a program's module answers with
+// the panic of `sys.wasm_no_switch`, is bound here instead, over JS promise
+// integration. Each fiber runs on an engine stack of its own, which the
+// embedder makes by calling the module's export `_fiber` through
+// `WebAssembly.promising`; a switch is the import `env.grasm_switch(save,
+// load)`, a `WebAssembly.Suspending` function that parks the running stack
+// at `save` and starts or resumes the one at `load`. Where the embedder has
+// no JSPI, `env.grasm_stacks()` answers 0 and a switch is the panic in the
+// Rust playground's words, as in a program's module (`sys.wasm_no_switch`).
+//
+// A context, here, is the fiber's shadow-stack pointer, until it first runs
+// its entry and argument, and where its shadow stack begins; the runtime
+// reserves 176 bytes for each.
+extern fn __host_grasm_stacks() -> i64
+extern fn __host_grasm_switch(save: addr, load: addr)
+extern fn __host_grasm_fiber(ctx: addr)
+extern fn __wasm_get_sp() -> i64
+extern fn __wasm_set_sp(sp: i64)
+extern fn grasm_panic_msg(p: addr, n: i64)
+extern fn __wasm_stack_top() -> i64
+
+/// Where the running engine stack's shadow stack begins: 0 for the run's
+/// own (the shadow stack's top), else the fiber's stack top.
+process_local BASE: i64
+
+/// The shadow stack's budget below where a stack begins, as the runtime's
+/// floor allows it (`compiler/rt/src/fiber.gr`'s `BUDGET`, 6 MiB, for the
+/// first stack and for a task's).
+let BUDGET = 6291456
+
+/// Whether the embedder switches stacks: 1, else 0.
+export fn wasm_stacks() -> i64 {
+    unsafe { __host_grasm_stacks() }
+}
+
+/// A fiber that will call `entry(arg)` with its shadow stack at `top`: what
+/// `compiler/wasm32`'s export `_fiber` reads. The embedder forgets any stack
+/// it parked at this context before.
+export fn wasm_ctx_init(ctx: addr, top: addr, entry: addr, arg: addr) {
+    unsafe {
+        ctx.store_i64(top.as_i64())
+        ctx.offset(8).store_i64(entry.as_i64())
+        ctx.offset(16).store_i64(arg.as_i64())
+        ctx.offset(24).store_i64(top.as_i64())
+        __host_grasm_fiber(ctx)
+    }
+}
+
+/// The running stack parked at `save`, its shadow-stack pointer with it,
+/// and the one at `load` run; back here when something switches to `save`.
+export fn wasm_ctx_switch(save: addr, load: addr) {
+    if wasm_stacks() != 1 {
+        // `sys.wasm_no_switch`'s panic, a program's module's.
+        unsafe { grasm_panic_msg(mem_static("`concurrent` needs a platform that can switch stacks, which this one cannot"), mem_static_len("`concurrent` needs a platform that can switch stacks, which this one cannot")) }
+    }
+    unsafe {
+        save.store_i64(__wasm_get_sp())
+        save.offset(24).store_i64(mem_process(BASE).atomic_load_i64(Acquire))
+        mem_process(BASE).atomic_store_i64(load.offset(24).load_i64(), Release)
+        __host_grasm_switch(save, load)
+        __wasm_set_sp(save.load_i64())
+        mem_process(BASE).atomic_store_i64(save.offset(24).load_i64(), Release)
+    }
+}
+
+/// How many bytes of the running stack's shadow-stack budget are left: the
+/// room the interpreter hops by (`tools/tirinterp`'s `STACKS_ROOM`). The
+/// shadow stack is kept in proportion to the engine's (`compiler/wasm32`'s
+/// `floor_scale`), so this measures the engine stack too.
+export fn wasm_stack_left() -> i64 {
+    unsafe {
+        var base = mem_process(BASE).atomic_load_i64(Acquire)
+        if base == 0 {
+            base = __wasm_stack_top()
+        }
+        BUDGET - (base - __wasm_get_sp())
+    }
+}

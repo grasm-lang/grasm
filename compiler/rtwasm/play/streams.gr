@@ -1,0 +1,140 @@
+// The standard streams of the playground's module (`tools/playground`,
+// docs/self-hosting.md §6.25), in `src/streams.gr`'s place: the module
+// imports no stream. What the program writes to standard output and to
+// standard error is kept here, each in the order written, for the answer
+// the export hands back (`wasm_on_exit`); standard input is the text the
+// caller handed over (`wasm_set_input`), read to its end and then empty.
+//
+// It imports nothing: a file outside `src/` cannot name the package's
+// modules (the capability check reads every file of the package), nor call
+// the library's own functions by their C names, which the package exports.
+// Its memory is the runtime's (`grasm_mem_alloc`, `mem_alloc`'s entry), and a
+// descriptor it does not have fails with -1, which `strerror` words as every
+// refusal here is worded.
+extern fn __wasm_memcpy(dst: addr, src: addr, n: i64)
+extern fn grasm_mem_alloc(size: i64, align: i64) -> i64
+extern fn grasm_mem_free(at: i64)
+
+/// Standard output's and standard error's bytes: each an address, a length
+/// and a capacity, 0 until the first write. Standard input's text, its
+/// length, and how much of it has been read.
+process_local OUT_P: i64
+process_local OUT_N: i64
+process_local OUT_C: i64
+process_local ERR_P: i64
+process_local ERR_N: i64
+process_local ERR_C: i64
+process_local IN_P: i64
+process_local IN_N: i64
+process_local IN_AT: i64
+
+/// `n` bytes at `q` appended to the stream whose cells are `pc`, `nc` and
+/// `cc`.
+fn append(pc: addr, nc: addr, cc: addr, q: addr, n: i64) {
+    unsafe {
+        var p = pc.atomic_load_i64(Acquire)
+        let len = nc.atomic_load_i64(Acquire)
+        var cap = cc.atomic_load_i64(Acquire)
+        if len + n > cap {
+            var want = if cap == 0 { 4096 } else { cap * 2 }
+            while want < len + n {
+                want = want * 2
+            }
+            let grown = mem_addr(grasm_mem_alloc(want, 16))
+            if len > 0 {
+                __wasm_memcpy(grown, mem_addr(p), len)
+            }
+            if p != 0 {
+                grasm_mem_free(p)
+            }
+            p = grown.as_i64()
+            cap = want
+            pc.atomic_store_i64(p, Release)
+            cc.atomic_store_i64(cap, Release)
+        }
+        __wasm_memcpy(mem_addr(p + len), q, n)
+        nc.atomic_store_i64(len + n, Release)
+    }
+}
+
+export fn write(fd: i32, p: addr, n: i64) -> i64 {
+    let f = fd.as_i64()
+    unsafe {
+        if f == 1 {
+            append(mem_process(OUT_P), mem_process(OUT_N), mem_process(OUT_C), p, n)
+            return n
+        }
+        if f == 2 {
+            append(mem_process(ERR_P), mem_process(ERR_N), mem_process(ERR_C), p, n)
+            return n
+        }
+    }
+    -1
+}
+
+/// Standard input: the caller's text, then nothing; any other descriptor
+/// is not here.
+export fn read(fd: i32, p: addr, n: i64) -> i64 {
+    if fd.as_i64() != 0 {
+        return -1
+    }
+    unsafe {
+        let at = mem_process(IN_AT).atomic_load_i64(Acquire)
+        let left = mem_process(IN_N).atomic_load_i64(Acquire) - at
+        let k = if n < left { n } else { left }
+        if k <= 0 {
+            return 0
+        }
+        __wasm_memcpy(p, mem_addr(mem_process(IN_P).atomic_load_i64(Acquire) + at), k)
+        mem_process(IN_AT).atomic_store_i64(at + k, Release)
+        k
+    }
+}
+
+export fn close(fd: i32) -> i32 {
+    0.as_i32()
+}
+
+/// The text standard input reads: `n` bytes at `p`, which stay where they
+/// are for the run.
+export fn wasm_set_input(p: addr, n: i64) {
+    unsafe {
+        mem_process(IN_P).atomic_store_i64(p.as_i64(), Release)
+        mem_process(IN_N).atomic_store_i64(n, Release)
+        mem_process(IN_AT).atomic_store_i64(0, Release)
+    }
+}
+
+/// The answer of a run that ended with status `code` -- every run of the
+/// playground ends through `exit`, which the backend's export catches and
+/// hands here (`compiler/wasm32`, `--exports`) -- as the Rust playground's
+/// module frames it (`crates/grasm_wasm`): little-endian `u32`s -- the whole
+/// length, the status, standard output's length, its bytes, the text's
+/// length, its bytes. The text is what the program wrote to standard error,
+/// less one newline at its end: for a program that writes nothing else
+/// there, the Rust module's text to the byte (a diagnostic, a panic's line,
+/// a refusal, each written there and ended with a newline).
+export fn wasm_on_exit(code: i64) -> addr {
+    unsafe {
+        let op = mem_process(OUT_P).atomic_load_i64(Acquire)
+        let on = mem_process(OUT_N).atomic_load_i64(Acquire)
+        let ep = mem_process(ERR_P).atomic_load_i64(Acquire)
+        var en = mem_process(ERR_N).atomic_load_i64(Acquire)
+        if en > 0 and mem_addr(ep + en - 1).load_u8().as_i64() == 10 {
+            en -= 1
+        }
+        let total = 16 + on + en
+        let f = mem_addr(grasm_mem_alloc(total, 16))
+        f.store_u32(total.as_u32())
+        f.offset(4).store_u32(code.bit_and(4294967295).as_u32())
+        f.offset(8).store_u32(on.as_u32())
+        if on > 0 {
+            __wasm_memcpy(f.offset(12), mem_addr(op), on)
+        }
+        f.offset(12 + on).store_u32(en.as_u32())
+        if en > 0 {
+            __wasm_memcpy(f.offset(16 + on), mem_addr(ep), en)
+        }
+        f
+    }
+}

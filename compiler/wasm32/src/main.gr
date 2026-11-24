@@ -29,6 +29,21 @@
 // with `argc` and the argument vector the embedder wrote at the address the
 // export `_args` answers, inside a `try_table` that catches tag 0, the
 // exception `_exit` throws (decision (2)), and answers the exit status.
+//
+// A module built `--exports` (`LinkOpts.exports`, docs/self-hosting.md
+// §6.25: the playground) has no `_start`: its roots are the program's
+// `export fn`s, each exported under its name with its integers crossing as
+// `i32` (unsigned-extended into the word, wrapped on the way out), the
+// shadow stack begun afresh at each call, the call inside a `try_table`
+// that catches tag 0 and hands the status to the C library's
+// `wasm_on_exit`, whose answer the export answers. An `export fn` whose
+// name begins `wasm_` is the C library's business and not exported, and
+// `export_from`/`export_to` rename a prefix on the way out. The
+// context switch is the C library's `wasm_ctx_init` and `wasm_ctx_switch`
+// (`compiler/rtwasm/src/stacks.gr`), and the module exports `_fiber(ctx)`,
+// which a new fiber's engine stack starts in. Its data segment is passive,
+// copied in by a start function `_init` and again by every run's reset
+// (`memory.init`).
 import enc
 import body
 import structure
@@ -41,6 +56,16 @@ type LinkOpts = {
     /// A function that may recurse keeps a shadow frame of this many
     /// hundredths of its engine frame (`body.gr`).
     floor_scale: i64,
+    /// A module of the program's `export fn`s, not of `_start` (above).
+    exports: bool,
+    /// An export whose name begins `export_from` is exported with
+    /// `export_to` in its place ("" for none): a name the language keeps
+    /// for the toolchain ([T-EXPORT]) given to an export of the module.
+    export_from: str,
+    export_to: str,
+    /// The memory's maximum in 64 KiB pages, 0 for none: a cap the gates
+    /// set to meet the out-of-memory path in bounded time.
+    max_pages: i64,
 }
 
 /// The encoder's cases (`enctest.gr`).
@@ -49,7 +74,7 @@ pub fn encode_cases() -> WCases {
 }
 
 pub fn default_opts() -> LinkOpts {
-    LinkOpts{ stack_size: 8388608, floor_scale: 700 }
+    LinkOpts{ stack_size: 8388608, floor_scale: 700, exports: false, export_from: "", export_to: "", max_pages: 0 }
 }
 
 let DATA_BASE = 1024
@@ -76,6 +101,9 @@ fn host_import(name: str) -> (str, str) {
         "__host_grasm_now_millis" -> ("grasm_now_millis", ">f")
         "__host_grasm_monotonic_millis" -> ("grasm_monotonic_millis", ">f")
         "__host_grasm_sleep_millis" -> ("grasm_sleep_millis", "f>-")
+        "__host_grasm_stacks" -> ("grasm_stacks", ">i")
+        "__host_grasm_switch" -> ("grasm_switch", "ii>-")
+        "__host_grasm_fiber" -> ("grasm_fiber", "i>-")
         _ -> ("", "")
     }
 }
@@ -88,6 +116,12 @@ fn intrinsic_of(name: str) -> i64 {
         "__wasm_memcpy" -> body.I_MEMCPY
         "__wasm_memset" -> body.I_MEMSET
         "__wasm_heap_base" -> body.I_HEAP_BASE
+        "__wasm_get_sp" -> body.I_GET_SP
+        "__wasm_set_sp" -> body.I_SET_SP
+        "__wasm_cells_base" -> body.I_CELLS_BASE
+        "__wasm_cells_end" -> body.I_CELLS_END
+        "__wasm_data_init" -> body.I_DATA_INIT
+        "__wasm_stack_top" -> body.I_STACK_TOP
         _ -> 0
     }
 }
@@ -146,6 +180,13 @@ type Link = {
     pcell_addr: [i64],
     tcell_addr: [i64],
     heap_base: i64,
+    /// The zeroed cells' first address and the one past them (the
+    /// arguments' area among them), and the data segment's length.
+    cells_base: i64,
+    cells_end: i64,
+    data_len: i64,
+    stack_top: i64,
+    exports: bool,
 }
 
 /// The kept function `key`'s position, enqueued when first seen.
@@ -190,6 +231,13 @@ fn want_slot(inout l: Link, key: i64) -> i64 {
 /// what the kind names (a function's key, an import's name in `sig`'s
 /// company, an intrinsic, an address).
 fn resolve(l: Link, k: i64, name: str) -> (i64, i64, str) ! str {
+    if (name == ir.RT_CTX_SWITCH or name == ir.RT_CTX_INIT) and l.exports {
+        let leaf = if name == ir.RT_CTX_SWITCH { "_wasm_ctx_switch" } else { "_wasm_ctx_init" }
+        match l.global.get(leaf) {
+            Some(key) -> return (R_DEF, key, "")
+            None -> fail("`{name}`: the C library defines no `{leaf.substr(1, leaf.len())}`")
+        }
+    }
     if name == ir.RT_CTX_SWITCH or name == ir.RT_CTX_INIT {
         match l.global.get("_wasm_no_switch") {
             Some(key) -> return (R_NOSWITCH, key, "")
@@ -344,9 +392,13 @@ fn layout(inout l: Link, o: LinkOpts) -> (bytes, i64, i64) {
             at += (p.tsize[c] + 15) / 16 * 16
         }
     }
+    l.cells_base = argv
+    l.cells_end = at
     let stack_bottom = (at + 65535) / 65536 * 65536
     let stack_top = stack_bottom + o.stack_size
     l.heap_base = stack_top
+    l.stack_top = stack_top
+    l.data_len = data.len()
     (data.to_bytes(), argv, stack_top)
 }
 
@@ -406,7 +458,7 @@ fn aux_of(l: Link, key: i64, nimp: i64, inout types: Map[str, i64], inout tlist:
             } else if rk == R_INTR {
                 ak = body.A_INTRINSIC
                 ai = rv
-                ac = l.heap_base
+                ac = if rv == body.I_CELLS_BASE { l.cells_base } else if rv == body.I_CELLS_END { l.cells_end } else if rv == body.I_DATA_INIT { if l.exports { l.data_len } else { -1 } } else if rv == body.I_STACK_TOP { l.stack_top } else { l.heap_base }
             } else if rk == R_CONST {
                 ak = body.A_CONST
                 ai = rv
@@ -436,6 +488,7 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         progs: progs, local: [], global: {}, defs: [], def_pos: {}, imports: [], import_sig: [], import_pos: {},
         table: [], table_pos: {}, str_base: [], desc_base: [], pcell_base: [], tcell_base: [],
         str_addr: [], desc_addr: [], pcell_addr: [], tcell_addr: [], heap_base: 0,
+        cells_base: 0, cells_end: 0, data_len: 0, stack_top: 0, exports: o.exports,
     }
     for k in 0..progs.len() {
         var m: Map[str, i64] = {}
@@ -452,12 +505,53 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         }
         l.local.push(m)
     }
-    let entry = l.local[0].get("_main") ?? -1
-    if entry < 0 {
-        fail("the program has no C entry (`_main`)")
+    // The roots: `_main`, or every `export fn` of the program and the C
+    // library's `wasm_on_exit`.
+    var entry = -1
+    var ex_keys: [i64] = []
+    var ex_names: [str] = []
+    var hook = -1
+    if l.exports {
+        let p0 = progs[0]
+        for fi in 0..p0.fns.len() {
+            let f = p0.fns[fi]
+            let nm = f.sym.substr(1, f.sym.len())
+            if f.global and not nm.starts_with("wasm_") {
+                ex_keys.push(fi)
+                if o.export_from != "" and nm.starts_with(o.export_from) {
+                    ex_names.push(o.export_to + nm.substr(o.export_from.len(), nm.len()))
+                } else {
+                    ex_names.push(nm)
+                }
+            }
+        }
+        if ex_keys.is_empty() {
+            fail("the program has no `export fn` for `--exports` to export")
+        }
+        // The program's C entry, which the C library's `wasm_main` calls by
+        // the name C gives it.
+        match l.local[0].get("_main") {
+            Some(fi) -> l.global.set("_main", fi)
+            None -> ()
+        }
+        hook = l.global.get("_wasm_on_exit") ?? -1
+    } else {
+        entry = l.local[0].get("_main") ?? -1
+        if entry < 0 {
+            fail("the program has no C entry (`_main`)")
+        }
     }
     let (data, argv, stack_top) = layout(l, o)
-    let _ = want(l, entry)
+    if l.exports {
+        for k in ex_keys {
+            let _ = want(l, k)
+        }
+        if hook >= 0 {
+            let _ = want(l, hook)
+        }
+    } else {
+        let _ = want(l, entry)
+    }
     try walk(l)
     let nimp = l.imports.len()
     // Types: every kept function's, every import's, the tag's, `_start`'s.
@@ -476,8 +570,13 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         def_type.push(intern_type(types, tlist, tps, trs, body.param_classes(f), body.result_class(f)))
     }
     let tag_type = intern_type(types, tlist, tps, trs, [3], 0)
-    let start_type = intern_type(types, tlist, tps, trs, [3], 3)
-    let args_type = intern_type(types, tlist, tps, trs, [], 3)
+    // `_start`'s and `_args`'s types before the bodies', as they always were.
+    var start_type = -1
+    var args_type = -1
+    if not l.exports {
+        start_type = intern_type(types, tlist, tps, trs, [3], 3)
+        args_type = intern_type(types, tlist, tps, trs, [], 3)
+    }
     var bopts = BodyOpts{ floor_scale: o.floor_scale }
     // Bodies.
     var bodies: [bytes] = []
@@ -489,29 +588,131 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
             Err(msg) -> fail("{f.sym} ({f.name}): {msg}")
         }
     }
-    // `_start`.
-    var sb = byte_builder()
-    enc.uleb(sb, 0)
-    enc.open(sb, enc.OP_BLOCK, enc.T_I32)
-    enc.try_table_catch(sb, enc.T_I32, 0, 0)
-    enc.op_idx(sb, enc.OP_LOCAL_GET, 0)
-    enc.op(sb, enc.OP_I64_EXTEND_I32_S)
-    enc.i64_const(sb, argv)
-    enc.op_idx(sb, enc.OP_CALL, nimp + (l.def_pos.get(entry) ?? 0))
-    enc.op(sb, enc.OP_I32_WRAP_I64)
-    enc.op(sb, enc.OP_END)
-    enc.op(sb, enc.OP_END)
-    enc.op(sb, enc.OP_END)
-    bodies.push(sb.to_bytes())
-    def_type.push(start_type)
-    let start_idx = nimp + l.defs.len()
-    // `_args`: the arguments' area.
-    var ab = byte_builder()
-    enc.uleb(ab, 0)
-    enc.i32_const(ab, argv)
-    enc.op(ab, enc.OP_END)
-    bodies.push(ab.to_bytes())
-    def_type.push(args_type)
+    // The functions the backend writes itself, after the kept ones: `_start`
+    // and `_args`, or each export's entry, `_fiber` and `_init`.
+    let first_own = nimp + l.defs.len()
+    var own_names: [str] = []
+    var exported: [str] = []
+    var exported_idx: [i64] = []
+    var init_idx = -1
+    if l.exports {
+        for j in 0..ex_keys.len() {
+            let f = progs[0].fns[ex_keys[j]]
+            let ps = body.param_classes(f)
+            let rc = body.result_class(f)
+            var wps: [i64] = []
+            for c in ps {
+                if c != 1 {
+                    fail("`export fn {ex_names[j]}`: a double crosses an export, which `--exports` does not take")
+                }
+                wps.push(3)
+            }
+            if rc == 2 {
+                fail("`export fn {ex_names[j]}`: a double crosses an export, which `--exports` does not take")
+            }
+            let callee_idx = nimp + (l.def_pos.get(ex_keys[j]) ?? 0)
+            var wb = byte_builder()
+            enc.uleb(wb, 0)
+            enc.i32_const(wb, stack_top)
+            enc.op_idx(wb, enc.OP_GLOBAL_SET, 0)
+            if rc == 0 {
+                for k in 0..wps.len() {
+                    enc.op_idx(wb, enc.OP_LOCAL_GET, k)
+                    enc.op(wb, enc.OP_I64_EXTEND_I32_U)
+                }
+                enc.op_idx(wb, enc.OP_CALL, callee_idx)
+            } else {
+                enc.open(wb, enc.OP_BLOCK, enc.T_I32)
+                enc.open(wb, enc.OP_BLOCK, enc.T_I32)
+                enc.try_table_catch(wb, enc.T_I32, 0, 0)
+                for k in 0..wps.len() {
+                    enc.op_idx(wb, enc.OP_LOCAL_GET, k)
+                    enc.op(wb, enc.OP_I64_EXTEND_I32_U)
+                }
+                enc.op_idx(wb, enc.OP_CALL, callee_idx)
+                enc.op(wb, enc.OP_I32_WRAP_I64)
+                enc.op(wb, enc.OP_END)
+                enc.op_idx(wb, enc.OP_BR, 1)
+                enc.op(wb, enc.OP_END)
+                // The status `_exit` threw; the shadow stack begun again,
+                // as the throw left it wherever it was.
+                enc.i32_const(wb, stack_top)
+                enc.op_idx(wb, enc.OP_GLOBAL_SET, 0)
+                if hook >= 0 {
+                    enc.op(wb, enc.OP_I64_EXTEND_I32_S)
+                    enc.op_idx(wb, enc.OP_CALL, nimp + (l.def_pos.get(hook) ?? 0))
+                    enc.op(wb, enc.OP_I32_WRAP_I64)
+                }
+                enc.op(wb, enc.OP_END)
+            }
+            enc.op(wb, enc.OP_END)
+            bodies.push(wb.to_bytes())
+            def_type.push(intern_type(types, tlist, tps, trs, wps, if rc == 0 { 0 } else { 3 }))
+            own_names.push(ex_names[j])
+            exported.push(ex_names[j])
+            exported_idx.push(first_own + j)
+        }
+        // `_fiber(ctx)`: a new fiber's first frame, on the engine stack the
+        // embedder made for it -- its shadow stack at the context's first
+        // word, its entry (a table slot) called with its argument.
+        var fb = byte_builder()
+        enc.uleb(fb, 0)
+        enc.op_idx(fb, enc.OP_LOCAL_GET, 0)
+        enc.mem(fb, enc.OP_I64_LOAD, 3, 0)
+        enc.op(fb, enc.OP_I32_WRAP_I64)
+        enc.op_idx(fb, enc.OP_GLOBAL_SET, 0)
+        enc.op_idx(fb, enc.OP_LOCAL_GET, 0)
+        enc.mem(fb, enc.OP_I64_LOAD, 3, 16)
+        enc.op_idx(fb, enc.OP_LOCAL_GET, 0)
+        enc.mem(fb, enc.OP_I64_LOAD, 3, 8)
+        enc.op(fb, enc.OP_I32_WRAP_I64)
+        enc.call_indirect(fb, intern_type(types, tlist, tps, trs, [1], 0))
+        enc.op(fb, enc.OP_UNREACHABLE)
+        enc.op(fb, enc.OP_END)
+        bodies.push(fb.to_bytes())
+        def_type.push(intern_type(types, tlist, tps, trs, [3], 0))
+        own_names.push("_fiber")
+        exported.push("_fiber")
+        exported_idx.push(first_own + ex_keys.len())
+        // `_init`: the start function, the data copied in.
+        var ib = byte_builder()
+        enc.uleb(ib, 0)
+        enc.data_init(ib, data.len())
+        enc.op(ib, enc.OP_END)
+        bodies.push(ib.to_bytes())
+        def_type.push(intern_type(types, tlist, tps, trs, [], 0))
+        own_names.push("_init")
+        init_idx = first_own + ex_keys.len() + 1
+    } else {
+        // `_start`.
+        var sb = byte_builder()
+        enc.uleb(sb, 0)
+        enc.open(sb, enc.OP_BLOCK, enc.T_I32)
+        enc.try_table_catch(sb, enc.T_I32, 0, 0)
+        enc.op_idx(sb, enc.OP_LOCAL_GET, 0)
+        enc.op(sb, enc.OP_I64_EXTEND_I32_S)
+        enc.i64_const(sb, argv)
+        enc.op_idx(sb, enc.OP_CALL, nimp + (l.def_pos.get(entry) ?? 0))
+        enc.op(sb, enc.OP_I32_WRAP_I64)
+        enc.op(sb, enc.OP_END)
+        enc.op(sb, enc.OP_END)
+        enc.op(sb, enc.OP_END)
+        bodies.push(sb.to_bytes())
+        def_type.push(start_type)
+        // `_args`: the arguments' area.
+        var ab = byte_builder()
+        enc.uleb(ab, 0)
+        enc.i32_const(ab, argv)
+        enc.op(ab, enc.OP_END)
+        bodies.push(ab.to_bytes())
+        def_type.push(args_type)
+        own_names.push("_start")
+        own_names.push("_args")
+        exported.push("_start")
+        exported.push("_args")
+        exported_idx.push(first_own)
+        exported_idx.push(first_own + 1)
+    }
     // The module.
     var m = byte_builder()
     for x in [0, 97, 115, 109, 1, 0, 0, 0] {
@@ -561,11 +762,22 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
     enc.uleb(sec, l.table.len() + 1)
     enc.uleb(sec, l.table.len() + 1)
     enc.section(m, 4, sec.to_bytes())
-    // Memory: the data, the stack and the heap's first page; no maximum.
+    // Memory: the data, the stack and the heap's first page; no maximum
+    // unless one is asked for.
     sec = byte_builder()
     enc.uleb(sec, 1)
-    sec.push_byte(0)
-    enc.uleb(sec, stack_top / 65536 + 1)
+    let min_pages = stack_top / 65536 + 1
+    if o.max_pages > 0 {
+        if o.max_pages < min_pages {
+            fail("a memory of at most {o.max_pages} pages cannot hold the {min_pages} the module begins with")
+        }
+        sec.push_byte(1)
+        enc.uleb(sec, min_pages)
+        enc.uleb(sec, o.max_pages)
+    } else {
+        sec.push_byte(0)
+        enc.uleb(sec, min_pages)
+    }
     enc.section(m, 5, sec.to_bytes())
     // The tag `_exit` throws.
     sec = byte_builder()
@@ -583,17 +795,22 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
     enc.section(m, 6, sec.to_bytes())
     // Exports.
     sec = byte_builder()
-    enc.uleb(sec, 3)
+    enc.uleb(sec, exported.len() + 1)
     enc.name(sec, "memory")
     sec.push_byte(2)
     enc.uleb(sec, 0)
-    enc.name(sec, "_start")
-    sec.push_byte(0)
-    enc.uleb(sec, start_idx)
-    enc.name(sec, "_args")
-    sec.push_byte(0)
-    enc.uleb(sec, start_idx + 1)
+    for j in 0..exported.len() {
+        enc.name(sec, exported[j])
+        sec.push_byte(0)
+        enc.uleb(sec, exported_idx[j])
+    }
     enc.section(m, 7, sec.to_bytes())
+    // The start function of a module built `--exports`.
+    if init_idx >= 0 {
+        sec = byte_builder()
+        enc.uleb(sec, init_idx)
+        enc.section(m, 8, sec.to_bytes())
+    }
     // Elements: the table's slots from 1.
     if l.table.len() > 0 {
         sec = byte_builder()
@@ -607,6 +824,12 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         }
         enc.section(m, 9, sec.to_bytes())
     }
+    // The data count, which `memory.init` needs before the code.
+    if l.exports {
+        sec = byte_builder()
+        enc.uleb(sec, 1)
+        enc.section(m, 12, sec.to_bytes())
+    }
     // Code.
     sec = byte_builder()
     enc.uleb(sec, bodies.len())
@@ -615,18 +838,22 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         sec.push_bytes(bs)
     }
     enc.section(m, 10, sec.to_bytes())
-    // Data: one active segment at DATA_BASE.
+    // Data: one segment, active at DATA_BASE, or passive for `--exports`.
     sec = byte_builder()
     enc.uleb(sec, 1)
-    enc.uleb(sec, 0)
-    enc.i32_const(sec, DATA_BASE)
-    sec.push_byte(enc.OP_END)
+    if l.exports {
+        enc.uleb(sec, 1)
+    } else {
+        enc.uleb(sec, 0)
+        enc.i32_const(sec, DATA_BASE)
+        sec.push_byte(enc.OP_END)
+    }
     enc.uleb(sec, data.len())
     sec.push_bytes(data)
     enc.section(m, 11, sec.to_bytes())
     // Names: every function's, so a trap's stack names Grasm functions.
     var names = byte_builder()
-    enc.uleb(names, nimp + l.defs.len() + 2)
+    enc.uleb(names, nimp + l.defs.len() + own_names.len())
     for j in 0..nimp {
         enc.uleb(names, j)
         enc.name(names, "env." + l.imports[j])
@@ -635,10 +862,10 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         enc.uleb(names, nimp + d)
         enc.name(names, key_fn(l, l.defs[d]).name)
     }
-    enc.uleb(names, start_idx)
-    enc.name(names, "_start")
-    enc.uleb(names, start_idx + 1)
-    enc.name(names, "_args")
+    for j in 0..own_names.len() {
+        enc.uleb(names, first_own + j)
+        enc.name(names, own_names[j])
+    }
     sec = byte_builder()
     enc.name(sec, "name")
     sec.push_byte(1)

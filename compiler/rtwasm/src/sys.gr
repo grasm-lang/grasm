@@ -9,7 +9,6 @@
 // for word (docs/self-hosting.md §6.24, the table under "The Rust
 // playground").
 
-extern fn __host_grasm_write(fd: i64, p: addr, n: i64) -> i64
 extern fn __host_grasm_entropy(p: addr, n: i64) -> i64
 extern fn __host_grasm_now_millis() -> f64
 extern fn __host_grasm_monotonic_millis() -> f64
@@ -22,6 +21,8 @@ process_local ERRNO: i64
 
 /// Darwin's `ENOTSUP`, which nothing else here sets.
 let ENOTSUP_W = 45
+/// Darwin's `EINVAL`: an error number with no message here.
+let EINVAL = 22
 /// Darwin's `EAGAIN`: a thread that cannot be made.
 let EAGAIN = 35
 /// Darwin's `CLOCK_MONOTONIC` (`compiler/rt/src/os.gr`).
@@ -34,12 +35,12 @@ fn refuse() -> i32 {
     -1.as_i32()
 }
 
-fn refuse64() -> i64 {
+pub fn refuse64() -> i64 {
     let _ = refuse()
     -1
 }
 
-fn refuse_null() -> addr {
+pub fn refuse_null() -> addr {
     let _ = refuse()
     unsafe { mem_addr(0) }
 }
@@ -56,6 +57,20 @@ export fn strerror(code: i32) -> addr {
     unsafe { mem_static("operation not supported on this platform") }
 }
 
+/// Rust's `std` reads a message for an error number through `strerror_r`
+/// (`tools/tirinterp`'s `os_words`, docs/self-hosting.md §6.23 decision
+/// (6)), and on `wasm32-unknown-unknown` has none, so an `IoFailed` there
+/// is the refusal's words alone: every number is unknown here (`EINVAL`),
+/// and the interpreter built for wasm leaves the refusal's text as it is.
+export fn strerror_r(code: i32, buf: addr, n: i64) -> i32 {
+    EINVAL.as_i32()
+}
+
+/// `std::fs::canonicalize` (`compiler/front`'s loader): no file system.
+export fn realpath(path: addr, resolved: addr) -> addr {
+    refuse_null()
+}
+
 /// `exit`'s end: the status thrown to the export that started the run.
 export fn _exit(code: i32) {
     unsafe { __wasm_throw(code.as_i64().bit_and(255)) }
@@ -66,29 +81,6 @@ export fn _exit(code: i32) {
 /// words.
 export fn wasm_no_switch() {
     unsafe { grasm_panic_msg(mem_static("`concurrent` needs a platform that can switch stacks, which this one cannot"), mem_static_len("`concurrent` needs a platform that can switch stacks, which this one cannot")) }
-}
-
-// ----- the standard streams -------------------------------------------------------
-
-export fn write(fd: i32, p: addr, n: i64) -> i64 {
-    let f = fd.as_i64()
-    if f == 1 or f == 2 {
-        return unsafe { __host_grasm_write(f, p, n) }
-    }
-    refuse64()
-}
-
-/// Standard input is empty (a module's program reads none); any other
-/// descriptor is not here.
-export fn read(fd: i32, p: addr, n: i64) -> i64 {
-    if fd.as_i64() == 0 {
-        return 0
-    }
-    refuse64()
-}
-
-export fn close(fd: i32) -> i32 {
-    0.as_i32()
 }
 
 // ----- clocks and entropy ----------------------------------------------------------

@@ -1,0 +1,32 @@
+// The standard streams of a program's module (`s3 --target wasm32`):
+// standard output and error through the host, standard input empty.
+//
+// A module built `--exports` -- the playground (`tools/playground`,
+// docs/self-hosting.md §6.25) -- is linked with `play/streams.gr` in this
+// file's place, as the runtime's Linux build takes `os/linux.gr` for its
+// `os.gr`: what the program writes kept in memory for the answer, standard
+// input the lines the caller handed over.
+import sys
+
+extern fn __host_grasm_write(fd: i64, p: addr, n: i64) -> i64
+
+export fn write(fd: i32, p: addr, n: i64) -> i64 {
+    let f = fd.as_i64()
+    if f == 1 or f == 2 {
+        return unsafe { __host_grasm_write(f, p, n) }
+    }
+    sys.refuse64()
+}
+
+/// Standard input is empty (a module's program reads none); any other
+/// descriptor is not here.
+export fn read(fd: i32, p: addr, n: i64) -> i64 {
+    if fd.as_i64() == 0 {
+        return 0
+    }
+    sys.refuse64()
+}
+
+export fn close(fd: i32) -> i32 {
+    0.as_i32()
+}

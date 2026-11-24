@@ -9,7 +9,9 @@ a value stack and a control stack, each instruction's types popped and
 pushed) for every instruction the backend emits, and the module's structure
 around the bodies: the sections in order, each read to its end, every index
 in range, the types of imports, functions, the table, memory, the tag,
-globals, exports, elements and data.
+globals, exports, elements and data -- and, for a module built `--exports`
+(the playground's, docs/self-hosting.md §6.25), the start function, the data
+count, a passive data segment and `memory.init`.
 
 An instruction it does not know is an error, not a pass: the backend emits
 only what is below, and a module that holds anything else is not one of its.
@@ -152,6 +154,8 @@ class Module:
         self.tags = []           # type index
         self.body_count = 0
         self.inst_count = 0
+        # The data count section's number, which `memory.init` needs.
+        self.data_count = None
 
 
 def blocktype(r, m):
@@ -366,6 +370,17 @@ def check_body(m, r, end, params, results, nlocals_out):
                 pop(I32)
                 pop(I32)
                 pop(I32)
+            elif sub == 8:
+                x = r.uleb()
+                if m.data_count is None:
+                    raise Invalid("memory.init with no data count section")
+                if x >= m.data_count:
+                    raise Invalid("memory.init of a data segment that is not there")
+                if r.byte() != 0:
+                    raise Invalid("memory.init's memory not 0")
+                pop(I32)
+                pop(I32)
+                pop(I32)
             else:
                 raise Invalid(f"an instruction 0xfc {sub} the backend does not emit")
         elif o == 0x08:
@@ -533,8 +548,15 @@ def validate(b):
                 for _ in range(s.uleb()):
                     if s.uleb() >= len(m.funcs):
                         raise Invalid("an element of a function that is not there")
+        elif sid == 8:
+            x = s.uleb()
+            if x >= len(m.funcs):
+                raise Invalid("a start function that is not there")
+            if m.types[m.funcs[x]] != ([], []):
+                raise Invalid("a start function that takes or answers something")
         elif sid == 12:
             data_count = s.uleb()
+            m.data_count = data_count
         elif sid == 10:
             seen_code = True
             n = s.uleb()
@@ -558,9 +580,10 @@ def validate(b):
                 raise Invalid("data segments not as counted")
             for _ in range(n):
                 flags = s.uleb()
-                if flags != 0 or not m.mems:
+                if flags not in (0, 1) or not m.mems:
                     raise Invalid("a data segment the backend does not write")
-                const_expr(s, I32, m)
+                if flags == 0:
+                    const_expr(s, I32, m)
                 s.take(s.uleb())
         if s.p != end:
             raise Invalid(f"section {sid} not read to its end")
