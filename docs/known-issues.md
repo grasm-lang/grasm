@@ -10,10 +10,13 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
-sixteen, one in `compiler/wasm32`, which no release ships yet -- a module
+seventeen, one in `compiler/wasm32`, which no release ships yet -- a module
 refusing a recursion at 3,390 to 9,368 calls, by shape, short of the 10,000
-[E-RECURSION-DEPTH] guarantees -- two in the Rust-built playground module -- a recursion of 174
-calls trapping and an `eprint`'s text lost -- the Rust interpreter aborting on an `==` of a value nested
+[E-RECURSION-DEPTH] guarantees -- one in the Grasm playground, which no
+release ships yet -- with no stack switched (an engine without JS promise
+integration) a recursion refused at 334 to 1,774 calls -- two in the
+Rust-built playground module -- a recursion of 174 calls trapping and an
+`eprint`'s text lost -- the Rust interpreter aborting on an `==` of a value nested
 3,000,000 deep, both runtimes reporting a failed name lookup as `ENOENT`,
 four in `grasm lsp`, `grasm dap` and the journal -- a replay leaving
 records unread in silence, a breakpoint by another path's
@@ -23,7 +26,8 @@ build after a `net_close`, a block whose value is a map literal and a statement 
 branches' values differ, refused natively, and four in the manifest reader
 (`grasm_pkg::toml`, and the Grasm toolchain's `packages/toml` with it): a
 string cut at an escaped quote, escapes not undone, a multi-line string
-read with its quotes, and text after a string taken into it. Open S4: twenty, five in
+read with its quotes, and text after a string taken into it. Open S4: twenty-one, the Rust-built playground module reading a line's
+`\r` where `grasm run` drops it, five in
 `grasm lsp` and `grasm dap` -- a surrogate pair read as two U+FFFD, an
 unparsable `Content-Length` after a good one, `terminate` not stopping the
 program, the adapter's own stack overflowing, registry packages not
@@ -42,9 +46,79 @@ directory it was compiled in. Two differences [E-RECURSION-DEPTH] allows
 between the Grasm command and the Rust one (§6.23): a recursion between the
 Rust interpreter's stack and 100,000 calls runs under the Grasm command, and
 one inside a task past 10,999 calls is refused by it.
-Latent: one, the Rust runtime's region sweep,
-which no compiled program reaches. Excluded from an oracle, not copied: one,
+Latent: two, the Rust runtime's region sweep,
+which no compiled program reaches, and both runtimes reporting a fiber's
+stack that cannot be mapped as "(message needs formatting)", which no
+program here could be made to reach natively. Excluded from an oracle, not copied: one,
 Ruby 2.6's `Date` giving one day two dates in the reform's gap.**
+
+## Found on 2026-11-23 by S8 part eight (the playground in Grasm)
+
+**With no stack switched, the Grasm playground refuses a recursion below
+10,000 calls -- *open, S3 (the coordinator's), in `tools/playground`, which
+no release ships yet*.** The playground's module (docs/self-hosting.md
+§6.25) switches stacks through JS promise integration, which the
+coordinator's decision (2) takes as the standard (phase 4, April 2025;
+Chrome and Edge 137, Firefox 153, Safari 27): there the interpreter hops to
+a fresh engine stack when the running one is nearly spent and a recursion
+runs to the reference's count, 99,999 calls, as under `grasm run`. On an
+engine without it (`'Suspending' in WebAssembly` false, which `run.mjs`
+stands in for with `GRASM_WASM_STACKS=0`) nothing can be switched: the
+interpreter runs on the one engine stack, node's or a browser's default of
+984 KB, until the runtime's floor, and each call of the program is many of
+the interpreter's. The deepest call that ran, by shape, measured on the
+module of this part: `1 + depth(n - 1)` 1,314; `d(n - 1)` as a statement
+1,774; through a function value 537; through `[n - 1].map(down)` 334. Past
+each, the clause's panic, "stack overflow: recursion too deep", and exit
+101 -- never a trap, which is why it is S3 and not S2 -- where the Rust
+module traps at 174 calls. `concurrent` is refused there in the Rust
+module's words, as that module refuses it everywhere. Held by `playtest`
+(the four shapes at 10,000 with no stack switched, each the panic).
+
+```
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    print("{depth(10000)}")
+}
+```
+
+**The Rust playground module reads a line ending `\r\n` with its `\r` --
+*open, S4 (the agent's)*.** `grasm_run_with_stdin` splits the text it is
+handed on `\n` alone, so `input()` answers `"a\r"` for the line `a\r\n`,
+where `grasm run` and a native build answer `"a"`. The Grasm playground
+reads standard input through the runtime, as `grasm run` does, and answers
+`"a"`: not copied (§6.25). `playtest` holds the Grasm module to `grasm run`
+on that input and counts it apart from the cases it holds to the Rust
+module.
+
+```
+fn main() {
+    let line = input()
+    print("[{line}] of {line.len()}")
+}
+```
+
+with standard input `a\r\n`: the Rust module prints `[a\r] of 2`,
+`grasm run` and the Grasm playground `[a] of 1`.
+
+**A fiber's stack that cannot be mapped is reported as "(message needs
+formatting)" -- *latent, both runtimes*.** `compiler/rt/src/fiber.gr`'s
+`take_stack` copies the Rust runtime (`grasm_fiber`'s `assert!` with a
+formatted message, which `grasm_rt_abi`'s panic handler cannot format) and
+panics "(message needs formatting)" when `mmap` refuses a task's stack. It
+was met in the Grasm playground, 99,998 calls deep with a hop every 100
+calls, before the C library there learned to end in "memory allocation of
+N bytes failed" first (§6.25). Natively it was not reproduced: macOS does
+not let `ulimit -v` be set, and 200,000 tasks waiting at once, each with
+its 6.5 MiB stack, were all mapped (1.1 GB resident). The wording is the
+runtime's to change, at S9 or when a Linux build can be held to a memory
+limit; `compiler/rt` is not changed here.
 
 ## Found on 2026-11-22 by S8 part seven (the wasm32 backend)
 
@@ -70,7 +144,13 @@ stack, never a flag; what falls short recorded). The deepest each shape of
 10,089, `plain` (`1 + depth(n - 1)`) 9,368, `doubles` 8,030, `tree` 7,026,
 `locals` 5,620, `closure` (through a function value and `map`) 3,390. The
 Rust playground's module, which traps rather than panics, reaches 173 on
-`plain` (above).
+`plain` (above). What closing it needs was measured in S8 part eight
+(docs/self-hosting.md §6.25 decision (5)): the engine's stack, not the
+shadow stack, is what runs out, and a level of two functions with no locals
+at all reaches only 7,777 levels on one, so only a switch of engine stacks
+closes it; that changes how every compiled module starts, and the
+coordinator put it in a later part of its own (2026-11-23). Open until
+then.
 
 **The playground module traps on a recursion of 174 calls -- *open, S3
 (the agent's)*.** `grasm_wasm.wasm`, the Rust interpreter built by rustc for
@@ -83,7 +163,9 @@ bound, never a trap; `wasmtest` sets aside the three corpus programs that
 recurse deep. Not copied by the wasm backend in Grasm, which checks the
 floor on its own shadow stack (docs/self-hosting.md §6.24, decision (5)).
 Severity is the agent's: `docs/release-scope.md` names the three engines,
-not the playground.
+not the playground. The Grasm playground (§6.25) runs the program below to
+99,999 calls under JS promise integration, as `grasm run` does, and without
+it ends in the clause's panic (above), never a trap.
 
 ```
 fn depth(n: i64) -> i64 {
@@ -104,8 +186,13 @@ error writes nowhere, and the module's answer has room for standard output
 and one diagnostic text only, so an `eprint`'s line never reaches the page;
 a panic's text arrives as its first line, without the stack trace `grasm
 run` prints. `wasmtest` compares standard output and the status, so it does
-not see either. Whether the Grasm-built playground copies this is part
-eight's decision (§6.24, decision (9)).
+not see either. The Grasm playground (`tools/playground`, docs/self-hosting.md
+§6.25 decision (4), the coordinator's) fixes it and the Rust module still
+loses it: the Grasm module's answer carries everything the program wrote to
+standard error, in the order written, in the frame's existing text field --
+`eprint`'s lines, then a panic's line -- with no change to the layout, and
+`playtest` holds that text to `grasm run`'s standard error, the stack trace
+stripped as `clidiff` strips it (`scripts/lib/trace.sh`).
 
 ```
 fn main() {
