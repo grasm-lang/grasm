@@ -179,6 +179,10 @@ type Cx = {
     blk: i64,
     aborted: bool,
     hop_node: i64,
+    // How this run moves to a fresh host stack (`STACKS_*`), and, for
+    // `STACKS_ROOM`, how much the running one has left.
+    stacks: i64,
+    stack_left: fn() -> i64 / {io, unsafe},
 }
 
 /// A string as itself: the placeholder for the debugger's `{:?}`.
@@ -290,6 +294,8 @@ pub fn new_cx(p: TirProg, args: [str]) -> Cx {
         blk: 0,
         aborted: false,
         hop_node: 0,
+        stacks: STACKS_COUNT,
+        stack_left: no_room_query,
     }
     journal.mark(cx)
     cx
@@ -547,6 +553,9 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
 /// stack: a spare of the block's inside a task, else a host task's.
 fn deep_node(inout cx: Cx, e: i64) -> Value {
     let k = kid(cx, e, 0)
+    if cx.stacks == STACKS_NONE or (cx.stacks == STACKS_ROOM and cx.stack_left() > HOP_ROOM) {
+        return ev(cx, k)
+    }
     if tasks.in_task(cx) {
         return tasks.hop(cx, k)
     }
@@ -1986,6 +1995,28 @@ fn assign(inout cx: Cx, e: i64) -> Value {
 pub let HOP = 500
 pub let MAX_DEPTH = 100000
 
+// How a run moves to a fresh host stack (docs/self-hosting.md §6.25). A
+// command hops by count (`STACKS_COUNT`): every `HOP` nested calls, and
+// every `load.DEEP` levels of an expression. The playground's module, where
+// a stack is an engine stack of node's or a browser's default size and a
+// call of the program costs a different share of it by shape, hops by room
+// (`STACKS_ROOM`): when the running stack has less than `HOP_ROOM` bytes
+// left, as `stack_left` answers -- its shadow stack's, which the wasm backend
+// keeps in proportion to the engine's. Where no stack can be switched at all
+// (`STACKS_NONE`, an engine without JS promise integration) there is no hop,
+// and a recursion goes on to the runtime's floor. Where a hop falls changes
+// nothing a program can see: the bound is still `MAX_DEPTH` calls, and
+// inside a task the count a command's spare stacks give.
+pub let STACKS_COUNT = 0
+pub let STACKS_NONE = 1
+pub let STACKS_ROOM = 2
+pub let HOP_ROOM = 524288
+
+/// `stack_left` for a run that hops by count: never asked.
+fn no_room_query() -> i64 {
+    0
+}
+
 /// A function's or a closure's body, one call deeper.
 fn body(inout cx: Cx, node: i64) -> Value {
     if cx.depth >= MAX_DEPTH {
@@ -1996,7 +2027,18 @@ fn body(inout cx: Cx, node: i64) -> Value {
     // block (`tasks.hop`): a nested host block's task could not wait on a
     // channel its siblings outside it serve.
     var r = VUnit
-    if cx.depth % HOP != 0 {
+    if cx.stacks == STACKS_ROOM {
+        if tasks.in_task(cx) and cx.depth >= (tasks.spares(cx) + 1) * HOP {
+            // Where a command's task has used its last spare stack.
+            r = fault(cx, "stack overflow: recursion too deep")
+        } else if cx.stack_left() > HOP_ROOM {
+            r = ev(cx, node)
+        } else if tasks.in_task(cx) {
+            r = tasks.hop(cx, node)
+        } else {
+            r = ev_elsewhere(cx, node)
+        }
+    } else if cx.depth % HOP != 0 or cx.stacks == STACKS_NONE {
         r = ev(cx, node)
     } else if tasks.in_task(cx) {
         r = tasks.hop(cx, node)

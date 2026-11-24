@@ -671,6 +671,11 @@ type Done = {
 /// How many spare host stacks a block has, shared by its tasks.
 pub let SPARES = 21
 
+/// The spare host stacks a block of this program has.
+pub fn spares(cx: Cx) -> i64 {
+    if cx.p.may_recurse { SPARES } else { 0 }
+}
+
 /// Runs a `concurrent` block's tasks to their end, as the reference's
 /// `run_tasks` does: `bodies` are the `go` bodies in the order they ran,
 /// `frames` the frame each saw. The block counts as run already.
@@ -700,7 +705,7 @@ pub fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
     cx.sc.bk_outer.push(cx.sc.running)
     // A program that cannot recurse needs no spare stacks: no task of it
     // goes deeper than one host stack holds (`load.may_recurse`).
-    let nsp = if cx.p.may_recurse { SPARES } else { 0 }
+    let nsp = spares(cx)
     var free: [i64] = []
     var k = nsp - 1
     while k >= 0 {

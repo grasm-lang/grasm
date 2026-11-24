@@ -538,6 +538,20 @@ fn render(file: str, src: bytes, s: i64, e: i64, msg: str, help: str) -> str {
 /// `render_diags`: each diagnostic in the file that owns its span -- the
 /// last whose base it is not before -- then the count.
 fn render_all(paths: [str], srcs: [bytes], bases: [i64], ds: [i64], de: [i64], dm: [str], dh: [str]) {
+    var out = rendered(paths, srcs, bases, ds, de, dm, dh)
+    out.push_str("{ds.len()} error(s) found\n")
+    write_stderr(out)
+}
+
+/// Every diagnostic rendered, each followed by a newline, as `render_all`
+/// writes them before its count; the text alone, with no count, is what the
+/// Rust playground's module answers (`tools/playground`,
+/// docs/self-hosting.md §6.25).
+pub fn diagnostics_text(paths: [str], srcs: [bytes], bases: [i64], ds: [i64], de: [i64], dm: [str], dh: [str]) -> str {
+    rendered(paths, srcs, bases, ds, de, dm, dh).to_str()
+}
+
+fn rendered(paths: [str], srcs: [bytes], bases: [i64], ds: [i64], de: [i64], dm: [str], dh: [str]) -> ByteBuilder {
     var out = byte_builder()
     for i in 0..ds.len() {
         var f = 0
@@ -557,8 +571,7 @@ fn render_all(paths: [str], srcs: [bytes], bases: [i64], ds: [i64], de: [i64], d
         out.push_str(render(paths[f], srcs[f], s, e, dm[i], dh[i]))
         out.push_byte(10)
     }
-    out.push_str("{ds.len()} error(s) found\n")
-    write_stderr(out)
+    out
 }
 
 /// What was built, which ends in a newline, on stderr as `eprint` would

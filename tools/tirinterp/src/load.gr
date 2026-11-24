@@ -108,6 +108,12 @@ pub let OP_J_BUILTIN = 112
 /// level of an operator chain, which nests as deep as it is long.
 pub let OP_DEEP = 113
 pub let DEEP = 400
+pub let DEEP_ROOM = 50
+
+/// `stack_left` for a load that hops by count: never asked.
+fn no_room_query() -> i64 {
+    0
+}
 
 /// The program, ready to run.
 type TirProg = {
@@ -258,6 +264,10 @@ type Loader = {
     // fresh host stack answered.
     nest: i64,
     hop_id: i64,
+    // How this load moves to a fresh host stack (`eval.STACKS_*`), and how
+    // much room the running one has left (docs/self-hosting.md §6.25).
+    stacks: i64,
+    stack_left: fn() -> i64 / {io, unsafe},
 }
 
 // ----- reading the tree ------------------------------------------------------
@@ -472,8 +482,16 @@ fn resolve(inout ld: Loader, table: Map[str, i64], name: str, what: str) -> i64 
 fn expr(inout ld: Loader, e: i64) -> i64 {
     ld.nest += 1
     var id = -1
-    if ld.nest % DEEP == 0 {
-        id = expr_elsewhere(ld, e)
+    // A run that hops by room (`eval.STACKS_ROOM`) looks every `DEEP_ROOM`
+    // levels, reads on and puts the node under an `OP_DEEP` whose evaluation
+    // looks again; it hops only when little room is left.
+    let every = if ld.stacks == 2 { DEEP_ROOM } else { DEEP }
+    if ld.nest % every == 0 and ld.stacks != 1 {
+        if ld.stacks == 2 and ld.stack_left() > 524288 {
+            id = expr_here(ld, e)
+        } else {
+            id = expr_elsewhere(ld, e)
+        }
         if ld.op[id] == OP_BINARY {
             let w = new_node(ld, OP_DEEP)
             set_kids(ld, w, [id])
@@ -1471,7 +1489,15 @@ pub fn load(t: Tree) -> TirProg ! [str] {
 /// The same; `need_main` false for `grasm test` and `bench`, which run a
 /// program's tests and benches whether it has a `main` or not.
 pub fn load_for(t: Tree, need_main: bool) -> TirProg ! [str] {
+    load_with(t, need_main, 0, no_room_query)
+}
+
+/// `load_for`, moving to fresh host stacks as `stacks` says
+/// (`eval.STACKS_*`), `stack_left` the room the running one has left.
+pub fn load_with(t: Tree, need_main: bool, stacks: i64, stack_left: fn() -> i64 / {io, unsafe}) -> TirProg ! [str] {
     var ld = new_loader(t)
+    ld.stacks = stacks
+    ld.stack_left = stack_left
     for r in t.roots {
         register(ld, r)
     }
@@ -1563,6 +1589,8 @@ fn new_loader(t: Tree) -> Loader {
         errors: [],
         nest: 0,
         hop_id: -1,
+        stacks: 0,
+        stack_left: no_room_query,
     }
 }
 

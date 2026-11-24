@@ -10,6 +10,7 @@ import sexp
 import load
 import eval
 import value
+import journal
 
 fn usage() {
     eprint("usage: tirinterp <program.tir> [-- args...]")
@@ -58,9 +59,34 @@ fn run(path: str, prog_args: [str]) {
 /// load -- as `run` does: what `grasm run` does after its checks
 /// (compiler/grasm, docs/self-hosting.md §6.17).
 pub fn run_tree(t: Tree, path: str, prog_args: [str]) {
-    match load.load(t) {
+    run_tree_with(t, path, prog_args, eval.STACKS_COUNT, no_room, false, bytes_filled(0, 0))
+}
+
+fn no_room() -> i64 {
+    0
+}
+
+/// `run_tree`, for a host with no process of its own (the playground's
+/// module, `tools/playground`, docs/self-hosting.md §6.25): moving to fresh
+/// host stacks as `stacks` says (`eval.STACKS_*`, `stack_left` the room the
+/// running one has left), and with `replay` a journal to replay, handed over
+/// as bytes where a command would name a file -- one `journal.parse` has
+/// accepted.
+pub fn run_tree_with(t: Tree, path: str, prog_args: [str], stacks: i64, stack_left: fn() -> i64 / {io, unsafe}, replay: bool, jr: bytes) {
+    match load.load_with(t, true, stacks, stack_left) {
         Ok(p) -> {
             var cx = eval.new_cx(p, prog_args)
+            cx.stacks = stacks
+            cx.stack_left = stack_left
+            if replay {
+                match journal.install(cx, jr) {
+                    Ok(_) -> ()
+                    Err(why) -> {
+                        eprint("cannot replay: {why}")
+                        exit(7)
+                    }
+                }
+            }
             var none: [Value] = []
             let r = eval.call_fn(cx, p.main_fn, none)
             if cx.ctl == 4 {
