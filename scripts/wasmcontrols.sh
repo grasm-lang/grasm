@@ -87,6 +87,13 @@ declare -a MISSED=()
 control() {
     local name=$1 file=$2 old=$3 new=$4
     shift 5
+    # `WASM_CONTROLS_ONLY="name ..."` runs those controls alone.
+    if [ -n "${WASM_CONTROLS_ONLY:-}" ]; then
+        case " $WASM_CONTROLS_ONLY " in
+        *" $name "*) ;;
+        *) return ;;
+        esac
+    fi
     rm -rf "$WORK/src"
     mkdir -p "$WORK/src"
     cp -R compiler "$WORK/src/"
@@ -267,7 +274,7 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     exit 1
 fi
 # A floor: a control quietly dropped is a check quietly lost.
-if [ "$controls" -lt 25 ]; then
+if [ -z "${WASM_CONTROLS_ONLY:-}" ] && [ "$controls" -lt 25 ]; then
     echo "fewer controls than the floor of 25"
     exit 1
 fi
