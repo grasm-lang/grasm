@@ -9293,6 +9293,95 @@ the default tiering (200,000 shallow calls before the deep one, so that
 TurboFan's code runs it) needed less room, not more: 0.50 or below on
 `plain` and `mutual`.
 
+#### Step two, as built
+
+(2026-11-25, this branch, the main checkout's compiler and node v25.2.1;
+other apps held swap at 21 to 23.5 GB, disk at 6.1 to 7.5 GB free and the
+load at 6 to 15, so no time here is to be quoted but the ratios; who
+decided what is said where it was decided.)
+
+- **What was built.** `compiler/wasm32`: in a program's module global 1,
+  the running segment's floor, one segment (898,779 bytes) below the shadow
+  stack's top; in every function that takes the floor, before its frame is
+  reserved, the segment's check and, past it, a call of the function's slow
+  path, out of line, which writes the hop record (`body.gr`'s `H_*`: the
+  thunk's table slot, a status, an exit status, the answer, the arguments)
+  below the shadow stack's pointer, calls the C library's `wasm_hop` and
+  answers what the thunk left; a thunk per such function in the table after
+  the program's own slots; the export `_deep(record)`, the thunk called
+  inside a `try_table` that catches the exit tag and writes its status into
+  the record; frames 1.08 times the engine frame's estimate, rounded to 8
+  bytes. A module built `--exports` keeps 7.0, 16 and no hop.
+  `compiler/rtwasm/src/deep.gr`: `wasm_hop`, which lowers the segment's
+  floor, asks the host (`env.grasm_deeper`), restores the floor, and trusts
+  only the record's status -- 1 answered, 2 an `exit` or a panic thrown
+  again, anything else a trap -- and without a fresh stack ends in the
+  runtime's own stack panic. `scripts/wasm/runprog.mjs` answers
+  `grasm_deeper` through `WebAssembly.promising` (0 under
+  `GRASM_WASM_STACKS=0`) and prints, as the process ends, what ended a
+  deeper stack that trapped. The fixtures `wasmstack/parmap.gr`,
+  `wasmstack/spawn.gr`, `wasmdeep/trap.gr` and `wasmdeep/split.gr`;
+  `wasmsubset`'s `stack` section -- the eight shapes with JSPI and without,
+  the tiers, the traps, the hot split -- and its holding of the three
+  programs set aside for depth (`WASM_SKIP_NO_DEPTH=1` in
+  `scripts/lib/wasmskip.sh`); seven controls in `scripts/wasmcontrols.sh`,
+  `WASM_CONTROLS_ONLY=` and `WASM_SUBSET_ONLY=stack` to run them alone;
+  `PLAYTEST_BASE_MODULE=` in `playtest`.
+- **Condition (c), refused when built.** In a program's module the switch's
+  imports (`grasm_switch`, `grasm_fiber`, `grasm_stacks`) are a build error
+  naming the caller; in a module built `--exports` the hop's import and
+  intrinsics are. A program that declares `extern fn __host_grasm_switch`
+  and calls it is refused by name. The runtime's own context switch was
+  already the panic of `sys.wasm_no_switch` in a program's module (§6.24
+  decision (4)).
+- **The trap fixture (condition (b)).** No Grasm program can trap, so
+  `wasmdeep/trap.gr` declares two of the C library's intrinsics, which only
+  the wasm link binds -- `__wasm_trap` (`unreachable`) and `__wasm_memcpy`
+  to an address past the memory (out of bounds) -- and calls one 100 and
+  30,000 calls deep, on the first engine stack and on the fourth. Each ends
+  as a trap: exit 1, `RuntimeError`, no output; the deep ones also print the
+  deeper stack's own error ("the deeper stack: RuntimeError: memory access
+  out of bounds").
+- **The playground, the same bytes as master's.** Built from master's tree
+  (`f3856fe7`) by master's driver and from this branch's by its own, the
+  two modules first differed by 40 bytes (3,496,479 and 3,496,519): the
+  playground links all of `compiler/rtwasm`'s TIR, and the backend lays out
+  every string of a linked program, reachable or not, so `deep.gr`'s panic
+  words -- 35 bytes and 5 of alignment -- were inserted at address 103,513,
+  and 804 constants in 277 of the 2,036 bodies moved by 35 or 40 with them:
+  no function added, no other byte of code changed, no code path. Found by
+  the coordinator from the size. `deep.gr` now ends a hop that cannot start
+  in the runtime's own stack panic (`grasm_panic_stack`, the same words) and
+  holds no string, and the two modules are the same bytes; `playtest`
+  compares its module with master's own (`PLAYTEST_BASE_MODULE=`), not with
+  another driver's build of this branch's sources, which is what its first
+  form did and why it said "the same bytes" of the 40-byte difference.
+- **The gates, on `ce40fbc5`** (`nice -n 10`, one at a time, by the agent's
+  resumable runner). `wasmsubset`, 50 minutes: "651 programs with a main,
+  118 set aside, 533 compared", "as grasm run: 533   as the native build
+  (stdout, stderr, status): 533   timed out: 0", "named par_map, par_filter
+  or spawn and held: 22, the Rust module running them as grasm run does:
+  21, otherwise: 1", "set aside by wasmtest for their depth and held here:
+  3", "modules: 533   built twice the same: 533   V8 validates: 533
+  (refuses 0)   wasm_validate.py: 533 valid, 0 invalid, 151975 bodies
+  checked", "refusals: 4 of 4", "stack: 8 of 8 shapes held", "deepest with
+  JSPI: closure 21841 doubles 52421 locals 35740 mutual 65528 parmap 60481
+  plain 60488 spawn 60488 tree 43685", "deepest without JSPI (open S3):
+  closure 3117 doubles 7487 locals 5104 mutual 9359 parmap 8632 plain 8639
+  spawn 8638 tree 6239", "past any depth under --liftoff-only and
+  --no-liftoff, the panic: 16 of 16", "a trap in a deeper stack ended as a
+  trap: 4 of 4", "the hot split: 516 ns a call across an edge, 4.2 ns beside
+  it: 122 times" (155 and 122 on two runs). `s3subset` "identical: 648
+  mismatched: 0   timed out: 0   no TIR: 0"; `objtest` "objects: 648
+  reproducible: 648 ... with problems: 0". The new controls, each a run,
+  `WASM_CONTROLS_ONLY`: "controls: 8   caught: 8   missed: 0" -- `w-floor`,
+  `w-hop`, `w-small` and `w-deep-catch` by "past any depth", `w-tier` by
+  "under --no-liftoff, past any depth" and by nothing flag-free, `w-done` by
+  "a trap in a deeper stack", `w-seg-nondet` by "not the same bytes", and
+  the refusal without JSPI by "without JSPI, past any depth" (then planted
+  as other words; now `w-deep-panic`, a trap where the panic is, after the
+  change above).
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
