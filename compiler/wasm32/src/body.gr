@@ -22,9 +22,26 @@
 // any that calls something -- also keeps a frame proportional to what the
 // engine's frame for it will be: `floor_scale`
 // hundredths of `8 * (parameters + locals) + 56` bytes, the engine's frame
-// as measured on V8 (§6.24), so that the shadow stack's budget of 6 MiB
-// below the floor's first asking (`compiler/rt/src/fiber.gr`) is spent when
-// the engine's 984 KB are nearly but not wholly spent.
+// as measured on V8 (§6.24).
+//
+// In a program's module (docs/self-hosting.md §6.26) the scale is 1.0, the
+// shadow stack modelling the engine's one to one, and the runtime's floor of
+// 6 MiB below its first asking (`compiler/rt/src/fiber.gr`) is the bound, as
+// a native build's 6 MiB of the machine's stack is. No engine stack holds
+// that much, so the shadow stack is cut in segments of what one engine stack
+// holds (global 1 is the running segment's floor), and a function that takes
+// the floor checks on entry, before it reserves its frame, whether its frame
+// would pass the segment's floor. If it would, it hops: it writes a hop
+// record below the shadow stack's pointer -- its thunk's table slot, a
+// status, an exit status, its answer, its arguments (`H_*`) -- and calls the
+// C library's `wasm_hop` (`compiler/rtwasm/src/deep.gr`), which runs the
+// thunk on a fresh engine stack and checks that it finished; the function
+// then answers what the thunk left. It is re-entered from its first
+// instruction with the arguments it was given, before it has loaded an
+// `inout` argument or reserved anything, so nothing it does is done twice.
+// In a module built `--exports` (the playground) the scale is 7.0 and the
+// shadow stack's budget of 6 MiB is spent when the engine's 984 KB are
+// nearly but not wholly spent, as §6.24 measured; it never hops.
 //
 // Control. The function's blocks are reducible (every corpus function was,
 // measured), and are structured by the dominator tree as Ramsey's "Beyond
@@ -68,6 +85,21 @@ pub let I_CELLS_BASE = 9
 pub let I_CELLS_END = 10
 pub let I_DATA_INIT = 11
 pub let I_STACK_TOP = 12
+/// For a program's module (docs/self-hosting.md §6.26): the running
+/// segment's floor read and written (global 1), a segment's size, and a trap.
+pub let I_GET_SEG = 13
+pub let I_SET_SEG = 14
+pub let I_SEGMENT = 15
+pub let I_TRAP = 16
+
+/// A hop record (§6.26), at the address `wasm_hop` is handed: the thunk's
+/// table slot; the status (0 not finished, 1 answered, 2 ended by `exit` or
+/// a panic); that exit's status; the answer; the arguments, a word each.
+pub let H_SLOT = 0
+pub let H_STATUS = 8
+pub let H_EXIT = 16
+pub let H_ANSWER = 24
+pub let H_ARGS = 32
 
 /// Per instruction of a function: what the link resolved.
 type Aux = {
@@ -81,6 +113,13 @@ type BodyOpts = {
     /// A recursive function's shadow frame, in hundredths of its engine
     /// frame.
     floor_scale: i64,
+    /// What a frame is rounded up to, in bytes.
+    round: i64,
+    /// For a function that takes the floor in a program's module: the C
+    /// library's `wasm_hop`, and the table slot of this function's thunk;
+    /// -1 where it never hops.
+    hop_fn: i64,
+    hop_slot: i64,
 }
 
 /// The class of a value: 1 `i64`, 2 `f64`.
@@ -144,7 +183,7 @@ pub fn frame_size(f: MirFn, o: BodyOpts, slots: i64) -> i64 {
             n = r
         }
     }
-    (n + 15) / 16 * 16
+    (n + o.round - 1) / o.round * o.round
 }
 
 /// The state of writing one body.
@@ -207,6 +246,9 @@ pub fn body(f: MirFn, aux: Aux, o: BodyOpts) -> bytes ! str {
         enc.uleb(b, 1)
         enc.byte(b, enc.T_I32)
     }
+    if f.floor and o.hop_fn >= 0 {
+        try hop(f, s, o, b)
+    }
     if frame > 0 {
         enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
         enc.i32_const(b, frame)
@@ -219,6 +261,81 @@ pub fn body(f: MirFn, aux: Aux, o: BodyOpts) -> bytes ! str {
     // Control never falls off the end: every path ends in a `return`, a
     // branch or a trap, and this keeps the body's type whatever it answers.
     enc.op(b, enc.OP_UNREACHABLE)
+    enc.op(b, enc.OP_END)
+    b.to_bytes()
+}
+
+/// The segment's check and the hop (above): if this function's frame would
+/// pass the running segment's floor, its call is made again on a fresh
+/// engine stack and its answer answered. The frame pointer's local holds the
+/// record's address, before the frame is reserved.
+fn hop(f: MirFn, s: BState, o: BodyOpts, inout b: ByteBuilder) -> () ! str {
+    if s.fp < 0 {
+        fail("a function that takes the floor and keeps no frame")
+    }
+    let pcs = param_classes(f)
+    let rs = H_ARGS + 8 * pcs.len()
+    enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
+    enc.i32_const(b, s.frame)
+    enc.op(b, enc.OP_I32_SUB)
+    enc.op_idx(b, enc.OP_GLOBAL_GET, 1)
+    enc.op(b, enc.OP_I32_LT_U)
+    enc.open(b, enc.OP_IF, enc.BT_EMPTY)
+    enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
+    enc.i32_const(b, rs)
+    enc.op(b, enc.OP_I32_SUB)
+    enc.op_idx(b, enc.OP_LOCAL_TEE, s.fp)
+    enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+    enc.i64_const(b, o.hop_slot)
+    enc.mem(b, enc.OP_I64_STORE, 3, H_SLOT)
+    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+    enc.i64_const(b, 0)
+    enc.mem(b, enc.OP_I64_STORE, 3, H_STATUS)
+    for k in 0..pcs.len() {
+        enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+        enc.op_idx(b, enc.OP_LOCAL_GET, k)
+        enc.mem(b, if pcs[k] == 2 { enc.OP_F64_STORE } else { enc.OP_I64_STORE }, 3, H_ARGS + 8 * k)
+    }
+    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+    enc.op(b, enc.OP_I64_EXTEND_I32_U)
+    enc.op_idx(b, enc.OP_CALL, o.hop_fn)
+    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+    enc.i32_const(b, rs)
+    enc.op(b, enc.OP_I32_ADD)
+    enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+    if s.rcls != 0 {
+        enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
+        enc.mem(b, if s.rcls == 2 { enc.OP_F64_LOAD } else { enc.OP_I64_LOAD }, 3, H_ANSWER)
+    }
+    enc.op(b, enc.OP_RETURN)
+    enc.op(b, enc.OP_END)
+    ()
+}
+
+/// The thunk of function `callee` (index `idx`), which a hop runs on a fresh
+/// engine stack (`_deep`): its arguments read from the record its one
+/// parameter points at, the call, its answer written back and the status
+/// made "answered".
+pub fn thunk(f: MirFn, idx: i64) -> bytes {
+    let pcs = param_classes(f)
+    let rc = result_class(f)
+    var b = byte_builder()
+    enc.uleb(b, 0)
+    if rc != 0 {
+        enc.op_idx(b, enc.OP_LOCAL_GET, 0)
+    }
+    for k in 0..pcs.len() {
+        enc.op_idx(b, enc.OP_LOCAL_GET, 0)
+        enc.mem(b, if pcs[k] == 2 { enc.OP_F64_LOAD } else { enc.OP_I64_LOAD }, 3, H_ARGS + 8 * k)
+    }
+    enc.op_idx(b, enc.OP_CALL, idx)
+    if rc != 0 {
+        enc.mem(b, if rc == 2 { enc.OP_F64_STORE } else { enc.OP_I64_STORE }, 3, H_ANSWER)
+    }
+    enc.op_idx(b, enc.OP_LOCAL_GET, 0)
+    enc.i64_const(b, 1)
+    enc.mem(b, enc.OP_I64_STORE, 3, H_STATUS)
     enc.op(b, enc.OP_END)
     b.to_bytes()
 }
@@ -595,6 +712,25 @@ fn intrinsic(inout b: ByteBuilder, s: BState, f: MirFn, i: i64, which: i64, heap
         enc.op(b, enc.OP_I32_WRAP_I64)
         enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
         return try call_result(b, s, f, i, 0)
+    }
+    if which == I_GET_SEG {
+        enc.op_idx(b, enc.OP_GLOBAL_GET, 1)
+        enc.op(b, enc.OP_I64_EXTEND_I32_U)
+        return try call_result(b, s, f, i, 1)
+    }
+    if which == I_SET_SEG {
+        get(b, s, args[0])
+        enc.op(b, enc.OP_I32_WRAP_I64)
+        enc.op_idx(b, enc.OP_GLOBAL_SET, 1)
+        return try call_result(b, s, f, i, 0)
+    }
+    if which == I_SEGMENT {
+        enc.i64_const(b, heap_base)
+        return try call_result(b, s, f, i, 1)
+    }
+    if which == I_TRAP {
+        enc.op(b, enc.OP_UNREACHABLE)
+        return ()
     }
     if which == I_DATA_INIT {
         if heap_base < 0 {

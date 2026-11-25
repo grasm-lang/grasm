@@ -1,0 +1,28 @@
+// `wasmsubset`'s stack (docs/self-hosting.md §6.26): the hot split. `walk`
+// recurses `d` deep and there calls `leaf(2)` `m` times; with `d` the deepest
+// at which `leaf` fits the first engine stack, no call hops, and one deeper,
+// every call of `leaf` hops to a fresh stack and back. The two runs' times
+// give a call across a segment's edge against a call beside it.
+fn leaf(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + leaf(n - 1)
+}
+
+fn walk(d: i64, m: i64) -> i64 {
+    if d == 0 {
+        var s = 0
+        for i in 0..m {
+            s += leaf(2)
+        }
+        return s
+    }
+    walk(d - 1, m)
+}
+
+fn main() {
+    let d = args()[0].parse_int() ?? 10
+    let m = args()[1].parse_int() ?? 10
+    print("{walk(d, m)}")
+}

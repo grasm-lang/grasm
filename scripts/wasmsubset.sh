@@ -26,16 +26,31 @@
 #   * the refusals (decisions (4) and (6)): `scripts/fixtures/wasmrefuse/`'s
 #     programs -- a `concurrent` block, files, a socket, another program --
 #     must print, write to stderr and exit as the Rust module does on them;
-#   * the stack (decision (5)): `scripts/fixtures/wasmstack/`'s recursions,
-#     each of a different shape, run past any depth: each must end in the
-#     runtime's panic, exit 101, never the engine's stack overflow -- a trap
-#     the clause rules out; and the depth each reaches, under node's default
-#     stack, printed.
+#   * the stack (decision (5), and §6.26, S8 part nine):
+#     `scripts/fixtures/wasmstack/`'s recursions, each of a different shape
+#     (two of them inside `par_map` and `spawn`), run past any depth and
+#     bisected for the deepest call that prints, under node's default stack
+#     and no flag. With JS promise integration a recursion hops to fresh
+#     engine stacks: each shape must reach at least the 10,000 calls
+#     [E-RECURSION-DEPTH] guarantees. Without it (`GRASM_WASM_STACKS=0`)
+#     nothing can hop: each must reach at least what it reached before hops
+#     existed, less 1% -- below 10,000 for most, the open S3 entry of
+#     docs/known-issues.md. Either way, past the bound the runtime's panic and
+#     exit 101, never the engine's stack overflow -- a trap the clause rules
+#     out. `scripts/fixtures/wasmdeep/trap.gr` traps on purpose, on the first
+#     engine stack and on one a hop made: each must end as a trap, never as
+#     an exit, a panic or output. And `wasmdeep/split.gr` prints the hot
+#     split's cost -- a call made across a segment's edge against one made
+#     beside it -- measured, not asserted;
+#   * the three programs `wasmtest` sets aside for their depth, which its
+#     Rust module cannot run (`WASM_SKIP_NO_DEPTH=1`): held here as any
+#     other, and counted apart;
 #
 # Counts asserted; the floor is the 508 programs `wasmtest` compared when
 # this was written (2026-11-22).
 #
-# `S3=<binary>` tests that driver; `WASM=<module>` names the Rust module
+# `WASM_SUBSET_ONLY=stack` runs the stack and the refusals alone, with no
+# corpus (for the controls). `S3=<binary>` tests that driver; `WASM=<module>` names the Rust module
 # (default the build `wasmtest` makes); `WASM_LIBC=<dir>` the wasm C
 # library's package (default `compiler/rtwasm`); `WASM_SUBSET_STOP=1` stops
 # at the first failure, for the controls (`scripts/wasmcontrols.sh`).
@@ -70,7 +85,14 @@ build_wasm() { # TIR OUT
     "$S3" "$1" -o "$2" --target wasm32 --runtime-tir "$WORK/rt.tir" --libc-tir "$WORK/rtwasm.tir"
 }
 
-s3_collect
+# `WASM_SUBSET_ONLY=stack` runs the stack alone (the controls of §6.26):
+# no corpus, so the floors are not met, and `WASM_SUBSET_STOP=1` with it.
+if [ "${WASM_SUBSET_ONLY:-}" = stack ]; then
+    S3_SRC=()
+    S3_TIR=()
+else
+    s3_collect
+fi
 mkdir -p "$WORK/mods"
 compared=0
 same_run=0
@@ -78,6 +100,7 @@ same_native=0
 threads_held=0
 threads_rust=0
 threads_rust_differs=0
+depth_held=0
 skipped=0
 reproducible=0
 timedout=0
@@ -115,6 +138,11 @@ for k in "${!S3_SRC[@]}"; do
     if [[ "$why" == needs\ threads* ]]; then
         why=$(WASM_SKIP_NO_THREADS=1 wasm_skip_reason "$src" "$subject")
         [ -z "$why" ] && held_threads=1
+    fi
+    held_depth=0
+    if [[ "$why" == recurses\ past* ]]; then
+        why=$(WASM_SKIP_NO_DEPTH=1 wasm_skip_reason "$src" "$subject")
+        [ -z "$why" ] && held_depth=1
     fi
     if [ -n "$why" ]; then
         skipped=$((skipped + 1))
@@ -163,6 +191,9 @@ for k in "${!S3_SRC[@]}"; do
     else
         failed "$src — its native build fails: $(head -1 "$WORK/nat.log")"
         continue
+    fi
+    if [ "$held_depth" = 1 ]; then
+        depth_held=$((depth_held + 1))
     fi
     if [ "$held_threads" = 1 ]; then
         threads_held=$((threads_held + 1))
@@ -215,30 +246,102 @@ for fx in scripts/fixtures/wasmrefuse/*.gr; do
     fi
 done
 
-# The stack.
+# The stack (§6.26). Each shape's depth before hops existed, the floor
+# without JS promise integration (less 1%, below).
+declare -A BEFORE=([closure]=3390 [doubles]=8030 [locals]=5620 [mutual]=10089 [plain]=9368 [tree]=7026 [parmap]=9362 [spawn]=9368)
+GUARANTEED=10000
+DEEP_MSG='panic: stack overflow: recursion too deep'
 stack_ok=0
 stack_bad=0
+stack_n=0
 declare -a DEPTHS=()
-for fx in scripts/fixtures/wasmstack/*.gr; do
-    "$GRASM" tir "$fx" >"$WORK/fx.tir" 2>/dev/null && build_wasm "$WORK/fx.tir" "$WORK/fx.wasm" >/dev/null 2>&1 || {
-        stack_bad=$((stack_bad + 1)); echo "FAILED: $fx does not build"; continue; }
-    node scripts/wasm/runprog.mjs "$WORK/fx.wasm" 100000000 >/dev/null 2>"$WORK/fx.err" </dev/null
-    c=$?
-    if [ "$c" = 101 ] && grep -qx 'panic: stack overflow: recursion too deep' "$WORK/fx.err"; then
-        stack_ok=$((stack_ok + 1))
-    else
-        stack_bad=$((stack_bad + 1))
-        echo "FAILED: $fx past any depth: exit $c, $(head -c 200 "$WORK/fx.err" | tr '\n' ' ')"
-    fi
-    # The deepest it reaches, by bisection on its argument.
-    lo=1
-    hi=200000
+declare -a DEPTHS_NJ=()
+# deepest MODULE [ENV]: the deepest call that prints, by bisection.
+deepest() {
+    local m=$1 lo=1 hi=400000 mid
+    shift
     while [ "$lo" -lt "$hi" ]; do
         mid=$(( (lo + hi + 1) / 2 ))
-        if node scripts/wasm/runprog.mjs "$WORK/fx.wasm" "$mid" >/dev/null 2>&1 </dev/null; then lo=$mid; else hi=$((mid - 1)); fi
+        if env "$@" node scripts/wasm/runprog.mjs "$m" "$mid" >/dev/null 2>&1 </dev/null; then lo=$mid; else hi=$((mid - 1)); fi
     done
-    DEPTHS+=("$(basename "$fx" .gr) $lo")
+    echo "$lo"
+}
+for fx in scripts/fixtures/wasmstack/*.gr; do
+    name=$(basename "$fx" .gr)
+    stack_n=$((stack_n + 1))
+    "$GRASM" tir "$fx" >"$WORK/fx.tir" 2>/dev/null && build_wasm "$WORK/fx.tir" "$WORK/fx.wasm" >/dev/null 2>&1 || {
+        stack_bad=$((stack_bad + 1)); echo "FAILED: $fx does not build"; continue; }
+    ok=1
+    for mode in jspi nojspi; do
+        if [ "$mode" = jspi ]; then e=(GRASM_WASM_STACKS=1); say=""; else e=(GRASM_WASM_STACKS=0); say=" without JSPI,"; fi
+        env "${e[@]}" node scripts/wasm/runprog.mjs "$WORK/fx.wasm" 100000000 >"$WORK/fx.out" 2>"$WORK/fx.err" </dev/null
+        c=$?
+        if [ "$c" != 101 ] || ! grep -qx "$DEEP_MSG" "$WORK/fx.err" || [ -s "$WORK/fx.out" ]; then
+            ok=0
+            echo "FAILED: $fx$say past any depth: exit $c, $(grep -v '^ *at ' "$WORK/fx.err" | head -c 200 | tr '\n' ' ')"
+        fi
+        d=$(deepest "$WORK/fx.wasm" "${e[@]}")
+        if [ "$mode" = jspi ]; then
+            DEPTHS+=("$name $d")
+            if [ "$d" -lt "$GUARANTEED" ]; then
+                ok=0
+                echo "FAILED: $fx reaches only $d calls, short of the $GUARANTEED guaranteed"
+            fi
+        else
+            DEPTHS_NJ+=("$name $d")
+            want=$(( ${BEFORE[$name]:-$GUARANTEED} * 99 / 100 ))
+            if [ "$d" -lt "$want" ]; then
+                ok=0
+                echo "FAILED: $fx without JSPI reaches only $d calls, below the $want held (${BEFORE[$name]:-?} before hops, less 1%)"
+            fi
+        fi
+    done
+    if [ "$ok" = 1 ]; then stack_ok=$((stack_ok + 1)); else stack_bad=$((stack_bad + 1)); fi
 done
+# A trap on the first engine stack and on one a hop made: a trap, never an
+# exit, a panic or output.
+trap_ok=0
+trap_n=0
+"$GRASM" tir scripts/fixtures/wasmdeep/trap.gr >"$WORK/trap.tir" 2>/dev/null && build_wasm "$WORK/trap.tir" "$WORK/trap.wasm" >/dev/null 2>&1 || {
+    stack_bad=$((stack_bad + 1)); echo "FAILED: scripts/fixtures/wasmdeep/trap.gr does not build"; }
+if [ -f "$WORK/trap.wasm" ]; then
+    for depth in 100 30000; do
+        for how in 1 2; do
+            trap_n=$((trap_n + 1))
+            node scripts/wasm/runprog.mjs "$WORK/trap.wasm" "$depth" "$how" >"$WORK/t.out" 2>"$WORK/t.err" </dev/null
+            c=$?
+            if [ "$c" = 1 ] && [ ! -s "$WORK/t.out" ] && grep -c 'RuntimeError' "$WORK/t.err" >/dev/null && ! grep -c '^panic: ' "$WORK/t.err" >/dev/null; then
+                trap_ok=$((trap_ok + 1))
+            else
+                echo "FAILED: a trap in a deeper stack (wasmdeep/trap.gr $depth $how) not ended as a trap: exit $c, stdout $(head -c 60 "$WORK/t.out" | tr '\n' ' '), $(grep -v '^ *at ' "$WORK/t.err" | head -c 200 | tr '\n' ' ')"
+            fi
+        done
+    done
+fi
+[ "$trap_ok" = 4 ] || stack_bad=$((stack_bad + 1))
+# The hot split: `split.gr`'s `leaf` called beside the first engine stack's
+# edge (the deepest `walk` at which it fits without a hop) and across it.
+split_line="not measured"
+"$GRASM" tir scripts/fixtures/wasmdeep/split.gr >"$WORK/split.tir" 2>/dev/null && build_wasm "$WORK/split.tir" "$WORK/split.wasm" >/dev/null 2>&1 || {
+    stack_bad=$((stack_bad + 1)); echo "FAILED: scripts/fixtures/wasmdeep/split.gr does not build"; }
+if [ -f "$WORK/split.wasm" ]; then
+    lo=1
+    hi=100000
+    while [ "$lo" -lt "$hi" ]; do
+        mid=$(( (lo + hi + 1) / 2 ))
+        if GRASM_WASM_STACKS=0 node scripts/wasm/runprog.mjs "$WORK/split.wasm" "$mid" 1 >/dev/null 2>&1 </dev/null; then lo=$mid; else hi=$((mid - 1)); fi
+    done
+    split_line=$(perl -MTime::HiRes=time -e '
+        my ($m, $edge) = @ARGV;
+        sub run { my $t = time; system("node scripts/wasm/runprog.mjs $m @_ >/dev/null 2>&1 </dev/null") == 0 or die "split.gr @_ failed\n"; time - $t }
+        my (@z, @b, @a);
+        for (1 .. 3) { push @z, run($edge, 0); push @b, run($edge, 20000000); push @a, run($edge + 1, 1000000) }
+        sub med { my @s = sort { $a <=> $b } @_; $s[1] }
+        my ($tz, $tb, $ta) = (med(@z), med(@b), med(@a));
+        my $beside = ($tb - $tz) / 20000000; my $across = ($ta - $tz) / 1000000;
+        printf "%.0f ns a call across an edge, %.1f ns beside it: %.0f times (medians of 3, walk at %d)", $across * 1e9, $beside * 1e9, $across / $beside, $edge;
+    ' "$WORK/split.wasm" "$lo" 2>&1 || true)
+fi
 
 echo
 echo "skipped, by reason:"
@@ -247,13 +350,26 @@ echo
 echo "wasmsubset: ${#S3_SRC[@]} programs with a main, $skipped set aside, $compared compared"
 echo "as grasm run: $same_run   as the native build (stdout, stderr, status): $same_native   timed out: $timedout"
 echo "named par_map, par_filter or spawn and held: $threads_held, the Rust module running them as grasm run does: $threads_rust, otherwise: $threads_rust_differs"
+echo "set aside by wasmtest for their depth and held here: $depth_held"
 echo "modules: $nmods   built twice the same: $reproducible   V8 validates: ${v8_ok:-0} (refuses ${v8_bad:-0})   wasm_validate.py: $pv_ok valid, $pv_bad invalid, $pv_bodies bodies checked"
 echo "refusals: $refuse_same of $refuse_n as the Rust module's"
-echo "stack: $stack_ok of $((stack_ok + stack_bad)) recursions past any depth end in the panic; deepest reached: ${DEPTHS[*]}"
+echo "stack: $stack_ok of $stack_n shapes held (at least $GUARANTEED calls with JSPI, past any depth the panic, with and without)"
+echo "stack, deepest with JSPI: ${DEPTHS[*]}"
+echo "stack, deepest without JSPI (open S3): ${DEPTHS_NJ[*]}"
+echo "stack, a trap in a deeper stack ended as a trap: $trap_ok of $trap_n"
+echo "stack, the hot split: $split_line"
 status=0
 [ "$fail" -gt 0 ] && status=1
 [ "$stack_bad" -gt 0 ] && status=1
 if [ -z "$STOP" ]; then
+    if [ "$stack_n" -lt 8 ] || [ "$stack_ok" -ne "$stack_n" ]; then
+        echo "the stack: $stack_ok of $stack_n shapes held, of at least 8"
+        status=1
+    fi
+    if [ "$depth_held" -lt 3 ]; then
+        echo "the programs set aside for their depth: $depth_held held, of 3"
+        status=1
+    fi
     if [ "$refuse_n" -lt 4 ] || [ "$refuse_same" -ne "$refuse_n" ]; then
         echo "the refusals: $refuse_same of $refuse_n alike, of at least 4"
         status=1

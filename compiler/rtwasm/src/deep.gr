@@ -1,0 +1,44 @@
+// A hop to a fresh engine stack, for a program's module (docs/self-hosting.md
+// §6.26). A function that takes the floor and would pass the running
+// segment's floor writes a hop record (`compiler/wasm32/src/body.gr`'s
+// `H_*`) and calls `wasm_hop`, which lowers the segment's floor by a
+// segment and asks the host for a fresh engine stack: the import
+// `env.grasm_deeper(record)`, which the embedder answers by calling the
+// module's export `_deep(record)` through `WebAssembly.promising` -- a stack
+// that runs to its end before the import returns -- and then 1, or 0 when
+// it has no `promising` (an engine without JS promise integration).
+//
+// The record's status is the only word trusted: 1 when the thunk answered,
+// 2 when an `exit` or a panic ended the deeper stack (thrown again here, so
+// it unwinds stack by stack to `_start`). Anything else means the deeper
+// stack did not finish -- a trap there, which the embedder sees only later
+// as a rejected promise -- and the run ends in a trap here, never in
+// whatever the record's answer slot holds. Without a fresh stack the
+// recursion ends in [E-RECURSION-DEPTH]'s panic, in its words.
+extern fn __host_grasm_deeper(rec: addr) -> i64
+extern fn __wasm_get_seg() -> i64
+extern fn __wasm_set_seg(f: i64)
+extern fn __wasm_segment() -> i64
+extern fn __wasm_get_sp() -> i64
+extern fn __wasm_throw(code: i64)
+extern fn __wasm_trap()
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+export fn wasm_hop(rec: addr) {
+    unsafe {
+        let saved = __wasm_get_seg()
+        __wasm_set_seg(__wasm_get_sp() - __wasm_segment())
+        let started = __host_grasm_deeper(rec)
+        __wasm_set_seg(saved)
+        if started == 0 {
+            grasm_panic_msg(mem_static("stack overflow: recursion too deep"), mem_static_len("stack overflow: recursion too deep"))
+        }
+        let status = rec.offset(8).load_i64()
+        if status == 2 {
+            __wasm_throw(rec.offset(16).load_i64())
+        }
+        if status != 1 {
+            __wasm_trap()
+        }
+    }
+}

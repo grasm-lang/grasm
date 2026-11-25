@@ -30,6 +30,18 @@
 // export `_args` answers, inside a `try_table` that catches tag 0, the
 // exception `_exit` throws (decision (2)), and answers the exit status.
 //
+// A program's module also hops to fresh engine stacks (docs/self-hosting.md
+// §6.26; `body.gr` says how a function hops): global 1 is the running
+// segment's floor, every function that takes the floor has a thunk in the
+// table after the program's own slots, and the export `_deep(record)` runs
+// a record's thunk inside a `try_table` that catches tag 0, writing the exit
+// status into the record. The embedder calls `_deep` through
+// `WebAssembly.promising` when the C library's `wasm_hop` calls the import
+// `env.grasm_deeper`: a fresh engine stack, which runs to its end before the
+// import returns. Nothing in a program's module can switch stacks -- the
+// switch's imports are refused when it is built -- so a hop never meets a
+// switch, which would return to the import before the stack had finished.
+//
 // A module built `--exports` (`LinkOpts.exports`, docs/self-hosting.md
 // §6.25: the playground) has no `_start`: its roots are the program's
 // `export fn`s, each exported under its name with its integers crossing as
@@ -54,8 +66,12 @@ type LinkOpts = {
     /// The shadow stack's size in bytes.
     stack_size: i64,
     /// A function that may recurse keeps a shadow frame of this many
-    /// hundredths of its engine frame (`body.gr`).
+    /// hundredths of its engine frame (`body.gr`); -1 for the module's own,
+    /// 100 for a program's (§6.26), 700 for one built `--exports` (§6.24).
     floor_scale: i64,
+    /// A segment of a program's shadow stack, in bytes: what one engine
+    /// stack holds (§6.26).
+    segment: i64,
     /// A module of the program's `export fn`s, not of `_start` (above).
     exports: bool,
     /// An export whose name begins `export_from` is exported with
@@ -74,10 +90,14 @@ pub fn encode_cases() -> WCases {
 }
 
 pub fn default_opts() -> LinkOpts {
-    LinkOpts{ stack_size: 8388608, floor_scale: 700, exports: false, export_from: "", export_to: "", max_pages: 0 }
+    LinkOpts{ stack_size: 8388608, floor_scale: -1, segment: SEGMENT, exports: false, export_from: "", export_to: "", max_pages: 0 }
 }
 
 let DATA_BASE = 1024
+/// The runtime's floor, 6 MiB (`compiler/rt/src/fiber.gr`'s `BUDGET`), in
+/// seven segments: each the engine stack §6.24's calibration gave one
+/// stack, so that the bound is 6 MiB of the engine's stack (§6.26).
+let SEGMENT = 898779
 /// The arguments' area: the embedder writes the argument vector there --
 /// eight-byte pointers, then the NUL-terminated strings they point at --
 /// and passes `_start` their count.
@@ -104,6 +124,7 @@ fn host_import(name: str) -> (str, str) {
         "__host_grasm_stacks" -> ("grasm_stacks", ">i")
         "__host_grasm_switch" -> ("grasm_switch", "ii>-")
         "__host_grasm_fiber" -> ("grasm_fiber", "i>-")
+        "__host_grasm_deeper" -> ("grasm_deeper", "i>i")
         _ -> ("", "")
     }
 }
@@ -122,6 +143,10 @@ fn intrinsic_of(name: str) -> i64 {
         "__wasm_cells_end" -> body.I_CELLS_END
         "__wasm_data_init" -> body.I_DATA_INIT
         "__wasm_stack_top" -> body.I_STACK_TOP
+        "__wasm_get_seg" -> body.I_GET_SEG
+        "__wasm_set_seg" -> body.I_SET_SEG
+        "__wasm_segment" -> body.I_SEGMENT
+        "__wasm_trap" -> body.I_TRAP
         _ -> 0
     }
 }
@@ -187,6 +212,7 @@ type Link = {
     data_len: i64,
     stack_top: i64,
     exports: bool,
+    segment: i64,
 }
 
 /// The kept function `key`'s position, enqueued when first seen.
@@ -255,10 +281,24 @@ fn resolve(l: Link, k: i64, name: str) -> (i64, i64, str) ! str {
     }
     let w = intrinsic_of(name)
     if w > 0 {
+        if l.exports and (w == body.I_GET_SEG or w == body.I_SET_SEG or w == body.I_SEGMENT) {
+            fail("`{name}`: a module built `--exports` has no segments (§6.26)")
+        }
         return (R_INTR, w, "")
     }
     let (imp, sig) = host_import(name)
     if imp != "" {
+        // A hop runs synchronously on a fresh engine stack and must end
+        // there; a switch inside it would return to the import first
+        // (§6.26). So the switch is the playground's alone, and the hop a
+        // program's alone: refused here, not trapped at the call, so that
+        // no module that could meet it is ever written.
+        if not l.exports and (imp == "grasm_switch" or imp == "grasm_fiber" or imp == "grasm_stacks") {
+            fail("`{name}`, called from {if k == 0 { "the program" } else { "the runtime" }}: switching stacks is a module's built `--exports` alone, and a program's module hops instead (§6.26)")
+        }
+        if l.exports and imp == "grasm_deeper" {
+            fail("`{name}`: a module built `--exports` does not hop (§6.26)")
+        }
         return (R_IMPORT, 0, imp + " " + sig)
     }
     var cands: [str] = []
@@ -458,7 +498,7 @@ fn aux_of(l: Link, key: i64, nimp: i64, inout types: Map[str, i64], inout tlist:
             } else if rk == R_INTR {
                 ak = body.A_INTRINSIC
                 ai = rv
-                ac = if rv == body.I_CELLS_BASE { l.cells_base } else if rv == body.I_CELLS_END { l.cells_end } else if rv == body.I_DATA_INIT { if l.exports { l.data_len } else { -1 } } else if rv == body.I_STACK_TOP { l.stack_top } else { l.heap_base }
+                ac = if rv == body.I_CELLS_BASE { l.cells_base } else if rv == body.I_CELLS_END { l.cells_end } else if rv == body.I_DATA_INIT { if l.exports { l.data_len } else { -1 } } else if rv == body.I_STACK_TOP { l.stack_top } else if rv == body.I_SEGMENT { l.segment } else { l.heap_base }
             } else if rk == R_CONST {
                 ak = body.A_CONST
                 ai = rv
@@ -488,7 +528,7 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         progs: progs, local: [], global: {}, defs: [], def_pos: {}, imports: [], import_sig: [], import_pos: {},
         table: [], table_pos: {}, str_base: [], desc_base: [], pcell_base: [], tcell_base: [],
         str_addr: [], desc_addr: [], pcell_addr: [], tcell_addr: [], heap_base: 0,
-        cells_base: 0, cells_end: 0, data_len: 0, stack_top: 0, exports: o.exports,
+        cells_base: 0, cells_end: 0, data_len: 0, stack_top: 0, exports: o.exports, segment: o.segment,
     }
     for k in 0..progs.len() {
         var m: Map[str, i64] = {}
@@ -551,9 +591,31 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         }
     } else {
         let _ = want(l, entry)
+        // The hop's C half, in every program's module (the runtime has a
+        // function that takes the floor).
+        match l.global.get("_wasm_hop") {
+            Some(key) -> {
+                let _ = want(l, key)
+            }
+            None -> fail("the C library defines no `wasm_hop` (§6.26)")
+        }
     }
     try walk(l)
     let nimp = l.imports.len()
+    // The functions that hop, in the order kept, and their thunks' slots
+    // after the program's own.
+    var hop_keys: [i64] = []
+    var hop_slot: Map[i64, i64] = {}
+    if not l.exports {
+        for key in l.defs {
+            if key_fn(l, key).floor {
+                hop_slot.set(key, l.table.len() + 1 + hop_keys.len())
+                hop_keys.push(key)
+            }
+        }
+    }
+    let scale = if o.floor_scale >= 0 { o.floor_scale } else if l.exports { 700 } else { 100 }
+    let round = if l.exports { 16 } else { 8 }
     // Types: every kept function's, every import's, the tag's, `_start`'s.
     var types: Map[str, i64] = {}
     var tlist: [str] = []
@@ -577,12 +639,14 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         start_type = intern_type(types, tlist, tps, trs, [3], 3)
         args_type = intern_type(types, tlist, tps, trs, [], 3)
     }
-    var bopts = BodyOpts{ floor_scale: o.floor_scale }
+    let hop_fn = if l.exports { -1 } else { nimp + (l.def_pos.get(l.global.get("_wasm_hop") ?? 0) ?? 0) }
     // Bodies.
     var bodies: [bytes] = []
     for key in l.defs {
         let f = key_fn(l, key)
         let aux = try aux_of(l, key, nimp, types, tlist, tps, trs)
+        let slot = hop_slot.get(key) ?? -1
+        let bopts = BodyOpts{ floor_scale: scale, round: round, hop_fn: if slot > 0 { hop_fn } else { -1 }, hop_slot: slot }
         match body.body(f, aux, bopts) {
             Ok(bs) -> bodies.push(bs)
             Err(msg) -> fail("{f.sym} ({f.name}): {msg}")
@@ -712,7 +776,48 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         exported.push("_args")
         exported_idx.push(first_own)
         exported_idx.push(first_own + 1)
+        // `_deep(record)`: a hop's fresh engine stack (§6.26) -- the
+        // record's thunk called inside a `try_table` that catches tag 0, the
+        // status `_exit` threw written into the record, the record's status
+        // made "ended".
+        let rec_type = intern_type(types, tlist, tps, trs, [3], 0)
+        var db = byte_builder()
+        enc.uleb(db, 1)
+        enc.uleb(db, 1)
+        db.push_byte(enc.T_I32)
+        enc.open(db, enc.OP_BLOCK, enc.T_I32)
+        enc.try_table_catch(db, enc.BT_EMPTY, 0, 0)
+        enc.op_idx(db, enc.OP_LOCAL_GET, 0)
+        enc.op_idx(db, enc.OP_LOCAL_GET, 0)
+        enc.mem(db, enc.OP_I64_LOAD, 3, body.H_SLOT)
+        enc.op(db, enc.OP_I32_WRAP_I64)
+        enc.call_indirect(db, rec_type)
+        enc.op(db, enc.OP_END)
+        enc.op(db, enc.OP_RETURN)
+        enc.op(db, enc.OP_END)
+        enc.op_idx(db, enc.OP_LOCAL_SET, 1)
+        enc.op_idx(db, enc.OP_LOCAL_GET, 0)
+        enc.op_idx(db, enc.OP_LOCAL_GET, 1)
+        enc.op(db, enc.OP_I64_EXTEND_I32_S)
+        enc.mem(db, enc.OP_I64_STORE, 3, body.H_EXIT)
+        enc.op_idx(db, enc.OP_LOCAL_GET, 0)
+        enc.i64_const(db, 2)
+        enc.mem(db, enc.OP_I64_STORE, 3, body.H_STATUS)
+        enc.op(db, enc.OP_END)
+        bodies.push(db.to_bytes())
+        def_type.push(rec_type)
+        own_names.push("_deep")
+        exported.push("_deep")
+        exported_idx.push(first_own + 2)
+        // The thunks, in the order of `hop_keys`.
+        for key in hop_keys {
+            let f = key_fn(l, key)
+            bodies.push(body.thunk(f, nimp + (l.def_pos.get(key) ?? 0)))
+            def_type.push(rec_type)
+            own_names.push(f.name + "$hop")
+        }
     }
+    let thunk_base = first_own + 3
     // The module.
     var m = byte_builder()
     for x in [0, 97, 115, 109, 1, 0, 0, 0] {
@@ -759,8 +864,8 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
     enc.uleb(sec, 1)
     sec.push_byte(enc.T_FUNCREF)
     sec.push_byte(1)
-    enc.uleb(sec, l.table.len() + 1)
-    enc.uleb(sec, l.table.len() + 1)
+    enc.uleb(sec, l.table.len() + hop_keys.len() + 1)
+    enc.uleb(sec, l.table.len() + hop_keys.len() + 1)
     enc.section(m, 4, sec.to_bytes())
     // Memory: the data, the stack and the heap's first page; no maximum
     // unless one is asked for.
@@ -785,13 +890,20 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
     sec.push_byte(0)
     enc.uleb(sec, tag_type)
     enc.section(m, 13, sec.to_bytes())
-    // Global 0: the shadow stack's pointer.
+    // Global 0: the shadow stack's pointer; for a program's module global
+    // 1, the running segment's floor, one segment below the top.
     sec = byte_builder()
-    enc.uleb(sec, 1)
+    enc.uleb(sec, if l.exports { 1 } else { 2 })
     sec.push_byte(enc.T_I32)
     sec.push_byte(1)
     enc.i32_const(sec, stack_top)
     sec.push_byte(enc.OP_END)
+    if not l.exports {
+        sec.push_byte(enc.T_I32)
+        sec.push_byte(1)
+        enc.i32_const(sec, stack_top - o.segment)
+        sec.push_byte(enc.OP_END)
+    }
     enc.section(m, 6, sec.to_bytes())
     // Exports.
     sec = byte_builder()
@@ -812,15 +924,18 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         enc.section(m, 8, sec.to_bytes())
     }
     // Elements: the table's slots from 1.
-    if l.table.len() > 0 {
+    if l.table.len() + hop_keys.len() > 0 {
         sec = byte_builder()
         enc.uleb(sec, 1)
         enc.uleb(sec, 0)
         enc.i32_const(sec, 1)
         sec.push_byte(enc.OP_END)
-        enc.uleb(sec, l.table.len())
+        enc.uleb(sec, l.table.len() + hop_keys.len())
         for key in l.table {
             enc.uleb(sec, nimp + (l.def_pos.get(key) ?? 0))
+        }
+        for j in 0..hop_keys.len() {
+            enc.uleb(sec, thunk_base + j)
         }
         enc.section(m, 9, sec.to_bytes())
     }

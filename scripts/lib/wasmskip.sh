@@ -61,6 +61,10 @@ wasm_skip_reason() {
     # the depth [E-RECURSION-DEPTH] promises is not reachable here. These
     # programs exist to recurse until something gives (and `scheme-demo` is
     # an interpreter run by an interpreter, every Scheme call two stacks).
+    # `WASM_SKIP_NO_DEPTH=1` leaves this rule out, for a gate whose modules
+    # hop to fresh stacks (`wasmsubset`, docs/self-hosting.md §6.26); the
+    # Rust module still traps at 174 calls.
+    [ "${WASM_SKIP_NO_DEPTH:-}" = 1 ] && return 0
     case "$src" in
         */E-RECURSION-DEPTH.gr|*/E-PANIC-TRACE.gr|*/scheme-demo/src/main.gr)
             echo "recurses past the stack a wasm module is given"

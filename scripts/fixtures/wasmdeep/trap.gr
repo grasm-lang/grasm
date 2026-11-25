@@ -1,0 +1,26 @@
+// `wasmsubset`'s stack (docs/self-hosting.md §6.26): a trap `n` calls deep --
+// `unreachable` (`how` 1) or a copy out of the memory's bounds (`how` 2) --
+// must end the run as a trap, on the first engine stack or on one a hop
+// made, never as a normal exit, a panic or output. The C library's
+// intrinsics (`__wasm_<name>`) stand in for a fault no Grasm program can
+// write; only the wasm link binds them.
+extern fn __wasm_trap()
+extern fn __wasm_memcpy(dst: addr, src: addr, n: i64)
+
+fn down(n: i64, how: i64) -> i64 {
+    if n == 0 {
+        if how == 1 {
+            unsafe { __wasm_trap() }
+        } else {
+            unsafe { __wasm_memcpy(mem_addr(4294967200), mem_addr(1024), 1000) }
+        }
+        return 0
+    }
+    1 + down(n - 1, how)
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    let how = args()[1].parse_int() ?? 1
+    print("{down(n, how)}")
+}

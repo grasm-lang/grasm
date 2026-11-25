@@ -23,13 +23,35 @@
 #                (built twice, not the same bytes)
 #   w-floor      no shadow frame for a recursion, so the engine's stack
 #                overflows before the floor -> wasmsubset (the stack)
+#
+# And the hop to fresh engine stacks (§6.26, S8 part nine), each by
+# `wasmsubset`'s stack:
+#
+#   w-hop        the segment's check never hops, so a recursion runs on one
+#                engine stack until it overflows -> past any depth
+#   w-small      frames sized too small (the scale 0.80, below every shape's
+#                smallest safe one), so the engine's stack overflows before
+#                the segment's floor -> past any depth
+#   w-deep-catch `_deep` does not catch an `exit` or a panic, so the panic
+#                past the bound, thrown on a deeper stack, is lost there and
+#                the run traps -> past any depth
+#   w-done       the hop's completion check dropped, so a stack that trapped
+#                is taken for one that answered -> a trap in a deeper stack
+#                not ended as a trap
+#   w-seg-nondet the driver takes the segment's size from the clock, so two
+#                builds differ -> not the same bytes
+#   w-deep-words without JSPI the hop refuses in other words than the
+#                clause's -> without JSPI, past any depth
 #   w-leb        a signed LEB128 ends a byte early when bit 5 is clear rather
 #                than bit 6 -> encodetest_wasm
 #   w-libm       `sin`'s kernel's first coefficient one bit off
 #                -> fuzz_wasmmath
 #
+# A section written after a gate's name (`gate:section`) runs that section
+# alone: `PLAYTEST_ONLY` for `playtest`, `WASM_SUBSET_ONLY` for `wasmsubset`.
+#
 # And the playground's (§6.25, S8 part eight), each by `playtest` on the
-# sections that show it (`PLAYTEST_ONLY`, written after the gate's name):
+# sections that show it:
 #
 #   w-nondet     (above) -> playtest (built twice, not the same bytes)
 #   p-frame      the answer's status and output length change places
@@ -85,7 +107,7 @@ control() {
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
         S3="$driver" WASM_LIBC="$WORK/src/compiler/rtwasm" PLAYGROUND="$WORK/src" DIRS=examples \
-            WASM_SUBSET_STOP=1 PLAYTEST_STOP=1 PLAYTEST_ONLY="$only" \
+            WASM_SUBSET_STOP=1 PLAYTEST_STOP=1 PLAYTEST_ONLY="$only" WASM_SUBSET_ONLY="$only" \
             FUZZ_WASMMATH_SEEDS=1 FUZZ_WASMMATH_CALLS=4000 "$gate" >"$log" 2>&1
         local code=$?
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
@@ -145,8 +167,41 @@ control w-nondet compiler/s3/src/main.gr \
     scripts/playtest.sh:build "not the same bytes"
 
 control w-floor compiler/wasm32/src/main.gr \
-    "LinkOpts{ stack_size: 8388608, floor_scale: 700," "LinkOpts{ stack_size: 8388608, floor_scale: 0," -- \
+    "} else if l.exports { 700 } else { 100 }" "} else if l.exports { 700 } else { 0 }" -- \
     scripts/wasmsubset.sh "past any depth"
+
+control w-hop $B \
+    "    if f.floor and o.hop_fn >= 0 {
+        try hop(f, s, o, b)" \
+    "    if f.floor and o.hop_fn >= 0 and false {
+        try hop(f, s, o, b)" -- \
+    scripts/wasmsubset.sh:stack "past any depth"
+
+control w-small compiler/wasm32/src/main.gr \
+    "} else if l.exports { 700 } else { 100 }" "} else if l.exports { 700 } else { 80 }" -- \
+    scripts/wasmsubset.sh:stack "past any depth"
+
+control w-deep-catch compiler/wasm32/src/main.gr \
+    "        enc.try_table_catch(db, enc.BT_EMPTY, 0, 0)" "        enc.open(db, enc.OP_BLOCK, enc.BT_EMPTY)" -- \
+    scripts/wasmsubset.sh:stack "past any depth"
+
+control w-done compiler/rtwasm/src/deep.gr \
+    "        if status != 1 {
+            __wasm_trap()
+        }" "" -- \
+    scripts/wasmsubset.sh:stack "a trap in a deeper stack"
+
+control w-seg-nondet compiler/s3/src/main.gr \
+    "    lo.exports = exports
+" "    lo.exports = exports
+    lo.segment = lo.segment - now_millis() % 65536
+" -- \
+    scripts/wasmsubset.sh "not the same bytes"
+
+control w-deep-words compiler/rtwasm/src/deep.gr \
+    '            grasm_panic_msg(mem_static("stack overflow: recursion too deep"), mem_static_len("stack overflow: recursion too deep"))' \
+    '            grasm_panic_msg(mem_static("stack overflow: no stack to hop to"), mem_static_len("stack overflow: no stack to hop to"))' -- \
+    scripts/wasmsubset.sh:stack "without JSPI, past any depth"
 
 control w-leb compiler/wasm32/src/enc.gr \
     "        if (x == 0 and lo.bit_and(64) == 0) or (x == -1 and lo.bit_and(64) != 0) {" \
@@ -204,7 +259,7 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     exit 1
 fi
 # A floor: a control quietly dropped is a check quietly lost.
-if [ "$controls" -lt 18 ]; then
-    echo "fewer controls than the floor of 18"
+if [ "$controls" -lt 24 ]; then
+    echo "fewer controls than the floor of 24"
     exit 1
 fi

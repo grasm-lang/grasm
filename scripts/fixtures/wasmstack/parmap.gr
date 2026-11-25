@@ -1,0 +1,14 @@
+// `wasmsubset`'s stack (docs/self-hosting.md §6.26): a recursion inside
+// `par_map`'s closure ([E-RECURSION-PARALLEL]). On wasm `par_map` runs on one
+// processor, on the calling engine stack, so it hops as any recursion does.
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    let n = args()[0].parse_int() ?? 10
+    print("{[n].par_map(|x| depth(x))[0]}")
+}

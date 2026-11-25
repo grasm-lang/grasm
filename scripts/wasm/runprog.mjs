@@ -11,10 +11,28 @@
 // the program's name first); and `_start(argc)`, which runs the program and
 // answers its exit status -- `exit` and a panic included, which unwind to
 // `_start` inside the module. Standard input is empty.
+//
+// A recursion deeper than one engine stack hops to a fresh one
+// (docs/self-hosting.md §6.26): the module calls `grasm_deeper(record)`, and
+// this calls the module's export `_deep(record)` through
+// `WebAssembly.promising`, which runs it on a stack of its own to its end
+// before returning -- so the run stays synchronous -- and answers 1; the
+// module checks that the stack finished. With no JS promise integration
+// (`GRASM_WASM_STACKS=0` stands in for an engine without it, as in
+// `scripts/wasm/run.mjs`) it answers 0, and the recursion ends in the
+// clause's panic.
 import { readFileSync, writeSync } from "node:fs";
 
 const [, , wasmPath, ...progArgs] = process.argv;
 let memory = null;
+let deep = null;
+// What ended a deeper stack otherwise than by returning or by `exit` -- a
+// trap -- reaches this only as a rejected promise, after the module has
+// already trapped on finding the stack unfinished: said at the end.
+let lost = null;
+process.on("exit", () => {
+  if (lost) process.stderr.write(`the deeper stack: ${lost}\n`);
+});
 const bytes = (p, n) => new Uint8Array(memory.buffer, p, n);
 
 const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), {
@@ -36,6 +54,14 @@ const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), {
     },
     grasm_now_millis: () => Date.now(),
     grasm_monotonic_millis: () => performance.now(),
+    grasm_deeper: (rec) => {
+      if (!deep) return 0;
+      // The deepest stack's rejection comes first: it is the cause.
+      deep(rec).catch((e) => {
+        lost ??= e;
+      });
+      return 1;
+    },
     // A call from wasm into the host cannot yield, so a sleep is a spin, as
     // in `scripts/wasm/run.mjs`.
     grasm_sleep_millis: (ms) => {
@@ -45,6 +71,9 @@ const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), {
   },
 });
 memory = instance.exports.memory;
+if ("promising" in WebAssembly && process.env.GRASM_WASM_STACKS !== "0" && instance.exports._deep) {
+  deep = WebAssembly.promising(instance.exports._deep);
+}
 const argv = ["main", ...progArgs].map((a) => new TextEncoder().encode(a + "\0"));
 const area = instance.exports._args() >>> 0;
 const view = new DataView(memory.buffer);

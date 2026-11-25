@@ -16,7 +16,9 @@
 #            `scripts/wasm_validate.py` validate it (bodies counted); its
 #            imports exactly the seven named below, each supplied by
 #            `run.mjs`; its exports the Rust module's five, of the same
-#            arities, with `memory` and `_fiber`
+#            arities, with `memory` and `_fiber`; and with
+#            `PLAYTEST_BASE_S3=<driver>`, the same bytes as that driver
+#            builds (docs/self-hosting.md §6.26: the playground unchanged)
 #   frame    `scripts/fixtures/play/`'s programs and the frame's edges --
 #            no source, invalid UTF-8, a bundle, standard input with and
 #            without a trailing newline, a journal that does not install --
@@ -155,6 +157,18 @@ if build_pg "$WORK/again.wasm" >/dev/null 2>&1 && cmp -s "$PGW" "$WORK/again.was
 else
     failed "the module built twice is not the same bytes"
 fi
+# The module built by another driver -- `PLAYTEST_BASE_S3=`, the base's
+# `compiler/s3`, for a change that must not move the playground (§6.26: a
+# program's module hops, one built `--exports` does not) -- the same bytes.
+base_same="not given"
+if [ -n "${PLAYTEST_BASE_S3:-}" ]; then
+    if S3="$PLAYTEST_BASE_S3" build_pg "$WORK/base.wasm" >/dev/null 2>&1 && cmp -s "$PGW" "$WORK/base.wasm"; then
+        base_same="the same bytes"
+    else
+        base_same="differs"
+        failed "the module is not the base driver's bytes ($PLAYTEST_BASE_S3)"
+    fi
+fi
 v8=$(node -e 'try { new WebAssembly.Module(require("fs").readFileSync(process.argv[1])); console.log("valid") } catch (e) { console.log("REFUSES " + e.message) }' "$PGW")
 [ "$v8" = valid ] || failed "V8 $v8"
 python3 -B scripts/wasm_validate.py "$PGW" >"$WORK/pv.txt" 2>&1
@@ -186,6 +200,7 @@ rw_bytes=$(wc -c <"$RUST_WASM" | tr -d ' ')
 pg_gz=$(gzip -9c "$PGW" | wc -c | tr -d ' ')
 rw_gz=$(gzip -9c "$RUST_WASM" | wc -c | tr -d ' ')
 echo "build: built twice the same: $built_same   V8: $v8   wasm_validate.py: $pv_bodies bodies   link: ${link_s}s"
+echo "build: as the base driver's: $base_same"
 echo "  exports: $pg_ar (the Rust module's: $rw_ar)"
 echo "  imports: $imports"
 echo "  size: $pg_bytes bytes ($pg_gz under gzip -9), the Rust module's $rw_bytes ($rw_gz)"
