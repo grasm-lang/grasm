@@ -9166,6 +9166,55 @@ no other engine): that a `promising` call runs synchronously until it
 suspends is what the JSPI proposal specifies, and is the one fact this
 design rests on that was measured on one engine only.
 
+#### The coordinator's decisions
+
+Taken by the coordinator on 2026-11-25, on the note above; the owner may
+reverse any of them.
+
+- (1): (B), the synchronous hop; the module's start stays synchronous and
+  no embedder changes. On conditions: (a) no silent wrong answer, ever --
+  after every hop a completion flag the deeper stack sets is checked, and a
+  stack that did not finish ends the run in a trap, never in whatever the
+  record's answer slot holds (the 138,601 measured above), although with
+  seven segments nesting is at most seven; (b) a trap inside a deeper
+  segment (`unreachable`, an access out of bounds) surfaces as a trap, as it
+  does today, never as a normal exit or wrong output, held by a fixture;
+  (c) a compiled module never reaches `grasm_switch` or anything
+  `Suspending` from inside a hop -- where anything in it could, it is
+  refused when the module is built or traps at the call, the choice and its
+  reason said where built; (d) the one fact verified on V8 alone -- that a
+  `promising` call runs synchronously until it suspends, as JSPI specifies
+  -- recorded as a risk here and in docs/known-issues.md where relevant.
+- (2): (2a): the runtime's floor of 6 MiB, the scale 1.0, frames rounded to
+  8 bytes, seven segments, so that the bound is the native one. The margin
+  between a segment (about 878 KB) and a JSPI stack (about 961 KB) measured
+  and recorded, and held two ways: no `RangeError` on any shape, on either
+  kind of stack, past the bound; and a control that catches frames sized
+  too small, the engine overflowing before the floor.
+- (3): accepted: hops only in functions that take the floor.
+- (4): accepted. Without JSPI, the clause's panic at today's depths, no
+  shape worse. The S3 entry split: closed for an engine with JSPI with the
+  measured depths; a no-JSPI entry open, S3 (the coordinator's), worded as
+  an open defect below the guaranteed 10,000, never as a difference the
+  clause allows. Workers recorded as the way to close it, in a later part.
+  The engines that ship JSPI named as §6.25 records them, no others.
+- (5): accepted: the playground unchanged and its no-JSPI entry open; the
+  gate that builds the playground's module asserts its bytes are master's.
+- (6): accepted: tasks stay refused in compiled modules; the `par_map` and
+  `spawn` fixtures join the `stack` line.
+- (7): the gates and floors as proposed, and two controls more: frames
+  sized too small (the scale lowered), so that a shape overflows the
+  engine's stack before the floor, caught as a trap or `RangeError` and
+  failing the gate; and the completion check dropped -- or, if no run can be
+  made to reach it, why not and what holds it instead. Six new controls in
+  all. The hot split measured on a fixture and its cost a call recorded as a
+  ratio, with no claim.
+- (8): one part, in the three steps proposed, each held before the next;
+  the final runs as the brief says, the whole `clidiff` with stage 2 among
+  them since the command carries `s3`; every control's planted text grepped
+  against the tree before the final run. Only measured depths are recorded
+  as reached; the figures predicted above are predictions.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
