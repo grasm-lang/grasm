@@ -294,7 +294,7 @@ fn resolve(l: Link, k: i64, name: str) -> (i64, i64, str) ! str {
         // program's alone: refused here, not trapped at the call, so that
         // no module that could meet it is ever written.
         if not l.exports and (imp == "grasm_switch" or imp == "grasm_fiber" or imp == "grasm_stacks") {
-            fail("`{name}`, called from {if k == 0 { "the program" } else { "the runtime" }}: switching stacks is a module's built `--exports` alone, and a program's module hops instead (§6.26)")
+            fail("`{name}`, called from {if k == 0 { "the program" } else { "the runtime" }}: switching stacks belongs to a module built `--exports` alone, and a program's module hops instead (§6.26)")
         }
         if l.exports and imp == "grasm_deeper" {
             fail("`{name}`: a module built `--exports` does not hop (§6.26)")

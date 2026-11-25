@@ -10,9 +10,10 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
-seventeen, one in `compiler/wasm32`, which no release ships yet -- a module
-refusing a recursion at 3,390 to 9,368 calls, by shape, short of the 10,000
-[E-RECURSION-DEPTH] guarantees -- one in the Grasm playground, which no
+seventeen, one in `compiler/wasm32`, which no release ships yet -- run by
+an engine without JS promise integration, a module refusing a recursion at
+3,401 to 10,210 calls, by shape, below the 10,000 [E-RECURSION-DEPTH]
+guarantees -- one in the Grasm playground, which no
 release ships yet -- with no stack switched (an engine without JS promise
 integration) a recursion refused at 334 to 1,774 calls -- two in the
 Rust-built playground module -- a recursion of 174 calls trapping and an
@@ -122,35 +123,66 @@ limit; `compiler/rt` is not changed here.
 
 ## Found on 2026-11-22 by S8 part seven (the wasm32 backend)
 
+**Run by an engine without JS promise integration, a program compiled to
+wasm refuses a recursion below 10,000 calls -- *open, S3 (the
+coordinator's), in `compiler/wasm32`, which no release ships yet*.**
+[E-RECURSION-DEPTH] guarantees at least 10,000 nested calls; this is an open
+defect below that guarantee, not a difference the clause allows. A module
+the Grasm backend writes (`s3 --target wasm32`, docs/self-hosting.md §6.24
+and §6.26) runs on the engine's own stack, which a page cannot enlarge (V8's
+984 KB under node and in a browser), and a recursion deeper than one engine
+stack holds hops to a fresh one, which the embedder makes with
+`WebAssembly.promising` -- JS promise integration (JSPI), which §6.25
+records as shipping in Chrome and Edge 137, Firefox 153 and Safari 27; only
+node v25.2.1's V8 was measured here. An engine without it cannot make a
+second stack, so the recursion ends at the first stack's end, in the
+clause's panic, "stack overflow: recursion too deep", and exit 101 -- never
+a trap, which is why it is S3 and not S2. The deepest each shape of
+`scripts/fixtures/wasmstack/` reaches there, measured by `wasmsubset` with
+`GRASM_WASM_STACKS=0` standing in for such an engine: `closure` (through a
+function value and `map`) 3,401, `locals` 5,615, `tree` 7,019, `doubles`
+8,022, `parmap` (inside `par_map`) 9,352, `spawn` (inside `spawn`) 9,358,
+`plain` (`1 + depth(n - 1)`) 9,359, `mutual` 10,210 -- what each reached
+before hops existed, within 0.1% below or above, and `wasmsubset` holds each
+to that less 1%. What would close it, recorded for a later part (the
+coordinator's decision): a worker per engine stack over a shared memory
+(measured in §6.26: about 20 µs a hop and 7 MB a worker, a page cross-origin
+isolated and the module in a worker), or core stack switching once an
+engine ships it with no flag. The Rust playground's module, which traps
+rather than panics, reaches 173 on `plain` (below).
+
+```
+fn depth(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    1 + depth(n - 1)
+}
+
+fn main() {
+    print("{depth(10000)}")
+}
+```
+
 **A program compiled to wasm refuses a recursion below 10,000 calls --
-*open, S3 (the coordinator's), in `compiler/wasm32`, which no release ships
-yet*.** [E-RECURSION-DEPTH] guarantees at least 10,000 nested calls; five
-of the six shapes below stop short of it. The stop is the clause's panic and
-exit 101, never a trap or wrong output, which is why it is S3 and not S2;
-it blocks the wasm backend from being called conforming until it is fixed.
-This entry was first written as "a difference the clause allows", the
-coordinator's wording in decision (5), corrected on review: the clause
-allows a bound above 10,000 to differ, not one below it. A module the Grasm
-backend writes (`s3 --target wasm32`, docs/self-hosting.md §6.24) runs on the
-engine's own stack, which a page cannot enlarge (V8's 984 KB under node and
-in a browser), and a stack overflow there is a trap wasm cannot catch. So
-every function that calls something keeps a frame on the module's shadow
-stack proportional to the engine frame it will cost, and the runtime's
-floor -- 6 MiB below where a recursion first asks for it -- is met on the
-shadow stack first, with the clause's panic and exit 101, never the trap
-(the coordinator's decision (5): the aim 10,000 calls under node's default
-stack, never a flag; what falls short recorded). The deepest each shape of
-`scripts/fixtures/wasmstack/` reaches, measured by `wasmsubset`: `mutual`
-10,089, `plain` (`1 + depth(n - 1)`) 9,368, `doubles` 8,030, `tree` 7,026,
-`locals` 5,620, `closure` (through a function value and `map`) 3,390. The
-Rust playground's module, which traps rather than panics, reaches 173 on
-`plain` (above). What closing it needs was measured in S8 part eight
-(docs/self-hosting.md §6.25 decision (5)): the engine's stack, not the
-shadow stack, is what runs out, and a level of two functions with no locals
-at all reaches only 7,777 levels on one, so only a switch of engine stacks
-closes it; that changes how every compiled module starts, and the
-coordinator put it in a later part of its own (2026-11-23). Open until
-then.
+*closed for an engine with JS promise integration, 2026-11-25*.** Found by
+S8 part seven (§6.24): one engine stack held 3,390 to 10,089 calls by shape,
+in the clause's panic. S8 part nine (§6.26) made a recursion deeper than one
+engine stack hop to a fresh one, synchronously, through
+`WebAssembly.promising`: the shadow stack models the engine's one to one
+and the runtime's own floor, 6 MiB below where a recursion first asks, is
+the bound, as a native build's 6 MiB of the machine's stack is. The deepest
+each shape reaches under node's default stack and no flag, measured by
+`wasmsubset`: `closure` 23,826, `locals` 39,316, `tree` 49,145, `doubles`
+56,166, `parmap` 65,522, `plain` 65,529, `spawn` 65,529, `mutual` 71,486;
+past each the panic and 101, never a trap. One risk, the coordinator's to
+know: that a `promising` call started from a synchronous import runs to its
+end before the import returns -- what JSPI specifies until a stack suspends,
+and what a compiled module relies on (it never suspends: the switch's
+imports are refused when it is built) -- was checked on V8 alone; no other
+engine was at hand. The hop's module checks that the deeper stack finished,
+so an engine that ran it otherwise would end the run in a trap, never in a
+wrong answer. Without JSPI it is the open entry above.
 
 **The playground module traps on a recursion of 174 calls -- *open, S3
 (the agent's)*.** `grasm_wasm.wasm`, the Rust interpreter built by rustc for
