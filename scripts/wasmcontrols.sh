@@ -44,8 +44,8 @@
 #                not ended as a trap
 #   w-seg-nondet the driver takes the segment's size from the clock, so two
 #                builds differ -> not the same bytes
-#   w-deep-words without JSPI the hop refuses in other words than the
-#                clause's -> without JSPI, past any depth
+#   w-deep-panic without JSPI the hop traps rather than ending in the
+#                clause's panic -> without JSPI, past any depth
 #   w-leb        a signed LEB128 ends a byte early when bit 5 is clear rather
 #                than bit 6 -> encodetest_wasm
 #   w-libm       `sin`'s kernel's first coefficient one bit off
@@ -213,9 +213,9 @@ control w-seg-nondet compiler/s3/src/main.gr \
 " -- \
     scripts/wasmsubset.sh "not the same bytes"
 
-control w-deep-words compiler/rtwasm/src/deep.gr \
-    '            grasm_panic_msg(mem_static("stack overflow: recursion too deep"), mem_static_len("stack overflow: recursion too deep"))' \
-    '            grasm_panic_msg(mem_static("stack overflow: no stack to hop to"), mem_static_len("stack overflow: no stack to hop to"))' -- \
+control w-deep-panic compiler/rtwasm/src/deep.gr \
+    '            grasm_panic_stack()' \
+    '            __wasm_trap()' -- \
     scripts/wasmsubset.sh:stack "without JSPI, past any depth"
 
 control w-leb compiler/wasm32/src/enc.gr \

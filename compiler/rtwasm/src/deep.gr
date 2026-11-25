@@ -14,7 +14,11 @@
 // stack did not finish -- a trap there, which the embedder sees only later
 // as a rejected promise -- and the run ends in a trap here, never in
 // whatever the record's answer slot holds. Without a fresh stack the
-// recursion ends in [E-RECURSION-DEPTH]'s panic, in its words.
+// recursion ends in [E-RECURSION-DEPTH]'s panic, the runtime's own
+// (`grasm_panic_stack`), so that its words are written once and this file
+// holds no string: the playground links all of this library's TIR, and a
+// string here would move every address after it in a module that never
+// hops (docs/self-hosting.md §6.26).
 extern fn __host_grasm_deeper(rec: addr) -> i64
 extern fn __wasm_get_seg() -> i64
 extern fn __wasm_set_seg(f: i64)
@@ -22,7 +26,7 @@ extern fn __wasm_segment() -> i64
 extern fn __wasm_get_sp() -> i64
 extern fn __wasm_throw(code: i64)
 extern fn __wasm_trap()
-extern fn grasm_panic_msg(p: addr, n: i64)
+extern fn grasm_panic_stack()
 
 export fn wasm_hop(rec: addr) {
     unsafe {
@@ -31,7 +35,7 @@ export fn wasm_hop(rec: addr) {
         let started = __host_grasm_deeper(rec)
         __wasm_set_seg(saved)
         if started == 0 {
-            grasm_panic_msg(mem_static("stack overflow: recursion too deep"), mem_static_len("stack overflow: recursion too deep"))
+            grasm_panic_stack()
         }
         let status = rec.offset(8).load_i64()
         if status == 2 {
