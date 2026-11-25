@@ -8822,6 +8822,350 @@ but the interleaved ratios; who decided what is said where it was decided.)
   code did not change: `s3subset`, `objtest` and `fixpoint` hold it), the
   Linux ELF gates.
 
+### 6.26 S8 part nine: a program compiled to wasm reaches 10,000 calls
+
+Written 2026-11-24, before any code, as the design to build to.
+[E-RECURSION-DEPTH] guarantees at least 10,000 nested calls and a panic past
+an implementation's bound, never a trap. A module the Grasm backend writes
+(`s3 --target wasm32`, §6.24) stops short on five of the six shapes of
+`scripts/fixtures/wasmstack/` -- `mutual` 10,089, `plain` 9,368, `doubles`
+8,030, `tree` 7,026, `locals` 5,620, `closure` 3,390 -- each in the clause's
+panic, which is the open S3 entry of docs/known-issues.md. Part eight
+measured why (§6.25 decision (5)): the engine's own stack runs out first,
+the shadow stack being sized to it, and a level of two functions with no
+locals at all reaches only 7,777 levels on one engine stack, so nothing but
+a second engine stack closes it. This part does that. The Rust toolchain
+stays stage 0 and the oracle and is not changed; `compiler/rt` and
+`compiler/mir` are not changed either. The decisions are numbered (1) to
+(8); each is proposed by the agent implementing this part, and is the
+coordinator's to accept and the owner's to reverse. Where there is a choice
+the alternatives are written under the decision.
+
+#### What was measured
+
+Measured 2026-11-24 on this branch's base (`f3856fe7`) with the main
+checkout's `grasm` (stage 0) for `grasm tir`, `s3` built from this tree by
+stage 0 in scratch, scratch copies of `compiler/wasm32` changed for
+measuring only (said where used), and `node` v25.2.1 (V8 14.1.146.11), with
+no flag. Other apps held the load at 6 to 15 and swap at 19.8 to 21.5 GB, so
+no time below is to be quoted but the interleaved ratios. The engine's facts
+come from modules assembled byte by byte by part eight's builder, reused;
+nothing reached the network.
+
+**A second engine stack, synchronously.** Part eight's switch
+(`env.grasm_switch`, §6.25 decision (2)) is a `WebAssembly.Suspending`
+import, so everything that may reach it runs inside `WebAssembly.promising`
+and the run is asynchronous. A recursion needs less than a switch: a fresh
+stack that runs to its end and comes back. Measured on a function `f(n) = 1
++ f(n - 1)` of four `i64` locals that every 5,000 levels calls a plain
+import, which calls the module's export `g` through `promising` -- `g` runs
+`f(n - 1)` and leaves the answer in an exported global the import reads
+back:
+
+- *It runs to its end before the import returns.* 10,000 levels on 2 extra
+  stacks in 1.0 ms, 100,000 on 20 in 2.5 ms, 1,000,000 on 200 in 33.5 ms,
+  every answer right, the caller -- `f` called plainly from JavaScript --
+  never asynchronous and no `Suspending` anywhere. Without the hops, 20,000
+  levels overflow.
+- *Each such stack is a JSPI stack's size.* Levels one stack holds, by
+  bisection, a fresh process per probe, for 0, 4 and 16 locals: node's main
+  stack 15,608, 10,405, 5,202; a stack `promising` makes when called from
+  JavaScript 15,227, 10,151, 5,075; one started by a synchronous import
+  inside a wasm call the same, 15,227, 10,151, 5,075. A JSPI stack holds
+  97.6% of what the main stack does.
+- *A hop costs about 2.5 µs, either way.* 100,000 levels hopping every
+  5,000 or every 100, synchronous and through `Suspending` as part eight's
+  switch does, the four alternated, 30 rounds, medians, the difference over
+  980 hops, two runs: synchronous 2.34 and 2.64 µs a hop, through
+  `Suspending` 2.48 and 2.66.
+- *Nesting has a limit, and the synchronous form fails silently at it.*
+  Hopping every 100 levels, both forms fail at the 1,386th nested hop
+  (138,601 levels) with `RangeError: Maximum call stack size exceeded`,
+  as if each hop's JavaScript frames took about 710 bytes of node's main
+  stack (its 984 KB over 1,386). The synchronous probe, whose import did not check
+  that the inner stack had finished, then answered 138,601 for 1,000,000 --
+  wrong output. Whatever starts a stack must check that it finished.
+- *An exception is seen only where it is caught.* A wasm exception left
+  uncaught on the started stack does not reach the import: `promising`
+  answers a promise, which is rejected later. Caught by a `try_table` on
+  that same stack, its value is in memory before the import returns.
+- *A switch inside a synchronous hop breaks it.* A `Suspending` import
+  called on a stack the synchronous import started parks that stack and the
+  import returns before it has finished (the probe read -1, and the stack
+  finished afterwards with 42). A synchronous hop must never meet a switch.
+- *Memory.* 1,000,000 levels, 200 stacks live at the deepest: peak resident
+  148 MB, against 48 MB for 9,000 levels with none -- about 0.5 MB a live
+  stack. 1,000 runs of 100,000 levels (20 stacks each) in one instance:
+  resident 50 MiB after 200 runs, 62 MiB after 1,000.
+- *Without JSPI, a stack from another thread.* The module's memory shared,
+  a worker per stack, a hop that writes `n` to the next worker's slot and
+  waits (`Atomics.wait`) for its answer: 100,000 levels with 23 workers in
+  1.05 to 1.24 ms a run, the 23 started in 79 to 113 ms; 209 workers 1,204
+  ms; about 20 µs a hop; peak resident 213 MB with 23 workers, about 7 MB a
+  worker. It works under node. In a browser it needs a shared memory, so a
+  cross-origin isolated page, and `Atomics.wait` is refused on a page's
+  main thread, so the module would have to run in a worker.
+
+**The compiled modules today, and on a JSPI stack.** The six fixtures built
+by `s3` from this tree, each run past any depth and bisected for the
+deepest call that prints, by `scripts/wasm/runprog.mjs` and by a copy of it
+that calls `_start` through `WebAssembly.promising` (so the whole program
+runs on a JSPI stack): `closure` 3,390, `doubles` 8,030, `locals` 5,620,
+`mutual` 10,089, `plain` 9,368, `tree` 7,026 both ways, past each the panic
+"stack overflow: recursion too deep" and 101 both ways, never a trap. The
+calibration of §6.24 (shadow frames seven times the engine frame) holds on
+a JSPI stack, 2.4% smaller as it is. A recursion inside `par_map` (`[n].par_map(|x|
+depth(x))`) reaches 9,362 and one inside a `parallel` block's `spawn`
+9,368: on wasm both run on the calling engine stack (one processor, no
+thread), as `plain` does. Of the three corpus programs `wasmtest` sets aside
+for their depth, compiled to wasm today: `E-RECURSION-DEPTH` ends in the
+panic, 101, where `grasm run` prints `10000` twice; `E-PANIC-TRACE`
+(unbounded) ends in the panic and 101 as `grasm run` does; `scheme-demo`
+prints and exits as `grasm run` does.
+
+**One engine stack's share, if the shadow stack models it one to one.** A
+scratch copy of `compiler/wasm32` with every shadow frame at 1.0 times the
+engine frame's estimate (`8 * (parameters + locals) + 56` bytes, §6.24)
+instead of 7.0, and a check on entry to every function that takes the
+floor against a second global, set to 6 MiB / 7 (898,779 bytes) below the
+shadow stack's top, that traps (`unreachable`) when passed: the deepest call
+each shape reaches before that check, on node's stack and on a JSPI stack
+alike, with frames rounded to 16 bytes as today -- `closure` 3,301,
+`doubles` 8,022, `locals` 5,615, `mutual` 9,359, `plain` 9,359, `tree` 7,019
+-- and rounded to 8 -- 3,401, 8,022, 5,615, 10,210, 9,359, 7,019, the
+`par_map` shape 9,352 and the `spawn` shape 9,358. Past each, the check,
+never a `RangeError`, on both stacks. Rounded to 8, four shapes hold
+what they hold today less 0.1% and two more (`closure` 0.3%, `mutual`
+1.2%); the rounding to 16 lost 7% on `mutual`, taking it below 10,000.
+Whether the room left at the check holds the hop's own frames as well as
+it holds the panic's is the gates' to show; the panic's room is §6.24's
+calibration, which failed at a scale of 6.5 (8% more levels on `plain`).
+
+**The cost on programs that never recurse deep.** The same entry check (9
+bytes: two `global.get`, `i32.lt_u`, an `if` around `unreachable`) in every
+function that takes the floor, never taken, against the module as it is;
+and the module as it is with `_start` called through `promising` and
+awaited, which is what an asynchronous start costs. Seven rounds, the three
+alternated and the order rotated, median seconds of a whole run under node,
+every output the same; `fib(40)` is 331 million calls of a function that
+takes the floor:
+
+| program | today | entry check | ratio | start through `promising` | ratio |
+|---|---:|---:|---:|---:|---:|
+| `fib(40)` | 0.634 | 0.645 | 1.017 | 0.635 | 1.001 |
+| `sieve` | 0.459 | 0.459 | 1.000 | 0.460 | 1.002 |
+| `matmul` | 0.438 | 0.434 | 0.993 | 0.426 | 0.974 |
+| `sort` | 0.254 | 0.255 | 1.005 | 0.262 | 1.032 |
+| `tree` | 0.580 | 0.570 | 0.983 | 0.572 | 0.988 |
+| `wordfreq` | 1.488 | 1.480 | 0.995 | 1.488 | 1.000 |
+
+Geometric means 0.999 and 0.999; an earlier nine-round run of `fib(40)` and
+`tree` gave 0.994 and 0.980 for the check, 0.991 and 0.989 for the start.
+Neither is distinguishable from the noise at these loads. Functions that
+take the floor, by module: one in every module (the runtime's), `hello` 1,
+`fib` 2, `b28-demo` 2, `tree` 3, `scheme-demo` 6.
+
+#### What each way costs
+
+| | (A) part eight's switch, the start asynchronous | (B) a synchronous hop | (C) a worker per stack |
+|---|---|---|---|
+| engines | JSPI | JSPI | shared memory and workers; no JSPI needed |
+| the module's start | through `promising`, awaited by every embedder | unchanged | unchanged, but in a worker on a page |
+| a hop | about 2.5 µs | about 2.5 µs | about 20 µs, a worker 4 to 5 ms to start and about 7 MB |
+| a program that never recurses deep | 0.999 (start) and 0.999 (check), measured | 0.999 (check), measured | a shared memory in every module, not measured |
+| size | about 90 bytes a function that takes the floor and 300 a module, estimated | the same | more: a shared memory needs a maximum, and every module the threads feature |
+| lines, estimated | `compiler/wasm32` 180, `compiler/rtwasm` 80, `runprog.mjs` 50 (part eight's glue) | 150 to 200, 50, 15 | 500 to 800 with the page's worker |
+| tasks in a compiled module later | ready: a hop is a switch | the hop moves onto the switch then | no |
+
+The sizes are estimates from the functions counted above (a 120,255-byte
+`hello` module would grow by about 0.4 KB, `scheme-demo`'s 243,924 by about
+0.85 KB), measured when built. Three more ways were weighed and set aside:
+**(D)** an asyncify-style lowering (§6.25's (2c)) unwinds the frames into
+memory and rewinds them onto the same engine stack, so it adds switching
+but not depth; **(E)** core stack switching is behind flags in this node,
+and a page cannot set one; **(F)** smaller engine frames cannot pass 7,777
+levels of two functions, and `closure` has several frames a level.
+
+#### The decisions
+
+**(1) The mechanism: a synchronous hop to a fresh engine stack, (B).**
+Proposed. A function that takes the floor checks on entry, before it
+reserves its shadow frame, whether that frame would pass the current
+segment's floor -- a second global, `global 1`, beside the shadow stack's
+pointer. If it would, it does not run here: it writes a hop record below
+the shadow stack's pointer (its own thunk's table slot, its arguments, room
+for its answer and a status), moves the pointer below it, and calls the C
+library's `wasm_hop(record)` (`compiler/rtwasm/src/deep.gr`, new), which
+sets the segment's floor one segment below the pointer and calls one new
+import, `env.grasm_deeper(record) -> i32`. The embedder answers it by
+calling the module's new export `_deep(record)` through
+`WebAssembly.promising` -- a fresh engine stack, which runs to its end
+before the import returns (measured above) -- and answering 1, or 0 when it
+has no `promising`. `_deep`, written by the backend, calls the thunk inside
+a `try_table` that catches the tag `_exit` throws and writes its status in
+the record; the thunk, one per function that takes the floor, reads the
+arguments, calls the function -- whose check now passes -- and writes its
+answer. Back in `wasm_hop`: the floor restored; an `exit` or a panic in the
+deeper stack thrown again here with its status, so it unwinds stack by
+stack to `_start`; a record the deeper stack did not finish (a trap there)
+ends in a trap, never in a made-up answer (the silent wrong output
+measured above). The function then takes its answer from the record, moves
+the pointer back and returns it. The function is re-entered from its first
+instruction with the arguments it was given, before it has loaded an
+`inout` argument or reserved anything, so nothing it does is done twice.
+The shadow stack stays one contiguous stack across hops, so the runtime's
+floor and its check, which MIR already emits, are untouched and remain the
+bound (decision (2)); the segment's check is the backend's alone.
+
+What it costs: the module's start, `runprog.mjs`'s and every embedder's
+calls, stay synchronous; `runprog.mjs` gains the import (about 15 lines,
+`GRASM_WASM_STACKS=0` standing in for an engine without JSPI as in
+`run.mjs`); 2.3 to 2.6 µs a hop, and one hop per segment of depth (about
+3,400 to 10,200 levels, decision (2)), so 10,000 levels of `closure` take
+three hops, 7.5 µs; nothing measurable on a program that never hops (the
+table above). One cost is new and is not in the native builds: a call made
+over and over across a segment's edge -- a loop at the edge calling a
+function that takes the floor -- pays a hop on every call, 2.5 µs where a
+call costs a few nanoseconds. Go's segmented stacks met the same ("hot
+split") and Go moved to contiguous, copied stacks in 1.3; a wasm module
+cannot copy the engine's stack. It is accepted here, measured on a fixture
+in step two and recorded, not hidden. The alternatives: **(1b)**, (A)
+above: the same hop made with part eight's switch, which makes every
+compiled module's start asynchronous and every embedder await it, for no
+gain in speed or depth -- its one advantage, that a hop could then meet a
+task's switch, has no use while compiled modules refuse tasks (§6.24
+decision (4)), and if a later part gives them tasks through JSPI the hop
+moves onto the switch there, the thunks and records unchanged; **(1c)**,
+(C), the only way measured that works without JSPI, at the costs above and
+a page in a worker -- not proposed now, and listed with decision (4).
+
+**(2) The bound: the runtime's own, on a shadow stack that models the
+engine stack one to one.** Proposed. Every shadow frame becomes 1.0 times
+the engine frame's estimate (`floor_scale` 100, from 700), rounded to 8
+bytes (from 16), and a segment is 6 MiB / 7 = 898,779 bytes of it -- the
+engine stack §6.24's calibration already gave each stack, so each segment
+holds what one stack holds today (measured above, to 0.1%). The runtime's
+floor stays where `compiler/rt` puts it, 6 MiB below where a recursion
+first asks, which is now seven segments: a program compiled to wasm may use
+about 6 MiB of the engine's stack, as a native build may use 6 MiB of the
+machine's. The depths that predicts, seven segments' worth, to be measured:
+`closure` about 23,800, `locals` 39,300, `tree` 49,100, `doubles` 56,100,
+`plain` 65,500, `mutual` 71,400 -- each at least twice the clause's 10,000.
+Past it, the runtime's own check panics in its words on the last stack,
+where §6.24's calibration (holding on a JSPI stack, measured) leaves room
+for it. At most eight engine stacks are live, eight hops' frames on node's
+main stack (about 6 KB of its 984 KB, against 1,386 hops' worth), about 4
+MB resident by the measure above; the shadow stack's 8 MiB of linear memory is not enlarged.
+The alternatives: **(2b)** the scale kept at 7.0 and the shadow stack made
+seven times larger (about 50 MiB of linear memory from the start), the
+runtime's floor asked once before `main` from 42 MiB down so that it lands
+at the bottom -- more memory, the same depths; **(2c)** a count of hops as
+the bound: the runtime's floor would have to move with each segment, which
+only `compiler/rt` could do.
+
+**(3) Which functions hop.** Proposed: exactly those that take the floor
+(MIR's `floor`). Every unbounded recursion passes through one -- that is how
+the clause's panic is guaranteed today -- and between two of them the
+frames that do not take it are counted on the shadow stack and covered by
+the margin §6.24 measured, as now. A thunk and a check for each: the 9
+bytes of the check, a hop path of about 30 bytes and 5 an argument, a thunk
+of about 20 and 5 an argument; one `_deep`, one import and `wasm_hop` a
+module. Deterministic: the thunks in the functions' order, built twice the
+same as every module is.
+
+**(4) An engine without JSPI: the clause's panic, at today's depths, and
+the entry kept open for it.** Proposed. `grasm_deeper` answers 0 and
+`wasm_hop` ends the run in "stack overflow: recursion too deep" and 101 --
+the clause's words, not a new refusal -- at the first segment's end: the
+depths measured above with frames by 8 (`closure` 3,401 to `mutual`
+10,210), the same as today's within 0.1%, so nothing gets worse there.
+docs/known-issues.md's S3 entry is closed for an engine with JSPI with the
+measured depths, and a narrower one stays open, S3, for an engine without
+it, those depths in it -- a defect, not "a difference the clause allows".
+What would close it is (C), a worker per stack, at the costs measured
+above, or core stack switching once an engine ships it unflagged: neither
+proposed in this part, both the coordinator's or the owner's to put in a
+later one.
+
+**(5) The playground: not changed, and its no-JSPI entry not closed by
+this.** Proposed. A module built `--exports` keeps the scale of 7.0, frames
+by 16 and no hop, so `tools/playground`'s module is the same bytes as
+master's (checked once in the final runs) and `playtest` holds unchanged.
+Under JSPI it already reaches 99,998 calls by the interpreter's own hops by
+room (§6.25). The no-JSPI entry of part eight is not closed by this
+mechanism, measured three ways: the hop needs `WebAssembly.promising`, half
+of the same proposal as `Suspending`, so an engine without JSPI has neither
+(the coordinator's own test for it, `'Suspending' in WebAssembly`, stands for
+both); the interpreter's hops switch (`grasm_switch`, `Suspending`), and a
+switch inside a synchronous hop returns to the import before the stack has
+finished (measured above); and each call of the program is many of the
+interpreter's frames, 334 to 1,774 calls to an engine stack. What would close
+it: (C), or an interpreter whose calls of the program do not recurse on the
+host's stack -- a rewrite of `tools/tirinterp`'s evaluator, not proposed.
+
+**(6) Threads and tasks.** On wasm `par_map`, `par_filter` and a
+`parallel` block's `spawn` run on one processor, on the calling engine
+stack (measured: 9,362 and 9,368 levels, as `plain`), so the hop applies to
+a recursion inside them as to any other, and [E-RECURSION-PARALLEL] holds as
+[E-RECURSION-DEPTH] does. Proposed: two fixtures more in
+`scripts/fixtures/wasmstack/`, `parmap.gr` and `spawn.gr`, held like the
+six. Tasks stay refused in a compiled module (§6.24 decision (4)): a
+`concurrent` block's leaf panics before any switch, so a hop never meets
+one; a later part that gives compiled modules tasks through JSPI moves the
+hop onto the switch, as (1b) says.
+
+**(7) How it is held.**
+
+- **`wasmsubset`'s `stack` line**: the eight shapes, each built and run
+  past any depth (the panic, 101, never a trap) and bisected, with JSPI and
+  with `GRASM_WASM_STACKS=0`; with JSPI each asserted at or past 10,000 and
+  its depth printed; without, each the panic and its depth printed, held to
+  at least today's numbers less 1% (no shape worse than before). About a
+  minute.
+- **`wasmsubset`'s corpus**: the three programs `wasmtest` sets aside for
+  their depth (`E-RECURSION-DEPTH`, `E-PANIC-TRACE`, `scheme-demo`) held,
+  as grasm run and as the native build, and counted apart as the thread
+  programs are -- `scripts/lib/wasmskip.sh` gaining `WASM_SKIP_NO_DEPTH=1`
+  beside `WASM_SKIP_NO_THREADS=1`. No new skip anywhere.
+- **`wasmtest`** unchanged: it holds the Rust module, which still traps at
+  174 calls, so its three depth skips stay; its line must be the line it
+  gives today.
+- **`playtest`** unchanged, and the playground's module the same bytes as
+  master's.
+- **`wasmcontrols`** gains, each run alone first and then in the whole: the
+  hop dropped (the entry check falls through), so a shape traps or falls
+  short of 10,000; the panic past the bound turned into a trap (`_deep`
+  without its catch, so a panic in a deeper stack is lost); a module built
+  twice differently (the build's clock in a thunk's name); and the refusal
+  without JSPI worded otherwise than the clause. Each control's planted text
+  checked against the tree before the final run, and `clicontrols`' and
+  `wasmcontrols`' existing plants into `compiler/wasm32` grepped after every
+  commit that moves its code.
+- **What must not move**: `s3subset`, `objtest`, `fixpoint` (the native
+  targets' code does not change); `replaytest`; the whole `clidiff` with
+  stage 2, since the command carries `s3` (about 13 to 15 hours).
+
+**(8) One part, in steps.** Proposed, each step held before the next:
+the backend's check, thunks, `_deep` and the scale, `compiler/rtwasm`'s
+`deep.gr`, `runprog.mjs`'s import and the two fixtures, held by
+`wasmsubset`'s `stack` section and by `s3subset` and `objtest`; then the
+three depth programs held and the controls; then the final runs and the
+entry of docs/known-issues.md. The part ends when every shape reaches
+10,000 under node's default stack with no flag, past the bound the panic
+and 101, the S3 entry closed for engines with JSPI with the measured depths
+and the narrower one open for engines without.
+
+**What is left for S8 after this part, if it ends there**: the LSP on the
+query engine; the debugger's cost per statement; `grasm-j`; the scheduler's
+cost per switch; the in-task recursion bound of 10,999; a recursion below
+10,000 on an engine without JSPI, compiled (decision (4)) and in the
+playground (decision (5)); the site's switch, the owner's.
+
+What engines other than this V8 do could not be measured here (no network,
+no other engine): that a `promising` call runs synchronously until it
+suspends is what the JSPI proposal specifies, and is the one fact this
+design rests on that was measured on one engine only.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
