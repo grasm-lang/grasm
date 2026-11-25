@@ -12,7 +12,7 @@ yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` r
 so that it computes other values than `grasm run` with no error. Open S3:
 seventeen, one in `compiler/wasm32`, which no release ships yet -- run by
 an engine without JS promise integration, a module refusing a recursion at
-3,401 to 10,210 calls, by shape, below the 10,000 [E-RECURSION-DEPTH]
+3,117 to 9,359 calls, by shape, below the 10,000 [E-RECURSION-DEPTH]
 guarantees -- one in the Grasm playground, which no
 release ships yet -- with no stack switched (an engine without JS promise
 integration) a recursion refused at 334 to 1,774 calls -- two in the
@@ -140,11 +140,22 @@ clause's panic, "stack overflow: recursion too deep", and exit 101 -- never
 a trap, which is why it is S3 and not S2. The deepest each shape of
 `scripts/fixtures/wasmstack/` reaches there, measured by `wasmsubset` with
 `GRASM_WASM_STACKS=0` standing in for such an engine: `closure` (through a
-function value and `map`) 3,401, `locals` 5,615, `tree` 7,019, `doubles`
-8,022, `parmap` (inside `par_map`) 9,352, `spawn` (inside `spawn`) 9,358,
-`plain` (`1 + depth(n - 1)`) 9,359, `mutual` 10,210 -- what each reached
-before hops existed, within 0.1% below or above, and `wasmsubset` holds each
-to that less 1%. What would close it, recorded for a later part (the
+function value and `map`) 3,117, `locals` 5,104, `tree` 6,239, `doubles`
+7,487, `parmap` (inside `par_map`) 8,632, `spawn` (inside `spawn`) 8,638,
+`plain` (`1 + depth(n - 1)`) 8,639, `mutual` 9,359, and `wasmsubset` holds
+each to that less 1%. Without JSPI no shape now reaches 10,000. Before
+hops existed `mutual` reached 10,089 and the others 3,390 to 9,368; they
+lost about 7% (12% on `tree`) when the shadow frames were made 1.08 times
+the engine frame's estimate rather than 1.0, so that no tier of V8 traps:
+with V8's TurboFan compiling from the start (`--no-liftoff`) a level of
+`mutual` took 2% more of the engine's stack than its estimate, so at 1.0 it
+would have overflowed the engine's stack -- a trap -- before the floor's
+panic (docs/self-hosting.md §6.26; the coordinator's decision, a trap being
+worse than a shallower panic). That margin, at least 5% for every shape
+under V8's default tiering, `--liftoff-only` and `--no-liftoff`, was
+measured on node v25.2.1's V8 14.1 alone: other engines' frame sizes and
+inlining are not measured, no other engine being at hand, and nothing is
+claimed for them. What would close it, recorded for a later part (the
 coordinator's decision): a worker per engine stack over a shared memory
 (measured in §6.26: about 20 µs a hop and 7 MB a worker, a page cross-origin
 isolated and the module in a worker), or core stack switching once an
@@ -173,9 +184,11 @@ engine stack hop to a fresh one, synchronously, through
 and the runtime's own floor, 6 MiB below where a recursion first asks, is
 the bound, as a native build's 6 MiB of the machine's stack is. The deepest
 each shape reaches under node's default stack and no flag, measured by
-`wasmsubset`: `closure` 23,826, `locals` 39,316, `tree` 49,145, `doubles`
-56,166, `parmap` 65,522, `plain` 65,529, `spawn` 65,529, `mutual` 71,486;
-past each the panic and 101, never a trap. One risk, the coordinator's to
+`wasmsubset`: `closure` 21,841, `locals` 35,740, `tree` 43,685, `doubles`
+52,421, `parmap` 60,481, `plain` 60,488, `spawn` 60,488, `mutual` 65,528;
+past each the panic and 101, never a trap, under V8's default tiering and,
+in `wasmsubset`'s check of the tiers, under `--liftoff-only` and
+`--no-liftoff` too (the margin above, measured on this V8 alone). One risk, the coordinator's to
 know: that a `promising` call started from a synchronous import runs to its
 end before the import returns -- what JSPI specifies until a stack suspends,
 and what a compiled module relies on (it never suspends: the switch's

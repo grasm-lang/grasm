@@ -32,8 +32,9 @@
 //
 // A program's module also hops to fresh engine stacks (docs/self-hosting.md
 // §6.26; `body.gr` says how a function hops): global 1 is the running
-// segment's floor, every function that takes the floor has a thunk in the
-// table after the program's own slots, and the export `_deep(record)` runs
+// segment's floor, every function that takes the floor has a slow path and
+// a thunk, the thunk in the table after the program's own slots, and the
+// export `_deep(record)` runs
 // a record's thunk inside a `try_table` that catches tag 0, writing the exit
 // status into the record. The embedder calls `_deep` through
 // `WebAssembly.promising` when the C library's `wasm_hop` calls the import
@@ -67,7 +68,7 @@ type LinkOpts = {
     stack_size: i64,
     /// A function that may recurse keeps a shadow frame of this many
     /// hundredths of its engine frame (`body.gr`); -1 for the module's own,
-    /// 100 for a program's (§6.26), 700 for one built `--exports` (§6.24).
+    /// 108 for a program's (§6.26), 700 for one built `--exports` (§6.24).
     floor_scale: i64,
     /// A segment of a program's shadow stack, in bytes: what one engine
     /// stack holds (§6.26).
@@ -95,8 +96,8 @@ pub fn default_opts() -> LinkOpts {
 
 let DATA_BASE = 1024
 /// The runtime's floor, 6 MiB (`compiler/rt/src/fiber.gr`'s `BUDGET`), in
-/// seven segments: each the engine stack §6.24's calibration gave one
-/// stack, so that the bound is 6 MiB of the engine's stack (§6.26).
+/// seven segments: each the engine stack §6.24's calibration gave one stack
+/// (§6.26).
 let SEGMENT = 898779
 /// The arguments' area: the embedder writes the argument vector there --
 /// eight-byte pointers, then the NUL-terminated strings they point at --
@@ -614,7 +615,7 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
             }
         }
     }
-    let scale = if o.floor_scale >= 0 { o.floor_scale } else if l.exports { 700 } else { 100 }
+    let scale = if o.floor_scale >= 0 { o.floor_scale } else if l.exports { 700 } else { 108 }
     let round = if l.exports { 16 } else { 8 }
     // Types: every kept function's, every import's, the tag's, `_start`'s.
     var types: Map[str, i64] = {}
@@ -640,13 +641,20 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
         args_type = intern_type(types, tlist, tps, trs, [], 3)
     }
     let hop_fn = if l.exports { -1 } else { nimp + (l.def_pos.get(l.global.get("_wasm_hop") ?? 0) ?? 0) }
+    // Each slow path's index: after `_start`, `_args`, `_deep` and the
+    // thunks (`body.slow`).
+    var slow_pos: Map[i64, i64] = {}
+    for j in 0..hop_keys.len() {
+        slow_pos.set(hop_keys[j], nimp + l.defs.len() + 3 + hop_keys.len() + j)
+    }
     // Bodies.
     var bodies: [bytes] = []
     for key in l.defs {
         let f = key_fn(l, key)
         let aux = try aux_of(l, key, nimp, types, tlist, tps, trs)
         let slot = hop_slot.get(key) ?? -1
-        let bopts = BodyOpts{ floor_scale: scale, round: round, hop_fn: if slot > 0 { hop_fn } else { -1 }, hop_slot: slot }
+        let sp_idx = slow_pos.get(key) ?? -1
+        let bopts = BodyOpts{ floor_scale: scale, round: round, hop_fn: if slot > 0 { sp_idx } else { -1 }, hop_slot: slot }
         match body.body(f, aux, bopts) {
             Ok(bs) -> bodies.push(bs)
             Err(msg) -> fail("{f.sym} ({f.name}): {msg}")
@@ -815,6 +823,12 @@ pub fn link(progs: [MirProg], o: LinkOpts) -> bytes ! str {
             bodies.push(body.thunk(f, nimp + (l.def_pos.get(key) ?? 0)))
             def_type.push(rec_type)
             own_names.push(f.name + "$hop")
+        }
+        for key in hop_keys {
+            let f = key_fn(l, key)
+            bodies.push(body.slow(f, hop_fn, hop_slot.get(key) ?? 0))
+            def_type.push(intern_type(types, tlist, tps, trs, body.param_classes(f), body.result_class(f)))
+            own_names.push(f.name + "$slow")
         }
     }
     let thunk_base = first_own + 3

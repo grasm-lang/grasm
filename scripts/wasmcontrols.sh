@@ -32,6 +32,10 @@
 #   w-small      frames sized too small (the scale 0.80, below every shape's
 #                smallest safe one), so the engine's stack overflows before
 #                the segment's floor -> past any depth
+#   w-tier       the scale 1.00: above every shape's smallest safe one under
+#                V8's default tiering (0.95 at most) and below `mutual`'s with
+#                TurboFan from the start (1.02), so only the tiers show it
+#                -> under --no-liftoff, past any depth
 #   w-deep-catch `_deep` does not catch an `exit` or a panic, so the panic
 #                past the bound, thrown on a deeper stack, is lost there and
 #                the run traps -> past any depth
@@ -167,7 +171,7 @@ control w-nondet compiler/s3/src/main.gr \
     scripts/playtest.sh:build "not the same bytes"
 
 control w-floor compiler/wasm32/src/main.gr \
-    "} else if l.exports { 700 } else { 100 }" "} else if l.exports { 700 } else { 0 }" -- \
+    "} else if l.exports { 700 } else { 108 }" "} else if l.exports { 700 } else { 0 }" -- \
     scripts/wasmsubset.sh "past any depth"
 
 control w-hop $B \
@@ -178,8 +182,12 @@ control w-hop $B \
     scripts/wasmsubset.sh:stack "past any depth"
 
 control w-small compiler/wasm32/src/main.gr \
-    "} else if l.exports { 700 } else { 100 }" "} else if l.exports { 700 } else { 80 }" -- \
+    "} else if l.exports { 700 } else { 108 }" "} else if l.exports { 700 } else { 80 }" -- \
     scripts/wasmsubset.sh:stack "past any depth"
+
+control w-tier compiler/wasm32/src/main.gr \
+    "} else if l.exports { 700 } else { 108 }" "} else if l.exports { 700 } else { 100 }" -- \
+    scripts/wasmsubset.sh:stack "under --no-liftoff, past any depth"
 
 control w-deep-catch compiler/wasm32/src/main.gr \
     "        enc.try_table_catch(db, enc.BT_EMPTY, 0, 0)" "        enc.open(db, enc.OP_BLOCK, enc.BT_EMPTY)" -- \
@@ -259,7 +267,7 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     exit 1
 fi
 # A floor: a control quietly dropped is a check quietly lost.
-if [ "$controls" -lt 24 ]; then
-    echo "fewer controls than the floor of 24"
+if [ "$controls" -lt 25 ]; then
+    echo "fewer controls than the floor of 25"
     exit 1
 fi

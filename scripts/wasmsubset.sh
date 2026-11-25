@@ -33,11 +33,15 @@
 #     and no flag. With JS promise integration a recursion hops to fresh
 #     engine stacks: each shape must reach at least the 10,000 calls
 #     [E-RECURSION-DEPTH] guarantees. Without it (`GRASM_WASM_STACKS=0`)
-#     nothing can hop: each must reach at least what it reached before hops
-#     existed, less 1% -- below 10,000 for most, the open S3 entry of
-#     docs/known-issues.md. Either way, past the bound the runtime's panic and
-#     exit 101, never the engine's stack overflow -- a trap the clause rules
-#     out. `scripts/fixtures/wasmdeep/trap.gr` traps on purpose, on the first
+#     nothing can hop: each must reach at least what it reached when this
+#     was written, less 1% -- below 10,000 for every shape, the open S3 entry
+#     of docs/known-issues.md. Either way, past the bound the runtime's panic
+#     and exit 101, never the engine's stack overflow -- a trap the clause
+#     rules out. Every depth is from runs with no flag. Then the tiers: each
+#     shape run past any depth again under node's `--liftoff-only` and
+#     `--no-liftoff` (TurboFan from the start), which change only which of
+#     V8's compilers makes the code and so the size of its frames, never the
+#     stack's: the panic and 101 under each, never a `RangeError`. `scripts/fixtures/wasmdeep/trap.gr` traps on purpose, on the first
 #     engine stack and on one a hop made: each must end as a trap, never as
 #     an exit, a panic or output. And `wasmdeep/split.gr` prints the hot
 #     split's cost -- a call made across a segment's edge against one made
@@ -246,14 +250,16 @@ for fx in scripts/fixtures/wasmrefuse/*.gr; do
     fi
 done
 
-# The stack (§6.26). Each shape's depth before hops existed, the floor
-# without JS promise integration (less 1%, below).
-declare -A BEFORE=([closure]=3390 [doubles]=8030 [locals]=5620 [mutual]=10089 [plain]=9368 [tree]=7026 [parmap]=9362 [spawn]=9368)
+# The stack (§6.26). Each shape's depth without JS promise integration as
+# measured on 2026-11-25 at the scale 1.08, the floor (less 1%, below).
+declare -A BEFORE=([closure]=3117 [doubles]=7487 [locals]=5104 [mutual]=9359 [plain]=8639 [tree]=6239 [parmap]=8632 [spawn]=8638)
 GUARANTEED=10000
 DEEP_MSG='panic: stack overflow: recursion too deep'
 stack_ok=0
 stack_bad=0
 stack_n=0
+tier_ok=0
+tier_n=0
 declare -a DEPTHS=()
 declare -a DEPTHS_NJ=()
 # deepest MODULE [ENV]: the deepest call that prints, by bisection.
@@ -292,9 +298,22 @@ for fx in scripts/fixtures/wasmstack/*.gr; do
             want=$(( ${BEFORE[$name]:-$GUARANTEED} * 99 / 100 ))
             if [ "$d" -lt "$want" ]; then
                 ok=0
-                echo "FAILED: $fx without JSPI reaches only $d calls, below the $want held (${BEFORE[$name]:-?} before hops, less 1%)"
+                echo "FAILED: $fx without JSPI reaches only $d calls, below the $want held (${BEFORE[$name]:-?} measured, less 1%)"
             fi
         fi
+    done
+    # The tiers: a frame's size is the compiler's, so each must leave the
+    # floor first.
+    for tier in --liftoff-only --no-liftoff; do
+        node "$tier" scripts/wasm/runprog.mjs "$WORK/fx.wasm" 100000000 >"$WORK/fx.out" 2>"$WORK/fx.err" </dev/null
+        c=$?
+        if [ "$c" = 101 ] && grep -qx "$DEEP_MSG" "$WORK/fx.err" && [ ! -s "$WORK/fx.out" ]; then
+            tier_ok=$((tier_ok + 1))
+        else
+            ok=0
+            echo "FAILED: $fx under $tier, past any depth: exit $c, $(grep -v '^ *at ' "$WORK/fx.err" | head -c 200 | tr '\n' ' ')"
+        fi
+        tier_n=$((tier_n + 1))
     done
     if [ "$ok" = 1 ]; then stack_ok=$((stack_ok + 1)); else stack_bad=$((stack_bad + 1)); fi
 done
@@ -356,6 +375,7 @@ echo "refusals: $refuse_same of $refuse_n as the Rust module's"
 echo "stack: $stack_ok of $stack_n shapes held (at least $GUARANTEED calls with JSPI, past any depth the panic, with and without)"
 echo "stack, deepest with JSPI: ${DEPTHS[*]}"
 echo "stack, deepest without JSPI (open S3): ${DEPTHS_NJ[*]}"
+echo "stack, past any depth under --liftoff-only and --no-liftoff, the panic: $tier_ok of $tier_n"
 echo "stack, a trap in a deeper stack ended as a trap: $trap_ok of $trap_n"
 echo "stack, the hot split: $split_line"
 status=0

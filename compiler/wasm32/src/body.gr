@@ -24,19 +24,25 @@
 // hundredths of `8 * (parameters + locals) + 56` bytes, the engine's frame
 // as measured on V8 (§6.24).
 //
-// In a program's module (docs/self-hosting.md §6.26) the scale is 1.0, the
-// shadow stack modelling the engine's one to one, and the runtime's floor of
+// In a program's module (docs/self-hosting.md §6.26) the scale is 1.08, the
+// shadow stack modelling the engine's nearly one to one -- 1.0 and a margin
+// of at least 5% for every shape of `scripts/fixtures/wasmstack/` under each
+// of V8's tiers, measured (TurboFan from the start needed 1.02) -- and the
+// runtime's floor of
 // 6 MiB below its first asking (`compiler/rt/src/fiber.gr`) is the bound, as
 // a native build's 6 MiB of the machine's stack is. No engine stack holds
 // that much, so the shadow stack is cut in segments of what one engine stack
 // holds (global 1 is the running segment's floor), and a function that takes
 // the floor checks on entry, before it reserves its frame, whether its frame
-// would pass the segment's floor. If it would, it hops: it writes a hop
-// record below the shadow stack's pointer -- its thunk's table slot, a
-// status, an exit status, its answer, its arguments (`H_*`) -- and calls the
-// C library's `wasm_hop` (`compiler/rtwasm/src/deep.gr`), which runs the
-// thunk on a fresh engine stack and checks that it finished; the function
-// then answers what the thunk left. It is re-entered from its first
+// would pass the segment's floor. If it would, it hops: it calls its slow
+// path (`slow`), out of line so that the function's own frame does not grow
+// -- with the hop written inline, V8's TurboFan inlining made a level of
+// `mutual` 20% larger than its estimate -- which writes a hop record below
+// the shadow stack's pointer (its thunk's table slot, a status, an exit
+// status, its answer, its arguments: `H_*`), calls the C library's
+// `wasm_hop` (`compiler/rtwasm/src/deep.gr`), which runs the thunk on a
+// fresh engine stack and checks that it finished, and answers what the thunk
+// left. The function is re-entered from its first
 // instruction with the arguments it was given, before it has loaded an
 // `inout` argument or reserved anything, so nothing it does is done twice.
 // In a module built `--exports` (the playground) the scale is 7.0 and the
@@ -115,9 +121,9 @@ type BodyOpts = {
     floor_scale: i64,
     /// What a frame is rounded up to, in bytes.
     round: i64,
-    /// For a function that takes the floor in a program's module: the C
-    /// library's `wasm_hop`, and the table slot of this function's thunk;
-    /// -1 where it never hops.
+    /// For a function that takes the floor in a program's module: its slow
+    /// path's function index, and the table slot of its thunk; -1 where it
+    /// never hops.
     hop_fn: i64,
     hop_slot: i64,
 }
@@ -265,52 +271,68 @@ pub fn body(f: MirFn, aux: Aux, o: BodyOpts) -> bytes ! str {
     b.to_bytes()
 }
 
-/// The segment's check and the hop (above): if this function's frame would
-/// pass the running segment's floor, its call is made again on a fresh
-/// engine stack and its answer answered. The frame pointer's local holds the
-/// record's address, before the frame is reserved.
+/// The segment's check (above): if this function's frame would pass the
+/// running segment's floor, its slow path is called with its arguments and
+/// what that answers is answered.
 fn hop(f: MirFn, s: BState, o: BodyOpts, inout b: ByteBuilder) -> () ! str {
-    if s.fp < 0 {
-        fail("a function that takes the floor and keeps no frame")
-    }
     let pcs = param_classes(f)
-    let rs = H_ARGS + 8 * pcs.len()
     enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
     enc.i32_const(b, s.frame)
     enc.op(b, enc.OP_I32_SUB)
     enc.op_idx(b, enc.OP_GLOBAL_GET, 1)
     enc.op(b, enc.OP_I32_LT_U)
     enc.open(b, enc.OP_IF, enc.BT_EMPTY)
-    enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
-    enc.i32_const(b, rs)
-    enc.op(b, enc.OP_I32_SUB)
-    enc.op_idx(b, enc.OP_LOCAL_TEE, s.fp)
-    enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
-    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
-    enc.i64_const(b, o.hop_slot)
-    enc.mem(b, enc.OP_I64_STORE, 3, H_SLOT)
-    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
-    enc.i64_const(b, 0)
-    enc.mem(b, enc.OP_I64_STORE, 3, H_STATUS)
     for k in 0..pcs.len() {
-        enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
         enc.op_idx(b, enc.OP_LOCAL_GET, k)
-        enc.mem(b, if pcs[k] == 2 { enc.OP_F64_STORE } else { enc.OP_I64_STORE }, 3, H_ARGS + 8 * k)
     }
-    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
-    enc.op(b, enc.OP_I64_EXTEND_I32_U)
     enc.op_idx(b, enc.OP_CALL, o.hop_fn)
-    enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
-    enc.i32_const(b, rs)
-    enc.op(b, enc.OP_I32_ADD)
-    enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
-    if s.rcls != 0 {
-        enc.op_idx(b, enc.OP_LOCAL_GET, s.fp)
-        enc.mem(b, if s.rcls == 2 { enc.OP_F64_LOAD } else { enc.OP_I64_LOAD }, 3, H_ANSWER)
-    }
     enc.op(b, enc.OP_RETURN)
     enc.op(b, enc.OP_END)
     ()
+}
+
+/// The hop's slow path for `f`, out of line so that `f`'s own frame does not
+/// grow: the record written, `wasm_hop` (index `hop`) called, the answer
+/// answered. Same type as `f`.
+pub fn slow(f: MirFn, hop: i64, slot: i64) -> bytes {
+    let pcs = param_classes(f)
+    let rc = result_class(f)
+    let np = pcs.len()
+    let rs = H_ARGS + 8 * np
+    let r = np
+    var b = byte_builder()
+    enc.uleb(b, 1)
+    enc.uleb(b, 1)
+    b.push_byte(enc.T_I32)
+    enc.op_idx(b, enc.OP_GLOBAL_GET, 0)
+    enc.i32_const(b, rs)
+    enc.op(b, enc.OP_I32_SUB)
+    enc.op_idx(b, enc.OP_LOCAL_TEE, r)
+    enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+    enc.op_idx(b, enc.OP_LOCAL_GET, r)
+    enc.i64_const(b, slot)
+    enc.mem(b, enc.OP_I64_STORE, 3, H_SLOT)
+    enc.op_idx(b, enc.OP_LOCAL_GET, r)
+    enc.i64_const(b, 0)
+    enc.mem(b, enc.OP_I64_STORE, 3, H_STATUS)
+    for k in 0..np {
+        enc.op_idx(b, enc.OP_LOCAL_GET, r)
+        enc.op_idx(b, enc.OP_LOCAL_GET, k)
+        enc.mem(b, if pcs[k] == 2 { enc.OP_F64_STORE } else { enc.OP_I64_STORE }, 3, H_ARGS + 8 * k)
+    }
+    enc.op_idx(b, enc.OP_LOCAL_GET, r)
+    enc.op(b, enc.OP_I64_EXTEND_I32_U)
+    enc.op_idx(b, enc.OP_CALL, hop)
+    enc.op_idx(b, enc.OP_LOCAL_GET, r)
+    enc.i32_const(b, rs)
+    enc.op(b, enc.OP_I32_ADD)
+    enc.op_idx(b, enc.OP_GLOBAL_SET, 0)
+    if rc != 0 {
+        enc.op_idx(b, enc.OP_LOCAL_GET, r)
+        enc.mem(b, if rc == 2 { enc.OP_F64_LOAD } else { enc.OP_I64_LOAD }, 3, H_ANSWER)
+    }
+    enc.op(b, enc.OP_END)
+    b.to_bytes()
 }
 
 /// The thunk of function `callee` (index `idx`), which a hop runs on a fresh

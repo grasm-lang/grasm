@@ -9215,6 +9215,82 @@ reverse any of them.
   against the tree before the final run. Only measured depths are recorded
   as reached; the figures predicted above are predictions.
 
+#### The coordinator's decisions on step two, and the tiers
+
+Taken by the coordinator on 2026-11-25, on the agent's reports; the owner
+may reverse any of them.
+
+- **Where the completion check lives: in the module.** The agent's
+  decision, accepted by the coordinator: `wasm_hop` trusts only the status
+  the deeper stack wrote in the record, and traps on anything but answered
+  or ended, so no embedder's glue can leave the check out; the embedder's
+  import only says whether it could start a stack.
+- **Condition (c): refused when the module is built,** as the agent did it
+  (the switch's imports in a program's module, the hop's in one built
+  `--exports`): accepted.
+- **The hot split** -- a call made across a segment's edge against one made
+  beside it, measured by `wasmsubset` at 155 times (624 ns and 4.0 ns) -- is
+  recorded as measured, a known cost, with no claim; in docs/known-issues.md
+  only if a corpus program meets it, which is to be checked.
+- **The tiers.** Asked to measure the margin under V8's other tiers, the
+  agent found that the hop as first committed (`f806e96b`, written inline in
+  the function's prologue, at the scale 1.0) let the engine's stack overflow
+  before the floor under `--no-liftoff` (TurboFan compiling everything from
+  the start): `mutual` needed 1.20, `plain`, `parmap` and `spawn` 1.10. The
+  cause, shown by `--no-liftoff --no-wasm-inlining`, under which `mutual`
+  panics: V8's wasm inlining, with the hop's code in the function, made a
+  level larger than its estimate. The coordinator's principle: a trap is a
+  worse failure than a shallower panic, so correctness under every tier
+  comes before the depth without JSPI. Decided: (iv), a slow path TurboFan
+  does not inline, tried first in scratch for about an hour; if it failed,
+  (ii), the hop out of line, at the smallest scale leaving at least 5% under
+  all three tiers; the depths without JSPI allowed to fall by what that
+  costs (relaxing "no shape worse"), their floors the new depths less 1% and
+  the open S3 entry saying plainly that no shape now reaches 10,000 without
+  JSPI and why; a section of `wasmsubset` running each shape past any depth
+  under `--liftoff-only` and `--no-liftoff`, the coordinator's word on those
+  flags -- they change the compiler, never the stack, so they are allowed
+  for that check of the panic alone, and every depth stays a flag-free
+  one -- with a control only that section catches; and the margin stated
+  as measured on node v25.2.1's V8 14.1 alone, nothing claimed for other
+  engines, whose frame sizes and inlining could not be measured here.
+
+What was measured. The smallest scale, in hundredths of the engine frame's
+estimate, at which each shape run past any depth still ends in the panic
+rather than a `RangeError` -- by bisection, each probe a module built and run
+under node with no flag (default), `--liftoff-only` and `--no-liftoff`; with
+JSPI and without, the same in every cell but one (`closure` under (iv) with
+`--no-liftoff`, 102 and 101). Master's modules (no hop, `floor_scale` 700,
+frames by 16) for comparison, in the same units:
+
+| shape | master: default, Liftoff only, TurboFan only | the hop inline (`f806e96b`) | (iv) out of line through `call_indirect` | (ii) out of line, a direct call |
+|---|---|---|---|---|
+| `closure` | 637, 637, 637 | 92, 92, 92 | 92, 92, 102 | 92, 92, 83 |
+| `doubles` | 659, 659, 559 | 94, 94, 94 | 109, 109, 94 | 94, 94, 94 |
+| `locals` | 651, 651, 521 | 91, 91, 81 | 111, 111, 76 | 91, 91, 76 |
+| `mutual` | 583, 583, 583 | 83, 83, 120 | 102, 102, 83 | 83, 83, 102 |
+| `parmap` | 652, 652, 535 | 93, 93, 110 | 93, 93, 50 | 93, 93, 93 |
+| `plain` | 652, 652, 535 | 93, 93, 110 | 93, 93, 77 | 93, 93, 93 |
+| `spawn` | 652, 652, 535 | 93, 93, 110 | 93, 93, 77 | 93, 93, 93 |
+| `tree` | 651, 651, 401 | 95, 95, 83 | 95, 95, 70 | 95, 95, 83 |
+
+Master's margin is 5.9% at worst (`doubles`, 659 of 700). (iv), the slow
+path reached through `call_indirect`, is not inlined under `--no-liftoff`
+but costs room under the default tiering (`locals` 1.11, `doubles` 1.09):
+the worst of the three at 1.11, so not taken. (ii), the slow path a direct
+call, is taken: its worst is 1.02 (`mutual` under `--no-liftoff`), so the
+scale is 1.08, which leaves 5.9% there and at least 13.7% everywhere else;
+1.07 would have left 4.9%. (The agent chose 1.08 over the coordinator's
+1.07 for that reason.) The depths at 1.08, flag-free, with JSPI and
+without: `closure` 21,841 and 3,117, `locals` 35,740 and 5,104, `tree`
+43,685 and 6,239, `doubles` 52,421 and 7,487, `parmap` 60,481 and 8,632,
+`plain` 60,488 and 8,639, `spawn` 60,488 and 8,638, `mutual` 65,528 and
+9,359 -- without JSPI 7% below what the scale 1.0 gave (12% on `tree`), and
+`mutual` below 10,000 for the first time. Warming the recursion first under
+the default tiering (200,000 shallow calls before the deep one, so that
+TurboFan's code runs it) needed less room, not more: 0.50 or below on
+`plain` and `mutual`.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
