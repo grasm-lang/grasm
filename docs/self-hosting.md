@@ -9280,8 +9280,10 @@ but costs room under the default tiering (`locals` 1.11, `doubles` 1.09):
 the worst of the three at 1.11, so not taken. (ii), the slow path a direct
 call, is taken: its worst is 1.02 (`mutual` under `--no-liftoff`), so the
 scale is 1.08, which leaves 5.9% there and at least 13.7% everywhere else;
-1.07 would have left 4.9%. (The agent chose 1.08 over the coordinator's
-1.07 for that reason.) The depths at 1.08, flag-free, with JSPI and
+1.07 would have left 4.9%. The agent chose 1.08 over the coordinator's
+1.07 for that reason, and the coordinator accepted it (2026-11-25): the
+rule was the margin of 5%, which 1.08 holds. (iv) was tried first, as
+decided, its table above, and failed that margin under the default tiering. The depths at 1.08, flag-free, with JSPI and
 without: `closure` 21,841 and 3,117, `locals` 35,740 and 5,104, `tree`
 43,685 and 6,239, `doubles` 52,421 and 7,487, `parmap` 60,481 and 8,632,
 `plain` 60,488 and 8,639, `spawn` 60,488 and 8,638, `mutual` 65,528 and
