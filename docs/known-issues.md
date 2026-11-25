@@ -176,7 +176,7 @@ fn main() {
 ```
 
 **A program compiled to wasm refuses a recursion below 10,000 calls --
-*closed for an engine with JS promise integration, 2026-11-25*.** Found by
+*closed for an engine with JS promise integration, 2026-11-26*.** Found by
 S8 part seven (§6.24): one engine stack held 3,390 to 10,089 calls by shape,
 in the clause's panic. S8 part nine (§6.26) made a recursion deeper than one
 engine stack hop to a fresh one, synchronously, through
@@ -188,7 +188,10 @@ each shape reaches under node's default stack and no flag, measured by
 52,421, `parmap` 60,481, `plain` 60,488, `spawn` 60,488, `mutual` 65,528;
 past each the panic and 101, never a trap, under V8's default tiering and,
 in `wasmsubset`'s check of the tiers, under `--liftoff-only` and
-`--no-liftoff` too (the margin above, measured on this V8 alone). One risk, the coordinator's to
+`--no-liftoff` too (the margin above, measured on this V8 alone). Held by
+the final run of S8 part nine on `d2baac06`; the three corpus programs the
+Rust module cannot run for their depth now run compiled, `scheme-demo`
+hopping 22 times. One risk, the coordinator's to
 know: that a `promising` call started from a synchronous import runs to its
 end before the import returns -- what JSPI specifies until a stack suspends,
 and what a compiled module relies on (it never suspends: the switch's

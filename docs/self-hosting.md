@@ -9382,6 +9382,109 @@ decided what is said where it was decided.)
   as other words; now `w-deep-panic`, a trap where the panic is, after the
   change above).
 
+#### The final runs
+
+(2026-11-25 and 26, on `d2baac06`, the final tree but for the documents
+after it, by the agent's resumable runner, `nice -n 10`, one gate at a time,
+no network; other apps held swap at 21 to 21.5 GB and disk at 7.0 to 18.3
+GB free; the gates were run with no engine flag but in `wasmsubset`'s check
+of the tiers, the coordinator's word on it.)
+
+- **Which corpus programs hop** (a scan of the 533 modules `wasmsubset`
+  compares, each run once with a runner counting the hops, 11 minutes):
+  530 never hop. `scheme-demo` hops 22 times in its run -- a Scheme
+  interpreter run by a compiled module, its recursion through the
+  evaluator deeper than one engine stack holds; `E-PANIC-TRACE` 6, an
+  unbounded recursion running through the segments to the runtime's floor
+  and its panic; `E-RECURSION-DEPTH` 2, its two recursions of 10,000 calls
+  each passing the first stack once. All three are the programs `wasmtest`
+  sets aside for their depth, which this part's modules now run. None makes
+  calls across a segment's edge over and over, the hot split: so it is
+  recorded here as a cost measured on a fixture -- 155, 122 and 140 times a
+  call made beside an edge on three runs (624, 516 and 616 ns against 4.0,
+  4.2 and 4.4 ns), varying with the load -- and not in docs/known-issues.md,
+  and nothing is claimed of it.
+- **The gates.** `wasmsubset`, 50 minutes: "wasmsubset: 651 programs with a
+  main, 118 set aside, 533 compared", "as grasm run: 533   as the native
+  build (stdout, stderr, status): 533   timed out: 0", "named par_map,
+  par_filter or spawn and held: 22, the Rust module running them as grasm
+  run does: 21, otherwise: 1", "set aside by wasmtest for their depth and
+  held here: 3", "modules: 533   built twice the same: 533   V8 validates:
+  533 (refuses 0)   wasm_validate.py: 533 valid, 0 invalid, 151975 bodies
+  checked", "refusals: 4 of 4 as the Rust module's", "stack: 8 of 8 shapes
+  held (at least 10000 calls with JSPI, past any depth the panic, with and
+  without)", "stack, deepest with JSPI: closure 21841 doubles 52421 locals
+  35740 mutual 65528 parmap 60481 plain 60488 spawn 60488 tree 43685",
+  "stack, deepest without JSPI (open S3): closure 3117 doubles 7487 locals
+  5104 mutual 9359 parmap 8632 plain 8639 spawn 8638 tree 6239", "stack,
+  past any depth under --liftoff-only and --no-liftoff, the panic: 16 of
+  16", "stack, a trap in a deeper stack ended as a trap: 4 of 4", "stack,
+  the hot split: 616 ns a call across an edge, 4.4 ns beside it: 140 times
+  (medians of 3, walk at 6603)". `playtest`, 102 minutes: "build: built
+  twice the same: 1   V8: valid   wasm_validate.py: 2036 bodies   link:
+  11s", "build: as the base's module: the same bytes", "size: 3496479 bytes
+  (821266 under gzip -9), the Rust module's 1939255 (564375)", "frame: 16
+  cases, 2 modes each   as the Rust module: 27   as grasm run, by decision:
+  5", "session: 18 runs in one instance   as a fresh instance: 18", "stack:
+  30 runs   as held: 28   past the Rust interpreter's stack, within the
+  count: 1   past a task's spare stacks: 1", "corpus: compared 508   as
+  grasm run: 508 (standard error too: 508)   as the Rust module: 508   set
+  aside: 114", "replay: identical on every engine", "speed: geometric mean
+  of this module's time over the Rust module's, three interleaved rounds:
+  1.464", "playtest: 102 minutes   failed: 0". `wasmcontrols`, 44 minutes:
+  "controls: 25   caught: 25   missed: 0". `wasmtest`: "identical: 508
+  mismatched: 0   skipped: 143", the line it gave before this part.
+  `replaytest`: "journaled: 44   unhooked: 0   no test program: 0", "a
+  native recording replayed elsewhere: identical on every engine".
+  `encodetest_wasm`: "cases: 234   forms: 91   agreeing: 234   disagreeing:
+  0". `s3subset`: "identical: 648   mismatched: 0   timed out: 0   no TIR:
+  0"; `objtest`: "objects: 648   reproducible: 648 ... with problems: 0";
+  `fixpoint`: "compared: 54 ... identical: 54   differ: 0", "stage 2's TIR
+  the same as grasm tir's: 6 of 6", "the command's build the stage
+  pipeline's (its rt.o and the 4 programs): 5 of 5". The stage-1 command
+  from this tree (5,228,984 bytes), the sections the change reaches, 62
+  minutes: "lines: 280   the same: 275 ... a target refused: 4", "fmt: 2075
+  files, each and four rewrites, 20750 commands   the same: 20750", "lint:
+  2075 files, 5599 commands (1449 with --only)   the same: 5599", "build:
+  648 programs with a main (3 link a system library)   the same output: 648,
+  0 of them refusals   run alike: 648   built twice the same: 648", "target:
+  65 programs ... the same output, the triple's object made twice the same:
+  195 of 195". The whole `clidiff` with fixpoint's stage-2 command (the
+  command carries `s3`), 808 minutes, exit 0, every floor held: among its
+  lines "run: 651 programs with a main   the same: 651   timed out: 0",
+  "test: 1737 programs, 1961 commands ...   the same: 1960, 12 of them with
+  a failing test   both timed out, --contracts: 1", "schedules: 20
+  programs, 121 commands   the same: 121 ...", "stack: 13 programs, 26
+  commands   the same: 22   past the Rust interpreter's stack, within the
+  count: 2   past a task's spare stacks: 2", "bundle: 651 programs with a
+  main ... built twice the same: 651", "journal: 652 programs recorded   the
+  same: 652, 185 of them with a journal (1 differing only in a failed
+  lookup's IoFailed text, 1 only in socket handles after a net_close) ...",
+  "dap: 1049 sessions compared   the same: 1008, 96 of them fixed   the Rust
+  adapter running it otherwise than grasm run: 28 ... the same under one
+  recording: 13 ...", "given the program's own run time: 0", "lsp: 2092
+  sessions   the same: 2092, 17 of them fixed". `clicontrols`, 159
+  minutes: "controls: 36   caught: 36   missed: 0". `fmttest`: "formatted:
+  2069   unformatted: 0   does not parse: 5   exempt: 1"; `gfmttest`:
+  "checked: 1539   disagreeing: 0"; `linttest`: "linted: 2070   findings:
+  1177   does not parse: 5   broke: 0"; `gatecheck`: "gate helpers checked:
+  609   undefined: 0   corpus copied: 0   grep -q under pipefail: 0   gates
+  not executable: 0".
+- **Not run:** `tirinterp` (the interpreter did not change: no file under
+  `tools/`, `compiler/front`, `compiler/mir` or `compiler/rt` differs from
+  `f3856fe7`), `fuzz_wasmmath` (the C library's libm did not change),
+  `xs3subset` (the native targets' code did not change: `s3subset`,
+  `objtest` and `fixpoint` hold it), the rest of `allgates.sh`, the Linux
+  ELF gates.
+
+**What is left for S8 after this part**: the LSP on the query engine; the
+debugger's cost per statement; `grasm-j`; the scheduler's cost per switch;
+the in-task recursion bound of 10,999; a recursion below 10,000 on an
+engine without JS promise integration, compiled (3,117 to 9,359 calls by
+shape, open S3; a worker per stack the recorded way to close it) and in the
+playground (334 to 1,774, open S3); the margin of the tiers measured on V8
+alone; the site's switch, the owner's.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
