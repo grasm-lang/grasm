@@ -9130,10 +9130,10 @@ unsafe fn grasm_net_wait_now(handles: *mut RtVal, timeout: *mut RtVal) -> *mut R
     }
 
     #[cfg(target_os = "macos")]
-    let waited = kq_wait(&wanted, timeout_ms);
+    let waited = kq_wait(&wanted, timeout_ms).unwrap_or_else(|| poll_wait(&wanted, timeout_ms));
     #[cfg(not(target_os = "macos"))]
-    let waited = None;
-    let (ready, listener) = match waited.unwrap_or_else(|| poll_wait(&wanted, timeout_ms)) {
+    let waited = poll_wait(&wanted, timeout_ms);
+    let (ready, listener) = match waited {
         Ok(r) => r,
         Err(e) => return err_of(io_err("IoFailed", e)),
     };
