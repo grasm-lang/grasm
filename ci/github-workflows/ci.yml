@@ -15,7 +15,9 @@ jobs:
             name: linux-x86_64
           - os: macos-latest
             name: macos-arm64
-          - os: macos-13
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-15-intel
             name: macos-x86_64
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -24,6 +26,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - name: Build
         run: cargo build --release --workspace
       - name: Unit + integration tests
@@ -93,6 +98,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - run: cargo build --release --workspace
       # These generate programs rather than reading a fixed corpus, so they are
       # the gate that finds what nobody thought to write down. They are slower
