@@ -13,8 +13,8 @@
 // The functions used here are the ones every C library has and whose answers
 // do not depend on the machine.
 extern fn strlen(s: str) -> i64
-extern fn atoi(s: str) -> i64
-extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
+extern fn atoi(s: str) -> i32
+extern fn memcmp(a: bytes, b: bytes, n: i64) -> i32
 extern fn strchr(s: str, c: i32) -> addr
 extern fn free(p: addr)
 

@@ -50,9 +50,11 @@ jobs:
         # and only the release build above has made it.
         run: cargo test --release --workspace
       - name: Lints (deny warnings)
+        # In release, as allgates runs it: grasm_rt_abi is no_std with
+        # panic=abort, which only the release profile sets.
         # --all-targets so test files are linted too; a lint that only fires in
         # a test still fires on someone's machine.
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
       - name: Differential test (native vs interpreter)
         run: ./scripts/difftest.sh
       - name: Specification conformance

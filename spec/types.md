@@ -710,8 +710,13 @@ or nothing:
 
 ```grasm
 extern fn strlen(s: str) -> i64
-extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
+extern fn memcmp(a: bytes, b: bytes, n: i64) -> i32
 ```
+
+The declaration is the C prototype's, width for width: `memcmp` returns a C
+`int`, so `i32`. Declared `i64`, the upper half of the result is whatever the
+callee left in the register -- sign-extended by macOS's C library, not by
+glibc's -- and `memcmp(a, c, 3) < 0` was false on Linux.
 
 A `str` crosses as a **NUL-terminated copy**: C finds a string's end by its
 NUL, and a Grasm string carries its length instead. One holding a NUL byte
