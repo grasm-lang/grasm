@@ -1705,7 +1705,7 @@ a clean leak check, and fails against the old backend.
 
 ## Found on 2026-10-19 by an outside review
 
-**The published release cannot build natively -- *open*.** v1.0.0 is two bare
+**The published release cannot build natively -- *closed by v1.1.0*.** v1.0.0 is two bare
 binaries and `SHA256SUMS`. `grasm run` works from the download; `grasm build
 --native` stops with "cannot find the Grasm runtime", because
 `libgrasm_rt_abi.a` is not in it, and the message told the user to keep a
@@ -1714,13 +1714,16 @@ binaries and `SHA256SUMS`. `grasm run` works from the download; `grasm build
 has no .tar.gz archives"). `scripts/package.sh` now makes an archive with the
 runtime and BUILD-INFO and refuses to checksum one that cannot build a program
 from an empty directory; `.github/workflows/release.yml` runs it, publishes,
-and downloads the result again to check it. None of that has produced a
-published release yet, so this stays open until one is.
+and downloads the result again to check it. v1.1.0 is the first release made
+that way, for macOS on arm64 and x86_64, and was checked after publishing by
+downloading it (`scripts/verify_release.sh --tag v1.1.0`); v1.0.0 stays as it
+was.
 
 **CI has never run -- *open*.** The workflows are written; the public
 repository holds them in `ci/github-workflows/`, because the import was pushed
 without GitHub's `workflow` scope. Every gate result in this repository comes
-from one arm64 Mac. No Linux binary has been linked or run anywhere.
+from one arm64 Mac. Linux binaries have been linked and run only in a local
+virtual machine on that Mac (S7, docs/self-hosting.md §6.18), never on CI.
 
 **Replay called C functions for real -- S1, *closed*.** Under `GRASM_REPLAY`
 an `extern fn` ran live: `unsafe { getpid() }` recorded 18839 and replayed
