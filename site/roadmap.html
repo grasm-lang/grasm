@@ -59,8 +59,8 @@
 
 <p class="eyebrow">More</p>
 <h1>Roadmap</h1>
-<p class="lede">Four workstreams toward a first release, running alongside the
-defect loop rather than instead of it.</p>
+<p class="lede">Five workstreams, running alongside the defect loop rather
+than instead of it.</p>
 
 <h2>1. This site</h2>
 <p>In progress — you are reading it. The <a href="playground.html">playground</a>
@@ -70,7 +70,11 @@ module is only as current as the last time anybody ran it. It has been wrong
 twice: the copy this site serves was five days behind the committed one, and
 the committed one was then nine days behind the compiler, so every page under
 <code>ProjectGold/</code> was running an older language than the pages
-describing it. Both found by checking rather than by noticing. The
+describing it. Both found by checking rather than by noticing. A second
+module, built by the compiler written in Grasm, is held to that one by
+<code>playtest</code> and is not what this site serves; switching is the
+owner's decision (<a href="playground.html">the playground page</a> has its
+figures). The
 <a href="tutorial.html">tutorial</a> and
 <a href="library.html">library reference</a> are the documents themselves,
 rendered when the site is written rather than summarised here.</p>
@@ -132,6 +136,31 @@ review rounds finding nothing new</em> — each conducted by someone who has see
 only the language pack, not this repository's history. Those rounds have not
 run. Until they do, the claim is not available, and no number of green gates
 substitutes for it.</p>
+
+<h2>5. Self-hosting</h2>
+<p>Decided on 20 October 2026 and planned in <code>docs/self-hosting.md</code>:
+the whole toolchain in Grasm — the compiler, its machine-code backends, the
+linker and the runtime — built by <code>grasm</code> itself, with no Rust,
+Cranelift, LLVM, C compiler or system linker in building it or in a user's
+native build. It writes machine code and object files itself; it never
+translates a program to C or any other language. Until the cutover the Rust
+toolchain is stage 0: it builds the first stage, it is what a release is built
+with, and every gate compares against it.</p>
+<div class="scroll"><table>
+<tr><th>Stage</th><th>Where it stands, as recorded</th></tr>
+<tr><td>S0, TIR</td><td>Specified in <code>docs/tir.md</code>; a TIR interpreter in Grasm prints and exits as <code>grasm run</code> does on every corpus program with a <code>main</code>.</td></tr>
+<tr><td>S1, the systems subset</td><td><code>u64</code>, bit operations, builders, raw memory and atomics, function addresses, <code>call_c</code>, <code>export fn</code>, thread-local cells and tuple map keys, each with spec clauses, both engines, conformance tests and a fuzz gate; the context switch was built with the runtime (§5, §6.9).</td></tr>
+<tr><td>S2, the frontend</td><td>Lexer, parser, checker and TIR in Grasm, held to the Rust frontend's tokens, trees, TIR and diagnostics; its exit criteria met (§6.13).</td></tr>
+<tr><td>S3, the arm64 backend</td><td>Every corpus program with a <code>main</code> that links no system library, 648 of 651, prints and exits as the Cranelift build does (<code>s3subset</code>, 25 and 26 November 2026). Its code is slower than Cranelift's; the figures §6.15 records were taken under load and are marked not to be quoted.</td></tr>
+<tr><td>S4, the linker</td><td>Grasm's own; it links the native build on arm64 macOS from source, and <code>cc</code> stays as <code>GRASM_LINKER=cc</code>.</td></tr>
+<tr><td>S5, the runtime</td><td>All of the runtime's entry points come from Grasm, and a program links with the Grasm runtime alone (§6.12).</td></tr>
+<tr><td>S6, self-compilation</td><td>Built by the Rust toolchain (stage 1), the compiler builds itself with no Rust runtime, no <code>cc</code> and no system linker on the way (stage 2), and stage 2 builds a stage 3 that is the same bytes: <code>fixpoint</code>, 54 of 54 identical, 25 and 26 November 2026.</td></tr>
+<tr><td>S7, more targets</td><td>x86-64 Mach-O, run under Rosetta, and Linux ELF on arm64 and x86-64 with an ELF linker. The Linux gates passed on 13 November 2026 in a local virtual machine, not on CI (<a href="status.html">the status page</a>).</td></tr>
+<tr><td>S8, the rest of the toolchain</td><td>Continues. The <code>grasm</code> command is written in Grasm and held to the Rust one by <code>clidiff</code>; the wasm32 backend builds the 533 corpus programs <code>wasmsubset</code> compares, each as <code>grasm run</code> and the native build, and a playground module. Left, among what §6.26 lists: the language server on a query engine, the debugger's cost per statement, the scheduler's cost per switch, the in-task recursion bound, recursion below 10,000 calls on an engine without JS promise integration, and the site's switch to the Grasm-built playground, which is the owner's decision.</td></tr>
+<tr><td>S9, the cutover</td><td>Not started: a release built entirely by stage 2, diverse double-compiling against the archived Rust implementation, Rust removed from the main branch and kept on a tag.</td></tr>
+</table></div>
+<p>Not promised by the plan: peak performance beyond Cranelift's class, Windows,
+or a target beyond the four of S7.</p>
 
 </main>
 </div>

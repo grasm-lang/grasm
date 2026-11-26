@@ -76,6 +76,34 @@ three have to match it.</p>
   <tr><td>Fibers</td><td><code>grasm_fiber</code></td><td>The stack switch a lightweight task runs on.</td></tr>
   <tr><td>Wasm</td><td><code>grasm_wasm</code></td><td>The interpreter, compiled for <code>wasm32</code>.</td></tr>
 </table>
+<p>Those crates are Rust, and they are what a release is built from. Beside
+them is a second compiler, written in Grasm.</p>
+
+<h2>The compiler in Grasm</h2>
+<p><code>compiler/</code> holds the toolchain again, in Grasm: a frontend to
+TIR (<code>compiler/front</code>); a mid-end and register allocators shared by
+the arm64 and x86-64 backends (<code>compiler/mir</code>,
+<code>compiler/vcode</code>, <code>compiler/aarch64</code>,
+<code>compiler/x86_64</code>) and a wasm32 backend
+(<code>compiler/wasm32</code>); Mach-O and ELF object writers; a linker for
+both (<code>compiler/link</code>); the runtime (<code>compiler/rt</code>); and
+the <code>grasm</code> command (<code>compiler/grasm</code>). It writes machine
+code and object files itself, with no Cranelift, LLVM, C compiler or system
+linker, and never translates a program to another language.</p>
+<p>Built by the Rust toolchain, it is stage 1. Stage 1 builds the compiler
+again, on its own runtime and linked by its own linker, with no Rust runtime,
+no <code>cc</code> and no <code>grasm</code> on the way: stage 2. Stage 2
+builds stage 3, and <code>fixpoint</code> requires the two to be the same
+bytes — on 25 and 26 November 2026, 54 compared, 54 identical. On the same
+runs it was held to the Rust toolchain: 648 corpus programs built by its arm64
+backend identical to the Cranelift build (<code>s3subset</code>), 533 compiled
+to wasm identical to <code>grasm run</code> and the native build
+(<code>wasmsubset</code>), and the whole <code>clidiff</code> with stage 2's
+<code>grasm</code> command passing against the Rust command.</p>
+<p>It does not ship yet. Until the cutover the Rust toolchain stays stage 0,
+the oracle every gate compares against, and what a release is built with;
+<a href="roadmap.html">the roadmap</a> has each stage, and
+<code>docs/self-hosting.md</code> every gate's line.</p>
 
 <h2>Why a compiled program links no standard library</h2>
 <p>A hello-world was 351.1 KB, and about 135 KB of it was
@@ -116,7 +144,7 @@ check. <code>region</code> is checked but does not yet free in bulk — the
 specification says so in the clause itself rather than implying otherwise.</p>
 
 <h2>The gates</h2>
-<p>193 of them, each judged by its exit code and nothing else. That rule
+<p>258 of them, each judged by its exit code and nothing else. That rule
 exists because a gate once reported <code>identical: 184  mismatched: 0</code>,
 which was true, while failing three lines further down.</p>
 <div class="grid two">
@@ -125,7 +153,7 @@ which was true, while failing three lines further down.</p>
   <div class="card"><h3>Differential</h3><p>Against things outside this project:
   OpenSSL for certificates, real zlib, git’s own object store, V8 for
   WebAssembly, clang’s assembler.</p></div>
-  <div class="card"><h3>Generated</h3><p>22 generators build programs
+  <div class="card"><h3>Generated</h3><p>25 generators build programs
   nobody wrote, then require every engine to agree on them too.</p></div>
   <div class="card"><h3>Laws</h3><p>218 properties that must hold. A law a
   degenerate implementation satisfies is not a law, and each one here is chosen

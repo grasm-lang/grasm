@@ -159,12 +159,12 @@ grep finds every place they do.</p>
 collector either. <a href="tiers.html">The four tiers →</a></p>
 
 <h2>6. The specification is normative, and every clause has a program</h2>
-<p>267 normative clauses in 3,544 lines, under a hard ceiling —
+<p>268 normative clauses in 3,549 lines, under a hard ceiling —
 every addition since has been paid for by compressing prose already written —
-and 274 programs in <code>spec/conformance</code>, so a clause is
+and 275 programs in <code>spec/conformance</code>, so a clause is
 not a sentence about intent but a file that fails. 167 clauses are
 <code>stable</code> and will not change incompatibly before 2.0;
-25 are <code>provisional</code> and 82 are
+25 are <code>provisional</code> and 83 are
 <code>experimental</code>, and a clause moves between those levels one at a
 time, on its own evidence.</p>
 
@@ -186,7 +186,7 @@ above and not only at the end of the site.</p>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
-<tr><td>Linux, today</td><td>CI compiles it. This machine type-checked it for the first time on 15 October 2026, which is the first time the 2,100 lines of <code>cfg(not(macos))</code> went through a compiler here: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for the whole workspace, every crate. In a debug profile one crate does not build — the runtime's <code>no_std</code> staticlib, which rustc refuses to compile under unwinding panics on any platform, and release is the only profile it is ever built in. Nothing has been <em>linked</em> or <em>run</em> on Linux, and a type-check is not a working binary.</td></tr>
+<tr><td>Linux, today</td><td>There is no Linux release, and the <code>grasm</code> command does not run on Linux yet. The compiler written in Grasm has arm64 and x86-64 Linux backends and its own ELF linker, and on 13 November 2026 the corpus built by it ran in an Ubuntu virtual machine on the development Mac, agreeing with the Rust compiler's build for each triple: 647 of 648 identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed. That is a local virtual machine, not CI; the CI workflows have never run.</td></tr>
 </table></div>
 
 <p class="note"><strong>The one-line version.</strong> Everywhere else, the

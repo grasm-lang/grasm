@@ -486,25 +486,35 @@ PAGES["install.html"] = (
     """
 <p class="eyebrow">Start</p>
 <h1>Install</h1>
-<p class="lede">Download one binary. Every subcommand is inside it, and there
-is no runtime to install beside it.</p>
+<p class="lede">Download one archive. Every subcommand is in the one binary,
+and the runtime library a native build links sits beside it.</p>
 
 <h2>Download</h2>"""
     + code(
-        """curl -fLO https://github.com/grasm-lang/grasm/releases/latest/download/grasm-aarch64-apple-darwin
-chmod +x grasm-aarch64-apple-darwin && mv grasm-aarch64-apple-darwin grasm
+        """curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.0/grasm-macos-arm64.tar.gz
+tar -xzf grasm-macos-arm64.tar.gz
+cd grasm-macos-arm64
 
 ./grasm run hello.gr""",
-        "One binary, eighteen subcommands, nothing beside it.",
+        "v1.1.0: grasm, libgrasm_rt_abi.a beside it, and BUILD-INFO naming the commit.",
     )
     + """
-<p>Apple silicon. On an Intel Mac take <code>grasm-x86_64-apple-darwin</code>
-instead. <a href="https://github.com/grasm-lang/grasm/releases/latest">Every
-download and its checksum →</a></p>
+<p>Apple silicon. On an Intel Mac take <code>grasm-macos-x86_64.tar.gz</code>
+instead; the checksums are in <code>SHA256SUMS</code> beside them.
+<a href="https://github.com/grasm-lang/grasm/releases/latest">Every
+download and its checksum →</a> There is no Linux release.</p>
+<p>v1.1.0 links a native build with a C toolchain's <code>cc</code>. Grasm's
+own linker, <code>grasm-link</code>, exists: built from source, a native build
+on arm64 macOS links with it and runs no C compiler or system linker — it reads
+only the SDK's text stubs for libSystem — and the arm64 macOS archive carries
+it from the release after v1.1.0. Elsewhere it links with <code>cc</code>.</p>
 
 <h2>Or build it</h2>
-<p>A Rust toolchain bootstraps the compiler, the way every language starts —
-and <strong>none of it survives into what you ship</strong>.
+<p>A Rust toolchain builds the compiler you download, the way every language
+starts, and will until the cutover: a second compiler, written in Grasm,
+already builds itself, and is not yet what ships
+(<a href="architecture.html">how it is built</a>). And
+<strong>none of the Rust survives into what you ship</strong>.
 All four crates a compiled Grasm program links are <code>no_std</code>: the
 runtime reaches the operating system through <code>grasm_sys</code>, over raw
 syscalls and libc, never over Rust's standard library. A hello-world is
@@ -519,11 +529,17 @@ cd grasm
 cargo build --release --workspace
 
 ./target/release/grasm run examples/hello.gr
+
+GRASM_LINKER=cc target/release/grasm build compiler/link/src/main.gr --native -o target/release/grasm-link
 """
     )
     + """
 <p>The binary is <code>target/release/grasm</code>. Put it on your path, or call
-it where it is.</p>
+it where it is. The last line builds <code>grasm-link</code>, the linker
+<code>--native</code> uses on arm64 macOS, with the compiler, linked by
+<code>cc</code> this once; the gates do it for you. A native build finds
+<code>libgrasm_rt_abi.a</code> and, on arm64 macOS, <code>grasm-link</code> beside it; <code>GRASM_LINKER=cc</code>
+links with <code>cc</code> instead.</p>
 
 <h2>What you get</h2>
 <div class="scroll"><table>
@@ -545,8 +561,11 @@ it where it is.</p>
 in <code>editors/vscode</code>. A debug adapter is in
 <code>crates/grasm_dap</code>.</p>
 
-<div class="note"><b>No release binaries yet.</b> Building from source is the
-only route today. That is on the <a href="roadmap.html">roadmap</a>.</div>
+<div class="note"><b>Release binaries are for macOS only.</b> v1.1.0 is
+published for arm64 and x86_64 with SHA-256 sums and no Apple Developer
+signature, so Gatekeeper asks before the first run. There is no Linux
+release; <a href="status.html">the status page</a> says what has run on
+Linux and where.</div>
 """,
 )
 
@@ -615,6 +634,24 @@ recursion limit the specification promises.</p>
 <p>In this page the missing facilities refuse the same way: a program that
 opens a file or a socket gets the ordinary error back, and <code>par_map</code>
 runs on one core with the same answer.</p>
+
+<h2>A second module, built by Grasm</h2>
+<p>The module this page serves is the Rust one. A second playground module
+exists, <code>tools/playground</code> — the Grasm frontend and TIR interpreter
+compiled by the compiler written in Grasm, through its own wasm32 backend —
+and <code>playtest</code> holds it to the Rust module and to
+<code>grasm run</code>. Its run of 25 and 26 November 2026: 508 corpus
+programs compared, all 508 the same as <code>grasm run</code> and as the Rust
+module, 114 set aside; 3,496,479 bytes against the committed Rust module's
+1,939,255; 1.464 times the Rust module's time, as a geometric mean over three interleaved
+rounds. Where the engine has JS promise integration it switches stacks and a
+recursion runs to 99,999 calls, as under <code>grasm run</code>; on an engine
+without it, it panics at 334 to 1,774 calls by shape, below the 10,000 the
+specification promises. The Rust-built module traps at 174 calls and loses
+the text of an <code>eprint</code>. The shallow recursion, the trap and the
+lost text are open defects in <code>docs/known-issues.md</code>. This page
+does not serve the Grasm-built module: switching is the owner's decision, not
+yet taken.</p>
 """,
 )
 
@@ -1475,14 +1512,15 @@ table because the margin moved once already with nothing noticing: see
 <tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>No 32-bit float</td><td><code>i8</code>, <code>i16</code>, <code>i32</code>, <code>u8</code>, <code>u16</code>, <code>u32</code> and <code>u64</code> are real types that wrap at their width (<code>spec/types.md</code> [T-INT-FIXED], [T-U64]), converted with <code>as_U</code> and <code>try_U</code>; a <code>u64</code> divides, compares, sorts and prints unsigned. <code>usize</code> and <code>f32</code> are refused rather than aliased. There is nothing wider than 64 bits. <code>bytes</code> is writable in place at one byte each, so a byte buffer is no longer eightfold — but a buffer of <em>samples</em> is still <code>[f64]</code> at eight bytes apiece.</td></tr>
 <tr><td>No shared mutable state across threads</td><td><code>par_map</code> and <code>par_filter</code> demand an empty effect row and will not reach a <code>ref</code> from outside; a task cannot be spawned per list element. No mutable globals, statics or thread-locals, and a handler holds no state between calls — which is what makes a recording replay.</td></tr>
-<tr><td>No SIMD, no file handles, no string builder</td><td>No intrinsics or autovectoriser. Whole-file and ranged reads only — no <code>seek</code>, no <code>mmap</code>, no streaming encoder. <code>str</code> is immutable, so appending in a loop is quadratic; collect and <code>join</code>.</td></tr>
+<tr><td>No SIMD, no file handles</td><td>No intrinsics or autovectoriser. Whole-file and ranged reads only — no <code>seek</code>, no <code>mmap</code>, no streaming encoder. <code>str</code> is immutable, so <code>s = s + x</code> in a loop is quadratic; a <code>StrBuilder</code> appends in amortized constant time (<code>spec/library.md</code> [L-LIB-BUILDER], an experimental clause), or collect and <code>join</code>.</td></tr>
 <tr><td>A window, but no widgets</td><td><code>packages/sdl</code> binds SDL2 — window, renderer, streaming texture, event poll — and <code>scripts/sdltest.sh</code> drives the whole path at <b>0.4 ms a frame</b> at 256&times;256 RGBA, gated with no display. What is missing above that is the toolkit: no buttons, sliders, text fields or layout, and no glyph rasteriser, so text means binding SDL2_ttf. Nothing addresses the GPU, and the wasm build ships the interpreter without DOM reach.</td></tr>
 <tr><td>A union error cannot be narrowed</td><td><code>(A|B)</code> is raised, propagated and printed, never destructured. Declare one sum type and match it.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
 <tr><td>Small standard library</td><td>«methods» methods. Enough for «gold» whole programs and «apps» applications; you will find gaps in something larger.</td></tr>
-<tr><td>Linux never linked or run here</td><td>The «linux_lines» lines of the operating-system layer written for Linux went through a compiler on this machine for the first time on 15 October 2026: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for every crate. Nothing has been linked or run, and a type-check does not catch a wrong constant — which is how <code>AF_INET6</code> was 30 on Linux for four commits. CI compiles it properly.</td></tr>
+<tr><td>No Linux release, and no CI</td><td>The release is macOS only, and the <code>grasm</code> command does not run on Linux yet. What has run there: on 13 November 2026, in an Ubuntu 25.10 virtual machine on the development Mac (OrbStack; arm64, glibc 2.42, x86-64 programs through Rosetta), the five Linux gates passed for both triples. Their reference is the Rust compiler's objects for the triple, linked with the Rust runtime built for it by the machine's GNU tools; against it, the ELF objects of the compiler written in Grasm, linked by that compiler's own linker: on each triple 647 of 648 programs identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed; 324 links per triple byte for byte GNU ld's (<code>docs/self-hosting.md</code> §6.18). That is a local virtual machine, not CI. The CI workflows are written and have never run: the public repository keeps them in <code>ci/github-workflows/</code>.</td></tr>
+<tr><td>The compiler in Grasm does not ship yet</td><td>A second compiler, written in Grasm, builds itself to a fixed point (<a href="architecture.html">how it is built</a>), but the Rust toolchain is still what a release is built with, the oracle every gate compares against, and the bootstrap. S8, the rest of the toolchain, continues; S9, the cutover, has not started.</td></tr>
 <tr><td>Tasks refuse every effect</td><td>«tasks» tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
-<tr><td>One gate is red, on purpose</td><td>The specification is <b>«spec_pages»</b> pages against the «spec_cap» §19.2 binds it to, and <code>crates/grasm_spec/tests/core.rs</code> fails past 70 because that is where recording the gap stops being enough. It crossed on 12 October when <code>[E-SCHEDULE]</code> was rewritten. The ceiling is not being raised and the metric is not being re-scoped, because <code>spec/core.md</code> rules both out: <em>a number that is met by redefining what counts is not a number</em>. <code>docs/known-issues.md</code> has what closing it costs.</td></tr>
+<tr><td>The specification is over its budget</td><td>The specification is <b>«spec_pages»</b> pages against the «spec_cap» §19.2 binds it to, and <code>crates/grasm_spec/tests/core.rs</code> fails past 70 because that is where recording the gap stops being enough. It crossed on 12 October when <code>[E-SCHEDULE]</code> was rewritten, and was back at 70, the test's ceiling, on 19 October, by moving records out of normative clauses rather than by raising anything; the commitment is still 20 pages away. The ceiling is not being raised and the metric is not being re-scoped, because <code>spec/core.md</code> rules both out: <em>a number that is met by redefining what counts is not a number</em>. <code>docs/known-issues.md</code> has what closing it costs.</td></tr>
 <tr><td>No query engine</td><td>Edit-to-diagnostic is p95 «incr_p95» ms by re-checking the whole program, which is fast enough at this repository's size and will not be at a million lines.</td></tr>
 <tr><td>No users but this project</td><td>Nobody has hit it from an angle nobody here thought of.</td></tr>
 <tr><td>Region sweep not implemented</td><td>Tier 1's rule is enforced; the bulk deallocation it makes sound is not built.</td></tr>
@@ -1537,8 +1575,8 @@ PAGES["roadmap.html"] = (
     """
 <p class="eyebrow">More</p>
 <h1>Roadmap</h1>
-<p class="lede">Four workstreams toward a first release, running alongside the
-defect loop rather than instead of it.</p>
+<p class="lede">Five workstreams, running alongside the defect loop rather
+than instead of it.</p>
 
 <h2>1. This site</h2>
 <p>In progress — you are reading it. The <a href="playground.html">playground</a>
@@ -1548,7 +1586,11 @@ module is only as current as the last time anybody ran it. It has been wrong
 twice: the copy this site serves was five days behind the committed one, and
 the committed one was then nine days behind the compiler, so every page under
 <code>ProjectGold/</code> was running an older language than the pages
-describing it. Both found by checking rather than by noticing. The
+describing it. Both found by checking rather than by noticing. A second
+module, built by the compiler written in Grasm, is held to that one by
+<code>playtest</code> and is not what this site serves; switching is the
+owner's decision (<a href="playground.html">the playground page</a> has its
+figures). The
 <a href="tutorial.html">tutorial</a> and
 <a href="library.html">library reference</a> are the documents themselves,
 rendered when the site is written rather than summarised here.</p>
@@ -1610,6 +1652,31 @@ review rounds finding nothing new</em> — each conducted by someone who has see
 only the language pack, not this repository's history. Those rounds have not
 run. Until they do, the claim is not available, and no number of green gates
 substitutes for it.</p>
+
+<h2>5. Self-hosting</h2>
+<p>Decided on 20 October 2026 and planned in <code>docs/self-hosting.md</code>:
+the whole toolchain in Grasm — the compiler, its machine-code backends, the
+linker and the runtime — built by <code>grasm</code> itself, with no Rust,
+Cranelift, LLVM, C compiler or system linker in building it or in a user's
+native build. It writes machine code and object files itself; it never
+translates a program to C or any other language. Until the cutover the Rust
+toolchain is stage 0: it builds the first stage, it is what a release is built
+with, and every gate compares against it.</p>
+<div class="scroll"><table>
+<tr><th>Stage</th><th>Where it stands, as recorded</th></tr>
+<tr><td>S0, TIR</td><td>Specified in <code>docs/tir.md</code>; a TIR interpreter in Grasm prints and exits as <code>grasm run</code> does on every corpus program with a <code>main</code>.</td></tr>
+<tr><td>S1, the systems subset</td><td><code>u64</code>, bit operations, builders, raw memory and atomics, function addresses, <code>call_c</code>, <code>export fn</code>, thread-local cells and tuple map keys, each with spec clauses, both engines, conformance tests and a fuzz gate; the context switch was built with the runtime (§5, §6.9).</td></tr>
+<tr><td>S2, the frontend</td><td>Lexer, parser, checker and TIR in Grasm, held to the Rust frontend's tokens, trees, TIR and diagnostics; its exit criteria met (§6.13).</td></tr>
+<tr><td>S3, the arm64 backend</td><td>Every corpus program with a <code>main</code> that links no system library, 648 of 651, prints and exits as the Cranelift build does (<code>s3subset</code>, 25 and 26 November 2026). Its code is slower than Cranelift's; the figures §6.15 records were taken under load and are marked not to be quoted.</td></tr>
+<tr><td>S4, the linker</td><td>Grasm's own; it links the native build on arm64 macOS from source, and <code>cc</code> stays as <code>GRASM_LINKER=cc</code>.</td></tr>
+<tr><td>S5, the runtime</td><td>All of the runtime's entry points come from Grasm, and a program links with the Grasm runtime alone (§6.12).</td></tr>
+<tr><td>S6, self-compilation</td><td>Built by the Rust toolchain (stage 1), the compiler builds itself with no Rust runtime, no <code>cc</code> and no system linker on the way (stage 2), and stage 2 builds a stage 3 that is the same bytes: <code>fixpoint</code>, 54 of 54 identical, 25 and 26 November 2026.</td></tr>
+<tr><td>S7, more targets</td><td>x86-64 Mach-O, run under Rosetta, and Linux ELF on arm64 and x86-64 with an ELF linker. The Linux gates passed on 13 November 2026 in a local virtual machine, not on CI (<a href="status.html">the status page</a>).</td></tr>
+<tr><td>S8, the rest of the toolchain</td><td>Continues. The <code>grasm</code> command is written in Grasm and held to the Rust one by <code>clidiff</code>; the wasm32 backend builds the 533 corpus programs <code>wasmsubset</code> compares, each as <code>grasm run</code> and the native build, and a playground module. Left, among what §6.26 lists: the language server on a query engine, the debugger's cost per statement, the scheduler's cost per switch, the in-task recursion bound, recursion below 10,000 calls on an engine without JS promise integration, and the site's switch to the Grasm-built playground, which is the owner's decision.</td></tr>
+<tr><td>S9, the cutover</td><td>Not started: a release built entirely by stage 2, diverse double-compiling against the archived Rust implementation, Rust removed from the main branch and kept on a tag.</td></tr>
+</table></div>
+<p>Not promised by the plan: peak performance beyond Cranelift's class, Windows,
+or a target beyond the four of S7.</p>
 """,
 )
 
@@ -1738,6 +1805,34 @@ three have to match it.</p>
   <tr><td>Fibers</td><td><code>grasm_fiber</code></td><td>The stack switch a lightweight task runs on.</td></tr>
   <tr><td>Wasm</td><td><code>grasm_wasm</code></td><td>The interpreter, compiled for <code>wasm32</code>.</td></tr>
 </table>
+<p>Those crates are Rust, and they are what a release is built from. Beside
+them is a second compiler, written in Grasm.</p>
+
+<h2>The compiler in Grasm</h2>
+<p><code>compiler/</code> holds the toolchain again, in Grasm: a frontend to
+TIR (<code>compiler/front</code>); a mid-end and register allocators shared by
+the arm64 and x86-64 backends (<code>compiler/mir</code>,
+<code>compiler/vcode</code>, <code>compiler/aarch64</code>,
+<code>compiler/x86_64</code>) and a wasm32 backend
+(<code>compiler/wasm32</code>); Mach-O and ELF object writers; a linker for
+both (<code>compiler/link</code>); the runtime (<code>compiler/rt</code>); and
+the <code>grasm</code> command (<code>compiler/grasm</code>). It writes machine
+code and object files itself, with no Cranelift, LLVM, C compiler or system
+linker, and never translates a program to another language.</p>
+<p>Built by the Rust toolchain, it is stage 1. Stage 1 builds the compiler
+again, on its own runtime and linked by its own linker, with no Rust runtime,
+no <code>cc</code> and no <code>grasm</code> on the way: stage 2. Stage 2
+builds stage 3, and <code>fixpoint</code> requires the two to be the same
+bytes — on 25 and 26 November 2026, 54 compared, 54 identical. On the same
+runs it was held to the Rust toolchain: 648 corpus programs built by its arm64
+backend identical to the Cranelift build (<code>s3subset</code>), 533 compiled
+to wasm identical to <code>grasm run</code> and the native build
+(<code>wasmsubset</code>), and the whole <code>clidiff</code> with stage 2's
+<code>grasm</code> command passing against the Rust command.</p>
+<p>It does not ship yet. Until the cutover the Rust toolchain stays stage 0,
+the oracle every gate compares against, and what a release is built with;
+<a href="roadmap.html">the roadmap</a> has each stage, and
+<code>docs/self-hosting.md</code> every gate's line.</p>
 
 <h2>Why a compiled program links no standard library</h2>
 <p>A hello-world was «hello_was» KB, and about «symbolizer_kb» KB of it was
@@ -1841,7 +1936,7 @@ in the same type system, and holding them there with «gates» gates on every
 build, is the part that is new.</p>
 
 <h2>The honest edge</h2>
-<p>Version 1.0, built inside one repository. Everything above is real and
+<p>Version «version», pre-alpha, built inside one repository. Everything above is real and
 gated; here is precisely where the edge of it sits today, so nobody finds out
 the hard way:</p>
 <ul>
@@ -2316,7 +2411,7 @@ above and not only at the end of the site.</p>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
-<tr><td>Linux, today</td><td>CI compiles it. This machine type-checked it for the first time on 15 October 2026, which is the first time the «linux_lines» lines of <code>cfg(not(macos))</code> went through a compiler here: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for the whole workspace, every crate. In a debug profile one crate does not build — the runtime's <code>no_std</code> staticlib, which rustc refuses to compile under unwinding panics on any platform, and release is the only profile it is ever built in. Nothing has been <em>linked</em> or <em>run</em> on Linux, and a type-check is not a working binary.</td></tr>
+<tr><td>Linux, today</td><td>There is no Linux release, and the <code>grasm</code> command does not run on Linux yet. The compiler written in Grasm has arm64 and x86-64 Linux backends and its own ELF linker, and on 13 November 2026 the corpus built by it ran in an Ubuntu virtual machine on the development Mac, agreeing with the Rust compiler's build for each triple: 647 of 648 identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed. That is a local virtual machine, not CI; the CI workflows have never run.</td></tr>
 </table></div>
 
 <p class="note"><strong>The one-line version.</strong> Everywhere else, the
@@ -2403,7 +2498,7 @@ last recorded run on this machine:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
 <tr><td>difftest / corpus</td><td>«difftest» programs</td><td><b>0 differences</b> across the engines</td></tr>
-<tr><td><code>leakcheck</code></td><td>«leak_programs» programs</td><td><b>1 leaking</b> — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> holds 16 allocations at exit, so this gate is <b>red</b>. The ratchet is at zero, which is why one leak fails it. See <code>docs/known-issues.md</code>.</td></tr>
+<tr><td><code>leakcheck</code></td><td>«leak_programs» programs</td><td><b>0 leaks</b> on 12 October. One was found on 15 October — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> held 16 allocations at exit, and the ratchet is at zero, so the gate was red — and on 19 October it reported 0 leaking of 579 checked. See <code>docs/known-issues.md</code>.</td></tr>
 <tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>«use_programs» programs</td><td><b>0 differences</b></td></tr>
 <tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>«cross_total» programs</td><td><b>«cross_pass» pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on «when_cross»: all «cross», nothing declined</em></td></tr>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
@@ -2420,8 +2515,7 @@ diff of what was printed.</p>
 The <code>crosstest</code> figure was taken on a machine at load 38 rising to
 134, where two <em>parallel</em> tests differed and then agreed on re-run, 3 of
 3 and 2 of 2. They are recorded as load artefacts because that is what they
-are, and the figure wants taking again on a quiet machine before anyone calls
-it green.</p>
+are, and the figure was taken again on a quiet machine, as the row says.</p>
 
 <h2>The three that moved, and what moved them</h2>
 
@@ -2487,7 +2581,7 @@ mistake bought →</a></p>
 <tr><td><b>Tasks refuse every effect</b> — G6's uncolored half</td><td>The task count is met; the goal is not. A task that cannot do I/O is not the thing the goal asks for.</td></tr>
 <tr><td><b>Sub-50 ms at a million lines</b> — G3's other half</td><td>A query engine. What exists is a batch compiler with an object cache, re-checking the whole program on every keystroke, and at this repository's size that is fast enough to hide the problem.</td></tr>
 <tr><td><b>G11's last 4% and 2%</b></td><td>Priced before building: list repetition and a stepped range are what Python has and Grasm does not on the worst row. Not closable by adding library methods.</td></tr>
-<tr><td><b>Linux has never been compiled here</b></td><td>About «linux_lines» lines of the operating-system layer are written for it and no target is installed on this machine. CI's ubuntu runner compiles it; a compile catches code that does not build, and does not catch a wrong constant — which is exactly how <code>AF_INET6</code> survived.</td></tr>
+<tr><td><b>Linux: a local virtual machine, not CI, and no release</b></td><td>The compiler written in Grasm targets arm64 and x86-64 Linux with its own ELF linker, and its five Linux gates passed on 13 November 2026 in an Ubuntu virtual machine on the development Mac (<a href="status.html">the status page</a> has the lines). What it would take: a <code>grasm</code> command that runs on Linux, a Linux release, and CI that has run at all — the workflows are written and never have.</td></tr>
 <tr><td><b>No remote registry</b></td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td><b>G1 and G10 need users</b></td><td>A week to ship a service, and 500 companies. Neither is a number this repository can produce by working harder on it.</td></tr>
 </table></div>

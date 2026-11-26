@@ -109,6 +109,24 @@ recursion limit the specification promises.</p>
 opens a file or a socket gets the ordinary error back, and <code>par_map</code>
 runs on one core with the same answer.</p>
 
+<h2>A second module, built by Grasm</h2>
+<p>The module this page serves is the Rust one. A second playground module
+exists, <code>tools/playground</code> — the Grasm frontend and TIR interpreter
+compiled by the compiler written in Grasm, through its own wasm32 backend —
+and <code>playtest</code> holds it to the Rust module and to
+<code>grasm run</code>. Its run of 25 and 26 November 2026: 508 corpus
+programs compared, all 508 the same as <code>grasm run</code> and as the Rust
+module, 114 set aside; 3,496,479 bytes against the committed Rust module's
+1,939,255; 1.464 times the Rust module's time, as a geometric mean over three interleaved
+rounds. Where the engine has JS promise integration it switches stacks and a
+recursion runs to 99,999 calls, as under <code>grasm run</code>; on an engine
+without it, it panics at 334 to 1,774 calls by shape, below the 10,000 the
+specification promises. The Rust-built module traps at 174 calls and loses
+the text of an <code>eprint</code>. The shallow recursion, the trap and the
+lost text are open defects in <code>docs/known-issues.md</code>. This page
+does not serve the Grasm-built module: switching is the owner's decision, not
+yet taken.</p>
+
 </main>
 </div>
 <footer class="sitefoot">

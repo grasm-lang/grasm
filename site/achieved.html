@@ -82,19 +82,19 @@ is met on all four engines, and the ≥99% figure is unmeasurable because nobody
 has run a Grasm program in production.</p>
 
 <h2>The gates, and what each one would catch</h2>
-<p>Judged by exit code alone, 193 of them. These are the figures from the
+<p>Judged by exit code alone, 258 of them. These are the figures from the
 last recorded run on this machine:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
 <tr><td>difftest / corpus</td><td>511 programs</td><td><b>0 differences</b> across the engines</td></tr>
-<tr><td><code>leakcheck</code></td><td>226 programs</td><td><b>1 leaking</b> — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> holds 16 allocations at exit, so this gate is <b>red</b>. The ratchet is at zero, which is why one leak fails it. See <code>docs/known-issues.md</code>.</td></tr>
+<tr><td><code>leakcheck</code></td><td>226 programs</td><td><b>0 leaks</b> on 12 October. One was found on 15 October — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> held 16 allocations at exit, and the ratchet is at zero, so the gate was red — and on 19 October it reported 0 leaking of 579 checked. See <code>docs/known-issues.md</code>.</td></tr>
 <tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>197 programs</td><td><b>0 differences</b></td></tr>
 <tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>224 programs</td><td><b>195 pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on 25 October 2026: all 648, nothing declined</em></td></tr>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
 <tr><td>unit tests</td><td>every crate</td><td><b>609 pass</b></td></tr>
 <tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>
-<tr><td>fuzzers</td><td>22 generators</td><td>clean</td></tr>
-<tr><td>conformance</td><td>274 programs</td><td>one per normative clause</td></tr>
+<tr><td>fuzzers</td><td>25 generators</td><td>clean</td></tr>
+<tr><td>conformance</td><td>275 programs</td><td>one per normative clause</td></tr>
 </table></div>
 <p><code>leakcheck</code> and <code>usecheck</code> are the two no other check
 replaces: a leaking program produces exactly the right output, and a premature
@@ -104,8 +104,7 @@ diff of what was printed.</p>
 The <code>crosstest</code> figure was taken on a machine at load 38 rising to
 134, where two <em>parallel</em> tests differed and then agreed on re-run, 3 of
 3 and 2 of 2. They are recorded as load artefacts because that is what they
-are, and the figure wants taking again on a quiet machine before anyone calls
-it green.</p>
+are, and the figure was taken again on a quiet machine, as the row says.</p>
 
 <h2>The three that moved, and what moved them</h2>
 
@@ -145,7 +144,7 @@ a receiver rather than another sender, and a round costs what is runnable.</p>
 <p>That changed an observable rule, so the specification changed with it:
 <code>[E-SCHEDULE]</code> now wakes the longest-waiting sender or receiver
 instead of going round-robin. It is an <em>experimental</em> clause, and all
-274 conformance programs produce identical output across the change.
+275 conformance programs produce identical output across the change.
 The interpreter stops near 285,000 tasks and is allowed to: an
 interpreter frame costs about 10 KB where a compiled one costs 30 bytes.</p>
 
@@ -171,7 +170,7 @@ mistake bought →</a></p>
 <tr><td><b>Tasks refuse every effect</b> — G6's uncolored half</td><td>The task count is met; the goal is not. A task that cannot do I/O is not the thing the goal asks for.</td></tr>
 <tr><td><b>Sub-50 ms at a million lines</b> — G3's other half</td><td>A query engine. What exists is a batch compiler with an object cache, re-checking the whole program on every keystroke, and at this repository's size that is fast enough to hide the problem.</td></tr>
 <tr><td><b>G11's last 4% and 2%</b></td><td>Priced before building: list repetition and a stepped range are what Python has and Grasm does not on the worst row. Not closable by adding library methods.</td></tr>
-<tr><td><b>Linux has never been compiled here</b></td><td>About 2,100 lines of the operating-system layer are written for it and no target is installed on this machine. CI's ubuntu runner compiles it; a compile catches code that does not build, and does not catch a wrong constant — which is exactly how <code>AF_INET6</code> survived.</td></tr>
+<tr><td><b>Linux: a local virtual machine, not CI, and no release</b></td><td>The compiler written in Grasm targets arm64 and x86-64 Linux with its own ELF linker, and its five Linux gates passed on 13 November 2026 in an Ubuntu virtual machine on the development Mac (<a href="status.html">the status page</a> has the lines). What it would take: a <code>grasm</code> command that runs on Linux, a Linux release, and CI that has run at all — the workflows are written and never have.</td></tr>
 <tr><td><b>No remote registry</b></td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td><b>G1 and G10 need users</b></td><td>A week to ship a service, and 500 companies. Neither is a number this repository can produce by working harder on it.</td></tr>
 </table></div>

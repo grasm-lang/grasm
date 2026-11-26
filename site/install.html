@@ -59,20 +59,30 @@
 
 <p class="eyebrow">Start</p>
 <h1>Install</h1>
-<p class="lede">Download one binary. Every subcommand is inside it, and there
-is no runtime to install beside it.</p>
+<p class="lede">Download one archive. Every subcommand is in the one binary,
+and the runtime library a native build links sits beside it.</p>
 
-<h2>Download</h2><figure class="code"><pre><code>curl <span class="op">-</span>fLO https<span class="op">:</span><span class="cm">//github.com/grasm-lang/grasm/releases/latest/download/grasm-aarch64-apple-darwin</span>
-chmod <span class="op">+</span>x grasm<span class="op">-</span>aarch64<span class="op">-</span>apple<span class="op">-</span>darwin <span class="op">&amp;</span><span class="op">&amp;</span> mv grasm<span class="op">-</span>aarch64<span class="op">-</span>apple<span class="op">-</span>darwin grasm
+<h2>Download</h2><figure class="code"><pre><code>curl <span class="op">-</span>fLO https<span class="op">:</span><span class="cm">//github.com/grasm-lang/grasm/releases/download/v1.1.0/grasm-macos-arm64.tar.gz</span>
+tar <span class="op">-</span>xzf grasm<span class="op">-</span>macos<span class="op">-</span>arm64<span class="op">.</span>tar<span class="op">.</span>gz
+cd grasm<span class="op">-</span>macos<span class="op">-</span>arm64
 
-<span class="op">.</span><span class="op">/</span>grasm run hello<span class="op">.</span>gr</code></pre><figcaption>One binary, eighteen subcommands, nothing beside it.</figcaption></figure>
-<p>Apple silicon. On an Intel Mac take <code>grasm-x86_64-apple-darwin</code>
-instead. <a href="https://github.com/grasm-lang/grasm/releases/latest">Every
-download and its checksum →</a></p>
+<span class="op">.</span><span class="op">/</span>grasm run hello<span class="op">.</span>gr</code></pre><figcaption>v1.1.0: grasm, libgrasm_rt_abi.a beside it, and BUILD-INFO naming the commit.</figcaption></figure>
+<p>Apple silicon. On an Intel Mac take <code>grasm-macos-x86_64.tar.gz</code>
+instead; the checksums are in <code>SHA256SUMS</code> beside them.
+<a href="https://github.com/grasm-lang/grasm/releases/latest">Every
+download and its checksum →</a> There is no Linux release.</p>
+<p>v1.1.0 links a native build with a C toolchain's <code>cc</code>. Grasm's
+own linker, <code>grasm-link</code>, exists: built from source, a native build
+on arm64 macOS links with it and runs no C compiler or system linker — it reads
+only the SDK's text stubs for libSystem — and the arm64 macOS archive carries
+it from the release after v1.1.0. Elsewhere it links with <code>cc</code>.</p>
 
 <h2>Or build it</h2>
-<p>A Rust toolchain bootstraps the compiler, the way every language starts —
-and <strong>none of it survives into what you ship</strong>.
+<p>A Rust toolchain builds the compiler you download, the way every language
+starts, and will until the cutover: a second compiler, written in Grasm,
+already builds itself, and is not yet what ships
+(<a href="architecture.html">how it is built</a>). And
+<strong>none of the Rust survives into what you ship</strong>.
 All four crates a compiled Grasm program links are <code>no_std</code>: the
 runtime reaches the operating system through <code>grasm_sys</code>, over raw
 syscalls and libc, never over Rust's standard library. A hello-world is
@@ -83,9 +93,15 @@ syscalls and libc, never over Rust's standard library. A hello-world is
 cd grasm
 cargo build <span class="op">-</span><span class="op">-</span>release <span class="op">-</span><span class="op">-</span>workspace
 
-<span class="op">.</span><span class="op">/</span>target<span class="op">/</span>release<span class="op">/</span>grasm run examples<span class="op">/</span>hello<span class="op">.</span>gr</code></pre>
+<span class="op">.</span><span class="op">/</span>target<span class="op">/</span>release<span class="op">/</span>grasm run examples<span class="op">/</span>hello<span class="op">.</span>gr
+
+<span class="ty">GRASM_LINKER</span><span class="op">=</span>cc target<span class="op">/</span>release<span class="op">/</span>grasm build compiler<span class="op">/</span>link<span class="op">/</span>src<span class="op">/</span>main<span class="op">.</span>gr <span class="op">-</span><span class="op">-</span>native <span class="op">-</span>o target<span class="op">/</span>release<span class="op">/</span>grasm<span class="op">-</span>link</code></pre>
 <p>The binary is <code>target/release/grasm</code>. Put it on your path, or call
-it where it is.</p>
+it where it is. The last line builds <code>grasm-link</code>, the linker
+<code>--native</code> uses on arm64 macOS, with the compiler, linked by
+<code>cc</code> this once; the gates do it for you. A native build finds
+<code>libgrasm_rt_abi.a</code> and, on arm64 macOS, <code>grasm-link</code> beside it; <code>GRASM_LINKER=cc</code>
+links with <code>cc</code> instead.</p>
 
 <h2>What you get</h2>
 <div class="scroll"><table>
@@ -107,8 +123,11 @@ it where it is.</p>
 in <code>editors/vscode</code>. A debug adapter is in
 <code>crates/grasm_dap</code>.</p>
 
-<div class="note"><b>No release binaries yet.</b> Building from source is the
-only route today. That is on the <a href="roadmap.html">roadmap</a>.</div>
+<div class="note"><b>Release binaries are for macOS only.</b> v1.1.0 is
+published for arm64 and x86_64 with SHA-256 sums and no Apple Developer
+signature, so Gatekeeper asks before the first run. There is no Linux
+release; <a href="status.html">the status page</a> says what has run on
+Linux and where.</div>
 
 </main>
 </div>

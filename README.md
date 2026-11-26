@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://grasm-lang.github.io"><img src="https://img.shields.io/badge/grasm--lang.github.io-visit-3DDC97?style=for-the-badge&labelColor=0A101C" alt="website"></a>
   <img src="https://img.shields.io/badge/v1.1.0-pre--alpha-17A2A2?style=for-the-badge&labelColor=0A101C" alt="v1.1.0">
-  <img src="https://img.shields.io/badge/gates-103%20green%20·%201%20red-F6AE2D?style=for-the-badge&labelColor=0A101C" alt="gates">
+  <img src="https://img.shields.io/badge/self--hosting-S8%20of%20S9-F6AE2D?style=for-the-badge&labelColor=0A101C" alt="self-hosting: S8 of S9">
   <img src="https://img.shields.io/badge/GC-none-3DDC97?style=for-the-badge&labelColor=0A101C" alt="no GC">
 </p>
 
@@ -54,8 +54,8 @@ error: package `crypto-core` performs [io] but permits []
 
 <img src="assets/replay.svg" alt="A recorded journal replays byte-identically on the interpreter, native binary and wasm" width="100%">
 
-Every read from outside the program goes through **28 builtins**, and
-`GRASM_RECORD` writes down what each one returned. That journal *is* the bug
+Every read from outside the program goes through **44 journaled builtins**,
+and `GRASM_RECORD` writes down what each one returned. That journal *is* the bug
 report. `GRASM_REPLAY` runs it back — on a different engine, in a sandbox with
 no sockets, no filesystem, no clock and no processes.
 
@@ -140,25 +140,44 @@ program links are `#![no_std]`; `grasm_rt_abi` supplies Grasm's own
 `#[global_allocator]` and `#[panic_handler]`. A hello-world is **85.7 KB**
 and `nm` finds no Rust standard library in it.
 
-The compiler is *written in* Rust today, the way Rust's first compiler was
-written in OCaml and Go's in C. That is a bootstrap, and it is the one thing
-here designed to be replaced — [`MASTERPLAN.md`](MASTERPLAN.md) puts
-self-hosting at Phase 4. The language does not depend on it.
+The compiler you download is *written in* Rust, the way Rust's first compiler
+was written in OCaml and Go's in C. That is a bootstrap, and it is the one
+thing here designed to be replaced. The replacement exists:
+[`compiler/`](compiler/) is a second compiler written in Grasm — frontend,
+arm64, x86-64 and wasm32 backends, Mach-O and ELF writers, its own linker, its
+own runtime, the `grasm` command — and **it builds itself**. Built by the Rust
+toolchain it is stage 1; stage 1 builds it again with no Rust runtime, no `cc`
+and no `grasm` on the way; that stage 2 builds a stage 3 that is the same bytes,
+54 artifacts of 54. It does not ship yet: until the cutover the Rust toolchain
+stays the oracle every gate compares against and what a release is built with.
+[`docs/self-hosting.md`](docs/self-hosting.md) has the plan and every gate's
+line.
 
 ## Speed, stated honestly
 
 <img src="assets/speed.svg" alt="Eight benchmark programs against Rust -O3, geomean 0.965×" width="100%">
 
-## Measured, 15 October 2026
+## Measured
 
 | Gate | What it compares | Programs |
 |---|---|---:|
-| `difftest` | interpreter · native · bundle agree | **511** |
-| `crosstest` | cross-compiled x86_64, identical | **511** |
-| `wasmtest` | identical in the browser engine | **415** |
+| `difftest` | interpreter · native · bundle agree | **648** |
+| `crosstest` | cross-compiled x86_64, identical | **648** |
+| `wasmtest` | identical in the browser engine | **508** |
 | `ProjectGold` | whole applications, every engine | **44** |
-| `fuzz_laws` | algebraic laws against arithmetic | **205** |
-| `depth` | nested calls reached, 10,000 promised | **31,444** |
+| `fuzz_laws` | algebraic laws against arithmetic | **218** |
+| `depth` | nested calls reached, 10,000 promised | **31,093** |
+
+Those six from the run of 25 October 2026 (`site/facts.json`). The compiler in
+Grasm, from its runs of 25 and 26 November 2026:
+
+| Gate | What it compares | Result |
+|---|---|---:|
+| `fixpoint` | stage 3 against stage 2, byte for byte | **54 of 54** |
+| `s3subset` | its arm64 build against the Cranelift build | **648**, 0 mismatched |
+| `wasmsubset` | its wasm build against `grasm run` and native | **533**, all |
+| `playtest` | its playground module against the Rust one | **508**, all |
+| `elfsubset` | its Linux build, per triple, in a local VM (13 Nov) | **647 of 648** |
 
 | Goal | Target | Measured |
 |---|---|---|
@@ -167,9 +186,11 @@ self-hosting at Phase 4. The language does not depend on it.
 | Edit → diagnostic | ≤ 50 ms | **p50 21 ms** |
 | Lightweight tasks | 1M per node | **1,000,000 in 22 s** |
 
-> **One gate is red on purpose.** The specification is 71 pages against the 50
-> it binds itself to. Raising the ceiling would meet the number by redefining
-> it. [`docs/known-issues.md`](docs/known-issues.md) prices the fix.
+> **One commitment is missed on purpose.** The specification is 70 pages
+> against the 50 it binds itself to. Its test allows 70 and no more, and prose
+> moved out of the spec, not a raised ceiling, brought it back there. Raising
+> either number would meet it by redefining it.
+> [`docs/known-issues.md`](docs/known-issues.md) prices the fix.
 
 ## Taste
 
@@ -221,14 +242,18 @@ tar -xzf grasm-macos-arm64.tar.gz
 
 **One binary, seventeen subcommands**, with the runtime library that native
 builds link beside it in the archive. On its own it checks, formats, lints,
-tests and runs programs; `grasm build --native` also needs a C toolchain's
-`cc` to link with, until Grasm's own linker exists. Intel Macs take
-`grasm-macos-x86_64.tar.gz`; checksums are in `SHA256SUMS` beside them.
+tests and runs programs; v1.1.0's `grasm build --native` also needs a C
+toolchain's `cc` to link with. Grasm's own linker, `grasm-link`, now exists:
+built from source, a native build on arm64 macOS links with it and runs no C
+compiler or system linker, and the arm64 macOS archive carries it from the
+release after v1.1.0. Intel Macs take `grasm-macos-x86_64.tar.gz`; checksums
+are in `SHA256SUMS` beside them. There is no Linux release.
 [All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
 
 Building from source needs a Rust toolchain to bootstrap the compiler, the way
-every language starts — [`docs/overview.md`](docs/overview.md) has it, and
-nothing of that toolchain reaches what you ship.
+every language starts, until the cutover —
+[`docs/overview.md`](docs/overview.md) has it, and nothing of that toolchain
+reaches what you ship.
 
 | What | Where |
 |---|---|
@@ -237,7 +262,8 @@ nothing of that toolchain reaches what you ship.
 | 📐 Language specification | [`spec/`](spec/) |
 | 📊 Goals against measurements | [`docs/northstar.md`](docs/northstar.md) |
 | 🗺️ Strategy and roadmap | [`MASTERPLAN.md`](MASTERPLAN.md) |
+| 🔁 The compiler in Grasm, stage by stage | [`docs/self-hosting.md`](docs/self-hosting.md) |
 | 🐛 Open defects, with reproducers | [`docs/known-issues.md`](docs/known-issues.md) |
 | 🔎 101 findings from building it | [`ProjectGold/FINDINGS.md`](ProjectGold/FINDINGS.md) |
 
-<p align="center"><sub>Pre-alpha. One platform exercised (arm64 macOS); Linux type-checks and has never been linked.<br>Every number on this page comes from the gate run that produced it, recorded in <code>site/facts.json</code>.</sub></p>
+<p align="center"><sub>Pre-alpha. Released for macOS (arm64; x86_64, exercised under Rosetta). Linux builds have run only in a local virtual machine, never on CI, and there is no Linux release.<br>Every number on this page comes from the gate run that produced it, recorded in <code>site/facts.json</code>, <code>docs/northstar.md</code> and <code>docs/self-hosting.md</code>.</sub></p>

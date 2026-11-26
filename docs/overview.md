@@ -13,8 +13,11 @@ value semantics with ownership (`own`/`inout`, no lifetime annotations), an
 error unions (`T ! E` with `try`/`fail`), generics, ADTs with exhaustive
 matching — and a single-binary toolchain.
 
-This repository contains the working Grasm-Core implementation (Rust) plus the
-full strategic blueprint ([MASTERPLAN.md](../MASTERPLAN.md)).
+This repository contains the working Grasm-Core implementation in Rust, which
+is what a release is built from; in `compiler/`, a second compiler written in
+Grasm, which builds itself and does not ship yet
+([docs/self-hosting.md](self-hosting.md), and below); and the full
+strategic blueprint ([MASTERPLAN.md](../MASTERPLAN.md)).
 
 ```grasm
 effect Clock { fn now() -> i64 }
@@ -43,13 +46,61 @@ fn main() {
 
 `docs/northstar.md` records the MASTERPLAN's own measurable goals against
 measurements, taken by `./scripts/northstar.sh` rather than remembered. Thirteen
-rows: four met, one met with the qualification written next to it, one partly,
-four missed with numbers attached, and three that cannot be measured from inside
-this repository at all — two of those need someone else to use the language.
+rows: nine met, several with the qualification written next to them; two missed
+by 4% and 2% (G11, tokens against Python and Go); and two that cannot be
+measured from inside this repository at all, because they need someone else to
+use the language (G1, G10).
 
 `spec/core.md` does the same for the kernel-language commitment:
 37 constructs against a budget of 30, with the seven that would close the gap
 named.
+
+### The compiler in Grasm
+
+Phase 4 (`docs/self-hosting.md`, decided 2026-10-20) makes the whole toolchain
+Grasm: the compiler, its machine-code backends, the linker and the runtime,
+built by `grasm` itself, with no Rust, Cranelift, LLVM, C compiler or system
+linker in building it or in a user's native build. It writes machine code and
+object files itself and never translates a program to C or any other
+language. Where it stands, each line a gate's on the final runs of S8 part
+nine (2026-11-25 and 26, §6.26) unless it says otherwise:
+
+- **It builds itself.** `compiler/` holds a frontend to TIR, a mid-end and
+  backends for arm64, x86-64 and wasm32, Mach-O and ELF object writers, a
+  linker for both, the runtime, and the `grasm` command. Built by the Rust
+  toolchain it is stage 1; stage 1 builds it again on its own runtime, linked
+  by its own linker, with no Rust runtime, no `cc` and no `grasm` on the way
+  (stage 2); stage 2 builds a stage 3 that is the same bytes. `fixpoint`:
+  "compared: 54 ... identical: 54   differ: 0".
+- **It is held to the Rust toolchain.** `s3subset`: every corpus program with a
+  `main` that links no system library, built by the arm64 backend, prints and
+  exits as the Cranelift build does -- "identical: 648   mismatched: 0". The
+  corpus compiled to wasm by it (`wasmsubset`): 533 compared, 533 as `grasm
+  run` and as the native build. The whole `clidiff` with stage 2's `grasm`
+  command passed against the Rust command, among its lines "run: 651 programs
+  with a main   the same: 651" and "lsp: 2092 sessions   the same: 2092".
+- **More targets** (S7, §6.16 and §6.18): x86-64 Mach-O, run under Rosetta,
+  and Linux ELF on arm64 and x86-64, linked by its own linker to GNU ld's
+  bytes. The Linux gates passed on 2026-11-13 in an Ubuntu virtual machine on
+  the development Mac (OrbStack), not on CI: on each triple 647 of 648
+  programs identical to the Rust compiler's build, the one other agreeing with
+  the Cranelift build and not the interpreter, as listed.
+- **A playground module built by it** (`tools/playground`, §6.25): `playtest`
+  holds it to the Rust module and `grasm run` -- 508 corpus programs compared,
+  508 the same as both. It is 3,496,479 bytes against the Rust module's
+  1,939,255 and takes 1.464 times its time (geometric mean). The site still
+  serves the Rust-built module; switching is the owner's decision.
+
+What is not done: nothing released is built by it. The Rust toolchain is
+still stage 0, the oracle every gate compares against, and what a release is
+built with. Its code is slower than Cranelift's (§6.15 records figures taken
+under load and marked not to be quoted). S8, the rest of the toolchain,
+continues -- among what §6.26 leaves are the language server on a query
+engine, the debugger's cost per statement, and a recursion below 10,000 calls
+on a wasm engine without JS promise integration (open in
+`docs/known-issues.md`). S9, the cutover -- a release built entirely by stage
+2, the diverse double-compiling check, Rust removed from the main branch --
+has not started.
 
 ### Something built with it
 
@@ -391,11 +442,14 @@ params, `map`/`filter` (lowered as inline loops), and multi-module programs.
 **Targets.** `--target <triple>` emits an object for a supported
 architecture. A unit test emits a hello-world object for `x86_64` and `aarch64`
 Linux, `riscv64gc`, big-endian `s390x` and `x86_64` macOS, and checks only that
-one was written. Objects are linked and run only on macOS here: arm64 natively
-and x86_64 under Rosetta (`scripts/crosstest.sh`). No Linux build has been
-linked or run. Host builds link automatically; cross builds emit the object
-for you to link with that target's toolchain and a `libgrasm_rt_abi.a` built
-for it:
+one was written. Objects are linked and run on macOS, arm64 natively and x86_64
+under Rosetta (`scripts/crosstest.sh`), and for the two Linux triples in an
+Ubuntu virtual machine on the development Mac, where `elfsubset` links them with
+the Rust runtime built for the triple by the machine's GNU tools as its
+reference (`docs/self-hosting.md` §6.18) -- a local machine, not CI. There is no
+Linux release, and the `grasm` command does not run on Linux yet. Host builds
+link automatically; cross builds emit the object for you to link with that
+target's toolchain and a `libgrasm_rt_abi.a` built for it:
 
 ```
 rustup target add x86_64-apple-darwin
@@ -409,14 +463,15 @@ The backend also compiles structured concurrency, generic functions
 as data, a closure bound to a name, and lists of either, dispatched through an
 indirect call.
 
-`scripts/difftest.sh` is the correctness gate: every program in `examples/`,
-`projects/`, `spec/conformance/`, and `benchmarks/` is run through both engines
-and the outputs must match byte for byte. Current status — **130 identical, 0
-mismatched, 0 unsupported**: nothing in the repository is left to the
-interpreter. Anything the backend cannot compile names the missing feature and
-points at the interpreter; it never silently miscompiles.
+`scripts/difftest.sh` is the correctness gate: every program in the corpus
+(`scripts/lib/corpus.sh`) is run through both engines and the outputs must
+match byte for byte. Its last recorded run (`site/facts.json`, 2026-10-25):
+**648 identical**, every program with a `main` but the three that link SDL,
+which `scripts/sdltest.sh` checks against real SDL2 instead. Anything the
+backend cannot compile names the missing feature and points at the
+interpreter; it never silently miscompiles.
 
-Those 130 programs are still a sample, and a sample only finds the
+Those programs are still a sample, and a sample only finds the
 disagreements someone thought to look for. `scripts/fuzz_differential.py`
 generates programs instead — well-typed by construction, and total by
 construction, so codegen is the only thing left to disagree about. It earned
@@ -470,13 +525,15 @@ while its binary called libc; and `unsafe { sqrt }` carried one onto
 run).
 
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
-prove the backend isn't accidentally host-specific — currently **130 identical,
-0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
+prove the backend isn't accidentally host-specific — its last recorded run
+(`site/facts.json`, 2026-10-25): **648 identical** for x86_64 built on arm64
+and run under Rosetta. CI
 (`.github/workflows/ci.yml`) is written to run build + tests + clippy + the
 differential gate on linux-x86_64, macos-arm64 and macos-x86_64. It has not
 run: the public repository keeps the workflow files in `ci/github-workflows/`
 until a push carrying GitHub's `workflow` scope moves them into place. The
-gates in this README ran on one arm64 Mac.
+gates in this README ran on one arm64 Mac, the Linux ones in an Ubuntu virtual
+machine on it.
 
 `scripts/fuzz_modules.py` builds programs of more than one file, which nothing
 else here does. Twenty positions a name from another module can stand in — a
@@ -671,7 +728,8 @@ rule has no conformance program, if a program names a rule that no longer
 exists, or if any program's behavior differs from what it declares. The
 specification therefore cannot drift from the implementation without a red test.
 
-Currently **65 normative clauses, 65 conformance programs**.
+On 2026-11-26, **268 normative clauses and 275 conformance programs** (the site
+counts both from the tree each time it is written).
 
 ## Layout
 
@@ -686,6 +744,8 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `crates/grasm_pkg` | manifests, resolution, capability ceilings, lockfiles |
 | `crates/grasm_spec` | specification conformance harness |
 | `crates/grasm` | the `grasm` CLI |
+| `compiler/` | the compiler in Grasm (Phase 4, not shipped): `front` (source to TIR), `mir`, `vcode`, `aarch64`, `x86_64`, `wasm32`, `macho`, `elf`, `link`, `rt` and its parts, `s3` (the backend's driver) and `grasm` (the command) |
+| `tools/` | `tirinterp` (the TIR interpreter in Grasm), `gfmt`, `playground` (the playground module built by the Grasm wasm32 backend) |
 | `examples/` | small demos (hello, errors, effects, ownership) |
 | `projects/beginner` | validation: games, todo, text stats, unit converter |
 | `projects/intermediate` | validation: JSON parser, CSV pipeline, KV store, calculator |
@@ -693,24 +753,37 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `spec/` | normative specification + one conformance program per clause |
 | `editors/` | VS Code extension and LSP setup for other editors |
 | `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py`, `fuzz_fallible.py`, `fuzz_generics.py`, `fuzz_rows.py`, `fuzz_handlers.py` and `fuzz_extern.py` (generated programs) |
-| `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
+| `MASTERPLAN.md` | the full v0.3 strategic blueprint |
+| `docs/self-hosting.md` | Phase 4, the self-hosted toolchain: the plan, every part as built, and every gate's line |
 
 ## Status
 
-Grasm-Core (the master plan's §19 kernel language), Phase-2 features (modules,
-maps, self-contained builds), and the **Cranelift native backend** are complete
-and validated: 175 Rust tests + 40+ in-language test blocks across 17 programs,
-an adversarial fuzz/stress suite, a native-vs-interpreter differential gate, and
-zero clippy warnings, and a 3-platform CI matrix. The interpreter remains the
-reference semantics; the native backend is checked against it on every program,
-on both the host and a cross-compiled target. Next milestones (see MASTERPLAN
-§13): LSP, concurrency runtime, package manager, first-class function values.
+Pre-alpha. v1.1.0 is the latest release, for macOS on arm64 and x86_64; there
+is no Linux release. What ships is the Rust implementation: Grasm-Core (the
+master plan's §19 kernel language), modules, maps, self-contained builds, the
+Cranelift native backend, the wasm build behind the playground, the language
+server and debug adapter, structured concurrency with lightweight tasks, the
+package manager with capability ceilings, and first-class function values. The
+interpreter remains the reference semantics; the native backend is checked
+against it on every program, on the host and on a cross-compiled target.
+`docs/northstar.md` has the goals against measurements and
+`docs/known-issues.md` every open defect.
+
+The self-hosted toolchain (Phase 4, `docs/self-hosting.md`) is under way and
+does not ship: the compiler in Grasm builds itself to a fixed point and targets
+arm64 and x86-64 macOS and Linux and wasm32 ("The compiler in Grasm", above).
+S8, the rest of the toolchain, continues; S9, the cutover, has not started, so
+the Rust toolchain stays the oracle and the bootstrap.
+
+CI has never run. The workflows are written and the public repository keeps
+them in `ci/github-workflows/`; every gate result in this repository comes from
+one arm64 Mac, the Linux ones from an Ubuntu virtual machine on it.
 
 ## Project
 
-Apache-2.0 (`LICENSE`, `NOTICE`). Pre-1.0 — `docs/stability.md` says exactly
-what that means, and `spec/stability.md` records the level of every normative
-clause. A clause with no recorded level fails the test suite, so the policy
+Apache-2.0 (`LICENSE`, `NOTICE`). Version 1.1.0 — `docs/stability.md` says
+exactly what 1.0 commits to, and `spec/stability.md` records the level of every
+normative clause. A clause with no recorded level fails the test suite, so the policy
 cannot drift away from the specification.
 
 - `CONTRIBUTING.md` — the gates, and the one rule the rest follows from
