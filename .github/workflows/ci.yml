@@ -32,7 +32,10 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
       - name: Unit + integration tests
-        run: cargo test --workspace
+        # In release, as scripts/allgates.sh runs them: the CLI tests build
+        # natively and find libgrasm_rt_abi.a beside the binary under test,
+        # and only the release build above has made it.
+        run: cargo test --release --workspace
       - name: Lints (deny warnings)
         # --all-targets so test files are linted too; a lint that only fires in
         # a test still fires on someone's machine.

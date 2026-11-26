@@ -2408,6 +2408,12 @@ fn build_native_incremental(
                     c.arg(format!("-Wl,-exported_symbol,_{e}"));
                 }
             } else if cfg!(target_os = "linux") {
+                // glibc keeps the maths functions (`sin`, `log`, `pow`, ...)
+                // in libm, which `cc` does not link by default; on macOS
+                // they are in libSystem. Without it every program that
+                // calls one failed to link on Linux, which the first CI run
+                // found (macOS had been the only host).
+                c.arg("-lm");
                 for e in &exports {
                     c.arg(format!("-Wl,--export-dynamic-symbol={e}"));
                 }
