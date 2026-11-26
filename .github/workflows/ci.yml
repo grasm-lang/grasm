@@ -1,5 +1,8 @@
 name: CI
 
+# Rust pinned to the toolchain the local gates run (1.99.1): a newer
+# stable's clippy brings lints the tree was never held to, and CI then
+# disagrees with scripts/allgates.sh about the same commit.
 on:
   push:
     branches: [main, master]
@@ -23,14 +26,24 @@ jobs:
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           components: clippy
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
       - name: Build
         run: cargo build --release --workspace
+      - name: Grasm's own linker (arm64 macOS)
+        # `--native` links with grasm-link on arm64 macOS (docs/self-hosting.md
+        # S4), built from compiler/link by the compiler just built -- by cc and
+        # then by itself, as scripts/package.sh builds it for a release.
+        if: matrix.name == 'macos-arm64'
+        run: |
+          GRASM_LINKER=cc ./target/release/grasm build compiler/link/src/main.gr --native -o target/release/grasm-link.stage
+          GRASM_LINKER="$PWD/target/release/grasm-link.stage" ./target/release/grasm build compiler/link/src/main.gr --native -o target/release/grasm-link
+          rm target/release/grasm-link.stage
       - name: Unit + integration tests
         # In release, as scripts/allgates.sh runs them: the CLI tests build
         # natively and find libgrasm_rt_abi.a beside the binary under test,
@@ -100,7 +113,9 @@ jobs:
     name: generated programs
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -133,7 +148,9 @@ jobs:
     name: cross-target object emission
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - run: cargo build --release --workspace
       - name: Emit objects for every supported architecture
         run: |

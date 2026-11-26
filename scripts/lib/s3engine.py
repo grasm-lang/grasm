@@ -50,6 +50,7 @@ limit; a run killed by SIGKILL is run once more from a fresh inode, as
 
 import importlib.util as _ilu
 import os
+import platform
 import re
 import subprocess
 
@@ -167,6 +168,21 @@ class Engine:
         # The x86-64 reference: its object and its binary.
         self.xref = os.path.join(work, "s3.xref")
         self.xref_obj = self.xref + ".o"
+        # The engine builds for a macOS host: the driver's default target is
+        # arm64 Mach-O and the link is `cc ... -Wl,-dead_strip`. On any other
+        # host (CI's Linux runners) it is not run, and `report` says so rather
+        # than counting 120 link failures or passing in silence. The Linux
+        # objects compiler/s3 writes are held by `elfsubset` instead
+        # (docs/self-hosting.md §6.18).
+        self.host = platform.system()
+        self.not_here = None
+        if self.host != "Darwin":
+            self.not_here = (f"s3 engine: not run on {self.host}: compiler/s3 is held here on "
+                             "macOS hosts only; its Linux objects by elfsubset "
+                             "(docs/self-hosting.md §6.18)")
+            self.driver = None
+            self.own_driver = False
+            return
         if not os.path.isfile(self.rt):
             self.error = f"the runtime {self.rt} is missing"
         self.driver = os.environ.get("S3")
@@ -234,6 +250,8 @@ class Engine:
         beside a disagreement so it says which engine moved. Answers
         "agreed", "declined" or "failed", and counts it.
         """
+        if self.not_here:
+            return "not run"
         self.offered += 1
         if self.error:
             return self._fail(label, self.error)
@@ -320,6 +338,9 @@ class Engine:
     def report(self, show=5):
         """Prints the failures, the reasons for refusals, and the summary.
         Answers True when this engine passes."""
+        if self.not_here:
+            print(self.not_here)
+            return True
         for label, why in self.failures[:show]:
             print(f"S3 DISAGREES {label}: {why}")
         if len(self.failures) > show:

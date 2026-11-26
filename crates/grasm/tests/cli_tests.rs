@@ -2773,9 +2773,18 @@ fn c_calls_grasm_through_addresses_and_exports() {
     let w = Work::new("fnaddr_native");
     let src = w.0.join("cb.gr");
     let out = w.0.join("cb");
+    // `dlsym`'s RTLD_DEFAULT is the handle -2 on macOS and the null
+    // handle on glibc; -2 on Linux is no handle, so `dlsym` answered null
+    // and the program stopped after its first line (the first CI run).
+    let rtld_default = if cfg!(target_os = "linux") {
+        "mem_addr(0)"
+    } else {
+        "mem_addr(-2)"
+    };
     std::fs::write(
         &src,
-        "extern fn qsort(base: addr, n: i64, width: i64, cmp: addr)\nextern fn dlsym(handle: addr, name: str) -> addr\n\ntype Unary = fn(i64) -> i64\ntype Wide = fn(i64, i64) -> i64\n\nfn by_value(a: addr, b: addr) -> i32 / {unsafe, mem} {\n    var r: i32 = 0\n    unsafe {\n        let x = a.load_i32()\n        let y = b.load_i32()\n        if x < y {\n            r = -1\n        } else if x > y {\n            r = 1\n        }\n    }\n    r\n}\n\nexport fn cli_triple(n: i64) -> i64 {\n    n * 3\n}\n\nexport fn cli_narrow(a: i8, b: u16) -> i64 {\n    a.as_i64() * 100000 + b.as_i64()\n}\n\n// Named by nothing in the program: only `dlsym` reaches it.\nexport fn cli_lonely(n: i64) -> i64 {\n    n + 100\n}\n\nfn main() {\n    unsafe {\n        let xs = [5, -3, 9, -1, 7, 0]\n        let base = mem_alloc(4 * xs.len(), 4)\n        for i in 0..xs.len() {\n            base.offset(4 * i).store_i32(xs[i].as_i32())\n        }\n        qsort(base, xs.len(), 4, mem_fn_addr(by_value))\n        var sorted: [i32] = []\n        for i in 0..xs.len() {\n            sorted.push(base.offset(4 * i).load_i32())\n        }\n        mem_free(base)\n        print(\"{sorted}\")\n        let found = dlsym(mem_addr(-2), \"cli_triple\")\n        print(\"{found == mem_fn_addr(cli_triple)} {found.call_c(Unary, 14)}\")\n        print(\"{mem_fn_addr(cli_narrow).call_c(Wide, 0x1ff, 0x7fff0005)}\")\n        print(\"{dlsym(mem_addr(-2), \"cli_lonely\").call_c(Unary, 1)}\")\n    }\n}\n",
+        "extern fn qsort(base: addr, n: i64, width: i64, cmp: addr)\nextern fn dlsym(handle: addr, name: str) -> addr\n\ntype Unary = fn(i64) -> i64\ntype Wide = fn(i64, i64) -> i64\n\nfn by_value(a: addr, b: addr) -> i32 / {unsafe, mem} {\n    var r: i32 = 0\n    unsafe {\n        let x = a.load_i32()\n        let y = b.load_i32()\n        if x < y {\n            r = -1\n        } else if x > y {\n            r = 1\n        }\n    }\n    r\n}\n\nexport fn cli_triple(n: i64) -> i64 {\n    n * 3\n}\n\nexport fn cli_narrow(a: i8, b: u16) -> i64 {\n    a.as_i64() * 100000 + b.as_i64()\n}\n\n// Named by nothing in the program: only `dlsym` reaches it.\nexport fn cli_lonely(n: i64) -> i64 {\n    n + 100\n}\n\nfn main() {\n    unsafe {\n        let xs = [5, -3, 9, -1, 7, 0]\n        let base = mem_alloc(4 * xs.len(), 4)\n        for i in 0..xs.len() {\n            base.offset(4 * i).store_i32(xs[i].as_i32())\n        }\n        qsort(base, xs.len(), 4, mem_fn_addr(by_value))\n        var sorted: [i32] = []\n        for i in 0..xs.len() {\n            sorted.push(base.offset(4 * i).load_i32())\n        }\n        mem_free(base)\n        print(\"{sorted}\")\n        let found = dlsym(mem_addr(-2), \"cli_triple\")\n        print(\"{found == mem_fn_addr(cli_triple)} {found.call_c(Unary, 14)}\")\n        print(\"{mem_fn_addr(cli_narrow).call_c(Wide, 0x1ff, 0x7fff0005)}\")\n        print(\"{dlsym(mem_addr(-2), \"cli_lonely\").call_c(Unary, 1)}\")\n    }\n}\n"
+            .replace("mem_addr(-2)", rtld_default),
     )
     .unwrap();
     let (code, msg) = run(&[
