@@ -174,12 +174,19 @@ class Engine:
         # than counting 120 link failures or passing in silence. The Linux
         # objects compiler/s3 writes are held by `elfsubset` instead
         # (docs/self-hosting.md §6.18).
+        # An x86-64 Mac (CI's macos-15-intel) cannot run the arm64 default
+        # either; there x86-64 is held by `xs3subset` from an arm64 Mac.
         self.host = platform.system()
         self.not_here = None
         if self.host != "Darwin":
             self.not_here = (f"s3 engine: not run on {self.host}: compiler/s3 is held here on "
-                             "macOS hosts only; its Linux objects by elfsubset "
+                             "arm64 macOS hosts only; its Linux objects by elfsubset "
                              "(docs/self-hosting.md §6.18)")
+        elif platform.machine() != "arm64":
+            self.not_here = (f"s3 engine: not run on a {platform.machine()} Mac: compiler/s3 is "
+                             "held here on arm64 macOS hosts only; its x86-64 objects by "
+                             "xs3subset (docs/self-hosting.md §6.16)")
+        if self.not_here:
             self.driver = None
             self.own_driver = False
             return
