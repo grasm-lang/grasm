@@ -133,7 +133,7 @@ is not being added blind.
 
 A release archive holds `grasm`, `libgrasm_rt_abi.a` (what `--native` links;
 `grasm` finds it beside itself) and `BUILD-INFO`, naming the commit it was built
-from; from the release after v1.1.0, the arm64 macOS archive also holds
+from; from the next macOS release, the arm64 macOS archive also holds
 `grasm-link`, Grasm's own linker. `scripts/package.sh` makes one, and before it
 writes the checksum it unpacks it into an empty directory, runs a program,
 builds it natively and runs the result. Unpack it and put the files somewhere
@@ -141,10 +141,11 @@ on your `PATH`, together.
 
 v1.1.0 is the first release made this way, for macOS on arm64 and x86_64; it
 was checked again after publishing by downloading it (`scripts/verify_release.sh
---tag v1.1.0`). v1.0.0 predates the script: it is two bare binaries, and
+--tag v1.1.0`). v1.1.1, for Linux on x86-64 and arm64, was built, published and
+downloaded again by CI's release workflow on GitHub's Ubuntu runners. v1.0.0 predates the script: it is two bare binaries, and
 `grasm build --native` from that download stops with "cannot find the Grasm
 runtime". v1.1.0 and earlier link native builds with a C toolchain's `cc`.
-From source, and from the next release, a native build on arm64 macOS links
+From source, and from the next macOS release, a native build on arm64 macOS links
 with `grasm-link` and runs no C compiler or system linker; it reads only the
 SDK's text stubs for libSystem (from the Command Line Tools or Xcode).
 Elsewhere it links with `cc` (`docs/self-hosting.md`).
@@ -153,6 +154,15 @@ Elsewhere it links with `cc` (`docs/self-hosting.md`).
 curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.0/grasm-macos-arm64.tar.gz
 tar -xzf grasm-macos-arm64.tar.gz
 cd grasm-macos-arm64
+./grasm run hello.gr
+```
+
+On Linux (`grasm-linux-arm64.tar.gz` on arm64):
+
+```
+curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.1/grasm-linux-x86_64.tar.gz
+tar -xzf grasm-linux-x86_64.tar.gz
+cd grasm-linux-x86_64
 ./grasm run hello.gr
 ```
 
@@ -446,8 +456,10 @@ one was written. Objects are linked and run on macOS, arm64 natively and x86_64
 under Rosetta (`scripts/crosstest.sh`), and for the two Linux triples in an
 Ubuntu virtual machine on the development Mac, where `elfsubset` links them with
 the Rust runtime built for the triple by the machine's GNU tools as its
-reference (`docs/self-hosting.md` §6.18) -- a local machine, not CI. There is no
-Linux release, and the `grasm` command does not run on Linux yet. Host builds
+reference (`docs/self-hosting.md` §6.18) -- a local machine, not CI. The Rust
+`grasm` command builds and passes CI's gates on Linux x86-64 and arm64, and
+v1.1.1 ships it for both; the `grasm` command written in Grasm does not run on
+Linux yet. Host builds
 link automatically; cross builds emit the object for you to link with that
 target's toolchain and a `libgrasm_rt_abi.a` built for it:
 
@@ -758,8 +770,10 @@ counts both from the tree each time it is written).
 
 ## Status
 
-Pre-alpha. v1.1.0 is the latest release, for macOS on arm64 and x86_64; there
-is no Linux release. What ships is the Rust implementation: Grasm-Core (the
+Pre-alpha. v1.1.1 is the latest release, for Linux on x86-64 and arm64 only;
+for macOS, on arm64 and x86_64, the latest is v1.1.0, since arm64 macOS 26.7
+refuses to start a native build without an `LC_UUID` (`docs/known-issues.md`).
+What ships is the Rust implementation: Grasm-Core (the
 master plan's §19 kernel language), modules, maps, self-contained builds, the
 Cranelift native backend, the wasm build behind the playground, the language
 server and debug adapter, structured concurrency with lightweight tasks, the
@@ -775,13 +789,15 @@ arm64 and x86-64 macOS and Linux and wasm32 ("The compiler in Grasm", above).
 S8, the rest of the toolchain, continues; S9, the cutover, has not started, so
 the Rust toolchain stays the oracle and the bootstrap.
 
-CI has never run. The workflows are written and the public repository keeps
-them in `ci/github-workflows/`; every gate result in this repository comes from
-one arm64 Mac, the Linux ones from an Ubuntu virtual machine on it.
+CI runs on Linux x86-64, Linux arm64, arm64 macOS and x86-64 macOS since
+2026-11-26; every job passes but arm64 macOS's, which stops on the `LC_UUID`
+entry in `docs/known-issues.md`. CI runs the workflow's gates; the rest of
+`scripts/allgates.sh` runs on one arm64 Mac, and the Grasm compiler's Linux
+gates in an Ubuntu virtual machine on it.
 
 ## Project
 
-Apache-2.0 (`LICENSE`, `NOTICE`). Version 1.1.0 — `docs/stability.md` says
+Apache-2.0 (`LICENSE`, `NOTICE`). Version 1.1.1 — `docs/stability.md` says
 exactly what 1.0 commits to, and `spec/stability.md` records the level of every
 normative clause. A clause with no recorded level fails the test suite, so the policy
 cannot drift away from the specification.

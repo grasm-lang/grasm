@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://grasm-lang.github.io"><img src="https://img.shields.io/badge/grasm--lang.github.io-visit-3DDC97?style=for-the-badge&labelColor=0A101C" alt="website"></a>
-  <img src="https://img.shields.io/badge/v1.1.0-pre--alpha-17A2A2?style=for-the-badge&labelColor=0A101C" alt="v1.1.0">
+  <img src="https://img.shields.io/badge/v1.1.1-pre--alpha-17A2A2?style=for-the-badge&labelColor=0A101C" alt="v1.1.1">
   <img src="https://img.shields.io/badge/self--hosting-S8%20of%20S9-F6AE2D?style=for-the-badge&labelColor=0A101C" alt="self-hosting: S8 of S9">
   <img src="https://img.shields.io/badge/GC-none-3DDC97?style=for-the-badge&labelColor=0A101C" alt="no GC">
 </p>
@@ -235,20 +235,28 @@ Randomness and time arrive as arguments. → [`docs/grasmwire.md`](docs/grasmwir
 ## Start
 
 ```sh
-curl -fLO https://github.com/grasm-lang/grasm/releases/latest/download/grasm-macos-arm64.tar.gz
+# macOS (arm64; Intel Macs take grasm-macos-x86_64.tar.gz)
+curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.0/grasm-macos-arm64.tar.gz
 tar -xzf grasm-macos-arm64.tar.gz
 ./grasm-macos-arm64/grasm run hello.gr
+
+# Linux (x86-64; arm64 takes grasm-linux-arm64.tar.gz)
+curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.1/grasm-linux-x86_64.tar.gz
+tar -xzf grasm-linux-x86_64.tar.gz
+./grasm-linux-x86_64/grasm run hello.gr
 ```
 
 **One binary, seventeen subcommands**, with the runtime library that native
 builds link beside it in the archive. On its own it checks, formats, lints,
-tests and runs programs; v1.1.0's `grasm build --native` also needs a C
+tests and runs programs; a released `grasm build --native` also needs a C
 toolchain's `cc` to link with. Grasm's own linker, `grasm-link`, now exists:
 built from source, a native build on arm64 macOS links with it and runs no C
 compiler or system linker, and the arm64 macOS archive carries it from the
-release after v1.1.0. Intel Macs take `grasm-macos-x86_64.tar.gz`; checksums
-are in `SHA256SUMS` beside them. There is no Linux release.
-[All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
+next macOS release. v1.1.1 is Linux only: arm64 macOS 26.7 refuses to start a
+native build without an `LC_UUID`, so macOS stays on v1.1.0 until that is
+fixed ([`docs/known-issues.md`](docs/known-issues.md)). Checksums are in
+`SHA256SUMS` beside each archive.
+[All downloads →](https://github.com/grasm-lang/grasm/releases)
 
 Building from source needs a Rust toolchain to bootstrap the compiler, the way
 every language starts, until the cutover —
@@ -266,4 +274,4 @@ reaches what you ship.
 | 🐛 Open defects, with reproducers | [`docs/known-issues.md`](docs/known-issues.md) |
 | 🔎 101 findings from building it | [`ProjectGold/FINDINGS.md`](ProjectGold/FINDINGS.md) |
 
-<p align="center"><sub>Pre-alpha. Released for macOS (arm64; x86_64, exercised under Rosetta). Linux builds have run only in a local virtual machine, never on CI, and there is no Linux release.<br>Every number on this page comes from the gate run that produced it, recorded in <code>site/facts.json</code>, <code>docs/northstar.md</code> and <code>docs/self-hosting.md</code>.</sub></p>
+<p align="center"><sub>Pre-alpha. Released for macOS (v1.1.0: arm64; x86_64) and Linux (v1.1.1: x86-64, arm64). CI runs on all four since 26 Nov 2026; every job passes but arm64 macOS's. The Grasm compiler's own Linux gates run in a local virtual machine, not on CI.<br>Every number on this page comes from the gate run that produced it, recorded in <code>site/facts.json</code>, <code>docs/northstar.md</code> and <code>docs/self-hosting.md</code>.</sub></p>

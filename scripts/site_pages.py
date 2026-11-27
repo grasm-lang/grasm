@@ -501,13 +501,26 @@ cd grasm-macos-arm64
     + """
 <p>Apple silicon. On an Intel Mac take <code>grasm-macos-x86_64.tar.gz</code>
 instead; the checksums are in <code>SHA256SUMS</code> beside them.
-<a href="https://github.com/grasm-lang/grasm/releases/latest">Every
-download and its checksum →</a> There is no Linux release.</p>
+<a href="https://github.com/grasm-lang/grasm/releases">Every
+download and its checksum →</a></p>
+<p>On Linux, v1.1.1, for x86-64 and arm64 (<code>grasm-linux-arm64.tar.gz</code>):</p>"""
+    + code(
+        """curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.1/grasm-linux-x86_64.tar.gz
+tar -xzf grasm-linux-x86_64.tar.gz
+cd grasm-linux-x86_64
+
+./grasm run hello.gr""",
+        "v1.1.1: Linux only; a native build links with cc.",
+    )
+    + """
+<p>v1.1.1 has no macOS archive: arm64 macOS 26.7 refuses to start a native
+build that has no <code>LC_UUID</code>, and Grasm's native builds take it out
+(<code>docs/known-issues.md</code>). macOS stays on v1.1.0 until that is fixed.</p>
 <p>v1.1.0 links a native build with a C toolchain's <code>cc</code>. Grasm's
 own linker, <code>grasm-link</code>, exists: built from source, a native build
 on arm64 macOS links with it and runs no C compiler or system linker — it reads
 only the SDK's text stubs for libSystem — and the arm64 macOS archive carries
-it from the release after v1.1.0. Elsewhere it links with <code>cc</code>.</p>
+it from the next macOS release. Elsewhere it links with <code>cc</code>.</p>
 
 <h2>Or build it</h2>
 <p>A Rust toolchain builds the compiler you download, the way every language
@@ -561,11 +574,11 @@ links with <code>cc</code> instead.</p>
 in <code>editors/vscode</code>. A debug adapter is in
 <code>crates/grasm_dap</code>.</p>
 
-<div class="note"><b>Release binaries are for macOS only.</b> v1.1.0 is
-published for arm64 and x86_64 with SHA-256 sums and no Apple Developer
-signature, so Gatekeeper asks before the first run. There is no Linux
-release; <a href="status.html">the status page</a> says what has run on
-Linux and where.</div>
+<div class="note"><b>Release binaries.</b> v1.1.0 is published for macOS on
+arm64 and x86_64 with SHA-256 sums and no Apple Developer signature, so
+Gatekeeper asks before the first run. v1.1.1 is published for Linux on x86-64
+and arm64 only; <a href="status.html">the status page</a> says why there is no
+macOS v1.1.1.</div>
 """,
 )
 
@@ -1517,7 +1530,7 @@ table because the margin moved once already with nothing noticing: see
 <tr><td>A union error cannot be narrowed</td><td><code>(A|B)</code> is raised, propagated and printed, never destructured. Declare one sum type and match it.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
 <tr><td>Small standard library</td><td>«methods» methods. Enough for «gold» whole programs and «apps» applications; you will find gaps in something larger.</td></tr>
-<tr><td>No Linux release, and no CI</td><td>The release is macOS only, and the <code>grasm</code> command does not run on Linux yet. What has run there: on 13 November 2026, in an Ubuntu 25.10 virtual machine on the development Mac (OrbStack; arm64, glibc 2.42, x86-64 programs through Rosetta), the five Linux gates passed for both triples. Their reference is the Rust compiler's objects for the triple, linked with the Rust runtime built for it by the machine's GNU tools; against it, the ELF objects of the compiler written in Grasm, linked by that compiler's own linker: on each triple 647 of 648 programs identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed; 324 links per triple byte for byte GNU ld's (<code>docs/self-hosting.md</code> §6.18). That is a local virtual machine, not CI. The CI workflows are written and have never run: the public repository keeps them in <code>ci/github-workflows/</code>.</td></tr>
+<tr><td>Linux: v1.1.1 and CI</td><td>v1.1.1 is a Linux release, x86-64 and arm64, built, published and downloaded again by CI on GitHub's Ubuntu runners; it ships the Rust <code>grasm</code> command, which passes CI's gates on both. CI has run since 26 November 2026 on Linux x86-64, Linux arm64, arm64 macOS and x86-64 macOS; every job passes but arm64 macOS's, which stops because macOS 26.7 refuses a native build without an <code>LC_UUID</code> (<code>docs/known-issues.md</code>). The <code>grasm</code> command written in Grasm does not run on Linux yet. What its compiler's Linux output has run on: on 13 November 2026, in an Ubuntu 25.10 virtual machine on the development Mac (OrbStack; arm64, glibc 2.42, x86-64 programs through Rosetta), the five Linux gates passed for both triples. Their reference is the Rust compiler's objects for the triple, linked with the Rust runtime built for it by the machine's GNU tools; against it, the ELF objects of the compiler written in Grasm, linked by that compiler's own linker: on each triple 647 of 648 programs identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed; 324 links per triple byte for byte GNU ld's (<code>docs/self-hosting.md</code> §6.18). That is a local virtual machine, not CI: CI does not run those five gates.</td></tr>
 <tr><td>The compiler in Grasm does not ship yet</td><td>A second compiler, written in Grasm, builds itself to a fixed point (<a href="architecture.html">how it is built</a>), but the Rust toolchain is still what a release is built with, the oracle every gate compares against, and the bootstrap. S8, the rest of the toolchain, continues; S9, the cutover, has not started.</td></tr>
 <tr><td>Tasks refuse every effect</td><td>«tasks» tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
 <tr><td>The specification is over its budget</td><td>The specification is <b>«spec_pages»</b> pages against the «spec_cap» §19.2 binds it to, and <code>crates/grasm_spec/tests/core.rs</code> fails past 70 because that is where recording the gap stops being enough. It crossed on 12 October when <code>[E-SCHEDULE]</code> was rewritten, and was back at 70, the test's ceiling, on 19 October, by moving records out of normative clauses rather than by raising anything; the commitment is still 20 pages away. The ceiling is not being raised and the metric is not being re-scoped, because <code>spec/core.md</code> rules both out: <em>a number that is met by redefining what counts is not a number</em>. <code>docs/known-issues.md</code> has what closing it costs.</td></tr>
@@ -2411,7 +2424,7 @@ above and not only at the end of the site.</p>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
-<tr><td>Linux, today</td><td>There is no Linux release, and the <code>grasm</code> command does not run on Linux yet. The compiler written in Grasm has arm64 and x86-64 Linux backends and its own ELF linker, and on 13 November 2026 the corpus built by it ran in an Ubuntu virtual machine on the development Mac, agreeing with the Rust compiler's build for each triple: 647 of 648 identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed. That is a local virtual machine, not CI; the CI workflows have never run.</td></tr>
+<tr><td>Linux, today</td><td>v1.1.1 ships the Rust <code>grasm</code> command for Linux on x86-64 and arm64, held by CI there; the <code>grasm</code> command written in Grasm does not run on Linux yet. The compiler written in Grasm has arm64 and x86-64 Linux backends and its own ELF linker, and on 13 November 2026 the corpus built by it ran in an Ubuntu virtual machine on the development Mac, agreeing with the Rust compiler's build for each triple: 647 of 648 identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed. That is a local virtual machine; CI does not run those gates.</td></tr>
 </table></div>
 
 <p class="note"><strong>The one-line version.</strong> Everywhere else, the
@@ -2581,7 +2594,7 @@ mistake bought →</a></p>
 <tr><td><b>Tasks refuse every effect</b> — G6's uncolored half</td><td>The task count is met; the goal is not. A task that cannot do I/O is not the thing the goal asks for.</td></tr>
 <tr><td><b>Sub-50 ms at a million lines</b> — G3's other half</td><td>A query engine. What exists is a batch compiler with an object cache, re-checking the whole program on every keystroke, and at this repository's size that is fast enough to hide the problem.</td></tr>
 <tr><td><b>G11's last 4% and 2%</b></td><td>Priced before building: list repetition and a stepped range are what Python has and Grasm does not on the worst row. Not closable by adding library methods.</td></tr>
-<tr><td><b>Linux: a local virtual machine, not CI, and no release</b></td><td>The compiler written in Grasm targets arm64 and x86-64 Linux with its own ELF linker, and its five Linux gates passed on 13 November 2026 in an Ubuntu virtual machine on the development Mac (<a href="status.html">the status page</a> has the lines). What it would take: a <code>grasm</code> command that runs on Linux, a Linux release, and CI that has run at all — the workflows are written and never have.</td></tr>
+<tr><td><b>Linux: the Grasm compiler in a local virtual machine only</b></td><td>v1.1.1 ships the Rust toolchain for Linux, and CI holds it there. The compiler written in Grasm targets arm64 and x86-64 Linux with its own ELF linker, and its five Linux gates passed on 13 November 2026 in an Ubuntu virtual machine on the development Mac (<a href="status.html">the status page</a> has the lines). What it would take: a <code>grasm</code> command written in Grasm that runs on Linux, and those gates on CI.</td></tr>
 <tr><td><b>No remote registry</b></td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td><b>G1 and G10 need users</b></td><td>A week to ship a service, and 500 companies. Neither is a number this repository can produce by working harder on it.</td></tr>
 </table></div>

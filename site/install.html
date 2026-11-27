@@ -14,7 +14,7 @@
 </head><body data-page="install">
 <header class="topbar">
   <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
-  <span class="ver">v1.1.0</span>
+  <span class="ver">v1.1.1</span>
   <nav>
     <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
@@ -69,13 +69,21 @@ cd grasm<span class="op">-</span>macos<span class="op">-</span>arm64
 <span class="op">.</span><span class="op">/</span>grasm run hello<span class="op">.</span>gr</code></pre><figcaption>v1.1.0: grasm, libgrasm_rt_abi.a beside it, and BUILD-INFO naming the commit.</figcaption></figure>
 <p>Apple silicon. On an Intel Mac take <code>grasm-macos-x86_64.tar.gz</code>
 instead; the checksums are in <code>SHA256SUMS</code> beside them.
-<a href="https://github.com/grasm-lang/grasm/releases/latest">Every
-download and its checksum →</a> There is no Linux release.</p>
+<a href="https://github.com/grasm-lang/grasm/releases">Every
+download and its checksum →</a></p>
+<p>On Linux, v1.1.1, for x86-64 and arm64 (<code>grasm-linux-arm64.tar.gz</code>):</p><figure class="code"><pre><code>curl <span class="op">-</span>fLO https<span class="op">:</span><span class="cm">//github.com/grasm-lang/grasm/releases/download/v1.1.1/grasm-linux-x86_64.tar.gz</span>
+tar <span class="op">-</span>xzf grasm<span class="op">-</span>linux<span class="op">-</span>x86_64<span class="op">.</span>tar<span class="op">.</span>gz
+cd grasm<span class="op">-</span>linux<span class="op">-</span>x86_64
+
+<span class="op">.</span><span class="op">/</span>grasm run hello<span class="op">.</span>gr</code></pre><figcaption>v1.1.1: Linux only; a native build links with cc.</figcaption></figure>
+<p>v1.1.1 has no macOS archive: arm64 macOS 26.7 refuses to start a native
+build that has no <code>LC_UUID</code>, and Grasm's native builds take it out
+(<code>docs/known-issues.md</code>). macOS stays on v1.1.0 until that is fixed.</p>
 <p>v1.1.0 links a native build with a C toolchain's <code>cc</code>. Grasm's
 own linker, <code>grasm-link</code>, exists: built from source, a native build
 on arm64 macOS links with it and runs no C compiler or system linker — it reads
 only the SDK's text stubs for libSystem — and the arm64 macOS archive carries
-it from the release after v1.1.0. Elsewhere it links with <code>cc</code>.</p>
+it from the next macOS release. Elsewhere it links with <code>cc</code>.</p>
 
 <h2>Or build it</h2>
 <p>A Rust toolchain builds the compiler you download, the way every language
@@ -123,11 +131,11 @@ links with <code>cc</code> instead.</p>
 in <code>editors/vscode</code>. A debug adapter is in
 <code>crates/grasm_dap</code>.</p>
 
-<div class="note"><b>Release binaries are for macOS only.</b> v1.1.0 is
-published for arm64 and x86_64 with SHA-256 sums and no Apple Developer
-signature, so Gatekeeper asks before the first run. There is no Linux
-release; <a href="status.html">the status page</a> says what has run on
-Linux and where.</div>
+<div class="note"><b>Release binaries.</b> v1.1.0 is published for macOS on
+arm64 and x86_64 with SHA-256 sums and no Apple Developer signature, so
+Gatekeeper asks before the first run. v1.1.1 is published for Linux on x86-64
+and arm64 only; <a href="status.html">the status page</a> says why there is no
+macOS v1.1.1.</div>
 
 </main>
 </div>

@@ -14,7 +14,7 @@
 </head><body data-page="different">
 <header class="topbar">
   <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
-  <span class="ver">v1.1.0</span>
+  <span class="ver">v1.1.1</span>
   <nav>
     <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
@@ -186,7 +186,7 @@ above and not only at the end of the site.</p>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
-<tr><td>Linux, today</td><td>There is no Linux release, and the <code>grasm</code> command does not run on Linux yet. The compiler written in Grasm has arm64 and x86-64 Linux backends and its own ELF linker, and on 13 November 2026 the corpus built by it ran in an Ubuntu virtual machine on the development Mac, agreeing with the Rust compiler's build for each triple: 647 of 648 identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed. That is a local virtual machine, not CI; the CI workflows have never run.</td></tr>
+<tr><td>Linux, today</td><td>v1.1.1 ships the Rust <code>grasm</code> command for Linux on x86-64 and arm64, held by CI there; the <code>grasm</code> command written in Grasm does not run on Linux yet. The compiler written in Grasm has arm64 and x86-64 Linux backends and its own ELF linker, and on 13 November 2026 the corpus built by it ran in an Ubuntu virtual machine on the development Mac, agreeing with the Rust compiler's build for each triple: 647 of 648 identical, 0 mismatched, the one other agreeing with the Cranelift build and not the interpreter, as listed. That is a local virtual machine; CI does not run those gates.</td></tr>
 </table></div>
 
 <p class="note"><strong>The one-line version.</strong> Everywhere else, the

@@ -14,7 +14,7 @@
 </head><body data-page="achieved">
 <header class="topbar">
   <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
-  <span class="ver">v1.1.0</span>
+  <span class="ver">v1.1.1</span>
   <nav>
     <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
@@ -170,7 +170,7 @@ mistake bought →</a></p>
 <tr><td><b>Tasks refuse every effect</b> — G6's uncolored half</td><td>The task count is met; the goal is not. A task that cannot do I/O is not the thing the goal asks for.</td></tr>
 <tr><td><b>Sub-50 ms at a million lines</b> — G3's other half</td><td>A query engine. What exists is a batch compiler with an object cache, re-checking the whole program on every keystroke, and at this repository's size that is fast enough to hide the problem.</td></tr>
 <tr><td><b>G11's last 4% and 2%</b></td><td>Priced before building: list repetition and a stepped range are what Python has and Grasm does not on the worst row. Not closable by adding library methods.</td></tr>
-<tr><td><b>Linux: a local virtual machine, not CI, and no release</b></td><td>The compiler written in Grasm targets arm64 and x86-64 Linux with its own ELF linker, and its five Linux gates passed on 13 November 2026 in an Ubuntu virtual machine on the development Mac (<a href="status.html">the status page</a> has the lines). What it would take: a <code>grasm</code> command that runs on Linux, a Linux release, and CI that has run at all — the workflows are written and never have.</td></tr>
+<tr><td><b>Linux: the Grasm compiler in a local virtual machine only</b></td><td>v1.1.1 ships the Rust toolchain for Linux, and CI holds it there. The compiler written in Grasm targets arm64 and x86-64 Linux with its own ELF linker, and its five Linux gates passed on 13 November 2026 in an Ubuntu virtual machine on the development Mac (<a href="status.html">the status page</a> has the lines). What it would take: a <code>grasm</code> command written in Grasm that runs on Linux, and those gates on CI.</td></tr>
 <tr><td><b>No remote registry</b></td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td><b>G1 and G10 need users</b></td><td>A week to ship a service, and 500 companies. Neither is a number this repository can produce by working harder on it.</td></tr>
 </table></div>

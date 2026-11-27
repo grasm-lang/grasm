@@ -5,7 +5,16 @@ before 2.0. Anything marked `provisional` may change in a minor release with a
 migration note here; anything `experimental` may change in any release. See
 `docs/stability.md`.
 
-## Unreleased — since 1.1.0
+## 1.1.1 — 2026-11-27
+
+The first archives for Linux, on x86-64 and arm64, and only those: there is
+no macOS archive in this release. GitHub's arm64 macOS 26.7 runner refuses a
+program that has no `LC_UUID` load command, and every native build takes
+the UUID out (`docs/known-issues.md`); 1.1.0's native builds take it out the
+same way. The changes below that are arm64 macOS's own -- `grasm-link` among
+them -- reach no archive until a macOS release. The archives were built,
+run from an empty directory, published and downloaded again by CI's release
+workflow on GitHub's Ubuntu runners.
 
 ### Security
 
@@ -21,6 +30,11 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **A native build on Linux could not link a program that calls a maths
+  function** (`sin`, `log`, `pow` and the rest): glibc keeps them in libm,
+  which `cc` does not link unless told, and macOS keeps them in libSystem.
+  48 corpus programs failed to link on the first CI run; the link line now
+  names `-lm`.
 - **An incremental `grasm build --native` could link a caller compiled for
   the wrong calling convention.** A function that can reach itself takes a
   hidden stack-floor argument, which is decided from bodies, and the object
@@ -96,6 +110,13 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Linux release archives**, `grasm-linux-x86_64.tar.gz` and
+  `grasm-linux-arm64.tar.gz`: `grasm`, `libgrasm_rt_abi.a` and
+  `BUILD-INFO`. `--native` links with `cc`.
+- **CI runs**: on Linux x86-64, Linux arm64, arm64 macOS and x86-64 macOS,
+  from 2026-11-26, with Rust pinned to the toolchain the local gates use.
+  Before that every result came from one arm64 Mac and a virtual machine on
+  it.
 - **TIR** (`docs/tir.md`): `grasm tir` prints a checked program with every
   decision the checker made written down, the first stage of the
   self-hosting plan. The `tirtest` gate holds the whole corpus to it.

@@ -70,7 +70,7 @@ import dap
 
 /// The toolchain's version, `grasm --version`'s: the workspace's, which the
 /// Rust command takes from its manifest. `clidiff` holds the two equal.
-let VERSION = "1.1.0"
+let VERSION = "1.1.1"
 
 /// Exported so that this executable's runtime never journals it
 /// (compiler/rt/src/journal.gr): `GRASM_RECORD` and `GRASM_REPLAY` are for

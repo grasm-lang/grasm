@@ -9,29 +9,69 @@ name: Release
 # cannot compile is not a release, and nothing had checked. Every step below
 # is a script that also runs on a laptop: scripts/package.sh builds and
 # verifies one archive, scripts/verify_release.sh checks a published tag.
+#
+# Run by hand, for a tag that already exists, with the platforms it is for:
+#
+#     gh workflow run release.yml -f tag=v1.1.1 -f platforms="linux-x86_64 linux-arm64"
+#
+# A release names its platforms rather than taking whatever happened to
+# build: v1.1.1 is Linux only because arm64 macOS 26.7 refuses a binary with
+# no LC_UUID (docs/known-issues.md), and a publish step that uploaded the
+# archives that succeeded would have shipped a partial release without
+# saying so. Every listed platform must build and pass, or nothing is
+# published.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build and publish (it must exist)"
+        required: true
+      platforms:
+        description: "Space-separated: linux-x86_64 linux-arm64 macos-arm64 macos-x86_64"
+        required: true
+        default: "linux-x86_64 linux-arm64 macos-arm64 macos-x86_64"
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      archives: ${{ steps.plan.outputs.archives }}
+      runners: ${{ steps.plan.outputs.runners }}
+    steps:
+      - id: plan
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -eu
+          archives=""
+          runners=""
+          for p in $PLATFORMS; do
+            case "$p" in
+              linux-x86_64) os=ubuntu-latest ;;
+              linux-arm64) os=ubuntu-24.04-arm ;;
+              macos-arm64) os=macos-latest ;;
+              macos-x86_64) os=macos-15-intel ;;
+              *) echo "unknown platform: $p"; exit 1 ;;
+            esac
+            archives="$archives{\"os\":\"$os\",\"name\":\"$p\"},"
+            runners="$runners\"$os\","
+          done
+          [ -n "$archives" ] || { echo "no platforms"; exit 1; }
+          echo "archives=[${archives%,}]" >> "$GITHUB_OUTPUT"
+          echo "runners=[${runners%,}]" >> "$GITHUB_OUTPUT"
+
   archive:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: macos-latest
-            name: macos-arm64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
+        include: ${{ fromJSON(needs.plan.outputs.archives) }}
     runs-on: ${{ matrix.os }}
     name: archive ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
@@ -44,11 +84,13 @@ jobs:
 
   publish:
     needs: archive
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           path: out
@@ -56,29 +98,35 @@ jobs:
       - name: Checksums and release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag }}
         run: |
+          notes="$PWD/ci/release-notes/$TAG.md"
           cd out
           sha256sum grasm-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" grasm-*.tar.gz SHA256SUMS --clobber -R "$GITHUB_REPOSITORY"
+          elif [ -f "$notes" ]; then
+            gh release create "$TAG" grasm-*.tar.gz SHA256SUMS --verify-tag \
+              --title "Grasm $TAG" --notes-file "$notes" -R "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" grasm-*.tar.gz SHA256SUMS --verify-tag \
               --title "Grasm $TAG" --notes "Built from $GITHUB_SHA." -R "$GITHUB_REPOSITORY"
           fi
 
   verify-download:
-    needs: publish
+    needs: [plan, publish]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+        os: ${{ fromJSON(needs.plan.outputs.runners) }}
     runs-on: ${{ matrix.os }}
     name: download check ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - name: Download the published release and use it
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/verify_release.sh --tag "${{ github.ref_name }}" -R "$GITHUB_REPOSITORY"
+        run: bash scripts/verify_release.sh --tag "${{ inputs.tag }}" -R "$GITHUB_REPOSITORY"

@@ -5,8 +5,10 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: two, a `^` chain of 100,000 terms aborting `grasm check` and an
-`IoFailed` that `grasm run` and a native binary word differently; one
+**Open S1: three, a `^` chain of 100,000 terms aborting `grasm check`, an
+`IoFailed` that `grasm run` and a native binary word differently, and a
+native build that arm64 macOS 26.7 refuses to start for its missing
+`LC_UUID`; one
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: one, `grasm dap` running a program without the checker's facts,
 so that it computes other values than `grasm run` with no error. Open S3:
@@ -1719,11 +1721,29 @@ that way, for macOS on arm64 and x86_64, and was checked after publishing by
 downloading it (`scripts/verify_release.sh --tag v1.1.0`); v1.0.0 stays as it
 was.
 
-**CI has never run -- *open*.** The workflows are written; the public
-repository holds them in `ci/github-workflows/`, because the import was pushed
-without GitHub's `workflow` scope. Every gate result in this repository comes
-from one arm64 Mac. Linux binaries have been linked and run only in a local
-virtual machine on that Mac (S7, docs/self-hosting.md §6.18), never on CI.
+**CI has never run -- *closed*.** The workflows moved into
+`.github/workflows/` on 2026-11-26 and CI runs on Linux x86-64, Linux arm64,
+arm64 macOS and x86-64 macOS, with Rust pinned to 1.99.1, the local gates'
+toolchain. Its first eight runs found the faults recorded in CHANGELOG.md
+under 1.1.1 (libm on Linux, a stale lockfile, a Linux-only lint, a C
+prototype in a conformance program) and the `LC_UUID` entry below; on the
+eighth, every job passed but arm64 macOS's. CI runs the workflow's list of
+gates, not the whole of `scripts/allgates.sh`, which still runs on one arm64
+Mac.
+
+**arm64 macOS 26.7 refuses to start a native build -- S1, *open*.** GitHub's
+`macos-26-arm64` runner (macOS 26.7.2) stops a program that has no `LC_UUID`
+load command: `dyld: missing LC_UUID load command`. Every native build takes
+the UUID out, for reproducibility: `grasm build --native` runs `strip
+-no_uuid` after `cc`, and `grasm-link -strip` writes none. Found as CI could
+not run `grasm-link.stage` (built by `cc` and stripped) to link `grasm-link`;
+macOS 26.1 on the development Mac and macOS 15 on CI's x86-64 runner start
+the same binaries. 1.1.0's native builds strip it the same way, so they are
+refused there too (inferred from the code, not tried on 26.7). The fix is a
+UUID computed from the output's own bytes, which `compiler/link` already
+writes when it does not strip; `scripts/linkdiff.sh` compares `-strip`
+output with `strip -no_uuid`'s byte for byte and has to change with it.
+Until then no release ships a macOS archive: 1.1.1 is Linux only.
 
 **Replay called C functions for real -- S1, *closed*.** Under `GRASM_REPLAY`
 an `extern fn` ran live: `unsafe { getpid() }` recorded 18839 and replayed

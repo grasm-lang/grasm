@@ -98,7 +98,7 @@ fn handle(inout sv: Server, method: str, req: Json) -> (Json, bool, [Json]) {
             ("documentSymbolProvider", JBool(true)),
             ("completionProvider", json.obj([("triggerCharacters", JArr([json.jstr(".")]))])),
         ])
-        let info = json.obj([("name", json.jstr("grasm-lsp")), ("version", json.jstr("1.1.0"))])
+        let info = json.obj([("name", json.jstr("grasm-lsp")), ("version", json.jstr("1.1.1"))])
         return (json.obj([("capabilities", caps), ("serverInfo", info)]), true, [])
     }
     if method == "shutdown" {
